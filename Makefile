@@ -5,7 +5,7 @@ endif
 CFLAGS = -g -Wall
 
 %.o: %.c
-	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install-base-2018-10-30-lin-x86-64/include/ -c $< -o $@
+	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ -c $< -o $@
 
 # TODO: create .a for outside projects
 # TODO: create utility which reads arbitrary ELF programs

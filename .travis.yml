@@ -1,0 +1,9 @@
+dist: xenial
+language: c
+before_install:
+ - git clone https://github.com/intelxed/xed.git xed
+ - git clone https://github.com/intelxed/mbuild.git mbuild
+ - (cd xed && ./mfile.py install --install-dir=kits/xed-install)
+script:
+ - XED_PATH=${PWD}/xed make all
+ - ./asmlint_test

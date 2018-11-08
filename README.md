@@ -49,7 +49,7 @@ First install the Intel x86 encoder decoder:
 git clone https://github.com/intelxed/xed.git xed
 git clone https://github.com/intelxed/mbuild.git mbuild
 cd xed
-./mfile.py
+./mfile.py install --install-dir=kits/xed-install
 ```
 
 Next build asmlint:

@@ -11,10 +11,10 @@ For example, `add eax, 1` can encode with either an 8- or 32-bit immediate:
 Using the former can result in smaller and faster code.  asmlint can help
 compiler writers generate better code and documents the complexity of x86.
 
-## Analyses
+## Implemented analyses
 
 * implicit EAX
-  - `81C0 00010000` instead of `05 00010000` (ADD EAX, 1)
+  - `81C0 00010000` instead of `05 00010000` (ADD EAX, 0x100)
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
 * suboptimal zero register
@@ -22,10 +22,10 @@ compiler writers generate better code and documents the complexity of x86.
 * unnecessary REX prefix
   - `40C9` instead of `C9` (LEAVE)
 
-## Possible analyses
+## Not yet implemented analyses
 
 single-instruction
-* CMP vs. TEST
+* CMP 0 vs. TEST
 * nonsense instructions
   - MOV RAX, RAX
 * strength reduce MUL with immediate to LEA
@@ -38,7 +38,7 @@ peephole
 * duplicate constant loads
 * [near-duplicate constant loads](https://paul.bone.id.au/2018/09/14/large-immediate-values/)
 * suboptimal no-ops
-  - multiple 0x90 instead of 0x60 0x90, etc.
+  - multiple `90` instead of a single `60 90`, etc.
 * unneeded register spills
 
 ## Compilation

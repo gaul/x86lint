@@ -1,2 +1,3 @@
 asmlint_test
+libasmlint.a
 *.o

@@ -1,6 +1,6 @@
-# asmlint
+# x86lint
 
-asmlint examines x86 instructions to find suboptimal encodings and sequences.
+x86lint examines x86 instructions to find suboptimal encodings and sequences.
 For example, `add eax, 1` can encode with either an 8- or 32-bit immediate:
 
 ```
@@ -8,7 +8,7 @@ For example, `add eax, 1` can encode with either an 8- or 32-bit immediate:
 81C0 01000000
 ```
 
-Using the former can result in smaller and faster code.  asmlint can help
+Using the former can result in smaller and faster code.  x86lint can help
 compiler writers generate better code and documents the complexity of x86.
 
 ## Implemented analyses
@@ -52,11 +52,11 @@ cd xed
 ./mfile.py install --install-dir=kits/xed-install
 ```
 
-Next build asmlint:
+Next build x86lint:
 
 ```
-git clone https://github.com/gaul/asmlint.git asmlint
-cd asmlint
+git clone https://github.com/gaul/x86lint.git x86lint
+cd x86lint
 XED_PATH=/path/to/xed make all
 ```
 

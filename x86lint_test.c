@@ -17,7 +17,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-#include "asmlint.h"
+#include "x86lint.h"
 #include "xed/xed-interface.h"
 
 static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, size_t len)

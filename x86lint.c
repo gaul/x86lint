@@ -24,6 +24,10 @@
 // TODO: consider valid uses of oversized immediate to avoid explicit no-op padding
 bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
 {
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
     int iclass = xed_decoded_inst_get_iclass(xedd);
 
     switch (iclass) {
@@ -109,6 +113,13 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_PUSHFQ:
     case XED_ICLASS_RET_NEAR:
         return false;
+    case XED_ICLASS_XOR:
+        // register could be zero-extended from 32-bit
+        if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) != XED_REG_INVALID &&
+            xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1) != XED_REG_INVALID) {
+            return false;
+        }
+        break;
     default:
         break;
     }

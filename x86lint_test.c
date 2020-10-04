@@ -68,6 +68,14 @@ static void check_unneedex_rex_test(void)
 {
     xed_decoded_inst_t xedd;
 
+    static const uint8_t xor_rax_rax[] = { 0x48, 0x31, 0xC0 };  // xor rax, rax
+    decode_instruction(&xedd, xor_rax_rax, sizeof(xor_rax_rax));
+    assert(!check_unneeded_rex(&xedd));
+
+    static const uint8_t xor_eax_eax[] = { 0x31, 0xC0 };  // xor rax, rax
+    decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));
+    assert(check_unneeded_rex(&xedd));
+
     static const uint8_t add_al_imm1_1[] = { 0x04, 0x01, };  // add al, 0x1
     decode_instruction(&xedd, add_al_imm1_1, sizeof(add_al_imm1_1));
     assert(check_unneeded_rex(&xedd));
@@ -138,9 +146,10 @@ int main(int argc, char *argv[])
         0x40, 0xc9,  // leave
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
+        0x48, 0x31, 0xC0,  // xor rax, rax
     };
     int errors = check_instructions(inst, sizeof(inst));
-    assert(errors == 4);
+    assert(errors == 5);
 
     return 0;
 }

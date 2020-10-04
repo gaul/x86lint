@@ -20,6 +20,7 @@ compiler writers generate better code and documents the complexity of x86.
 * suboptimal zero register
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unnecessary REX prefix
+  - XOR RAX, RAX instead of XOR EAX, EAX
   - `40C9` instead of `C9` (LEAVE)
 
 ## Not yet implemented analyses

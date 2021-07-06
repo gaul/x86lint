@@ -12,10 +12,17 @@ lib: x86lint.o
 
 # TODO: create utility which reads arbitrary ELF programs
 
+x86lint: x86lint.o main.o
+	$(CC) $(CFLAGS) x86lint.o main.o ${XED_PATH}/obj/libxed.a -o x86lint
+
 test: x86lint.o x86lint_test.o
 	$(CC) $(CFLAGS) x86lint.o x86lint_test.o ${XED_PATH}/obj/libxed.a -o x86lint_test
 
-all: lib test
+all: lib x86lint test
 
 clean:
-	rm -f x86lint_test libx86lint.a *.o
+	rm -f \
+		x86lint \
+		x86lint_test \
+		libx86lint.a \
+		*.o

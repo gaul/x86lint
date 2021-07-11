@@ -1,6 +1,6 @@
 # x86lint
 
-x86lint examines x86 instructions to find suboptimal encodings and sequences.
+x86lint examines x86 machine code to find suboptimal encodings and sequences.
 For example, `add eax, 1` can encode with either an 8- or 32-bit immediate:
 
 ```
@@ -59,6 +59,15 @@ Next build x86lint:
 git clone https://github.com/gaul/x86lint.git x86lint
 cd x86lint
 XED_PATH=/path/to/xed make all
+```
+
+## Usage
+
+x86lint is intended to be part of compiler test suites which should `#include
+"x86lint.h"` and link `libx86lint.a`.  It can also read arbitrary ELF executables via:
+
+```
+./x86lint /bin/ls
 ```
 
 ## References

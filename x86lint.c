@@ -269,7 +269,13 @@ bool check_mov_zero(const xed_decoded_inst_t *xedd)
         return true;
     }
 
+    // do not consider stores of zero to memory
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
     switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
+    case 0:
     case 8:
     case 16:
         break;

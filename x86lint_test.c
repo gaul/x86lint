@@ -112,6 +112,10 @@ static void check_mov_zero_test(void)
     static const uint8_t xor_eax_eax[] = { 0x31, 0xC0, };  // xor eax, eax
     decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));
     assert(check_mov_zero(&xedd));
+
+    static const uint8_t mov_indirect_zero[] = { 0xC7, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, };  // mov dword ptr [rbp], 0x0
+    decode_instruction(&xedd, mov_indirect_zero, sizeof(mov_indirect_zero));
+    assert(check_mov_zero(&xedd));
 }
 
 static void check_implicit_register_test(void)

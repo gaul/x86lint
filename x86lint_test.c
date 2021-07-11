@@ -143,6 +143,19 @@ static void check_implicit_register_test(void)
     assert(check_implicit_register(&xedd));
 }
 
+static void check_implicit_immediate_test(void)
+{
+    xed_decoded_inst_t xedd;
+
+    static const uint8_t rotate_left_without_immediate[] = { 0xd1, 0xd0, };  // rcl eax, 1
+    decode_instruction(&xedd, rotate_left_without_immediate, sizeof(rotate_left_without_immediate));
+    assert(check_implicit_immediate(&xedd));
+
+    static const uint8_t rotate_left_with_immediate[] = { 0xc1, 0xd0, 0x01, };  // rcl eax, 1
+    decode_instruction(&xedd, rotate_left_with_immediate, sizeof(rotate_left_with_immediate));
+    assert(!check_implicit_immediate(&xedd));
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -152,6 +165,7 @@ int main(int argc, char *argv[])
     check_unneedex_rex_test();
     check_mov_zero_test();
     check_implicit_register_test();
+    check_implicit_immediate_test();
 
     static const uint8_t inst[] = {
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
@@ -159,9 +173,10 @@ int main(int argc, char *argv[])
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
+        0xc1, 0xd0, 0x01,  // rcl eax, 1
     };
     int errors = check_instructions(inst, sizeof(inst));
-    assert(errors == 5);
+    assert(errors == 6);
 
     return 0;
 }

@@ -22,6 +22,8 @@ compiler writers generate better code and documents the complexity of x86.
 * unnecessary REX prefix
   - XOR RAX, RAX instead of XOR EAX, EAX
   - `40C9` instead of `C9` (LEAVE)
+* unnecessary immediate
+  - `C1D0 01` instead of `D1D0` (RCL EAX, 1)
 
 ## Not yet implemented analyses
 

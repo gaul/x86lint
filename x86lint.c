@@ -343,6 +343,26 @@ bool check_implicit_register(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
+{
+    xed_uint64_t imm = xed_decoded_inst_get_unsigned_immediate(xedd);
+    if (imm != 1) {
+        return true;
+    }
+    switch (xedd->_inst->_iform_enum) {
+    case XED_IFORM_RCL_GPRv_IMMb:
+    case XED_IFORM_RCR_GPRv_IMMb:
+    case XED_IFORM_ROL_GPRv_IMMb:
+    case XED_IFORM_ROR_GPRv_IMMb:
+    //case XED_IFORM_SAL_GPRv_IMMb:
+    case XED_IFORM_SAR_GPRv_IMMb:
+    //case XED_IFORM_SHL_GPRv_IMMb:
+    case XED_IFORM_SHR_GPRv_IMMb:
+        return false;
+    }
+    return true;
+}
+
 static void dump_instruction(const xed_decoded_inst_t *xedd)
 {
     char buf[1024];
@@ -404,6 +424,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_implicit_register(&xedd);
         if (!result) {
             printf("unneeded explicit register at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_implicit_immediate(&xedd);
+        if (!result) {
+            printf("unneeded explicit immediate at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

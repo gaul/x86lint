@@ -69,6 +69,65 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+static bool check_rex_register(xed_reg_enum_t reg)
+{
+    switch (reg) {
+    case XED_REG_R8B:
+    case XED_REG_R9B:
+    case XED_REG_R10B:
+    case XED_REG_R11B:
+    case XED_REG_R12B:
+    case XED_REG_R13B:
+    case XED_REG_R14B:
+    case XED_REG_R15B:
+
+    case XED_REG_R8W:
+    case XED_REG_R9W:
+    case XED_REG_R10W:
+    case XED_REG_R11W:
+    case XED_REG_R12W:
+    case XED_REG_R13W:
+    case XED_REG_R14W:
+    case XED_REG_R15W:
+
+    case XED_REG_R8D:
+    case XED_REG_R9D:
+    case XED_REG_R10D:
+    case XED_REG_R11D:
+    case XED_REG_R12D:
+    case XED_REG_R13D:
+    case XED_REG_R14D:
+    case XED_REG_R15D:
+
+    case XED_REG_R8:
+    case XED_REG_R9:
+    case XED_REG_R10:
+    case XED_REG_R11:
+    case XED_REG_R12:
+    case XED_REG_R13:
+    case XED_REG_R14:
+    case XED_REG_R15:
+
+    case XED_REG_SPL:
+    case XED_REG_BPL:
+    case XED_REG_SIL:
+    case XED_REG_DIL:
+
+    case XED_REG_RAX:
+    case XED_REG_RCX:
+    case XED_REG_RDX:
+    case XED_REG_RBX:
+    case XED_REG_RSP:
+    case XED_REG_RBP:
+    case XED_REG_RSI:
+    case XED_REG_RDI:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
 /**
  * A REX prefix must be encoded when:
  *
@@ -78,8 +137,60 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
  */
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
 {
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    // TODO: instructions not requiring a REX prefix in 64-bit mode
+    // CALL (Near)
+    // ENTER
+    // Jcc
+    // JrCXZ
+    // JMP (Near)
+    // LEAVE
+    // LGDT
+    // LIDT
+    // LLDT
+    // LOOP
+    // LOOPcc
+    // LTR
+    // MOV CRn
+    // MOV DRn
+    // POP reg/mem
+    // POP reg
+    // POP FS
+    // POP GS
+    // POPF, POPFD, POPFQ
+    // PUSH imm8
+    // PUSH imm32
+    // PUSH reg/mem
+    // PUSH reg
+    // PUSH FS
+    // PUSH GS
+    // PUSHF, PUSHFD, PUSHFQ
+    // RET (Near)
+    case XED_ICLASS_LEAVE:
+        return !xed3_operand_get_rex(xedd);
+    default:
+        break;
+    }
+
+    for (int i = 0; i < xed_decoded_inst_number_of_memory_operands(xedd); ++i) {
+        if (check_rex_register(xed_decoded_inst_get_base_reg(xedd, i)) ||
+            check_rex_register(xed_decoded_inst_get_index_reg(xedd, i))) {
+            return true;
+        }
+    }
+    if (check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0)) ||
+        check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1)) ||
+        // TODO: are these correct?
+        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG0)) ||
+        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG1))) {
+        return true;
+    }
+
+    // Check if instruction has a REX prefix.
+    // TODO: REX byte must come first but is there a more robust way to test this?
     int8_t prefix = xed_decoded_inst_get_byte(xedd, 0);
     // TODO: handle instructions which do not default to 64-bit operands
+    // TODO: look at xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd))
     if ((prefix & 0xf0) != 0x40) {
         return true;
     }
@@ -87,15 +198,33 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_CALL_NEAR:
     case XED_ICLASS_ENTER:
-    case XED_ICLASS_JB: case XED_ICLASS_JBE: case XED_ICLASS_JL: case XED_ICLASS_JLE: case XED_ICLASS_JNB: case XED_ICLASS_JNBE: case XED_ICLASS_JNL: case XED_ICLASS_JNLE: case XED_ICLASS_JNO: case XED_ICLASS_JNP: case XED_ICLASS_JNS: case XED_ICLASS_JNZ: case XED_ICLASS_JO: case XED_ICLASS_JP: case XED_ICLASS_JS: case XED_ICLASS_JZ:
-    case XED_ICLASS_JCXZ: case XED_ICLASS_JECXZ: case XED_ICLASS_JRCXZ:
+    case XED_ICLASS_JB:
+    case XED_ICLASS_JBE:
+    case XED_ICLASS_JL:
+    case XED_ICLASS_JLE:
+    case XED_ICLASS_JNB:
+    case XED_ICLASS_JNBE:
+    case XED_ICLASS_JNL:
+    case XED_ICLASS_JNLE:
+    case XED_ICLASS_JNO:
+    case XED_ICLASS_JNP:
+    case XED_ICLASS_JNS:
+    case XED_ICLASS_JNZ:
+    case XED_ICLASS_JO:
+    case XED_ICLASS_JP:
+    case XED_ICLASS_JS:
+    case XED_ICLASS_JZ:
+    case XED_ICLASS_JCXZ:
+    case XED_ICLASS_JECXZ:
+    case XED_ICLASS_JRCXZ:
     case XED_ICLASS_JMP:
     case XED_ICLASS_LEAVE:
     case XED_ICLASS_LGDT:
     case XED_ICLASS_LIDT:
     case XED_ICLASS_LLDT:
     case XED_ICLASS_LOOP:
-    case XED_ICLASS_LOOPE: case XED_ICLASS_LOOPNE:
+    case XED_ICLASS_LOOPE:
+    case XED_ICLASS_LOOPNE:
     case XED_ICLASS_LTR:
     case XED_ICLASS_MOV_CR:
     case XED_ICLASS_MOV_DR:

@@ -70,7 +70,7 @@ static void check_unneedex_rex_test(void)
 
     static const uint8_t xor_rax_rax[] = { 0x48, 0x31, 0xC0 };  // xor rax, rax
     decode_instruction(&xedd, xor_rax_rax, sizeof(xor_rax_rax));
-    assert(!check_unneeded_rex(&xedd));
+    assert(check_unneeded_rex(&xedd));
 
     static const uint8_t xor_eax_eax[] = { 0x31, 0xC0 };  // xor rax, rax
     decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));

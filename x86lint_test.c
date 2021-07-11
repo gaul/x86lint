@@ -129,6 +129,14 @@ static void check_implicit_register_test(void)
     static const uint8_t add_ebx_imm4_1[] = { 0x81, 0xC3, 0x01, 0x00, 0x00, 0x00, };  // add ebx, 1
     decode_instruction(&xedd, add_ebx_imm4_1, sizeof(add_ebx_imm4_1));
     assert(check_implicit_register(&xedd));
+
+    static const uint8_t xor_eax_eax[] = { 0x31, 0xC0, };  // xor eax, eax
+    decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));
+    assert(check_implicit_register(&xedd));
+
+    static const uint8_t xor_rax_rax[] = { 0x48, 0x31, 0xC0, };  // xor rax, rax
+    decode_instruction(&xedd, xor_rax_rax, sizeof(xor_rax_rax));
+    assert(check_implicit_register(&xedd));
 }
 
 int main(int argc, char *argv[])
@@ -146,7 +154,7 @@ int main(int argc, char *argv[])
         0x40, 0xc9,  // leave
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
-        0x48, 0x31, 0xC0,  // xor rax, rax
+        0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
     };
     int errors = check_instructions(inst, sizeof(inst));
     assert(errors == 5);

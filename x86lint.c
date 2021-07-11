@@ -289,6 +289,7 @@ bool check_mov_zero(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// Some instructions implicitly specify EAX register without needing ModRM byte.
 bool check_implicit_register(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -306,8 +307,31 @@ bool check_implicit_register(const xed_decoded_inst_t *xedd)
         return true;
     }
 
-    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_EAX && xed_operand_values_has_modrm_byte(xedd)) {
-        return false;
+    if (!xed_operand_values_has_modrm_byte(xedd)) {
+        return true;
+    }
+
+    xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+
+    switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
+    case 8:
+        if (reg == XED_REG_AL) {
+            return false;
+        }
+        break;
+    case 16:
+        if (reg == XED_REG_AX) {
+            return false;
+        }
+        break;
+    case 32:
+        if (reg == XED_REG_EAX || reg == XED_REG_RAX) {
+            return false;
+        }
+        break;
+    case 0:
+    default:
+        break;
     }
 
     return true;

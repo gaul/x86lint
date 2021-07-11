@@ -347,7 +347,17 @@ static void dump_instruction(const xed_decoded_inst_t *xedd)
 {
     char buf[1024];
     xed_decoded_inst_dump(xedd, buf, sizeof(buf));
-    //printf("%s\n", buf);
+    printf("%s\n", buf);
+}
+
+static void dump_machine_code(const xed_decoded_inst_t *xedd, const uint8_t *inst)
+{
+    int i;
+    int len = xed_decoded_inst_get_length(xedd);
+    for (i = 0; i < len; ++i) {
+        printf("%02x ", inst[i]);
+    }
+    printf("\n");
 }
 
 int check_instructions(const uint8_t *inst, size_t len)
@@ -368,6 +378,8 @@ int check_instructions(const uint8_t *inst, size_t len)
         if (!result) {
             printf("oversized immediate at offset: %zu\n", offset);
             dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
             ++errors;
         }
 
@@ -375,20 +387,26 @@ int check_instructions(const uint8_t *inst, size_t len)
         if (!result) {
             printf("unneeded REX prefix at offset: %zu\n", offset);
             dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
             ++errors;
         }
 
         result = check_mov_zero(&xedd);
         if (!result) {
-            printf("suboptimal zero register: %zu\n", offset);
+            printf("suboptimal zero register at offset: %zu\n", offset);
             dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
             ++errors;
         }
 
         result = check_implicit_register(&xedd);
         if (!result) {
-            printf("unneeded explicit register: %zu\n", offset);
+            printf("unneeded explicit register at offset: %zu\n", offset);
             dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
             ++errors;
         }
 

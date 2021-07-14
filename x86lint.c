@@ -390,9 +390,12 @@ int check_instructions(const uint8_t *inst, size_t len)
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero(&xedd);
         xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len);
-        // TODO: better error handling
-        assert(err == XED_ERROR_NONE);
+        if (err != XED_ERROR_NONE) {
+            printf("Decoding error at offset: %zu: %s\n", offset, xed_error_enum_t2str(err));
+            return -1;
+        }
 
         bool result = check_oversized_immediate(&xedd);
         if (!result) {

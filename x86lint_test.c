@@ -64,6 +64,23 @@ static void check_oversized_immediate_test(void)
     assert(!check_oversized_immediate(&xedd));
 }
 
+static void check_oversized_add128_test(void)
+{
+    xed_decoded_inst_t xedd;
+
+    static const uint8_t add_imm1_127[] = { 0x83, 0xC0, 0x7F, };  // add eax, 0x7f
+    decode_instruction(&xedd, add_imm1_127, sizeof(add_imm1_127));
+    assert(check_oversized_add128(&xedd));
+
+    static const uint8_t add_imm4_128[] = { 0x05, 0x80, 0x00, 0x00, 0x00, };  // add eax, 0x80
+    decode_instruction(&xedd, add_imm4_128, sizeof(add_imm4_128));
+    assert(!check_oversized_add128(&xedd));
+
+    static const uint8_t sub_imm1_neg128[] = { 0x83, 0xE8, 0xFF, };  // sub eax, -128
+    decode_instruction(&xedd, sub_imm1_neg128, sizeof(sub_imm1_neg128));
+    assert(check_oversized_add128(&xedd));
+}
+
 static void check_unneedex_rex_test(void)
 {
     xed_decoded_inst_t xedd;
@@ -162,6 +179,7 @@ int main(int argc, char *argv[])
     xed_set_verbosity(99);
 
     check_oversized_immediate_test();
+    check_oversized_add128_test();
     check_unneedex_rex_test();
     check_mov_zero_test();
     check_implicit_register_test();
@@ -169,6 +187,7 @@ int main(int argc, char *argv[])
 
     static const uint8_t inst[] = {
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0x40, 0xc9,  // leave
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
@@ -176,7 +195,10 @@ int main(int argc, char *argv[])
         0xc1, 0xd0, 0x01,  // rcl eax, 1
     };
     int errors = check_instructions(inst, sizeof(inst));
-    assert(errors == 6);
+    if (errors != 7) {
+        printf("Expected 7 errors, actual: %d\n", errors);
+        return 1;
+    }
 
     return 0;
 }

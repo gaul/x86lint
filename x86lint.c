@@ -69,6 +69,36 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// Check for ADD REG, 128 which encodes as 5 bytes instead of SUB REG, -128
+// which encodes in 3 bytes.
+bool check_oversized_add128(const xed_decoded_inst_t *xedd)
+{
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_ADD) {
+        return true;
+    }
+
+    int64_t imm = (int64_t) xed_decoded_inst_get_unsigned_immediate(xedd);
+
+    switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
+    case 8:
+    case 16:
+        return true;
+    case 32:
+    case 64:
+        if (imm == 128) {
+            return false;
+        }
+        break;
+    default:
+        abort();
+    }
+    return true;
+}
+
 static bool check_rex_register(xed_reg_enum_t reg)
 {
     switch (reg) {
@@ -400,6 +430,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         bool result = check_oversized_immediate(&xedd);
         if (!result) {
             printf("oversized immediate at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_oversized_add128(&xedd);
+        if (!result) {
+            printf("oversized ADD 128 at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

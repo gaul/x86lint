@@ -393,6 +393,28 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
+{
+    bool has_lock = xed_decoded_inst_get_attribute(xedd, XED_ATTRIBUTE_LOCKED);
+
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_CMPXCHG:
+    case XED_ICLASS_CMPXCHG16B:
+    case XED_ICLASS_CMPXCHG8B:
+    case XED_ICLASS_XADD:
+        if (!has_lock) {
+            return false;
+        }
+        return true;
+    case XED_ICLASS_CMPXCHG16B_LOCK:
+    case XED_ICLASS_CMPXCHG8B_LOCK:
+    case XED_ICLASS_CMPXCHG_LOCK:
+    case XED_ICLASS_XADD_LOCK:
+    default:
+        return true;
+    }
+}
+
 static void dump_instruction(const xed_decoded_inst_t *xedd)
 {
     char buf[1024];
@@ -475,6 +497,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_implicit_immediate(&xedd);
         if (!result) {
             printf("unneeded explicit immediate at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_missing_lock_prefix(&xedd);
+        if (!result) {
+            printf("expected lock prefix at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

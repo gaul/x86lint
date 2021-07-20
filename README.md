@@ -15,6 +15,7 @@ compiler writers generate better code and documents the complexity of x86.
 
 * implicit EAX
   - `81C0 00010000` instead of `05 00010000` (ADD EAX, 0x100)
+* missing LOCK prefix on CMPXCHG and XADD
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
 * suboptimal zero register

@@ -173,6 +173,19 @@ static void check_implicit_immediate_test(void)
     assert(!check_implicit_immediate(&xedd));
 }
 
+static void check_missing_lock_prefix_test(void)
+{
+    xed_decoded_inst_t xedd;
+
+    static const uint8_t xadd_lock[] = { 0x67, 0xF0, 0x0F, 0xC1, 0x18, };  // xadd_lock [EAX] EBX
+    decode_instruction(&xedd, xadd_lock, sizeof(xadd_lock));
+    assert(check_missing_lock_prefix(&xedd));
+
+    static const uint8_t xadd_nolock[] = { 0x67, 0x0F, 0xC1, 0x18, };  // xadd [EAX] EBX
+    decode_instruction(&xedd, xadd_nolock, sizeof(xadd_nolock));
+    assert(!check_missing_lock_prefix(&xedd));
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -184,6 +197,7 @@ int main(int argc, char *argv[])
     check_mov_zero_test();
     check_implicit_register_test();
     check_implicit_immediate_test();
+    check_missing_lock_prefix_test();
 
     static const uint8_t inst[] = {
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
@@ -193,10 +207,11 @@ int main(int argc, char *argv[])
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
         0xc1, 0xd0, 0x01,  // rcl eax, 1
+        0x67, 0x0F, 0xC1, 0x18,  // xadd [EAX] EBX
     };
     int errors = check_instructions(inst, sizeof(inst));
-    if (errors != 7) {
-        printf("Expected 7 errors, actual: %d\n", errors);
+    if (errors != 8) {
+        printf("Expected 8 errors, actual: %d\n", errors);
         return 1;
     }
 

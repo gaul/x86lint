@@ -38,6 +38,9 @@ bool check_implicit_register(const xed_decoded_inst_t *xedd);
 // return false if instruction could use an implicit immediate encoding
 bool check_implicit_immediate(const xed_decoded_inst_t *xedd);
 
+// return false if instruction should have a LOCK prefix
+bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

@@ -173,6 +173,27 @@ static void check_implicit_immediate_test(void)
     assert(!check_implicit_immediate(&xedd));
 }
 
+static void check_and_strength_reduce_test(void)
+{
+    xed_decoded_inst_t xedd;
+
+    static const uint8_t and_imm1_ff[] = { 0x83, 0xe0, 0xff, };  // and eax, 0xff
+    decode_instruction(&xedd, and_imm1_ff, sizeof(and_imm1_ff));
+    assert(!check_and_strength_reduce(&xedd));
+
+    static const uint8_t and_imm1_fe[] = { 0x83, 0xe0, 0xfe, };  // and eax, 0xfe
+    decode_instruction(&xedd, and_imm1_fe, sizeof(and_imm1_fe));
+    assert(check_and_strength_reduce(&xedd));
+
+    static const uint8_t and_imm4_ffff[] = { 0x25, 0xff, 0xff, 0x00, 0x00, };  // and eax, 0xffff
+    decode_instruction(&xedd, and_imm4_ffff, sizeof(and_imm4_ffff));
+    assert(!check_and_strength_reduce(&xedd));
+
+    static const uint8_t and_imm4_ffffffff[] = { 0x25, 0xff, 0xff, 0xff, 0xff, };  // and eax, 0xffffffff
+    decode_instruction(&xedd, and_imm4_ffffffff, sizeof(and_imm4_ffffffff));
+    assert(!check_and_strength_reduce(&xedd));
+}
+
 static void check_missing_lock_prefix_test(void)
 {
     xed_decoded_inst_t xedd;
@@ -197,6 +218,7 @@ int main(int argc, char *argv[])
     check_mov_zero_test();
     check_implicit_register_test();
     check_implicit_immediate_test();
+    check_and_strength_reduce_test();
     check_missing_lock_prefix_test();
 
     static const uint8_t inst[] = {
@@ -207,11 +229,12 @@ int main(int argc, char *argv[])
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
         0xc1, 0xd0, 0x01,  // rcl eax, 1
+        0x83, 0xe0, 0xff,  // and eax, 0xff
         0x67, 0x0F, 0xC1, 0x18,  // xadd [EAX] EBX
     };
     int errors = check_instructions(inst, sizeof(inst));
-    if (errors != 8) {
-        printf("Expected 8 errors, actual: %d\n", errors);
+    if (errors != 9) {
+        printf("Expected 9 errors, actual: %d\n", errors);
         return 1;
     }
 

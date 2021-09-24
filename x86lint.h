@@ -38,6 +38,9 @@ bool check_implicit_register(const xed_decoded_inst_t *xedd);
 // return false if instruction could use an implicit immediate encoding
 bool check_implicit_immediate(const xed_decoded_inst_t *xedd);
 
+// return false if instruction could use movzbl, movzwl, or mov instead of AND REG, IMM
+bool check_and_strength_reduce(const xed_decoded_inst_t *xedd);
+
 // return false if instruction should have a LOCK prefix
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
 

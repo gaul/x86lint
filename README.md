@@ -18,6 +18,7 @@ compiler writers generate better code and documents the complexity of x86.
 * missing LOCK prefix on CMPXCHG and XADD
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
+* strength-reduce AND with immediate to movzbl
 * suboptimal zero register
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unnecessary REX prefix

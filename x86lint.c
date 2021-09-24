@@ -393,6 +393,16 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_AND) {
+        return true;
+    }
+
+    xed_uint64_t imm = xed_decoded_inst_get_unsigned_immediate(xedd);
+    return imm != 0xff && imm != 0xffff && imm != 0xffffffff;
+}
+
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
 {
     bool has_lock = xed_decoded_inst_get_attribute(xedd, XED_ATTRIBUTE_LOCKED);
@@ -497,6 +507,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_implicit_immediate(&xedd);
         if (!result) {
             printf("unneeded explicit immediate at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_and_strength_reduce(&xedd);
+        if (!result) {
+            printf("unneeded AND immediate at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

@@ -44,6 +44,9 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd);
 // return false if instruction should have a LOCK prefix
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
 
+// return false if instruction should not have a LOCK prefix
+bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

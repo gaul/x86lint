@@ -405,7 +405,7 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
 
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
 {
-    bool has_lock = xed_decoded_inst_get_attribute(xedd, XED_ATTRIBUTE_LOCKED);
+    bool has_lock = xed_operand_values_has_lock_prefix(xed_decoded_inst_operands_const(xedd));
 
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_CMPXCHG:
@@ -420,6 +420,18 @@ bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_CMPXCHG8B_LOCK:
     case XED_ICLASS_CMPXCHG_LOCK:
     case XED_ICLASS_XADD_LOCK:
+    default:
+        return true;
+    }
+}
+
+bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
+{
+    bool has_lock = xed_operand_values_has_lock_prefix(xed_decoded_inst_operands_const(xedd));
+
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_XCHG:
+        return !has_lock;
     default:
         return true;
     }
@@ -525,6 +537,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_missing_lock_prefix(&xedd);
         if (!result) {
             printf("expected lock prefix at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_superfluous_lock_prefix(&xedd);
+        if (!result) {
+            printf("superfluous lock prefix at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

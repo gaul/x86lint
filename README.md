@@ -26,6 +26,7 @@ compiler writers generate better code and documents the complexity of x86.
   - `40C9` instead of `C9` (LEAVE)
 * unnecessary immediate
   - `C1D0 01` instead of `D1D0` (RCL EAX, 1)
+* unneeded LOCK prefix on XCHG
 
 ## Not yet implemented analyses
 
@@ -34,8 +35,6 @@ single-instruction
 * nonsense instructions
   - MOV RAX, RAX
 * strength reduce MUL with immediate to LEA
-* unneeded LOCK prefix
-  - XCHG
 
 peephole
 * 16-byte alignment for jump targets

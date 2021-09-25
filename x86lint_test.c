@@ -198,13 +198,26 @@ static void check_missing_lock_prefix_test(void)
 {
     xed_decoded_inst_t xedd;
 
-    static const uint8_t xadd_lock[] = { 0x67, 0xF0, 0x0F, 0xC1, 0x18, };  // xadd_lock [EAX] EBX
+    static const uint8_t xadd_lock[] = { 0x67, 0xf0, 0x0f, 0xc1, 0x18, };  // lock xadd [eax], ebx
     decode_instruction(&xedd, xadd_lock, sizeof(xadd_lock));
     assert(check_missing_lock_prefix(&xedd));
 
-    static const uint8_t xadd_nolock[] = { 0x67, 0x0F, 0xC1, 0x18, };  // xadd [EAX] EBX
+    static const uint8_t xadd_nolock[] = { 0x67, 0x0f, 0xc1, 0x18, };  // xadd [eax], ebx
     decode_instruction(&xedd, xadd_nolock, sizeof(xadd_nolock));
     assert(!check_missing_lock_prefix(&xedd));
+}
+
+static void check_superfluous_lock_prefix_test(void)
+{
+    xed_decoded_inst_t xedd;
+
+    static const uint8_t xchg_lock[] = { 0xf0, 0x87, 0x07, };  // lock xchg [eax], ebx
+    decode_instruction(&xedd, xchg_lock, sizeof(xchg_lock));
+    assert(!check_superfluous_lock_prefix(&xedd));
+
+    static const uint8_t xchg_nolock[] = { 0x87, 0x07, };  // xchg [eax], ebx
+    decode_instruction(&xedd, xchg_nolock, sizeof(xchg_nolock));
+    assert(check_superfluous_lock_prefix(&xedd));
 }
 
 int main(int argc, char *argv[])
@@ -220,6 +233,7 @@ int main(int argc, char *argv[])
     check_implicit_immediate_test();
     check_and_strength_reduce_test();
     check_missing_lock_prefix_test();
+    check_superfluous_lock_prefix_test();
 
     static const uint8_t inst[] = {
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
@@ -230,11 +244,13 @@ int main(int argc, char *argv[])
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
         0xc1, 0xd0, 0x01,  // rcl eax, 1
         0x83, 0xe0, 0xff,  // and eax, 0xff
-        0x67, 0x0F, 0xC1, 0x18,  // xadd [EAX] EBX
+        0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
+        0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };
-    int errors = check_instructions(inst, sizeof(inst));
-    if (errors != 9) {
-        printf("Expected 9 errors, actual: %d\n", errors);
+    int expected = 10;
+    int actual = check_instructions(inst, sizeof(inst));
+    if (actual != expected) {
+        printf("Expected %d errors, actual: %d\n", expected, actual);
         return 1;
     }
 

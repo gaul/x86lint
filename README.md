@@ -21,7 +21,7 @@ compiler writers generate better code and documents the complexity of x86.
 * strength-reduce AND with immediate to movzbl
 * suboptimal no-ops
   - multiple `90` instead of a single `60 90`, etc.
-* suboptimal zero register
+* ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unnecessary REX prefix
   - XOR RAX, RAX instead of XOR EAX, EAX

@@ -565,6 +565,8 @@ int check_instructions(const uint8_t *inst, size_t len)
             ++errors;
         }
 
+        // TODO: Disabled due to false positives from CMOV sequences.  See #7.
+        /*
         result = check_mov_zero(&xedd);
         if (!result) {
             printf("suboptimal zero register at offset: %zu\n", offset);
@@ -573,6 +575,7 @@ int check_instructions(const uint8_t *inst, size_t len)
             printf("\n");
             ++errors;
         }
+        */
 
         result = check_implicit_register(&xedd);
         if (!result) {

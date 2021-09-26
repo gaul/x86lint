@@ -46,6 +46,10 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
         return true;
     }
 
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
     int64_t imm = (int64_t) xed_decoded_inst_get_unsigned_immediate(xedd);
 
     switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
@@ -304,6 +308,10 @@ bool check_mov_zero(const xed_decoded_inst_t *xedd)
         return true;
     }
 
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
     switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
     case 0:
     case 8:
@@ -348,6 +356,10 @@ bool check_implicit_register(const xed_decoded_inst_t *xedd)
     }
 
     xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
 
     switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
     case 8:

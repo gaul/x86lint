@@ -31,6 +31,36 @@ static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, si
     assert(err == XED_ERROR_NONE);
 }
 
+static void check_suboptimal_nops_test(void)
+{
+    static const uint8_t nop[] = { 0x90, };  // nop
+    assert(check_suboptimal_nops(nop, sizeof(nop)));
+
+    static const uint8_t nop2[] = { 0x90, 0x90, };  // nop ; nop
+    assert(!check_suboptimal_nops(nop2, sizeof(nop2)));
+
+    static const uint8_t nop_nop[] = { 0x66, 0x90, };  // data16 nop
+    assert(check_suboptimal_nops(nop_nop, sizeof(nop_nop)));
+
+    static const uint8_t nop4[] = { 0x0f, 0x1f, 0x40, 0x00, };  // NOP DWORD ptr [EAX + 00H]
+    assert(check_suboptimal_nops(nop4, sizeof(nop4)));
+
+    static const uint8_t nop4_nop4[] = {
+        0x0f, 0x1f, 0x40, 0x00,
+        0x0f, 0x1f, 0x40, 0x00,
+    };
+    assert(!check_suboptimal_nops(nop4_nop4, sizeof(nop4_nop4)));
+
+    static const uint8_t nop9[] = { 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, };  // NOP DWORD ptr [AX + AX*1 + 00000000H]
+    assert(check_suboptimal_nops(nop9, sizeof(nop9)));
+
+    static const uint8_t nop9_nop9[] = {
+        0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    assert(check_suboptimal_nops(nop9_nop9, sizeof(nop9_nop9)));
+}
+
 static void check_oversized_immediate_test(void)
 {
     xed_decoded_inst_t xedd;
@@ -225,6 +255,7 @@ int main(int argc, char *argv[])
     xed_tables_init();
     xed_set_verbosity(99);
 
+    check_suboptimal_nops_test();
     check_oversized_immediate_test();
     check_oversized_add128_test();
     check_unneedex_rex_test();
@@ -236,6 +267,7 @@ int main(int argc, char *argv[])
     check_superfluous_lock_prefix_test();
 
     static const uint8_t inst[] = {
+        0x90, 0x90,  // nop ; nop
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0x40, 0xc9,  // leave
@@ -247,7 +279,7 @@ int main(int argc, char *argv[])
         0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
         0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };
-    int expected = 10;
+    int expected = 11;
     int actual = check_instructions(inst, sizeof(inst));
     if (actual != expected) {
         printf("Expected %d errors, actual: %d\n", expected, actual);

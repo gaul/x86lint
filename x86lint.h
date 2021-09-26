@@ -20,6 +20,9 @@
 #include <stdbool.h>
 #include "xed/xed-interface.h"
 
+// return false if instruction sequence contains multiple adjacent no ops
+bool check_suboptimal_nops(const uint8_t *inst, size_t len);
+
 // return false if instruction has an oversized immediate
 bool check_oversized_immediate(const xed_decoded_inst_t *xedd);
 

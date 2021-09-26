@@ -21,6 +21,43 @@
 #include <stdlib.h>
 #include "xed/xed-interface.h"
 
+// TODO: handle 10-15 byte NOPs
+bool check_suboptimal_nops(const uint8_t *inst, size_t len)
+{
+    int prev_nop = 0;
+
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+
+        // TODO: make these configurable
+        xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+        xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        xed_error_enum_t err = xed_decode(&xedd, inst + i, len - i);
+        if (err != XED_ERROR_NONE) {
+            return false;
+        }
+
+        // TODO: call xed_operand_values_is_nop?
+        int iclass = xed_decoded_inst_get_iclass(&xedd);
+        bool cur_nop = iclass >= XED_ICLASS_NOP && iclass <= XED_ICLASS_NOP9;
+        if (!cur_nop) {
+            break;
+        }
+        // Assume that NOPs are greedy, encoding 10 bytes as 9 + 1 NOPs
+        if (prev_nop > 0 && prev_nop <= 8) {
+            return false;
+        }
+
+        prev_nop = xed_decoded_inst_get_length(&xedd);
+        i += prev_nop;
+    }
+
+    return true;
+}
+
 // TODO: consider valid uses of oversized immediate to avoid explicit no-op padding
 bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
 {
@@ -477,13 +514,31 @@ int check_instructions(const uint8_t *inst, size_t len)
         xed_decoded_inst_zero(&xedd);
         xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
 
-        xed_error_enum_t err = xed_decode(&xedd, inst + offset, len);
+        xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
             printf("Decoding error at offset: %zu: %s\n", offset, xed_error_enum_t2str(err));
             return -1;
         }
 
-        bool result = check_oversized_immediate(&xedd);
+        bool result = check_suboptimal_nops(inst + offset, len - offset);
+        if (!result) {
+            printf("suboptimal nops at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+
+            xed_decoded_inst_t xedd2;
+            xed_decoded_inst_zero(&xedd2);
+            xed_decoded_inst_set_mode(&xedd2, mmode, stack_addr_width);
+
+            size_t len2 = xed_decoded_inst_get_length(&xedd);
+            xed_decode(&xedd2, inst + offset + len2, len - offset - len2);
+            dump_instruction(&xedd2);
+            dump_machine_code(&xedd2, inst + offset + len2);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_oversized_immediate(&xedd);
         if (!result) {
             printf("oversized immediate at offset: %zu\n", offset);
             dump_instruction(&xedd);

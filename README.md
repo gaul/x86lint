@@ -19,6 +19,8 @@ compiler writers generate better code and documents the complexity of x86.
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
 * strength-reduce AND with immediate to movzbl
+* suboptimal no-ops
+  - multiple `90` instead of a single `60 90`, etc.
 * suboptimal zero register
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unnecessary REX prefix
@@ -41,8 +43,6 @@ peephole
 * [64-byte alignment for macro-fusion](https://code.fb.com/data-infrastructure/accelerate-large-scale-applications-with-bolt/)
 * duplicate constant loads
 * [near-duplicate constant loads](https://paul.bone.id.au/2018/09/14/large-immediate-values/)
-* suboptimal no-ops
-  - multiple `90` instead of a single `60 90`, etc.
 * unneeded register spills
 
 ## Compilation

@@ -19,6 +19,7 @@ compiler writers generate better code and documents the complexity of x86.
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
 * strength-reduce AND with immediate to movzbl
+* suboptimal CMP 0 instead of TEST
 * suboptimal no-ops
   - multiple `90` instead of a single `60 90`, etc.
 * ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)
@@ -33,7 +34,6 @@ compiler writers generate better code and documents the complexity of x86.
 ## Not yet implemented analyses
 
 single-instruction
-* CMP 0 vs. TEST
 * nonsense instructions
   - MOV RAX, RAX
 * strength reduce MUL with immediate to LEA

@@ -32,6 +32,9 @@ bool check_oversized_add128(const xed_decoded_inst_t *xedd);
 // return false if instruction has an unneeded rex prefix
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd);
 
+// return false if instruction uses CMP 0 instead of TEST
+bool check_cmp_zero(const xed_decoded_inst_t *xedd);
+
 // return false if instruction zeros a register with mov instead of xor
 bool check_mov_zero(const xed_decoded_inst_t *xedd);
 

@@ -165,6 +165,19 @@ static void check_mov_zero_test(void)
     assert(check_mov_zero(&xedd));
 }
 
+static void check_cmp_zero_test(void)
+{
+    xed_decoded_inst_t xedd;
+
+    static const uint8_t cmp_edx_0[] = { 0x83, 0xff, 0x00 };  // cmp edx, 0
+    decode_instruction(&xedd, cmp_edx_0, sizeof(cmp_edx_0));
+    assert(!check_cmp_zero(&xedd));
+
+    static const uint8_t cmp_edx_1[] = { 0x83, 0xff, 0x01 };  // cmp edx, 1
+    decode_instruction(&xedd, cmp_edx_1, sizeof(cmp_edx_1));
+    assert(check_cmp_zero(&xedd));
+}
+
 static void check_implicit_register_test(void)
 {
     xed_decoded_inst_t xedd;
@@ -259,6 +272,7 @@ int main(int argc, char *argv[])
     check_oversized_immediate_test();
     check_oversized_add128_test();
     check_unneedex_rex_test();
+    check_cmp_zero_test();
     check_mov_zero_test();
     check_implicit_register_test();
     check_implicit_immediate_test();
@@ -271,6 +285,7 @@ int main(int argc, char *argv[])
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0x40, 0xc9,  // leave
+        0x83, 0xff, 0x00,  // cmp edi, 0
         // TODO: Disabled due to false positives from CMOV sequences.  See #7.
         /*
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
@@ -282,7 +297,7 @@ int main(int argc, char *argv[])
         0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
         0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };
-    int expected = 10;
+    int expected = 11;
     int actual = check_instructions(inst, sizeof(inst));
     if (actual != expected) {
         printf("Expected %d errors, actual: %d\n", expected, actual);

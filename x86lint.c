@@ -330,6 +330,24 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+bool check_cmp_zero(const xed_decoded_inst_t *xedd)
+{
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    // do not consider comparisons of zero to memory
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_CMP) {
+        return true;
+    }
+
+    return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
+}
+
 // TODO: could have false positives for sequences preserving flags
 bool check_mov_zero(const xed_decoded_inst_t *xedd)
 {
@@ -559,6 +577,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_unneeded_rex(&xedd);
         if (!result) {
             printf("unneeded REX prefix at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_cmp_zero(&xedd);
+        if (!result) {
+            printf("suboptimal compare register at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

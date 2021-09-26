@@ -31,20 +31,6 @@ compiler writers generate better code and documents the complexity of x86.
   - `C1D0 01` instead of `D1D0` (RCL EAX, 1)
 * unneeded LOCK prefix on XCHG
 
-## Not yet implemented analyses
-
-single-instruction
-* nonsense instructions
-  - MOV RAX, RAX
-* strength reduce MUL with immediate to LEA
-
-peephole
-* 16-byte alignment for jump targets
-* [64-byte alignment for macro-fusion](https://code.fb.com/data-infrastructure/accelerate-large-scale-applications-with-bolt/)
-* duplicate constant loads
-* [near-duplicate constant loads](https://paul.bone.id.au/2018/09/14/large-immediate-values/)
-* unneeded register spills
-
 ## Compilation
 
 First install the Intel x86 encoder decoder:

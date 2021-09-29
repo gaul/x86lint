@@ -111,7 +111,7 @@ static void check_oversized_add128_test(void)
     assert(check_oversized_add128(&xedd));
 }
 
-static void check_unneedex_rex_test(void)
+static void check_unneeded_rex_test(void)
 {
     xed_decoded_inst_t xedd;
 
@@ -271,7 +271,7 @@ int main(int argc, char *argv[])
     check_suboptimal_nops_test();
     check_oversized_immediate_test();
     check_oversized_add128_test();
-    check_unneedex_rex_test();
+    check_unneeded_rex_test();
     check_cmp_zero_test();
     check_mov_zero_test();
     check_implicit_register_test();

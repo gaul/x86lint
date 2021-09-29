@@ -18,14 +18,14 @@ compiler writers generate better code and documents the complexity of x86.
 * missing LOCK prefix on CMPXCHG and XADD
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
-* strength-reduce AND with immediate to movzbl
-* suboptimal CMP 0 instead of TEST
+* strength-reduce AND with immediate to MOVZBL
+* suboptimal CMP 0 `83FF 00` instead of TEST `85C0`
 * suboptimal no-ops
   - multiple `90` instead of a single `60 90`, etc.
 * ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unnecessary REX prefix
-  - XOR RAX, RAX instead of XOR EAX, EAX
+  - XOR RAX, RAX `4831C0` instead of XOR EAX, EAX `31C0`
   - `40C9` instead of `C9` (LEAVE)
 * unnecessary immediate
   - `C1D0 01` instead of `D1D0` (RCL EAX, 1)

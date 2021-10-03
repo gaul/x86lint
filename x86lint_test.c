@@ -20,6 +20,14 @@
 #include "x86lint.h"
 #include "xed/xed-interface.h"
 
+#define CHECK_BYTES(func, ...) \
+do { \
+    static const uint8_t bytes[] = { __VA_ARGS__ }; \
+    xed_decoded_inst_t xedd; \
+    decode_instruction(&xedd, bytes, sizeof(bytes)); \
+    assert(func(&xedd)); \
+} while (0)
+
 static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, size_t len)
 {
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
@@ -63,204 +71,80 @@ static void check_suboptimal_nops_test(void)
 
 static void check_oversized_immediate_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t add_imm4_256[] = { 0x81, 0xC0, 0x00, 0x01, 0x00, 0x00, };  // add eax, 0x100
-    decode_instruction(&xedd, add_imm4_256, sizeof(add_imm4_256));
-    assert(check_oversized_immediate(&xedd));
-
-    static const uint8_t add_imm4_1[] = { 0x81, 0xC0, 0x01, 0x00, 0x00, 0x00, };  // add eax, 1
-    decode_instruction(&xedd, add_imm4_1, sizeof(add_imm4_1));
-    assert(!check_oversized_immediate(&xedd));
-
-    static const uint8_t add_eax_imm4_256[] = { 0x05, 0x00, 0x01, 0x00, 0x00, };  // add eax, 0x100
-    decode_instruction(&xedd, add_eax_imm4_256, sizeof(add_eax_imm4_256));
-    assert(check_oversized_immediate(&xedd));
-
-    static const uint8_t add_eax_imm4_1[] = { 0x05, 0x01, 0x00, 0x00, 0x00, };  // add eax, 1
-    decode_instruction(&xedd, add_eax_imm4_1, sizeof(add_eax_imm4_1));
-    assert(!check_oversized_immediate(&xedd));
-
-    static const uint8_t add_imm1_1[] = { 0x83, 0xC0, 0x01, };  // add eax, 0x01
-    decode_instruction(&xedd, add_imm1_1, sizeof(add_imm1_1));
-    assert(check_oversized_immediate(&xedd));
-
-    static const uint8_t mov_imm4_0[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, };  // mov eax, 0
-    decode_instruction(&xedd, mov_imm4_0, sizeof(mov_imm4_0));
-    assert(check_oversized_immediate(&xedd));
-
-    static const uint8_t mov_imm8_0[] = { 0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, };  // mov rax, 0
-    decode_instruction(&xedd, mov_imm8_0, sizeof(mov_imm8_0));
-    assert(!check_oversized_immediate(&xedd));
+    CHECK_BYTES( check_oversized_immediate, 0x81, 0xC0, 0x00, 0x01, 0x00, 0x00);  // add eax, 0x100
+    CHECK_BYTES(!check_oversized_immediate, 0x81, 0xC0, 0x01, 0x00, 0x00, 0x00);  // add eax, 1
+    CHECK_BYTES( check_oversized_immediate, 0x05, 0x00, 0x01, 0x00, 0x00);  // add eax, 0x100
+    CHECK_BYTES(!check_oversized_immediate, 0x05, 0x01, 0x00, 0x00, 0x00);  // add eax, 1
+    CHECK_BYTES( check_oversized_immediate, 0x83, 0xC0, 0x01);  // add eax, 1
+    CHECK_BYTES( check_oversized_immediate, 0xB8, 0x00, 0x00, 0x00, 0x00);  // mov eax, 0
+    CHECK_BYTES(!check_oversized_immediate, 0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);  // mov rax, 0
 }
 
 static void check_oversized_add128_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t add_imm1_127[] = { 0x83, 0xC0, 0x7F, };  // add eax, 0x7f
-    decode_instruction(&xedd, add_imm1_127, sizeof(add_imm1_127));
-    assert(check_oversized_add128(&xedd));
-
-    static const uint8_t add_imm4_128[] = { 0x05, 0x80, 0x00, 0x00, 0x00, };  // add eax, 0x80
-    decode_instruction(&xedd, add_imm4_128, sizeof(add_imm4_128));
-    assert(!check_oversized_add128(&xedd));
-
-    static const uint8_t sub_imm1_neg128[] = { 0x83, 0xE8, 0xFF, };  // sub eax, -128
-    decode_instruction(&xedd, sub_imm1_neg128, sizeof(sub_imm1_neg128));
-    assert(check_oversized_add128(&xedd));
+    CHECK_BYTES( check_oversized_add128, 0x83, 0xC0, 0x7F);  // add eax, 0x7f
+    CHECK_BYTES(!check_oversized_add128, 0x05, 0x80, 0x00, 0x00, 0x00);  // add eax, 0x80
+    CHECK_BYTES( check_oversized_add128, 0x83, 0xE8, 0xFF);  // sub eax, -0x80
 }
 
 static void check_unneeded_rex_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t xor_rax_rax[] = { 0x48, 0x31, 0xC0 };  // xor rax, rax
-    decode_instruction(&xedd, xor_rax_rax, sizeof(xor_rax_rax));
-    assert(check_unneeded_rex(&xedd));
-
-    static const uint8_t xor_eax_eax[] = { 0x31, 0xC0 };  // xor rax, rax
-    decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));
-    assert(check_unneeded_rex(&xedd));
-
-    static const uint8_t add_al_imm1_1[] = { 0x04, 0x01, };  // add al, 0x1
-    decode_instruction(&xedd, add_al_imm1_1, sizeof(add_al_imm1_1));
-    assert(check_unneeded_rex(&xedd));
-
-    static const uint8_t add_al_imm1_1_rex[] = { 0x40, 0x04, 0x01, };  // add al, 0x1
-    decode_instruction(&xedd, add_al_imm1_1_rex, sizeof(add_al_imm1_1_rex));
-    assert(!check_unneeded_rex(&xedd));
-
-    static const uint8_t add_r8b_imm1_1_rex[] = { 0x41, 0x80, 0xC0, 0x01, };  // add r8b, 1
-    decode_instruction(&xedd, add_r8b_imm1_1_rex, sizeof(add_r8b_imm1_1_rex));
-    assert(check_unneeded_rex(&xedd));
-
-    static const uint8_t leave[] = { 0xc9, };  // leave
-    decode_instruction(&xedd, leave, sizeof(leave));
-    assert(check_unneeded_rex(&xedd));
-
-    static const uint8_t leave_rex[] = { 0x40, 0xc9, };  // leave
-    decode_instruction(&xedd, leave_rex, sizeof(leave_rex));
-    assert(!check_unneeded_rex(&xedd));
+    CHECK_BYTES( check_unneeded_rex, 0x48, 0x31, 0xC0);  // xor rax, rax
+    CHECK_BYTES( check_unneeded_rex, 0x31, 0xC0);  // xor rax, rax
+    CHECK_BYTES( check_unneeded_rex, 0x04, 0x01);  // add al, 1
+    CHECK_BYTES(!check_unneeded_rex, 0x40, 0x04, 0x01);  // add al, 1
+    CHECK_BYTES( check_unneeded_rex, 0x41, 0x80, 0xC0, 0x01);  // add r8b, 1
+    CHECK_BYTES( check_unneeded_rex, 0xc9);  // leave
+    CHECK_BYTES(!check_unneeded_rex, 0x40, 0xc9);  // leave
 }
 
 static void check_mov_zero_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t mov_eax_imm4_0[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, };  // mov eax, 0
-    decode_instruction(&xedd, mov_eax_imm4_0, sizeof(mov_eax_imm4_0));
-    assert(!check_mov_zero(&xedd));
-
-    static const uint8_t mov_ebx_imm4_0[] = { 0xBB, 0x00, 0x00, 0x00, 0x00, };  // mov ebx, 0
-    decode_instruction(&xedd, mov_ebx_imm4_0, sizeof(mov_ebx_imm4_0));
-    assert(!check_mov_zero(&xedd));
-
-    static const uint8_t xor_eax_eax[] = { 0x31, 0xC0, };  // xor eax, eax
-    decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));
-    assert(check_mov_zero(&xedd));
-
-    static const uint8_t mov_indirect_zero[] = { 0xC7, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, };  // mov dword ptr [rbp], 0x0
-    decode_instruction(&xedd, mov_indirect_zero, sizeof(mov_indirect_zero));
-    assert(check_mov_zero(&xedd));
+    CHECK_BYTES(!check_mov_zero, 0xB8, 0x00, 0x00, 0x00, 0x00);  // mov eax, 0
+    CHECK_BYTES(!check_mov_zero, 0xBB, 0x00, 0x00, 0x00, 0x00);  // mov ebx, 0
+    CHECK_BYTES( check_mov_zero, 0x31, 0xC0);  // xor eax, eax
+    CHECK_BYTES( check_mov_zero, 0xC7, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00);  // mov dword ptr [rbp], 0
 }
 
 static void check_cmp_zero_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t cmp_edx_0[] = { 0x83, 0xff, 0x00 };  // cmp edx, 0
-    decode_instruction(&xedd, cmp_edx_0, sizeof(cmp_edx_0));
-    assert(!check_cmp_zero(&xedd));
-
-    static const uint8_t cmp_edx_1[] = { 0x83, 0xff, 0x01 };  // cmp edx, 1
-    decode_instruction(&xedd, cmp_edx_1, sizeof(cmp_edx_1));
-    assert(check_cmp_zero(&xedd));
+    CHECK_BYTES(!check_cmp_zero, 0x83, 0xff, 0x00);  // cmp edx, 0
+    CHECK_BYTES( check_cmp_zero, 0x83, 0xff, 0x01);  // cmp edx, 1
 }
 
 static void check_implicit_register_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t add_eax_imm4_1_implicit[] = { 0x05, 0x01, 0x00, 0x00, 0x00, };  // add eax, 1
-    decode_instruction(&xedd, add_eax_imm4_1_implicit, sizeof(add_eax_imm4_1_implicit));
-    assert(check_implicit_register(&xedd));
-
-    static const uint8_t add_eax_imm4_1_explicit[] = { 0x81, 0xC0, 0x01, 0x00, 0x00, 0x00, };  // add eax, 1
-    decode_instruction(&xedd, add_eax_imm4_1_explicit, sizeof(add_eax_imm4_1_explicit));
-    assert(!check_implicit_register(&xedd));
-
-    static const uint8_t add_ebx_imm4_1[] = { 0x81, 0xC3, 0x01, 0x00, 0x00, 0x00, };  // add ebx, 1
-    decode_instruction(&xedd, add_ebx_imm4_1, sizeof(add_ebx_imm4_1));
-    assert(check_implicit_register(&xedd));
-
-    static const uint8_t xor_eax_eax[] = { 0x31, 0xC0, };  // xor eax, eax
-    decode_instruction(&xedd, xor_eax_eax, sizeof(xor_eax_eax));
-    assert(check_implicit_register(&xedd));
-
-    static const uint8_t xor_rax_rax[] = { 0x48, 0x31, 0xC0, };  // xor rax, rax
-    decode_instruction(&xedd, xor_rax_rax, sizeof(xor_rax_rax));
-    assert(check_implicit_register(&xedd));
+    CHECK_BYTES( check_implicit_register, 0x05, 0x01, 0x00, 0x00, 0x00);  // add eax, 1
+    CHECK_BYTES(!check_implicit_register, 0x81, 0xC0, 0x01, 0x00, 0x00, 0x00);  // add eax, 1
+    CHECK_BYTES( check_implicit_register, 0x81, 0xC3, 0x01, 0x00, 0x00, 0x00);  // add ebx, 1
+    CHECK_BYTES( check_implicit_register, 0x31, 0xC0);  // xor eax, eax
+    CHECK_BYTES( check_implicit_register, 0x48, 0x31, 0xC0);  // xor rax, rax
 }
 
 static void check_implicit_immediate_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t rotate_left_without_immediate[] = { 0xd1, 0xd0, };  // rcl eax, 1
-    decode_instruction(&xedd, rotate_left_without_immediate, sizeof(rotate_left_without_immediate));
-    assert(check_implicit_immediate(&xedd));
-
-    static const uint8_t rotate_left_with_immediate[] = { 0xc1, 0xd0, 0x01, };  // rcl eax, 1
-    decode_instruction(&xedd, rotate_left_with_immediate, sizeof(rotate_left_with_immediate));
-    assert(!check_implicit_immediate(&xedd));
+    CHECK_BYTES( check_implicit_immediate, 0xd1, 0xd0);  // rcl eax, 1
+    CHECK_BYTES(!check_implicit_immediate, 0xc1, 0xd0, 0x01);  // rcl eax, 1
 }
 
 static void check_and_strength_reduce_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t and_imm1_ff[] = { 0x83, 0xe0, 0xff, };  // and eax, 0xff
-    decode_instruction(&xedd, and_imm1_ff, sizeof(and_imm1_ff));
-    assert(!check_and_strength_reduce(&xedd));
-
-    static const uint8_t and_imm1_fe[] = { 0x83, 0xe0, 0xfe, };  // and eax, 0xfe
-    decode_instruction(&xedd, and_imm1_fe, sizeof(and_imm1_fe));
-    assert(check_and_strength_reduce(&xedd));
-
-    static const uint8_t and_imm4_ffff[] = { 0x25, 0xff, 0xff, 0x00, 0x00, };  // and eax, 0xffff
-    decode_instruction(&xedd, and_imm4_ffff, sizeof(and_imm4_ffff));
-    assert(!check_and_strength_reduce(&xedd));
-
-    static const uint8_t and_imm4_ffffffff[] = { 0x25, 0xff, 0xff, 0xff, 0xff, };  // and eax, 0xffffffff
-    decode_instruction(&xedd, and_imm4_ffffffff, sizeof(and_imm4_ffffffff));
-    assert(!check_and_strength_reduce(&xedd));
+    CHECK_BYTES(!check_and_strength_reduce, 0x83, 0xe0, 0xff);  // and eax, 0xff
+    CHECK_BYTES( check_and_strength_reduce, 0x83, 0xe0, 0xfe);  // and eax, 0xfe
+    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0x00, 0x00);  // and eax, 0xffff
+    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0xff, 0xff);  // and eax, 0xffffffff
 }
 
 static void check_missing_lock_prefix_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t xadd_lock[] = { 0x67, 0xf0, 0x0f, 0xc1, 0x18, };  // lock xadd [eax], ebx
-    decode_instruction(&xedd, xadd_lock, sizeof(xadd_lock));
-    assert(check_missing_lock_prefix(&xedd));
-
-    static const uint8_t xadd_nolock[] = { 0x67, 0x0f, 0xc1, 0x18, };  // xadd [eax], ebx
-    decode_instruction(&xedd, xadd_nolock, sizeof(xadd_nolock));
-    assert(!check_missing_lock_prefix(&xedd));
+    CHECK_BYTES( check_missing_lock_prefix, 0x67, 0xf0, 0x0f, 0xc1, 0x18);  // lock xadd [eax], ebx
+    CHECK_BYTES(!check_missing_lock_prefix, 0x67, 0x0f, 0xc1, 0x18);  // xadd [eax], ebx
 }
 
 static void check_superfluous_lock_prefix_test(void)
 {
-    xed_decoded_inst_t xedd;
-
-    static const uint8_t xchg_lock[] = { 0xf0, 0x87, 0x07, };  // lock xchg [eax], ebx
-    decode_instruction(&xedd, xchg_lock, sizeof(xchg_lock));
-    assert(!check_superfluous_lock_prefix(&xedd));
-
-    static const uint8_t xchg_nolock[] = { 0x87, 0x07, };  // xchg [eax], ebx
-    decode_instruction(&xedd, xchg_nolock, sizeof(xchg_nolock));
-    assert(check_superfluous_lock_prefix(&xedd));
+    CHECK_BYTES(!check_superfluous_lock_prefix, 0xf0, 0x87, 0x07);  // lock xchg [eax], ebx
+    CHECK_BYTES( check_superfluous_lock_prefix, 0x87, 0x07);  // xchg [eax], ebx
 }
 
 int main(int argc, char *argv[])

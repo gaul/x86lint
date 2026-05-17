@@ -493,6 +493,13 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// AND r/m, 0xff/0xffff/0xffffffff can be replaced by MOVZBL / MOVZWL /
+// MOV (the latter via the EAX-write zero-extension rule), all of which
+// fit the same mask operation in fewer bytes.
+//
+// False positive if surrounding code reads ZF/SF/PF: AND sets them based
+// on the masked result and clears CF/OF; MOVZX and MOV do not touch
+// flags. A subsequent JZ/JS/JP would diverge.
 bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_AND) {

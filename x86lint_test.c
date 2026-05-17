@@ -198,6 +198,8 @@ static void check_implicit_register_test(void)
     CHECK_BYTES(!check_implicit_register, 0x66, 0x81, 0xC0, 0x01, 0x00);  // add ax, 1 (explicit)
     CHECK_BYTES( check_implicit_register, 0x48, 0x05, 0x01, 0x00, 0x00, 0x00);  // add rax, 1 (implicit)
     CHECK_BYTES(!check_implicit_register, 0x48, 0x81, 0xC0, 0x01, 0x00, 0x00, 0x00);  // add rax, 1 (explicit)
+    CHECK_BYTES( check_implicit_register, 0xa9, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (implicit)
+    CHECK_BYTES(!check_implicit_register, 0xf7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (explicit)
 }
 
 static void check_implicit_immediate_test(void)

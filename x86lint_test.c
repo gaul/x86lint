@@ -144,6 +144,9 @@ static void check_unneeded_rex_test(void)
     CHECK_BYTES( check_unneeded_rex, 0x41, 0xff, 0xd4);  // call r12 (REX.B needed)
     CHECK_BYTES( check_unneeded_rex, 0x41, 0xff, 0xe4);  // jmp r12 (REX.B needed)
     CHECK_BYTES( check_unneeded_rex, 0x41, 0xff, 0x55, 0x40);  // call [r13+0x40] (REX.B needed)
+    CHECK_BYTES(!check_unneeded_rex, 0x40, 0x8b, 0x00);  // mov eax, [rax] with bare REX (unneeded)
+    CHECK_BYTES( check_unneeded_rex, 0x48, 0x8b, 0x01);  // mov rax, [rcx] (REX.W needed for 64-bit op)
+    CHECK_BYTES( check_unneeded_rex, 0x41, 0x8b, 0x00);  // mov eax, [r8] (REX.B needed for r8 base)
 }
 
 static void check_mov_zero_test(void)

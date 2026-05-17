@@ -150,6 +150,36 @@ bool check_oversized_add128(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// True if this register requires a REX prefix when used as a memory base
+// or index. In 64-bit mode all 64-bit GPRs are valid base/index registers
+// without any REX prefix; only R8-R15 require REX.B/X to encode.
+static bool check_rex_addressing_register(xed_reg_enum_t reg)
+{
+    switch (reg) {
+    case XED_REG_R8:
+    case XED_REG_R9:
+    case XED_REG_R10:
+    case XED_REG_R11:
+    case XED_REG_R12:
+    case XED_REG_R13:
+    case XED_REG_R14:
+    case XED_REG_R15:
+
+    case XED_REG_R8D:
+    case XED_REG_R9D:
+    case XED_REG_R10D:
+    case XED_REG_R11D:
+    case XED_REG_R12D:
+    case XED_REG_R13D:
+    case XED_REG_R14D:
+    case XED_REG_R15D:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
 static bool check_rex_register(xed_reg_enum_t reg)
 {
     switch (reg) {
@@ -293,8 +323,8 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     }
 
     for (int i = 0; i < xed_decoded_inst_number_of_memory_operands(xedd); ++i) {
-        if (check_rex_register(xed_decoded_inst_get_base_reg(xedd, i)) ||
-            check_rex_register(xed_decoded_inst_get_index_reg(xedd, i))) {
+        if (check_rex_addressing_register(xed_decoded_inst_get_base_reg(xedd, i)) ||
+            check_rex_addressing_register(xed_decoded_inst_get_index_reg(xedd, i))) {
             return true;
         }
     }

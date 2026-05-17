@@ -77,6 +77,11 @@ int main(int argc, char **argv)
             continue;
         }
 
+        if (shdr.sh_size > 100 * 1024 * 1024) {
+            fprintf(stderr, "%s: section %u size too large (%lu bytes)\n",
+                argv[1], i, (unsigned long) shdr.sh_size);
+            goto out;
+        }
         buf = malloc(shdr.sh_size);
         if (buf == NULL) {
             fprintf(stderr, "%s: failed to allocate %lu bytes\n",

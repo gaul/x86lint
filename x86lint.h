@@ -80,6 +80,10 @@ bool check_unneeded_zero_displacement(const xed_decoded_inst_t *xedd);
 // return false if movsxd rax, eax could be cdqe (cltq in AT&T)
 bool check_unneeded_movsxd(const xed_decoded_inst_t *xedd);
 
+// return false if sub reg, reg is used as a zero idiom -- xor reg, reg is
+// the canonical form that CPUs recognize as dependency-breaking
+bool check_sub_self(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

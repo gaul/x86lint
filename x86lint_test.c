@@ -315,6 +315,19 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_sub_self_test(void)
+{
+    CHECK_BYTES(!check_sub_self, 0x29, 0xc0);              // sub eax, eax (use xor)
+    CHECK_BYTES(!check_sub_self, 0x48, 0x29, 0xc0);        // sub rax, rax
+    CHECK_BYTES(!check_sub_self, 0x4d, 0x29, 0xc0);        // sub r8, r8
+    CHECK_BYTES(!check_sub_self, 0x28, 0xc0);              // sub al, al
+    CHECK_BYTES(!check_sub_self, 0x66, 0x29, 0xc0);        // sub ax, ax
+    CHECK_BYTES( check_sub_self, 0x29, 0xc3);              // sub ebx, eax (different regs)
+    CHECK_BYTES( check_sub_self, 0x31, 0xc0);              // xor eax, eax (not SUB)
+    CHECK_BYTES( check_sub_self, 0x29, 0x00);              // sub [rax], eax (memory)
+    CHECK_BYTES( check_sub_self, 0x90);                    // nop
+}
+
 static void check_unneeded_movsxd_test(void)
 {
     CHECK_BYTES(!check_unneeded_movsxd, 0x48, 0x63, 0xc0);  // movsxd rax, eax (use cdqe)
@@ -413,6 +426,7 @@ int main(int argc, char *argv[])
     check_unneeded_sib_test();
     check_unneeded_zero_displacement_test();
     check_unneeded_movsxd_test();
+    check_sub_self_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

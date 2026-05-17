@@ -543,6 +543,20 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// sub reg, reg zeros the register at the same byte cost as xor reg, reg.
+// XOR is the canonical zero idiom that CPUs recognize and break the
+// dependency chain for; SUB does not get that treatment and serializes
+// on the prior value of the register.
+bool check_sub_self(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_SUB) {
+        return true;
+    }
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    return !(r0 != XED_REG_INVALID && r0 == r1);
+}
+
 // movsxd rax, eax (48 63 c0, 3 bytes) sign-extends EAX into RAX. The
 // CDQE / cltq instruction (48 98, 2 bytes) does the same.
 // TODO: similar opportunities exist for movsx eax, ax -> cwde and
@@ -824,6 +838,7 @@ static const struct check_entry checks[] = {
     {check_unneeded_sib,            "unneeded SIB byte"},
     {check_unneeded_zero_displacement, "unneeded zero displacement"},
     {check_unneeded_movsxd,         "unneeded MOVSXD"},
+    {check_sub_self,                "suboptimal SUB reg, reg"},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)

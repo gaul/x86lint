@@ -16,12 +16,16 @@ compiler writers generate better code and documents the complexity of x86.
 * implicit EAX
   - `81C0 00010000` instead of `05 00010000` (ADD EAX, 0x100)
 * missing LOCK prefix on CMPXCHG and XADD
+* oversized ADD 128
+  - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
+* oversized branch displacement
+  - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
 * strength-reduce AND with immediate to MOVZBL
 * suboptimal CMP 0 `83FF 00` instead of TEST `85C0`
 * suboptimal no-ops
-  - multiple `90` instead of a single `60 90`, etc.
+  - multiple `90` instead of a single `66 90`, etc.
 * ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unnecessary REX prefix

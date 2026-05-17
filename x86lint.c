@@ -340,10 +340,7 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
         }
     }
     if (check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0)) ||
-        check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1)) ||
-        // TODO: are these correct?
-        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG0)) ||
-        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG1))) {
+        check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1))) {
         return true;
     }
 

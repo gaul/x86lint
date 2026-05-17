@@ -258,11 +258,8 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     }
 
     // Check if instruction has a REX prefix.
-    // TODO: REX byte must come first but is there a more robust way to test this?
-    int8_t prefix = xed_decoded_inst_get_byte(xedd, 0);
     // TODO: handle instructions which do not default to 64-bit operands
-    // TODO: look at xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd))
-    if ((prefix & 0xf0) != 0x40) {
+    if (!xed3_operand_get_rex(xedd)) {
         return true;
     }
 
@@ -324,7 +321,10 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
         break;
     }
 
-    if ((prefix & 0x0f) == 0) {
+    if (xed3_operand_get_rexw(xedd) == 0 &&
+        xed3_operand_get_rexr(xedd) == 0 &&
+        xed3_operand_get_rexx(xedd) == 0 &&
+        xed3_operand_get_rexb(xedd) == 0) {
         return false;
     }
     return true;

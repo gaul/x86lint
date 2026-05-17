@@ -700,16 +700,16 @@ static const struct check_entry checks[] = {
     {check_oversized_immediate,     "oversized immediate"},
     {check_oversized_add128,        "oversized ADD 128"},
     {check_unneeded_rex,            "unneeded REX prefix"},
-    {check_cmp_zero,                "suboptimal compare register"},
+    {check_cmp_zero,                "suboptimal CMP zero"},
     {check_implicit_register,       "unneeded explicit register"},
     {check_implicit_immediate,      "unneeded explicit immediate"},
-    {check_and_strength_reduce,     "unneeded AND immediate"},
-    {check_missing_lock_prefix,     "expected lock prefix"},
-    {check_superfluous_lock_prefix, "superfluous lock prefix"},
+    {check_and_strength_reduce,     "suboptimal AND immediate"},
+    {check_missing_lock_prefix,     "missing LOCK prefix"},
+    {check_superfluous_lock_prefix, "unneeded LOCK prefix"},
     {check_oversized_branch,        "oversized branch displacement"},
-    {check_mov_self,                "redundant mov reg, reg"},
-    {check_add_zero,                "add/sub reg, 0"},
-    {check_mov_modrm_imm,           "unneeded modrm in mov reg, imm"},
+    {check_mov_self,                "redundant MOV reg, reg"},
+    {check_add_zero,                "redundant ADD/SUB zero"},
+    {check_mov_modrm_imm,           "oversized MOV encoding"},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)
@@ -731,7 +731,7 @@ int check_instructions(const uint8_t *inst, size_t len)
         }
 
         if (!check_suboptimal_nops(inst + offset, len - offset)) {
-            printf("suboptimal nops at offset: %zu\n", offset);
+            printf("suboptimal NOP sequence at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
 

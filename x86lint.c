@@ -543,6 +543,37 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// IMUL r, r, imm with imm in {2,3,4,5,8,9} can be replaced by a single
+// LEA, which on most uarches has shorter latency and uses the AGU instead
+// of the multiplier. Pure powers of two (2/4/8) also have shorter SHL
+// encodings when the source and destination match.
+//
+// Memory-source IMUL (IMUL r, [m], imm) is not flagged: the replacement
+// would need a separate load instruction first, making the sequence
+// longer and not strictly faster.
+//
+// False positive if surrounding code reads CF or OF: IMUL sets both on
+// signed overflow; LEA and SHL do not. A subsequent JC/JNC/JO/JNO would
+// diverge.
+bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_IMUL) {
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    switch (xed_decoded_inst_get_unsigned_immediate(xedd)) {
+    case 2: case 3: case 4: case 5: case 8: case 9:
+        return false;
+    default:
+        return true;
+    }
+}
+
 // sub reg, reg zeros the register at the same byte cost as xor reg, reg.
 // XOR is the canonical zero idiom that CPUs recognize and break the
 // dependency chain for; SUB does not get that treatment and serializes
@@ -839,6 +870,7 @@ static const struct check_entry checks[] = {
     {check_unneeded_zero_displacement, "unneeded zero displacement"},
     {check_unneeded_movsxd,         "unneeded MOVSXD"},
     {check_sub_self,                "suboptimal SUB reg, reg"},
+    {check_imul_to_lea,             "suboptimal IMUL constant"},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)

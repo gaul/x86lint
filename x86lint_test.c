@@ -315,6 +315,30 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_imul_to_lea_test(void)
+{
+    // imm8 form, all the LEA/SHL-friendly constants.
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x02);                    // imul eax, eax, 2
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x03);                    // imul eax, eax, 3
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x04);                    // imul eax, eax, 4
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x05);                    // imul eax, eax, 5
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x08);                    // imul eax, eax, 8
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x09);                    // imul eax, eax, 9
+    // imm32 form also matches.
+    CHECK_BYTES(!check_imul_to_lea, 0x69, 0xc0, 0x03, 0x00, 0x00, 0x00);  // imul eax, eax, 3
+    // Constants without a single-LEA equivalent.
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x06);                    // imul eax, eax, 6
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x07);                    // imul eax, eax, 7
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x0a);                    // imul eax, eax, 10
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0xfe);                    // imul eax, eax, -2 (sign-ext, LEA can't negate)
+    // Two-operand form (no immediate).
+    CHECK_BYTES( check_imul_to_lea, 0x0f, 0xaf, 0xc3);                    // imul eax, ebx
+    // Memory-source IMUL: LEA replacement needs extra load, would be longer.
+    CHECK_BYTES( check_imul_to_lea, 0x48, 0x6b, 0x43, 0x08, 0x03);        // imul rax, [rbx+8], 3
+    // Not IMUL.
+    CHECK_BYTES( check_imul_to_lea, 0x90);                                // nop
+}
+
 static void check_sub_self_test(void)
 {
     CHECK_BYTES(!check_sub_self, 0x29, 0xc0);              // sub eax, eax (use xor)
@@ -427,6 +451,7 @@ int main(int argc, char *argv[])
     check_unneeded_zero_displacement_test();
     check_unneeded_movsxd_test();
     check_sub_self_test();
+    check_imul_to_lea_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

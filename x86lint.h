@@ -84,6 +84,10 @@ bool check_unneeded_movsxd(const xed_decoded_inst_t *xedd);
 // the canonical form that CPUs recognize as dependency-breaking
 bool check_sub_self(const xed_decoded_inst_t *xedd);
 
+// return false if IMUL by a constant in {2,3,4,5,8,9} could be replaced
+// by a single LEA (or SHL for powers of two)
+bool check_imul_to_lea(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

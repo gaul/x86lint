@@ -540,6 +540,29 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// mov reg, reg with both operands the same register is a no-op, with one
+// exception: mov r32, r32 deliberately zero-extends to the corresponding
+// r64 (writing any 32-bit register clears the upper 32 bits). The 8-,
+// 16-, and 64-bit forms have no such side effect and are pure waste.
+bool check_mov_self(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV) {
+        return true;
+    }
+
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    if (r0 == XED_REG_INVALID || r0 != r1) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_operand_width(xedd) == 32) {
+        return true;
+    }
+
+    return false;
+}
+
 // Both JMP rel32 and Jcc rel32 have a 2-byte rel8 alternative when the
 // target is within reach. JMP rel32 is 5 bytes vs 2; Jcc rel32 is 6 vs 2.
 // Shortening shrinks the encoding, which shifts the displacement by the
@@ -732,6 +755,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_oversized_branch(&xedd);
         if (!result) {
             printf("oversized branch displacement at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_mov_self(&xedd);
+        if (!result) {
+            printf("redundant mov reg, reg at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

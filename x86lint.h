@@ -56,6 +56,10 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd);
 // return false if a JMP or Jcc uses rel32 when rel8 would reach the target
 bool check_oversized_branch(const xed_decoded_inst_t *xedd);
 
+// return false if instruction is a no-op mov reg, reg (excluding the
+// mov r32, r32 zero-extension idiom)
+bool check_mov_self(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

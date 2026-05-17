@@ -272,6 +272,17 @@ static void check_oversized_branch_test(void)
     CHECK_BYTES( check_oversized_branch, 0xe3, 0x00);  // jrcxz +0
 }
 
+static void check_mov_self_test(void)
+{
+    CHECK_BYTES(!check_mov_self, 0x48, 0x89, 0xc0);  // mov rax, rax (useless, REX.W)
+    CHECK_BYTES(!check_mov_self, 0x48, 0x89, 0xdb);  // mov rbx, rbx
+    CHECK_BYTES(!check_mov_self, 0x66, 0x89, 0xc0);  // mov ax, ax (no zero-ext, useless)
+    CHECK_BYTES(!check_mov_self, 0x88, 0xc0);        // mov al, al (useless)
+    CHECK_BYTES( check_mov_self, 0x89, 0xc0);        // mov eax, eax (zero-ext idiom, keep)
+    CHECK_BYTES( check_mov_self, 0x48, 0x89, 0xc3);  // mov rbx, rax (different regs)
+    CHECK_BYTES( check_mov_self, 0x90);              // nop (not MOV)
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -289,6 +300,7 @@ int main(int argc, char *argv[])
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
     check_oversized_branch_test();
+    check_mov_self_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

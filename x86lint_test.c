@@ -420,8 +420,13 @@ static void check_mov_modrm_imm_test(void)
     CHECK_BYTES( check_mov_modrm_imm, 0xb0, 0x01);                                // mov al, 1
     CHECK_BYTES( check_mov_modrm_imm, 0x66, 0xb8, 0x01, 0x00);                    // mov ax, 1
     CHECK_BYTES( check_mov_modrm_imm, 0xb8, 0x01, 0x00, 0x00, 0x00);              // mov eax, 1
-    // 64-bit modrm form (sign-ext) is shorter than movabs imm64, pass.
-    CHECK_BYTES( check_mov_modrm_imm, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // mov rax, 1
+    // REX.W C7 form with non-negative imm32 -- mov r32, imm32 (5 bytes)
+    // zero-extends to the same 64-bit value as the 7-byte sign-extending form.
+    CHECK_BYTES(!check_mov_modrm_imm, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // mov rax, 1
+    CHECK_BYTES(!check_mov_modrm_imm, 0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0x7f);  // mov rax, 0x7fffffff (top imm32 positive)
+    // REX.W C7 with negative imm32 -- sign-extension differs from zero-extension; C7 is the shortest form.
+    CHECK_BYTES( check_mov_modrm_imm, 0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff);  // mov rax, -1
+    CHECK_BYTES( check_mov_modrm_imm, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x80);  // mov rax, sign_ext(0x80000000)
     // Memory destination -- no +r form alternative, pass.
     CHECK_BYTES( check_mov_modrm_imm, 0xc7, 0x00, 0x01, 0x00, 0x00, 0x00);        // mov [rax], 1
     // Reg-reg mov has no immediate, pass.

@@ -719,10 +719,12 @@ bool check_unneeded_sib(const xed_decoded_inst_t *xedd)
 // MOV r/m, imm with a register destination has two encodings: the c6/c7
 // opcode with a modrm byte, and the b0/b8 +r form where the destination
 // register is encoded in the low 3 bits of the opcode (no modrm). The +r
-// form is one byte shorter for 8/16/32-bit operands. The 64-bit modrm
-// form (48 c7 c0 imm32, sign-extended) is shorter than movabs imm64 and
-// is not flagged here -- the existing 64-bit cases are handled by
-// check_oversized_immediate.
+// form is one byte shorter for 8/16/32-bit operands. For 64-bit operand
+// size the C7 modrm form (48 c7 c0 imm32, 7 bytes) sign-extends imm32;
+// when the value is non-negative the result matches what the 5-byte b8+r
+// form produces via the EAX-write zero-extension rule, so the 32-bit form
+// replaces it. A negative imm32 needs the C7 form (the only alternative
+// is the 10-byte movabs encoding).
 bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV) {
@@ -738,7 +740,16 @@ bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd)
         return true;
     }
     unsigned op_width = xed_decoded_inst_get_operand_width(xedd);
-    return op_width != 8 && op_width != 16 && op_width != 32;
+    if (op_width == 8 || op_width == 16 || op_width == 32) {
+        return false;
+    }
+    if (op_width == 64) {
+        int32_t imm = (int32_t) xed_decoded_inst_get_unsigned_immediate(xedd);
+        if (imm >= 0) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // add reg, 0 and sub reg, 0 leave the register unchanged but set flags

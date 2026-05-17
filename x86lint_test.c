@@ -134,6 +134,9 @@ static void check_oversized_immediate_test(void)
     CHECK_BYTES(!check_oversized_immediate, 0x81, 0xE8, 0x01, 0x00, 0x00, 0x00);  // sub eax, 1
     CHECK_BYTES(!check_oversized_immediate, 0x81, 0xF0, 0x01, 0x00, 0x00, 0x00);  // xor eax, 1
     CHECK_BYTES( check_oversized_immediate, 0xF7, 0xC0, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (TEST not in switch)
+    CHECK_BYTES(!check_oversized_immediate, 0x81, 0xC0, 0xff, 0xff, 0xff, 0xff);  // add eax, -1 (imm32=0xffffffff, fits in sign-ext imm8)
+    CHECK_BYTES(!check_oversized_immediate, 0x81, 0xC0, 0x80, 0xff, 0xff, 0xff);  // add eax, -0x80 (sign-ext imm8 boundary)
+    CHECK_BYTES( check_oversized_immediate, 0x81, 0xC0, 0x7f, 0xff, 0xff, 0xff);  // add eax, -129 (just past sign-ext imm8 range)
 }
 
 static void check_oversized_add128_test(void)

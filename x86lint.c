@@ -106,8 +106,15 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
     case 16:
         return true;
     case 32:
-        if (iclass != XED_ICLASS_MOV && imm >= INT8_MIN && imm <= INT8_MAX) {
-            return false;
+        if (iclass != XED_ICLASS_MOV) {
+            // Treat the raw imm32 as signed: 0xffffffff is -1, equivalent
+            // to sign-extending imm8=0xff. Otherwise XED's uint64 cast
+            // would put negative-as-imm32 values out of INT8 range and
+            // we would miss the shorter encoding.
+            int32_t i32 = (int32_t) imm;
+            if (i32 >= INT8_MIN && i32 <= INT8_MAX) {
+                return false;
+            }
         }
         break;
     case 64:

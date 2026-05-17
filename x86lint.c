@@ -446,7 +446,7 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     if (imm != 1) {
         return true;
     }
-    switch (xedd->_inst->_iform_enum) {
+    switch (xed_decoded_inst_get_iform_enum(xedd)) {
     case XED_IFORM_RCL_GPRv_IMMb:
     case XED_IFORM_RCR_GPRv_IMMb:
     case XED_IFORM_ROL_GPRv_IMMb:
@@ -456,6 +456,8 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     //case XED_IFORM_SHL_GPRv_IMMb:
     case XED_IFORM_SHR_GPRv_IMMb:
         return false;
+    default:
+        break;
     }
     return true;
 }

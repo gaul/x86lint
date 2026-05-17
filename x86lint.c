@@ -119,6 +119,9 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
 
 // Check for ADD REG, 128 which encodes as 5 bytes instead of SUB REG, -128
 // which encodes in 3 bytes.
+//
+// False positive if surrounding code reads CF: ADD sets CF on unsigned
+// overflow, SUB sets CF on borrow, so a subsequent JC/JNC/ADC/SBB diverges.
 bool check_oversized_add128(const xed_decoded_inst_t *xedd)
 {
     if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {

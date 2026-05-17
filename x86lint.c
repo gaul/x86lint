@@ -268,7 +268,6 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     // register operand (e.g. call r12, jmp [r13]).
     // These iclasses must be checked before the register-operand scan
     // below, which would otherwise trip on implicit RSP or RCX.
-    // TODO: handle non-flag PUSH/POP variants (reg, reg/mem, imm, FS, GS)
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_CALL_NEAR:
     case XED_ICLASS_ENTER:
@@ -302,7 +301,9 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_LTR:
     case XED_ICLASS_MOV_CR:
     case XED_ICLASS_MOV_DR:
+    case XED_ICLASS_POP:
     case XED_ICLASS_POPFQ:
+    case XED_ICLASS_PUSH:
     case XED_ICLASS_PUSHFQ:
     case XED_ICLASS_RET_NEAR:
         if (xed3_operand_get_rexr(xedd) == 0 &&

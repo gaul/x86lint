@@ -25,7 +25,14 @@ do { \
     static const uint8_t bytes[] = { __VA_ARGS__ }; \
     xed_decoded_inst_t xedd; \
     decode_instruction(&xedd, bytes, sizeof(bytes)); \
-    assert(func(&xedd)); \
+    bool _result = func(&xedd); \
+    if (!_result) { \
+        fprintf(stderr, "%s:%d: " #func " failed on:", __FILE__, __LINE__); \
+        for (size_t _i = 0; _i < sizeof(bytes); _i++) \
+            fprintf(stderr, " %02x", bytes[_i]); \
+        fprintf(stderr, "\n"); \
+    } \
+    assert(_result); \
 } while (0)
 
 static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, size_t len)

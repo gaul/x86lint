@@ -43,6 +43,13 @@ bool check_suboptimal_nops(const uint8_t *inst, size_t len)
         // TODO: call xed_operand_values_is_nop?
         int iclass = xed_decoded_inst_get_iclass(&xedd);
         bool cur_nop = iclass >= XED_ICLASS_NOP && iclass <= XED_ICLASS_NOP9;
+        // XED classifies PAUSE (F3 90) and ENDBR32/ENDBR64 (F3 0F 1E FB/FA)
+        // as NOP because they have no architectural effect, but they exist
+        // as spin-loop hints and CET indirect-branch markers respectively
+        // and are not interchangeable with padding NOPs.
+        if (cur_nop && xed3_operand_get_rep(&xedd)) {
+            cur_nop = false;
+        }
         if (!cur_nop) {
             break;
         }

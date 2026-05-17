@@ -67,6 +67,26 @@ static void check_suboptimal_nops_test(void)
         0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
     };
     assert(check_suboptimal_nops(nop9_nop9, sizeof(nop9_nop9)));
+
+    // ENDBR64 alone -- CET landing pad, not really a NOP.
+    static const uint8_t endbr64[] = { 0xf3, 0x0f, 0x1e, 0xfa };
+    assert(check_suboptimal_nops(endbr64, sizeof(endbr64)));
+
+    // PAUSE alone -- spin-loop hint, not really a NOP.
+    static const uint8_t pause[] = { 0xf3, 0x90 };
+    assert(check_suboptimal_nops(pause, sizeof(pause)));
+
+    // Alignment NOP immediately before ENDBR64 -- the Fedora CET pattern.
+    static const uint8_t nop66_endbr[] = { 0x66, 0x90, 0xf3, 0x0f, 0x1e, 0xfa };
+    assert(check_suboptimal_nops(nop66_endbr, sizeof(nop66_endbr)));
+
+    // NOP before PAUSE -- still pass, PAUSE doesn't count as a second NOP.
+    static const uint8_t nop_pause[] = { 0x90, 0xf3, 0x90 };
+    assert(check_suboptimal_nops(nop_pause, sizeof(nop_pause)));
+
+    // Two real NOPs before ENDBR64 -- still flagged, the two NOPs are wasteful.
+    static const uint8_t nopnop_endbr[] = { 0x90, 0x90, 0xf3, 0x0f, 0x1e, 0xfa };
+    assert(!check_suboptimal_nops(nopnop_endbr, sizeof(nopnop_endbr)));
 }
 
 static void check_oversized_immediate_test(void)

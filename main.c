@@ -47,6 +47,17 @@ int main(int argc, char **argv)
     int rc = 1;
     uint8_t *buf = NULL;
 
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "%s: failed to seek to end of file\n", argv[1]);
+        goto out;
+    }
+    long file_size_signed = ftell(f);
+    if (file_size_signed < 0) {
+        fprintf(stderr, "%s: failed to get file size\n", argv[1]);
+        goto out;
+    }
+    uint64_t file_size = (uint64_t) file_size_signed;
+
     Elf64_Ehdr ehdr;
     if (!read_at(f, 0, &ehdr, sizeof(ehdr))) {
         fprintf(stderr, "%s: failed to read ELF header\n", argv[1]);
@@ -75,6 +86,17 @@ int main(int argc, char **argv)
 
         if (shdr.sh_type != SHT_PROGBITS || !(shdr.sh_flags & SHF_EXECINSTR) || shdr.sh_size == 0) {
             continue;
+        }
+
+        // Validate the section fits within the file. Done as two checks
+        // to avoid wraparound on a forged sh_size near UINT64_MAX.
+        if (shdr.sh_offset > file_size ||
+            shdr.sh_size > file_size - shdr.sh_offset) {
+            fprintf(stderr,
+                "%s: section %u out of bounds (offset %lu size %lu, file %lu)\n",
+                argv[1], i, (unsigned long) shdr.sh_offset,
+                (unsigned long) shdr.sh_size, (unsigned long) file_size);
+            goto out;
         }
 
         buf = malloc(shdr.sh_size);

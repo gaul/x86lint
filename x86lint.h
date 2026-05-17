@@ -65,6 +65,10 @@ bool check_mov_self(const xed_decoded_inst_t *xedd);
 // if flags are unused)
 bool check_add_zero(const xed_decoded_inst_t *xedd);
 
+// return false if a mov reg, imm uses the c6/c7 modrm form with a
+// register destination when the b0/b8 +r form would be one byte shorter
+bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

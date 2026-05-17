@@ -540,6 +540,31 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// MOV r/m, imm with a register destination has two encodings: the c6/c7
+// opcode with a modrm byte, and the b0/b8 +r form where the destination
+// register is encoded in the low 3 bits of the opcode (no modrm). The +r
+// form is one byte shorter for 8/16/32-bit operands. The 64-bit modrm
+// form (48 c7 c0 imm32, sign-extended) is shorter than movabs imm64 and
+// is not flagged here -- the existing 64-bit cases are handled by
+// check_oversized_immediate.
+bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (!xed_operand_values_has_modrm_byte(xedd)) {
+        return true;
+    }
+    unsigned op_width = xed_decoded_inst_get_operand_width(xedd);
+    return op_width != 8 && op_width != 16 && op_width != 32;
+}
+
 // add reg, 0 and sub reg, 0 leave the register unchanged but set flags
 // as a side effect (CF/OF cleared, ZF/SF/PF reflect the register's
 // value). The equivalent test reg, reg has the same flag effect and is
@@ -800,6 +825,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_add_zero(&xedd);
         if (!result) {
             printf("add/sub reg, 0 at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_mov_modrm_imm(&xedd);
+        if (!result) {
+            printf("unneeded modrm in mov reg, imm at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

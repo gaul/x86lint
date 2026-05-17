@@ -295,6 +295,26 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_mov_modrm_imm_test(void)
+{
+    // modrm form -- one byte longer than the b0/b8 +r form, flag.
+    CHECK_BYTES(!check_mov_modrm_imm, 0xc6, 0xc0, 0x01);                          // mov al, 1 (modrm)
+    CHECK_BYTES(!check_mov_modrm_imm, 0x66, 0xc7, 0xc0, 0x01, 0x00);              // mov ax, 1 (modrm)
+    CHECK_BYTES(!check_mov_modrm_imm, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);        // mov eax, 1 (modrm)
+    // b0/b8 +r form -- already short, pass.
+    CHECK_BYTES( check_mov_modrm_imm, 0xb0, 0x01);                                // mov al, 1
+    CHECK_BYTES( check_mov_modrm_imm, 0x66, 0xb8, 0x01, 0x00);                    // mov ax, 1
+    CHECK_BYTES( check_mov_modrm_imm, 0xb8, 0x01, 0x00, 0x00, 0x00);              // mov eax, 1
+    // 64-bit modrm form (sign-ext) is shorter than movabs imm64, pass.
+    CHECK_BYTES( check_mov_modrm_imm, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // mov rax, 1
+    // Memory destination -- no +r form alternative, pass.
+    CHECK_BYTES( check_mov_modrm_imm, 0xc7, 0x00, 0x01, 0x00, 0x00, 0x00);        // mov [rax], 1
+    // Reg-reg mov has no immediate, pass.
+    CHECK_BYTES( check_mov_modrm_imm, 0x89, 0xc3);                                // mov ebx, eax
+    // Not a MOV, pass.
+    CHECK_BYTES( check_mov_modrm_imm, 0x90);                                      // nop
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -314,6 +334,7 @@ int main(int argc, char *argv[])
     check_oversized_branch_test();
     check_mov_self_test();
     check_add_zero_test();
+    check_mov_modrm_imm_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

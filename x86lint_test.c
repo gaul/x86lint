@@ -315,6 +315,16 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_unneeded_movsxd_test(void)
+{
+    CHECK_BYTES(!check_unneeded_movsxd, 0x48, 0x63, 0xc0);  // movsxd rax, eax (use cdqe)
+    CHECK_BYTES( check_unneeded_movsxd, 0x48, 0x63, 0xc8);  // movsxd rcx, eax (no shorter form)
+    CHECK_BYTES( check_unneeded_movsxd, 0x48, 0x63, 0xc1);  // movsxd rax, ecx (no shorter form)
+    CHECK_BYTES( check_unneeded_movsxd, 0x48, 0x63, 0x00);  // movsxd rax, [rax] (memory source)
+    CHECK_BYTES( check_unneeded_movsxd, 0x48, 0x98);        // cdqe (already short)
+    CHECK_BYTES( check_unneeded_movsxd, 0x90);              // nop (not MOVSXD)
+}
+
 static void check_unneeded_zero_displacement_test(void)
 {
     // Issue #4: disp8=0 and disp32=0 when no displacement would suffice.
@@ -402,6 +412,7 @@ int main(int argc, char *argv[])
     check_mov_modrm_imm_test();
     check_unneeded_sib_test();
     check_unneeded_zero_displacement_test();
+    check_unneeded_movsxd_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

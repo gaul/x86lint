@@ -543,6 +543,21 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// movsxd rax, eax (48 63 c0, 3 bytes) sign-extends EAX into RAX. The
+// CDQE / cltq instruction (48 98, 2 bytes) does the same.
+// TODO: similar opportunities exist for movsx eax, ax -> cwde and
+// movsx ax, al -> cbw.
+bool check_unneeded_movsxd(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOVSXD) {
+        return true;
+    }
+
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    return !(r0 == XED_REG_RAX && r1 == XED_REG_EAX);
+}
+
 // A zero displacement encoded as disp8 or disp32 wastes bytes that could
 // be elided. disp32=0 can always shrink to disp8=0 (saves 3 bytes); a
 // disp8=0 can often be omitted entirely (saves 1 byte). Exceptions:
@@ -808,6 +823,7 @@ static const struct check_entry checks[] = {
     {check_mov_modrm_imm,           "oversized MOV encoding"},
     {check_unneeded_sib,            "unneeded SIB byte"},
     {check_unneeded_zero_displacement, "unneeded zero displacement"},
+    {check_unneeded_movsxd,         "unneeded MOVSXD"},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)

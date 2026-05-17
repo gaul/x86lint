@@ -543,6 +543,43 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// modrm with rm=100 in 32-/64-bit addressing means "a SIB byte follows."
+// This is required when the base register's three-bit encoding overlaps
+// the SIB marker (RSP/R12, or ESP/R12D in 32-bit address mode), when
+// there is an index register, or for absolute disp32 addressing in
+// 64-bit mode (the special SIB.base=101 + no-index form). For other
+// single-register bases the SIB is redundant -- the same effective
+// address can be encoded with just modrm, saving one byte.
+bool check_unneeded_sib(const xed_decoded_inst_t *xedd)
+{
+    if (!xed_operand_values_has_sib_byte(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_index_reg(xedd, 0) != XED_REG_INVALID) {
+        return true;
+    }
+
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, 0);
+    if (base == XED_REG_INVALID) {
+        return true;
+    }
+
+    switch (base) {
+    case XED_REG_RSP:
+    case XED_REG_R12:
+    case XED_REG_ESP:
+    case XED_REG_R12D:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // MOV r/m, imm with a register destination has two encodings: the c6/c7
 // opcode with a modrm byte, and the b0/b8 +r form where the destination
 // register is encoded in the low 3 bits of the opcode (no modrm). The +r
@@ -710,6 +747,7 @@ static const struct check_entry checks[] = {
     {check_mov_self,                "redundant MOV reg, reg"},
     {check_add_zero,                "redundant ADD/SUB zero"},
     {check_mov_modrm_imm,           "oversized MOV encoding"},
+    {check_unneeded_sib,            "unneeded SIB byte"},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)

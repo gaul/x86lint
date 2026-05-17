@@ -315,6 +315,25 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_unneeded_sib_test(void)
+{
+    // Issue #5: redundant SIB for [rbp+disp8] when modrm alone suffices.
+    CHECK_BYTES( check_unneeded_sib, 0xc6, 0x45, 0x04, 0x05);              // mov [rbp+4], 5 (no SIB)
+    CHECK_BYTES(!check_unneeded_sib, 0xc6, 0x44, 0x65, 0x04, 0x05);        // mov [rbp+4], 5 (SIB redundant)
+    CHECK_BYTES(!check_unneeded_sib, 0xc6, 0x44, 0x25, 0x04, 0x05);        // same, scale=0
+    CHECK_BYTES(!check_unneeded_sib, 0xc6, 0x44, 0xa5, 0x04, 0x05);        // same, scale=4
+    CHECK_BYTES(!check_unneeded_sib, 0xc6, 0x44, 0xe5, 0x04, 0x05);        // same, scale=8
+    // RSP and R12 require SIB -- rm=100 in modrm is the SIB marker.
+    CHECK_BYTES( check_unneeded_sib, 0xc6, 0x04, 0x24, 0x05);              // mov [rsp], 5
+    CHECK_BYTES( check_unneeded_sib, 0x41, 0xc6, 0x04, 0x24, 0x05);        // mov [r12], 5
+    // Absolute disp32 in 64-bit mode uses SIB with base=none.
+    CHECK_BYTES( check_unneeded_sib, 0xc6, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00, 0x05); // mov [0x1000], 5
+    // Real index register present -- SIB needed.
+    CHECK_BYTES( check_unneeded_sib, 0xc6, 0x04, 0x05, 0x00, 0x10, 0x00, 0x00, 0x05); // mov [rax+disp32], 5 with index=rax (base=none)
+    // No SIB -- nothing to flag.
+    CHECK_BYTES( check_unneeded_sib, 0xc6, 0x00, 0x05);                    // mov [rax], 5
+}
+
 static void check_mov_modrm_imm_test(void)
 {
     // modrm form -- one byte longer than the b0/b8 +r form, flag.
@@ -355,6 +374,7 @@ int main(int argc, char *argv[])
     check_mov_self_test();
     check_add_zero_test();
     check_mov_modrm_imm_test();
+    check_unneeded_sib_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

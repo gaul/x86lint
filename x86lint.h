@@ -69,6 +69,10 @@ bool check_add_zero(const xed_decoded_inst_t *xedd);
 // register destination when the b0/b8 +r form would be one byte shorter
 bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd);
 
+// return false if instruction has a SIB byte that could be elided by
+// encoding the addressing mode directly in modrm
+bool check_unneeded_sib(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

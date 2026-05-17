@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone XED and mbuild
+        run: |
+          git clone https://github.com/intelxed/xed.git xed
+          git clone https://github.com/intelxed/mbuild.git mbuild
+
+      - name: Build XED
+        run: cd xed && ./mfile.py install --install-dir=kits/xed-install
+
+      - name: Build x86lint
+        run: XED_PATH=${PWD}/xed make all
+
+      - name: Run tests
+        run: ./x86lint_test

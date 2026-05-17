@@ -111,8 +111,13 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
         }
         break;
     case 64:
-        // TODO: sign vs. zero extension; should this be >= 0 and <= UINT32_MAX?
-        if (imm >= INT32_MIN && imm <= INT32_MAX) {
+        // mov r/m64, imm32 (7 bytes) sign-extends, so it covers signed
+        // [INT32_MIN, INT32_MAX]. mov r32, imm32 (5 bytes) zero-extends
+        // to r64 via the EAX-write rule, so it covers unsigned
+        // [0, UINT32_MAX]. Either shorter form replaces the 10-byte
+        // movabs encoding.
+        if ((imm >= INT32_MIN && imm <= INT32_MAX) ||
+            (uint64_t) imm <= UINT32_MAX) {
             return false;
         }
         break;

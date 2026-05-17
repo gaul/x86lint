@@ -87,6 +87,7 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_IMUL:
     case XED_ICLASS_MOV:
     case XED_ICLASS_OR:
+    case XED_ICLASS_PUSH:
     case XED_ICLASS_SBB:
     case XED_ICLASS_SUB:
     case XED_ICLASS_XOR:

@@ -137,6 +137,11 @@ static void check_oversized_immediate_test(void)
     CHECK_BYTES(!check_oversized_immediate, 0x81, 0xC0, 0xff, 0xff, 0xff, 0xff);  // add eax, -1 (imm32=0xffffffff, fits in sign-ext imm8)
     CHECK_BYTES(!check_oversized_immediate, 0x81, 0xC0, 0x80, 0xff, 0xff, 0xff);  // add eax, -0x80 (sign-ext imm8 boundary)
     CHECK_BYTES( check_oversized_immediate, 0x81, 0xC0, 0x7f, 0xff, 0xff, 0xff);  // add eax, -129 (just past sign-ext imm8 range)
+    // push imm32 / push imm8 -- both sign-extend to the pushed value in 64-bit mode.
+    CHECK_BYTES(!check_oversized_immediate, 0x68, 0x01, 0x00, 0x00, 0x00);        // push 1 (imm32, fits in imm8)
+    CHECK_BYTES(!check_oversized_immediate, 0x68, 0xff, 0xff, 0xff, 0xff);        // push -1 (sign-ext imm8=0xff)
+    CHECK_BYTES( check_oversized_immediate, 0x68, 0x00, 0x01, 0x00, 0x00);        // push 0x100 (needs imm32)
+    CHECK_BYTES( check_oversized_immediate, 0x6a, 0x01);                          // push 1 (imm8, already short)
 }
 
 static void check_oversized_add128_test(void)

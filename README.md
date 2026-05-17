@@ -20,6 +20,7 @@ compiler writers generate better code and documents the complexity of x86.
   - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
+  - `68 01000000` instead of `6A 01` (PUSH 1)
 * oversized MOV encoding
   - `C7C0 01000000` instead of `B8 01000000` (MOV EAX, 1)
   - `48 C7C0 01000000` instead of `B8 01000000` (MOV RAX, 1; the 32-bit form zero-extends)

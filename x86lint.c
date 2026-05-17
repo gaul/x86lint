@@ -540,6 +540,33 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// add reg, 0 and sub reg, 0 leave the register unchanged but set flags
+// as a side effect (CF/OF cleared, ZF/SF/PF reflect the register's
+// value). The equivalent test reg, reg has the same flag effect and is
+// 1-3 bytes shorter; the instruction can be removed entirely if the
+// flags are unused. Excludes memory operands -- those are touches that
+// may be intentional (cache line warm, MMIO trigger).
+bool check_add_zero(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+        break;
+    default:
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
+}
+
 // mov reg, reg with both operands the same register is a no-op, with one
 // exception: mov r32, r32 deliberately zero-extends to the corresponding
 // r64 (writing any 32-bit register clears the upper 32 bits). The 8-,
@@ -764,6 +791,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_mov_self(&xedd);
         if (!result) {
             printf("redundant mov reg, reg at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_add_zero(&xedd);
+        if (!result) {
+            printf("add/sub reg, 0 at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

@@ -60,6 +60,11 @@ bool check_oversized_branch(const xed_decoded_inst_t *xedd);
 // mov r32, r32 zero-extension idiom)
 bool check_mov_self(const xed_decoded_inst_t *xedd);
 
+// return false if instruction is add reg, 0 or sub reg, 0 (use TEST
+// reg, reg instead for the flag side-effect, or remove the instruction
+// if flags are unused)
+bool check_add_zero(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

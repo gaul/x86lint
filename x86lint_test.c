@@ -283,6 +283,18 @@ static void check_mov_self_test(void)
     CHECK_BYTES( check_mov_self, 0x90);              // nop (not MOV)
 }
 
+static void check_add_zero_test(void)
+{
+    CHECK_BYTES(!check_add_zero, 0x83, 0xc0, 0x00);              // add eax, 0
+    CHECK_BYTES(!check_add_zero, 0x48, 0x83, 0xc0, 0x00);        // add rax, 0
+    CHECK_BYTES(!check_add_zero, 0x83, 0xe8, 0x00);              // sub eax, 0
+    CHECK_BYTES(!check_add_zero, 0x05, 0x00, 0x00, 0x00, 0x00);  // add eax, 0 (imm32 form)
+    CHECK_BYTES( check_add_zero, 0x83, 0xc0, 0x01);              // add eax, 1 (not zero)
+    CHECK_BYTES( check_add_zero, 0x83, 0x00, 0x00);              // add dword ptr [rax], 0 (memory)
+    CHECK_BYTES( check_add_zero, 0x83, 0xd0, 0x00);              // adc eax, 0 (not ADD/SUB)
+    CHECK_BYTES( check_add_zero, 0x90);                          // nop
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -301,6 +313,7 @@ int main(int argc, char *argv[])
     check_superfluous_lock_prefix_test();
     check_oversized_branch_test();
     check_mov_self_test();
+    check_add_zero_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

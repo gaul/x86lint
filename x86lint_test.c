@@ -241,6 +241,34 @@ static void check_superfluous_lock_prefix_test(void)
     CHECK_BYTES( check_superfluous_lock_prefix, 0x87, 0x07);  // xchg [eax], ebx
 }
 
+static void check_oversized_branch_test(void)
+{
+    // JMP rel32 with small displacement -- fits in rel8.
+    // disp_short = disp_long + 3; +0 -> -3 fits as int8, flag.
+    CHECK_BYTES(!check_oversized_branch, 0xe9, 0x00, 0x00, 0x00, 0x00);  // jmp +0
+    // JMP rel32 at the boundary: disp_long=124, disp_short=127, just fits.
+    CHECK_BYTES(!check_oversized_branch, 0xe9, 0x7c, 0x00, 0x00, 0x00);  // jmp +124
+    // JMP rel32 just past the boundary: disp_long=125, disp_short=128, doesn't fit.
+    CHECK_BYTES( check_oversized_branch, 0xe9, 0x7d, 0x00, 0x00, 0x00);  // jmp +125
+    // JMP rel32 with large displacement -- needs rel32.
+    CHECK_BYTES( check_oversized_branch, 0xe9, 0x00, 0x10, 0x00, 0x00);  // jmp +0x1000
+    // JMP rel8 -- already short.
+    CHECK_BYTES( check_oversized_branch, 0xeb, 0x00);  // jmp +0
+    // Jcc rel32 with small displacement -- fits in rel8.
+    // disp_short = disp_long + 4; +0 -> -4 fits as int8, flag.
+    CHECK_BYTES(!check_oversized_branch, 0x0f, 0x84, 0x00, 0x00, 0x00, 0x00);  // jz +0
+    // Jcc rel32 boundary: disp_long=123, disp_short=127, just fits.
+    CHECK_BYTES(!check_oversized_branch, 0x0f, 0x84, 0x7b, 0x00, 0x00, 0x00);  // jz +123
+    // Jcc rel32 just past: disp_long=124, disp_short=128, doesn't fit.
+    CHECK_BYTES( check_oversized_branch, 0x0f, 0x84, 0x7c, 0x00, 0x00, 0x00);  // jz +124
+    // Jcc rel8 -- already short.
+    CHECK_BYTES( check_oversized_branch, 0x74, 0x00);  // jz +0
+    // CALL rel32 -- no rel8 alternative exists in x86-64.
+    CHECK_BYTES( check_oversized_branch, 0xe8, 0x00, 0x00, 0x00, 0x00);  // call +0
+    // JRCXZ has only rel8 form -- no shorter option exists.
+    CHECK_BYTES( check_oversized_branch, 0xe3, 0x00);  // jrcxz +0
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -257,6 +285,7 @@ int main(int argc, char *argv[])
     check_and_strength_reduce_test();
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
+    check_oversized_branch_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

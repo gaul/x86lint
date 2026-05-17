@@ -535,6 +535,50 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// Both JMP rel32 and Jcc rel32 have a 2-byte rel8 alternative when the
+// target is within reach. JMP rel32 is 5 bytes vs 2; Jcc rel32 is 6 vs 2.
+// Shortening shrinks the encoding, which shifts the displacement by the
+// size delta -- so the rel8 fits iff (current_disp + size_delta) fits in
+// int8.
+bool check_oversized_branch(const xed_decoded_inst_t *xedd)
+{
+    int size_delta;
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_JMP:
+        size_delta = 3;
+        break;
+    case XED_ICLASS_JB:
+    case XED_ICLASS_JBE:
+    case XED_ICLASS_JL:
+    case XED_ICLASS_JLE:
+    case XED_ICLASS_JNB:
+    case XED_ICLASS_JNBE:
+    case XED_ICLASS_JNL:
+    case XED_ICLASS_JNLE:
+    case XED_ICLASS_JNO:
+    case XED_ICLASS_JNP:
+    case XED_ICLASS_JNS:
+    case XED_ICLASS_JNZ:
+    case XED_ICLASS_JO:
+    case XED_ICLASS_JP:
+    case XED_ICLASS_JS:
+    case XED_ICLASS_JZ:
+        size_delta = 4;
+        break;
+    default:
+        return true;
+    }
+
+    // Only the rel32 form has a shorter alternative.
+    if (xed_decoded_inst_get_branch_displacement_width_bits(xedd) != 32) {
+        return true;
+    }
+
+    int32_t disp = (int32_t) xed_decoded_inst_get_branch_displacement(xedd);
+    int32_t new_disp = disp + size_delta;
+    return new_disp < INT8_MIN || new_disp > INT8_MAX;
+}
+
 static void dump_instruction(const xed_decoded_inst_t *xedd)
 {
     char buf[1024];
@@ -674,6 +718,15 @@ int check_instructions(const uint8_t *inst, size_t len)
         result = check_superfluous_lock_prefix(&xedd);
         if (!result) {
             printf("superfluous lock prefix at offset: %zu\n", offset);
+            dump_instruction(&xedd);
+            dump_machine_code(&xedd, inst + offset);
+            printf("\n");
+            ++errors;
+        }
+
+        result = check_oversized_branch(&xedd);
+        if (!result) {
+            printf("oversized branch displacement at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
             printf("\n");

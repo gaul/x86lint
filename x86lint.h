@@ -73,6 +73,10 @@ bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd);
 // encoding the addressing mode directly in modrm
 bool check_unneeded_sib(const xed_decoded_inst_t *xedd);
 
+// return false if instruction encodes a zero displacement that could be
+// shortened (disp32=0 -> disp8=0, or disp8=0 -> no displacement)
+bool check_unneeded_zero_displacement(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

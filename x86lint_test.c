@@ -315,6 +315,32 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_unneeded_zero_displacement_test(void)
+{
+    // Issue #4: disp8=0 and disp32=0 when no displacement would suffice.
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x01, 0x3e);                   // add [rsi], edi (no disp)
+    CHECK_BYTES(!check_unneeded_zero_displacement, 0x01, 0x7e, 0x00);             // add [rsi+0], edi (disp8=0)
+    CHECK_BYTES(!check_unneeded_zero_displacement, 0x01, 0xbe, 0,0,0,0);          // add [rsi+0], edi (disp32=0)
+    // RBP/R13 with disp8=0 is required (mod=00 rm=101 means RIP-rel).
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x01, 0x7d, 0x00);             // add [rbp+0], edi
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x45, 0x01, 0x7d, 0x00);       // add [r13+0], r15d
+    // RBP/R13 with disp32=0 is still oversized -- could shrink to disp8=0.
+    CHECK_BYTES(!check_unneeded_zero_displacement, 0x01, 0xbd, 0,0,0,0);          // add [rbp+0], edi (disp32=0)
+    // RIP-relative always uses disp32.
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x01, 0x3d, 0,0,0,0);          // add [rip+0], edi
+    // Absolute disp32 always needs disp32 (no base register).
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x01, 0x3c, 0x25, 0,0,0,0);    // add [0], edi
+    // RSP with disp8=0 -- can shrink to no-disp form using same SIB.
+    CHECK_BYTES(!check_unneeded_zero_displacement, 0x01, 0x7c, 0x24, 0x00);       // add [rsp+0], edi
+    // RSP with no displacement -- nothing to flag.
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x01, 0x3c, 0x24);             // add [rsp], edi
+    // Real nonzero displacement -- nothing to flag.
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x01, 0x7e, 0x04);             // add [rsi+4], edi
+    // Multi-byte NOPs deliberately use zero displacement for padding.
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x0f, 0x1f, 0x40, 0x00);       // 4-byte NOP [rax+0]
+    CHECK_BYTES( check_unneeded_zero_displacement, 0x0f, 0x1f, 0x80, 0,0,0,0);    // 7-byte NOP [rax+0]
+}
+
 static void check_unneeded_sib_test(void)
 {
     // Issue #5: redundant SIB for [rbp+disp8] when modrm alone suffices.
@@ -375,6 +401,7 @@ int main(int argc, char *argv[])
     check_add_zero_test();
     check_mov_modrm_imm_test();
     check_unneeded_sib_test();
+    check_unneeded_zero_displacement_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

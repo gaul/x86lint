@@ -32,7 +32,7 @@ compiler writers generate better code and documents the complexity of x86.
   - `83F8 00` instead of `85C0` (CMP EAX, 0 -> TEST EAX, EAX)
 * suboptimal IMUL constant
   - `6BC0 03` (IMUL EAX, EAX, 3) -- use LEA or SHL
-* suboptimal NOP sequence
+* ~~suboptimal NOP sequence~~, see [#9](https://github.com/gaul/x86lint/issues/9)
   - multiple `90` instead of a single `66 90`, etc.
 * suboptimal SUB reg, reg
   - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking

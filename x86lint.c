@@ -905,6 +905,11 @@ int check_instructions(const uint8_t *inst, size_t len)
             return -1;
         }
 
+        // Disabled: the savings are at most one decoded uop (same byte count)
+        // and benign alignment-padding patterns generate noise even after the
+        // PAUSE/ENDBR and combine-only-if-fits-in-9-bytes filters. The
+        // function remains in the public header for library consumers.
+        /*
         if (!check_suboptimal_nops(inst + offset, len - offset)) {
             printf("suboptimal NOP sequence at offset: %zu\n", offset);
             dump_instruction(&xedd);
@@ -920,6 +925,7 @@ int check_instructions(const uint8_t *inst, size_t len)
             printf("\n");
             ++errors;
         }
+        */
 
         for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
             if (!checks[i].fn(&xedd)) {

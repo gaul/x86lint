@@ -473,7 +473,7 @@ int main(int argc, char *argv[])
         0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
         0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };
-    int expected = 11;
+    int expected = 10;
     int actual = check_instructions(inst, sizeof(inst));
     if (actual != expected) {
         printf("Expected %d errors, actual: %d\n", expected, actual);

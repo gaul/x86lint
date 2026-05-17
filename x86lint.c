@@ -208,61 +208,17 @@ static bool check_rex_register(xed_reg_enum_t reg)
  */
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
 {
-    switch (xed_decoded_inst_get_iclass(xedd)) {
-    // TODO: instructions not requiring a REX prefix in 64-bit mode
-    // CALL (Near)
-    // ENTER
-    // Jcc
-    // JrCXZ
-    // JMP (Near)
-    // LEAVE
-    // LGDT
-    // LIDT
-    // LLDT
-    // LOOP
-    // LOOPcc
-    // LTR
-    // MOV CRn
-    // MOV DRn
-    // POP reg/mem
-    // POP reg
-    // POP FS
-    // POP GS
-    // POPF, POPFD, POPFQ
-    // PUSH imm8
-    // PUSH imm32
-    // PUSH reg/mem
-    // PUSH reg
-    // PUSH FS
-    // PUSH GS
-    // PUSHF, PUSHFD, PUSHFQ
-    // RET (Near)
-    case XED_ICLASS_LEAVE:
-        return !xed3_operand_get_rex(xedd);
-    default:
-        break;
-    }
-
-    for (int i = 0; i < xed_decoded_inst_number_of_memory_operands(xedd); ++i) {
-        if (check_rex_register(xed_decoded_inst_get_base_reg(xedd, i)) ||
-            check_rex_register(xed_decoded_inst_get_index_reg(xedd, i))) {
-            return true;
-        }
-    }
-    if (check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0)) ||
-        check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1)) ||
-        // TODO: are these correct?
-        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG0)) ||
-        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG1))) {
-        return true;
-    }
-
-    // Check if instruction has a REX prefix.
-    // TODO: handle instructions which do not default to 64-bit operands
+    // Nothing to flag without a REX prefix.
     if (!xed3_operand_get_rex(xedd)) {
         return true;
     }
 
+    // Instructions where REX.W has no effect (default 64-bit operand size).
+    // REX is still needed if R/X/B are required to address an extended
+    // register operand (e.g. call r12, jmp [r13]).
+    // These iclasses must be checked before the register-operand scan
+    // below, which would otherwise trip on implicit RSP or RCX.
+    // TODO: handle non-flag PUSH/POP variants (reg, reg/mem, imm, FS, GS)
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_CALL_NEAR:
     case XED_ICLASS_ENTER:
@@ -296,31 +252,51 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_LTR:
     case XED_ICLASS_MOV_CR:
     case XED_ICLASS_MOV_DR:
-    // TODO: POP reg/mem
-    // TODO: POP reg
-    // TODO: POP FS
-    // TODO: POP GS
     case XED_ICLASS_POPFQ:
-    // TODO: PUSH imm8
-    // TODO: PUSH imm32
-    // TODO: PUSH reg/mem
-    // TODO: PUSH reg
-    // TODO: PUSH FS
-    // TODO: PUSH GS
     case XED_ICLASS_PUSHFQ:
     case XED_ICLASS_RET_NEAR:
-        return false;
-    case XED_ICLASS_XOR:
-        // register could be zero-extended from 32-bit
-        if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) != XED_REG_INVALID &&
-            xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1) != XED_REG_INVALID) {
+        if (xed3_operand_get_rexr(xedd) == 0 &&
+            xed3_operand_get_rexx(xedd) == 0 &&
+            xed3_operand_get_rexb(xedd) == 0) {
+            return false;
+        }
+        return true;
+    case XED_ICLASS_XOR: {
+        // The same-register zero-idiom xor reg, reg with REX.W can shrink
+        // to the 32-bit form (which zero-extends). Different registers
+        // operate on full 64 bits; substituting the 32-bit form would
+        // change semantics by clearing the upper half. Also requires no
+        // other REX bits, since REX.R/X/B encode R8-R15.
+        xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+        xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        if (xed3_operand_get_rexw(xedd) &&
+            xed3_operand_get_rexr(xedd) == 0 &&
+            xed3_operand_get_rexx(xedd) == 0 &&
+            xed3_operand_get_rexb(xedd) == 0 &&
+            r0 != XED_REG_INVALID && r0 == r1) {
             return false;
         }
         break;
+    }
     default:
         break;
     }
 
+    for (int i = 0; i < xed_decoded_inst_number_of_memory_operands(xedd); ++i) {
+        if (check_rex_register(xed_decoded_inst_get_base_reg(xedd, i)) ||
+            check_rex_register(xed_decoded_inst_get_index_reg(xedd, i))) {
+            return true;
+        }
+    }
+    if (check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0)) ||
+        check_rex_register(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1)) ||
+        // TODO: are these correct?
+        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG0)) ||
+        check_rex_register(xed_decoded_inst_get_seg_reg(xedd, XED_OPERAND_REG1))) {
+        return true;
+    }
+
+    // Bare 0x40 prefix with no W/R/X/B bits set carries no information.
     if (xed3_operand_get_rexw(xedd) == 0 &&
         xed3_operand_get_rexr(xedd) == 0 &&
         xed3_operand_get_rexx(xedd) == 0 &&

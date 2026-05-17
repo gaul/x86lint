@@ -98,13 +98,32 @@ static void check_oversized_add128_test(void)
 
 static void check_unneeded_rex_test(void)
 {
-    CHECK_BYTES( check_unneeded_rex, 0x48, 0x31, 0xC0);  // xor rax, rax
-    CHECK_BYTES( check_unneeded_rex, 0x31, 0xC0);  // xor rax, rax
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x31, 0xC0);  // xor rax, rax (could be 31 C0)
+    CHECK_BYTES( check_unneeded_rex, 0x31, 0xC0);  // xor eax, eax
+    CHECK_BYTES( check_unneeded_rex, 0x4d, 0x31, 0xC0);  // xor r8, r8 (REX.B truly needed)
+    CHECK_BYTES( check_unneeded_rex, 0x48, 0x31, 0xD0);  // xor rax, rdx (full 64-bit XOR, REX.W needed)
     CHECK_BYTES( check_unneeded_rex, 0x04, 0x01);  // add al, 1
     CHECK_BYTES(!check_unneeded_rex, 0x40, 0x04, 0x01);  // add al, 1
     CHECK_BYTES( check_unneeded_rex, 0x41, 0x80, 0xC0, 0x01);  // add r8b, 1
     CHECK_BYTES( check_unneeded_rex, 0xc9);  // leave
     CHECK_BYTES(!check_unneeded_rex, 0x40, 0xc9);  // leave
+    CHECK_BYTES( check_unneeded_rex, 0xc3);  // ret
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0xc3);  // ret
+    CHECK_BYTES( check_unneeded_rex, 0xe8, 0x00, 0x00, 0x00, 0x00);  // call rel32
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0xe8, 0x00, 0x00, 0x00, 0x00);  // call rel32
+    CHECK_BYTES( check_unneeded_rex, 0x9c);  // pushfq
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x9c);  // pushfq
+    CHECK_BYTES( check_unneeded_rex, 0x9d);  // popfq
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x9d);  // popfq
+    CHECK_BYTES( check_unneeded_rex, 0xe2, 0x00);  // loop
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0xe2, 0x00);  // loop
+    CHECK_BYTES( check_unneeded_rex, 0xeb, 0x00);  // jmp short
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0xeb, 0x00);  // jmp short
+    CHECK_BYTES( check_unneeded_rex, 0x74, 0x00);  // jz short
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x74, 0x00);  // jz short
+    CHECK_BYTES( check_unneeded_rex, 0x41, 0xff, 0xd4);  // call r12 (REX.B needed)
+    CHECK_BYTES( check_unneeded_rex, 0x41, 0xff, 0xe4);  // jmp r12 (REX.B needed)
+    CHECK_BYTES( check_unneeded_rex, 0x41, 0xff, 0x55, 0x40);  // call [r13+0x40] (REX.B needed)
 }
 
 static void check_mov_zero_test(void)

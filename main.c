@@ -15,73 +15,94 @@
  */
 
 #include <elf.h>
-#include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "x86lint.h"
 
-int main(int argc, char **argv)
+static bool read_at(FILE *f, long off, void *buf, size_t n)
 {
-  FILE* ElfFile = NULL;
-  char* SectNames = NULL;
-  Elf64_Ehdr elfHdr;
-  Elf64_Shdr sectHdr;
-  uint32_t idx;
-  int errors = 0;
-
-  if(argc != 2) {
-    printf("usage: %s <ELF_FILE>\n", argv[0]);
-    exit(1);
-  }
-
-  if((ElfFile = fopen(argv[1], "r")) == NULL) {
-    perror("Error opening file");
-    exit(1);
-  }
-
-  xed_tables_init();
-  xed_set_verbosity(99);
-
-  // read ELF header, first thing in the file
-  fread(&elfHdr, 1, sizeof(Elf64_Ehdr), ElfFile);
-
-  fseek(ElfFile, elfHdr.e_shoff + elfHdr.e_shstrndx * sizeof(sectHdr), SEEK_SET);
-  fread(&sectHdr, 1, sizeof(sectHdr), ElfFile);
-
-  // next, read the section, string data
-  SectNames = malloc(sectHdr.sh_size);
-  fseek(ElfFile, sectHdr.sh_offset, SEEK_SET);
-  fread(SectNames, 1, sectHdr.sh_size, ElfFile);
-
-  // read all section headers
-  for (idx = 0; idx < elfHdr.e_shnum; idx++) {
-    const char* name = "";
-
-    fseek(ElfFile, elfHdr.e_shoff + idx * sizeof(sectHdr), SEEK_SET);
-    fread(&sectHdr, 1, sizeof(sectHdr), ElfFile);
-
-    if (!sectHdr.sh_name) {
-      continue;
+    if (fseek(f, off, SEEK_SET) != 0) {
+        return false;
     }
-    name = SectNames + sectHdr.sh_name;
-
-    // TODO: look at p_flags & PF_X instead?
-    if (strcmp(name, ".text") != 0) {
-      continue;
-    }
-
-    char *buf = malloc(sectHdr.sh_size);
-    fseek(ElfFile, sectHdr.sh_offset, SEEK_SET);
-    fread(buf, 1, sectHdr.sh_size, ElfFile);
-    errors += check_instructions((uint8_t *)buf, sectHdr.sh_size);
-    free(buf);
-  }
-
-  printf("%d errors\n", errors);
-
-  return (bool) errors;
+    return fread(buf, 1, n, f) == n;
 }
 
+int main(int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <ELF_FILE>\n", argv[0]);
+        return 1;
+    }
+
+    FILE *f = fopen(argv[1], "rb");
+    if (f == NULL) {
+        perror(argv[1]);
+        return 1;
+    }
+
+    int rc = 1;
+    uint8_t *buf = NULL;
+
+    Elf64_Ehdr ehdr;
+    if (!read_at(f, 0, &ehdr, sizeof(ehdr))) {
+        fprintf(stderr, "%s: failed to read ELF header\n", argv[1]);
+        goto out;
+    }
+
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, "%s: not an ELF file\n", argv[1]);
+        goto out;
+    }
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "%s: only 64-bit ELF files are supported\n", argv[1]);
+        goto out;
+    }
+
+    xed_tables_init();
+    xed_set_verbosity(99);
+
+    int errors = 0;
+    for (uint16_t i = 0; i < ehdr.e_shnum; ++i) {
+        Elf64_Shdr shdr;
+        if (!read_at(f, ehdr.e_shoff + (long) i * sizeof(shdr), &shdr, sizeof(shdr))) {
+            fprintf(stderr, "%s: failed to read section header %u\n", argv[1], i);
+            goto out;
+        }
+
+        if (shdr.sh_type != SHT_PROGBITS || !(shdr.sh_flags & SHF_EXECINSTR) || shdr.sh_size == 0) {
+            continue;
+        }
+
+        buf = malloc(shdr.sh_size);
+        if (buf == NULL) {
+            fprintf(stderr, "%s: failed to allocate %lu bytes\n",
+                argv[1], (unsigned long) shdr.sh_size);
+            goto out;
+        }
+        if (!read_at(f, shdr.sh_offset, buf, shdr.sh_size)) {
+            fprintf(stderr, "%s: failed to read section %u\n", argv[1], i);
+            goto out;
+        }
+
+        int n = check_instructions(buf, shdr.sh_size);
+        if (n < 0) {
+            goto out;
+        }
+        errors += n;
+
+        free(buf);
+        buf = NULL;
+    }
+
+    printf("%d errors\n", errors);
+    rc = errors != 0;
+
+out:
+    free(buf);
+    fclose(f);
+    return rc;
+}

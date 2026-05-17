@@ -455,6 +455,14 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
     }
 
     xed_uint64_t imm = xed_decoded_inst_get_unsigned_immediate(xedd);
+
+    // With REX.W the imm32 sign-extends to 64 bits, so AND r64, 0xffffffff
+    // is actually a no-op (sign-extended to all-ones). The mov eax, eax
+    // substitution would zero the upper 32 bits and is not equivalent.
+    if (xed3_operand_get_rexw(xedd) && imm == 0xffffffff) {
+        return true;
+    }
+
     return imm != 0xff && imm != 0xffff && imm != 0xffffffff;
 }
 

@@ -28,6 +28,8 @@ compiler writers generate better code and documents the complexity of x86.
   - `83C0 00` (ADD EAX, 0) -- use TEST or remove
 * redundant MOV reg, reg
   - `4889C0` (MOV RAX, RAX)
+* redundant shift/rotate by zero
+  - `C1E0 00` (SHL EAX, 0) -- no-op, flags also unchanged
 * suboptimal AND immediate
   - `83E0 FF` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal CMP zero

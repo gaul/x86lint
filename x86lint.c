@@ -592,6 +592,34 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
     }
 }
 
+// Shift and rotate instructions with an immediate count of 0 are pure
+// no-ops: the destination is unchanged and per the Intel SDM the flags
+// are explicitly "not affected" when the count is 0. The CL-register
+// form cannot be checked statically.
+bool check_shift_zero(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_RCL:
+    case XED_ICLASS_RCR:
+    case XED_ICLASS_ROL:
+    case XED_ICLASS_ROR:
+    case XED_ICLASS_SAR:
+    case XED_ICLASS_SHL:
+    case XED_ICLASS_SHLD:
+    case XED_ICLASS_SHR:
+    case XED_ICLASS_SHRD:
+        break;
+    default:
+        return true;
+    }
+
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
+}
+
 // sub reg, reg zeros the register at the same byte cost as xor reg, reg.
 // XOR is the canonical zero idiom that CPUs recognize and break the
 // dependency chain for; SUB does not get that treatment and serializes
@@ -900,6 +928,7 @@ static const struct check_entry checks[] = {
     {check_unneeded_movsxd,         "unneeded MOVSXD"},
     {check_sub_self,                "suboptimal SUB reg, reg"},
     {check_imul_to_lea,             "suboptimal IMUL constant"},
+    {check_shift_zero,              "redundant shift/rotate by zero"},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)

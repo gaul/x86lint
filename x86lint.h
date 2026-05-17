@@ -88,6 +88,10 @@ bool check_sub_self(const xed_decoded_inst_t *xedd);
 // by a single LEA (or SHL for powers of two)
 bool check_imul_to_lea(const xed_decoded_inst_t *xedd);
 
+// return false if a shift or rotate instruction has an immediate count of 0
+// (pure no-op; per Intel SDM the flags are not affected when count is 0)
+bool check_shift_zero(const xed_decoded_inst_t *xedd);
+
 // return number of failed checks
 int check_instructions(const uint8_t *inst, size_t len);
 

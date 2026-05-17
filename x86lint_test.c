@@ -323,6 +323,32 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
 }
 
+static void check_shift_zero_test(void)
+{
+    // Immediate count of 0 -- pure no-op for every shift/rotate iclass.
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xe0, 0x00);              // shl eax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xe8, 0x00);              // shr eax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xf8, 0x00);              // sar eax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xc0, 0x00);              // rol eax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xc8, 0x00);              // ror eax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xd0, 0x00);              // rcl eax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc1, 0xd8, 0x00);              // rcr eax, 0
+    CHECK_BYTES(!check_shift_zero, 0x0f, 0xa4, 0xd8, 0x00);        // shld eax, ebx, 0
+    CHECK_BYTES(!check_shift_zero, 0x0f, 0xac, 0xd8, 0x00);        // shrd eax, ebx, 0
+    // REX.W and 8-bit forms.
+    CHECK_BYTES(!check_shift_zero, 0x48, 0xc1, 0xe0, 0x00);        // shl rax, 0
+    CHECK_BYTES(!check_shift_zero, 0xc0, 0xe0, 0x00);              // shl al, 0
+    // Nonzero immediate -- not flagged.
+    CHECK_BYTES( check_shift_zero, 0xc1, 0xe0, 0x01);              // shl eax, 1
+    CHECK_BYTES( check_shift_zero, 0xc1, 0xe0, 0x07);              // shl eax, 7
+    // Implicit-1 form (D1 /4) has no immediate, not flagged.
+    CHECK_BYTES( check_shift_zero, 0xd1, 0xe0);                    // shl eax, 1
+    // CL-register form -- count not statically knowable, not flagged.
+    CHECK_BYTES( check_shift_zero, 0xd3, 0xe0);                    // shl eax, cl
+    // Not a shift.
+    CHECK_BYTES( check_shift_zero, 0x90);                          // nop
+}
+
 static void check_imul_to_lea_test(void)
 {
     // imm8 form, all the LEA/SHL-friendly constants.
@@ -465,6 +491,7 @@ int main(int argc, char *argv[])
     check_unneeded_movsxd_test();
     check_sub_self_test();
     check_imul_to_lea_test();
+    check_shift_zero_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

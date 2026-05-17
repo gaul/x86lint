@@ -87,6 +87,23 @@ static void check_suboptimal_nops_test(void)
     // Two real NOPs before ENDBR64 -- still flagged, the two NOPs are wasteful.
     static const uint8_t nopnop_endbr[] = { 0x90, 0x90, 0xf3, 0x0f, 0x1e, 0xfa };
     assert(!check_suboptimal_nops(nopnop_endbr, sizeof(nopnop_endbr)));
+
+    // gcc emits NOPs longer than 9 bytes via redundant prefixes for alignment.
+    // A small leading NOP plus an extended-prefix NOP is two instructions but
+    // would require an even longer extended NOP to merge -- not a real
+    // optimization opportunity, so don't flag.
+    static const uint8_t nop2_pad11[] = {
+        0x66, 0x90,
+        0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    assert(check_suboptimal_nops(nop2_pad11, sizeof(nop2_pad11)));
+
+    // Two 3-byte NOPs fit in a single 6-byte NOP -- real finding.
+    static const uint8_t nop3_nop3[] = {
+        0x0f, 0x1f, 0x00,
+        0x0f, 0x1f, 0x00,
+    };
+    assert(!check_suboptimal_nops(nop3_nop3, sizeof(nop3_nop3)));
 }
 
 static void check_oversized_immediate_test(void)

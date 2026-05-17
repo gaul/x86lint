@@ -53,13 +53,18 @@ bool check_suboptimal_nops(const uint8_t *inst, size_t len)
         if (!cur_nop) {
             break;
         }
-        // Assume that NOPs are greedy, encoding 10 bytes as 9 + 1 NOPs
-        if (prev_nop > 0 && prev_nop <= 8) {
+        // Flag only when the combined run could fit in a single multi-byte
+        // NOP from the standard greedy set (NOP/NOP2..NOP9, capped at 9
+        // bytes). Compilers also emit NOPs longer than 9 bytes via redundant
+        // prefixes for alignment padding; combining around those would not
+        // reduce byte count or instruction count.
+        int cur_len = xed_decoded_inst_get_length(&xedd);
+        if (prev_nop > 0 && prev_nop + cur_len <= 9) {
             return false;
         }
 
-        prev_nop = xed_decoded_inst_get_length(&xedd);
-        i += prev_nop;
+        prev_nop = cur_len;
+        i += cur_len;
     }
 
     return true;

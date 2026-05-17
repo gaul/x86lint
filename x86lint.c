@@ -497,11 +497,16 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
 
     xed_uint64_t imm = xed_decoded_inst_get_unsigned_immediate(xedd);
 
-    // With REX.W the imm32 sign-extends to 64 bits, so AND r64, 0xffffffff
-    // is actually a no-op (sign-extended to all-ones). The mov eax, eax
-    // substitution would zero the upper 32 bits and is not equivalent.
-    if (xed3_operand_get_rexw(xedd) && imm == 0xffffffff) {
-        return true;
+    // With REX.W the immediate sign-extends to 64 bits. An imm8 of 0xff
+    // (signed -1) and an imm32 of 0xffffffff both sign-extend to all-ones,
+    // making the AND a no-op. The mov eax, eax / movzbl substitutions
+    // would zero the upper 32 bits and are not equivalent.
+    if (xed3_operand_get_rexw(xedd)) {
+        unsigned width = xed_decoded_inst_get_immediate_width_bits(xedd);
+        if ((width == 8 && imm == 0xff) ||
+            (width == 32 && imm == 0xffffffff)) {
+            return true;
+        }
     }
 
     return imm != 0xff && imm != 0xffff && imm != 0xffffffff;

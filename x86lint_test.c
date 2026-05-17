@@ -236,6 +236,8 @@ static void check_and_strength_reduce_test(void)
     CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0x00, 0x00);  // and eax, 0xffff
     CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0xff, 0xff);  // and eax, 0xffffffff
     CHECK_BYTES( check_and_strength_reduce, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff);  // and rax, 0xffffffff (no-op via sign-ext)
+    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x83, 0xe0, 0xff);              // and rax, sign_ext(0xff) (no-op)
+    CHECK_BYTES(!check_and_strength_reduce, 0x83, 0xe0, 0xff);                    // and eax, sign_ext(0xff) (still flag)
     CHECK_BYTES( check_and_strength_reduce, 0x83, 0xc0, 0x01);  // add eax, 1 (not AND)
 }
 

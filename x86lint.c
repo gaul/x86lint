@@ -47,7 +47,7 @@ bool check_suboptimal_nops(const uint8_t *inst, size_t len)
         // as NOP because they have no architectural effect, but they exist
         // as spin-loop hints and CET indirect-branch markers respectively
         // and are not interchangeable with padding NOPs.
-        if (cur_nop && xed3_operand_get_rep(&xedd)) {
+        if (cur_nop && xed_operand_values_has_rep_prefix(xed_decoded_inst_operands_const(&xedd))) {
             cur_nop = false;
         }
         if (!cur_nop) {
@@ -265,7 +265,10 @@ static bool check_rex_register(xed_reg_enum_t reg)
  */
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
 {
-    // Nothing to flag without a REX prefix.
+    // Nothing to flag without a REX prefix. xed3_operand_get_rex is used
+    // here (and xed3_operand_get_rex{r,x,b} below) because XED's public
+    // xed_operand_values_* surface only exposes has_rexw_prefix; bare-REX
+    // presence and the individual R/X/B bits have no public accessor.
     if (!xed3_operand_get_rex(xedd)) {
         return true;
     }
@@ -327,7 +330,7 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
         // other REX bits, since REX.R/X/B encode R8-R15.
         xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
         xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
-        if (xed3_operand_get_rexw(xedd) &&
+        if (xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd)) &&
             xed3_operand_get_rexr(xedd) == 0 &&
             xed3_operand_get_rexx(xedd) == 0 &&
             xed3_operand_get_rexb(xedd) == 0 &&
@@ -352,7 +355,7 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
     }
 
     // Bare 0x40 prefix with no W/R/X/B bits set carries no information.
-    if (xed3_operand_get_rexw(xedd) == 0 &&
+    if (!xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd)) &&
         xed3_operand_get_rexr(xedd) == 0 &&
         xed3_operand_get_rexx(xedd) == 0 &&
         xed3_operand_get_rexb(xedd) == 0) {
@@ -512,7 +515,7 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
     // (signed -1) and an imm32 of 0xffffffff both sign-extend to all-ones,
     // making the AND a no-op. The mov eax, eax / movzbl substitutions
     // would zero the upper 32 bits and are not equivalent.
-    if (xed3_operand_get_rexw(xedd)) {
+    if (xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd))) {
         unsigned width = xed_decoded_inst_get_immediate_width_bits(xedd);
         if ((width == 8 && imm == 0xff) ||
             (width == 32 && imm == 0xffffffff)) {

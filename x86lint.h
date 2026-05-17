@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef __ASMLINT_H__
-#define __ASMLINT_H__
+#ifndef X86LINT_H
+#define X86LINT_H
 
 #include <stdbool.h>
 #include "xed/xed-interface.h"

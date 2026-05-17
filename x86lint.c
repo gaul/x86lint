@@ -679,6 +679,39 @@ static void dump_machine_code(const xed_decoded_inst_t *xedd, const uint8_t *ins
     printf("\n");
 }
 
+static void report_finding(const char *name, size_t offset,
+                           const xed_decoded_inst_t *xedd, const uint8_t *bytes)
+{
+    printf("%s at offset: %zu\n", name, offset);
+    dump_instruction(xedd);
+    dump_machine_code(xedd, bytes);
+    printf("\n");
+}
+
+struct check_entry {
+    bool (*fn)(const xed_decoded_inst_t *);
+    const char *name;
+};
+
+// check_suboptimal_nops is not in the table: it takes the raw byte stream
+// (not a decoded instruction) and reports a 2-instruction window.
+// check_mov_zero is omitted pending flag-liveness analysis (see issue #7).
+static const struct check_entry checks[] = {
+    {check_oversized_immediate,     "oversized immediate"},
+    {check_oversized_add128,        "oversized ADD 128"},
+    {check_unneeded_rex,            "unneeded REX prefix"},
+    {check_cmp_zero,                "suboptimal compare register"},
+    {check_implicit_register,       "unneeded explicit register"},
+    {check_implicit_immediate,      "unneeded explicit immediate"},
+    {check_and_strength_reduce,     "unneeded AND immediate"},
+    {check_missing_lock_prefix,     "expected lock prefix"},
+    {check_superfluous_lock_prefix, "superfluous lock prefix"},
+    {check_oversized_branch,        "oversized branch displacement"},
+    {check_mov_self,                "redundant mov reg, reg"},
+    {check_add_zero,                "add/sub reg, 0"},
+    {check_mov_modrm_imm,           "unneeded modrm in mov reg, imm"},
+};
+
 int check_instructions(const uint8_t *inst, size_t len)
 {
     int errors = 0;
@@ -692,12 +725,12 @@ int check_instructions(const uint8_t *inst, size_t len)
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
-            printf("Decoding error at offset: %zu: %s\n", offset, xed_error_enum_t2str(err));
+            printf("Decoding error at offset: %zu: %s\n",
+                offset, xed_error_enum_t2str(err));
             return -1;
         }
 
-        bool result = check_suboptimal_nops(inst + offset, len - offset);
-        if (!result) {
+        if (!check_suboptimal_nops(inst + offset, len - offset)) {
             printf("suboptimal nops at offset: %zu\n", offset);
             dump_instruction(&xedd);
             dump_machine_code(&xedd, inst + offset);
@@ -705,142 +738,19 @@ int check_instructions(const uint8_t *inst, size_t len)
             xed_decoded_inst_t xedd2;
             xed_decoded_inst_zero(&xedd2);
             xed_decoded_inst_set_mode(&xedd2, mmode, stack_addr_width);
-
-            size_t len2 = xed_decoded_inst_get_length(&xedd);
-            xed_decode(&xedd2, inst + offset + len2, len - offset - len2);
+            size_t cur_len = xed_decoded_inst_get_length(&xedd);
+            xed_decode(&xedd2, inst + offset + cur_len, len - offset - cur_len);
             dump_instruction(&xedd2);
-            dump_machine_code(&xedd2, inst + offset + len2);
+            dump_machine_code(&xedd2, inst + offset + cur_len);
             printf("\n");
             ++errors;
         }
 
-        result = check_oversized_immediate(&xedd);
-        if (!result) {
-            printf("oversized immediate at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_oversized_add128(&xedd);
-        if (!result) {
-            printf("oversized ADD 128 at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_unneeded_rex(&xedd);
-        if (!result) {
-            printf("unneeded REX prefix at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_cmp_zero(&xedd);
-        if (!result) {
-            printf("suboptimal compare register at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        // TODO: Disabled due to false positives from CMOV sequences.  See #7.
-        /*
-        result = check_mov_zero(&xedd);
-        if (!result) {
-            printf("suboptimal zero register at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-        */
-
-        result = check_implicit_register(&xedd);
-        if (!result) {
-            printf("unneeded explicit register at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_implicit_immediate(&xedd);
-        if (!result) {
-            printf("unneeded explicit immediate at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_and_strength_reduce(&xedd);
-        if (!result) {
-            printf("unneeded AND immediate at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_missing_lock_prefix(&xedd);
-        if (!result) {
-            printf("expected lock prefix at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_superfluous_lock_prefix(&xedd);
-        if (!result) {
-            printf("superfluous lock prefix at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_oversized_branch(&xedd);
-        if (!result) {
-            printf("oversized branch displacement at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_mov_self(&xedd);
-        if (!result) {
-            printf("redundant mov reg, reg at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_add_zero(&xedd);
-        if (!result) {
-            printf("add/sub reg, 0 at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
-        }
-
-        result = check_mov_modrm_imm(&xedd);
-        if (!result) {
-            printf("unneeded modrm in mov reg, imm at offset: %zu\n", offset);
-            dump_instruction(&xedd);
-            dump_machine_code(&xedd, inst + offset);
-            printf("\n");
-            ++errors;
+        for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+            if (!checks[i].fn(&xedd)) {
+                report_finding(checks[i].name, offset, &xedd, inst + offset);
+                ++errors;
+            }
         }
 
         offset += xed_decoded_inst_get_length(&xedd);

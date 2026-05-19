@@ -562,6 +562,89 @@ static void check_flag_liveness_test(void)
     assert(check_instructions(mov_cmove, sizeof(mov_cmove)) == 0);
 }
 
+// Instruction-flavor corners for flag liveness: pin the analyzer's handling
+// of "undefined" flag writes, partial flag writers, flag-only readers, the
+// MAX_LOOKAHEAD bound, and trap-style terminators.
+static void check_flag_liveness_corners_test(void)
+{
+    // IDIV leaves all arith flags "undefined" per Intel SDM. The analyzer
+    // treats undefined as written (the original value is destroyed), so
+    // mov_zero's concern set empties and the finding fires.
+    static const uint8_t mov_idiv_ret[] = {
+        0xBB, 0x01, 0x00, 0x00, 0x00,  // mov ebx, 1
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0xF7, 0xFB,                    // idiv ebx
+        0xC3,                          // ret
+    };
+    assert(check_instructions(mov_idiv_ret, sizeof(mov_idiv_ret)) == 1);
+
+    // INC writes OF/SF/ZF/AF/PF but not CF. The CF from add eax, 0x80 stays
+    // live through INC and gets consumed by ADC -- suppress.
+    static const uint8_t add_inc_adc[] = {
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
+        0xFF, 0xC3,                    // inc ebx
+        0x11, 0xD1,                    // adc ecx, edx
+        0xC3,                          // ret
+    };
+    assert(check_instructions(add_inc_adc, sizeof(add_inc_adc)) == 0);
+
+    // Same shape but the second ADD (not ADC) overwrites CF before any
+    // reader, so the oversized_add128 finding fires.
+    static const uint8_t add_inc_add[] = {
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
+        0xFF, 0xC3,                    // inc ebx
+        0x83, 0xC1, 0x01,              // add ecx, 1
+        0xC3,                          // ret
+    };
+    assert(check_instructions(add_inc_add, sizeof(add_inc_add)) == 1);
+
+    // SETcc reads a status flag and writes a byte register; treated as a
+    // flag reader by the analyzer.
+    static const uint8_t mov_sete_ret[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0x0F, 0x94, 0xC3,              // sete bl   (reads ZF)
+        0xC3,                          // ret
+    };
+    assert(check_instructions(mov_sete_ret, sizeof(mov_sete_ret)) == 0);
+
+    // 16-instruction lookahead bound: 16 transparent NOPs exhaust the
+    // budget before RET, so the analyzer returns LIVE conservatively.
+    static const uint8_t mov_16nops_ret[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0xC3,                          // ret (beyond the bound)
+    };
+    assert(check_instructions(mov_16nops_ret, sizeof(mov_16nops_ret)) == 0);
+
+    // Same shape with 15 NOPs: RET is the 16th instruction, reached as the
+    // last iteration, DEAD -> fire.
+    static const uint8_t mov_15nops_ret[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0xC3,
+    };
+    assert(check_instructions(mov_15nops_ret, sizeof(mov_15nops_ret)) == 1);
+
+    // INT3 carries XED_CATEGORY_INTERRUPT; analyzer bails LIVE.
+    static const uint8_t mov_int3[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0xCC,                          // int3
+    };
+    assert(check_instructions(mov_int3, sizeof(mov_int3)) == 0);
+
+    // UD2 isn't a recognized control transfer; the analyzer steps through
+    // it and runs out of buffer (-> LIVE). If a future change treats UD2
+    // as a terminator (it's overwhelmingly used as an unreachable marker
+    // by compilers), this assertion flips to 1.
+    static const uint8_t mov_ud2[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0x0F, 0x0B,                    // ud2
+    };
+    assert(check_instructions(mov_ud2, sizeof(mov_ud2)) == 0);
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -589,6 +672,7 @@ int main(int argc, char *argv[])
     check_imul_to_lea_test();
     check_shift_zero_test();
     check_flag_liveness_test();
+    check_flag_liveness_corners_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

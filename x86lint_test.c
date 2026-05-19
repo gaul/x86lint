@@ -16,6 +16,8 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "x86lint.h"
 #include "xed/xed-interface.h"
@@ -33,6 +35,61 @@ do { \
         fprintf(stderr, "\n"); \
     } \
     assert(_result); \
+} while (0)
+
+// Runs check_instructions(inst, len) with stdout captured to a memory
+// buffer so we can count per-category findings rather than just the total.
+// Returns the number of `name at offset:` reports (i.e., findings produced
+// by the check whose dispatcher name is `name`) and stores
+// check_instructions's return value -- the total finding count -- into
+// *total_out.
+static int count_findings(const uint8_t *inst, size_t len,
+                          const char *name, int *total_out)
+{
+    char *buf = NULL;
+    size_t bufsz = 0;
+    FILE *mem = open_memstream(&buf, &bufsz);
+    assert(mem != NULL);
+
+    FILE *saved = stdout;
+    fflush(stdout);
+    stdout = mem;
+    int total = check_instructions(inst, len);
+    fflush(mem);
+    stdout = saved;
+    fclose(mem);
+
+    char pat[128];
+    int written = snprintf(pat, sizeof(pat), "%s at offset:", name);
+    assert(written > 0 && written < (int) sizeof(pat));
+    int count = 0;
+    if (buf != NULL) {
+        for (char *p = buf; (p = strstr(p, pat)) != NULL; p += written) {
+            count++;
+        }
+    }
+
+    free(buf);
+    *total_out = total;
+    return count;
+}
+
+// Asserts that `bytes_arr` (an array-typed local with sizeof() yielding its
+// byte length) produces exactly `expected` findings of the given category
+// AND no other findings. The second clause catches the common regression
+// pattern where a new check starts firing on the same bytes and silently
+// keeps a total-count assertion happy.
+#define ASSERT_FINDINGS(bytes_arr, category, expected) do { \
+    int _total; \
+    int _cat = count_findings(bytes_arr, sizeof(bytes_arr), category, &_total); \
+    if (_cat != (expected) || _total != (expected)) { \
+        fprintf(stderr, \
+                "%s:%d: expected %d \"%s\" finding(s) and no others; " \
+                "got %d for category, %d total\n", \
+                __FILE__, __LINE__, (expected), category, _cat, _total); \
+    } \
+    assert(_cat == (expected)); \
+    assert(_total == (expected)); \
 } while (0)
 
 static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, size_t len)
@@ -477,14 +534,14 @@ static void check_flag_liveness_test(void)
         0xB8, 0x00, 0x00, 0x00, 0x00,
         0xC3,
     };
-    assert(check_instructions(mov_ret, sizeof(mov_ret)) == 1);
+    ASSERT_FINDINGS(mov_ret, "suboptimal MOV zero", 1);
 
     // mov eax, 0 ; je +0 -- JE reads ZF which xor would clobber, suppress.
     static const uint8_t mov_je[] = {
         0xB8, 0x00, 0x00, 0x00, 0x00,
         0x74, 0x00,
     };
-    assert(check_instructions(mov_je, sizeof(mov_je)) == 0);
+    ASSERT_FINDINGS(mov_je, "suboptimal MOV zero", 0);
 
     // mov eax, 0 ; mov ebx, 1 ; ret -- intermediate MOV doesn't touch
     // flags, RET kills them, finding fires.
@@ -493,7 +550,7 @@ static void check_flag_liveness_test(void)
         0xBB, 0x01, 0x00, 0x00, 0x00,
         0xC3,
     };
-    assert(check_instructions(mov_mov_ret, sizeof(mov_mov_ret)) == 1);
+    ASSERT_FINDINGS(mov_mov_ret, "suboptimal MOV zero", 1);
 
     // mov eax, 0 ; add ebx, 1 ; ret -- ADD overwrites all arith flags
     // before any reader, finding fires.
@@ -502,7 +559,7 @@ static void check_flag_liveness_test(void)
         0x83, 0xC3, 0x01,
         0xC3,
     };
-    assert(check_instructions(mov_add_ret, sizeof(mov_add_ret)) == 1);
+    ASSERT_FINDINGS(mov_add_ret, "suboptimal MOV zero", 1);
 
     // imul eax, eax, 4 ; jo +0 -- JO reads OF, LEA/SHL wouldn't produce
     // the same OF, suppress.
@@ -510,7 +567,7 @@ static void check_flag_liveness_test(void)
         0x6B, 0xC0, 0x04,
         0x70, 0x00,
     };
-    assert(check_instructions(imul_jo, sizeof(imul_jo)) == 0);
+    ASSERT_FINDINGS(imul_jo, "suboptimal IMUL constant", 0);
 
     // imul eax, eax, 4 ; add ebx, 1 ; ret -- CF/OF overwritten by ADD
     // before any reader, finding fires.
@@ -519,14 +576,14 @@ static void check_flag_liveness_test(void)
         0x83, 0xC3, 0x01,
         0xC3,
     };
-    assert(check_instructions(imul_add_ret, sizeof(imul_add_ret)) == 1);
+    ASSERT_FINDINGS(imul_add_ret, "suboptimal IMUL constant", 1);
 
     // and eax, 0xff ; jz +0 -- ZF is live, suppress.
     static const uint8_t and_jz[] = {
         0x83, 0xE0, 0xFF,
         0x74, 0x00,
     };
-    assert(check_instructions(and_jz, sizeof(and_jz)) == 0);
+    ASSERT_FINDINGS(and_jz, "suboptimal AND immediate", 0);
 
     // and eax, 0xff ; mov ebx, ecx ; ret -- MOV transparent, RET kills,
     // finding fires.
@@ -535,14 +592,14 @@ static void check_flag_liveness_test(void)
         0x89, 0xCB,
         0xC3,
     };
-    assert(check_instructions(and_mov_ret, sizeof(and_mov_ret)) == 1);
+    ASSERT_FINDINGS(and_mov_ret, "suboptimal AND immediate", 1);
 
     // mov eax, 0 alone at end of buffer -- we don't know what comes next,
     // conservative LIVE, suppress.
     static const uint8_t mov_alone[] = {
         0xB8, 0x00, 0x00, 0x00, 0x00,
     };
-    assert(check_instructions(mov_alone, sizeof(mov_alone)) == 0);
+    ASSERT_FINDINGS(mov_alone, "suboptimal MOV zero", 0);
 
     // mov eax, 0 ; call rel32 -- CALL clobbers caller-save flags via the
     // callee; we don't trace into it, conservative LIVE, suppress.
@@ -550,7 +607,7 @@ static void check_flag_liveness_test(void)
         0xB8, 0x00, 0x00, 0x00, 0x00,
         0xE8, 0x00, 0x00, 0x00, 0x00,
     };
-    assert(check_instructions(mov_call, sizeof(mov_call)) == 0);
+    ASSERT_FINDINGS(mov_call, "suboptimal MOV zero", 0);
 
     // mov eax, 0 ; cmove ebx, ecx ; ret -- CMOV reads ZF, suppress.
     // This is the original CMOV false positive from issue #7.
@@ -559,7 +616,7 @@ static void check_flag_liveness_test(void)
         0x0F, 0x44, 0xD9,
         0xC3,
     };
-    assert(check_instructions(mov_cmove, sizeof(mov_cmove)) == 0);
+    ASSERT_FINDINGS(mov_cmove, "suboptimal MOV zero", 0);
 }
 
 // Instruction-flavor corners for flag liveness: pin the analyzer's handling
@@ -576,7 +633,7 @@ static void check_flag_liveness_corners_test(void)
         0xF7, 0xFB,                    // idiv ebx
         0xC3,                          // ret
     };
-    assert(check_instructions(mov_idiv_ret, sizeof(mov_idiv_ret)) == 1);
+    ASSERT_FINDINGS(mov_idiv_ret, "suboptimal MOV zero", 1);
 
     // INC writes OF/SF/ZF/AF/PF but not CF. The CF from add eax, 0x80 stays
     // live through INC and gets consumed by ADC -- suppress.
@@ -586,7 +643,7 @@ static void check_flag_liveness_corners_test(void)
         0x11, 0xD1,                    // adc ecx, edx
         0xC3,                          // ret
     };
-    assert(check_instructions(add_inc_adc, sizeof(add_inc_adc)) == 0);
+    ASSERT_FINDINGS(add_inc_adc, "oversized ADD 128", 0);
 
     // Same shape but the second ADD (not ADC) overwrites CF before any
     // reader, so the oversized_add128 finding fires.
@@ -596,7 +653,7 @@ static void check_flag_liveness_corners_test(void)
         0x83, 0xC1, 0x01,              // add ecx, 1
         0xC3,                          // ret
     };
-    assert(check_instructions(add_inc_add, sizeof(add_inc_add)) == 1);
+    ASSERT_FINDINGS(add_inc_add, "oversized ADD 128", 1);
 
     // SETcc reads a status flag and writes a byte register; treated as a
     // flag reader by the analyzer.
@@ -605,7 +662,7 @@ static void check_flag_liveness_corners_test(void)
         0x0F, 0x94, 0xC3,              // sete bl   (reads ZF)
         0xC3,                          // ret
     };
-    assert(check_instructions(mov_sete_ret, sizeof(mov_sete_ret)) == 0);
+    ASSERT_FINDINGS(mov_sete_ret, "suboptimal MOV zero", 0);
 
     // 16-instruction lookahead bound: 16 transparent NOPs exhaust the
     // budget before RET, so the analyzer returns LIVE conservatively.
@@ -615,7 +672,7 @@ static void check_flag_liveness_corners_test(void)
         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
         0xC3,                          // ret (beyond the bound)
     };
-    assert(check_instructions(mov_16nops_ret, sizeof(mov_16nops_ret)) == 0);
+    ASSERT_FINDINGS(mov_16nops_ret, "suboptimal MOV zero", 0);
 
     // Same shape with 15 NOPs: RET is the 16th instruction, reached as the
     // last iteration, DEAD -> fire.
@@ -625,14 +682,14 @@ static void check_flag_liveness_corners_test(void)
         0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
         0xC3,
     };
-    assert(check_instructions(mov_15nops_ret, sizeof(mov_15nops_ret)) == 1);
+    ASSERT_FINDINGS(mov_15nops_ret, "suboptimal MOV zero", 1);
 
     // INT3 carries XED_CATEGORY_INTERRUPT; analyzer bails LIVE.
     static const uint8_t mov_int3[] = {
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0xCC,                          // int3
     };
-    assert(check_instructions(mov_int3, sizeof(mov_int3)) == 0);
+    ASSERT_FINDINGS(mov_int3, "suboptimal MOV zero", 0);
 
     // UD2 isn't a recognized control transfer; the analyzer steps through
     // it and runs out of buffer (-> LIVE). If a future change treats UD2
@@ -642,7 +699,7 @@ static void check_flag_liveness_corners_test(void)
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0x0F, 0x0B,                    // ud2
     };
-    assert(check_instructions(mov_ud2, sizeof(mov_ud2)) == 0);
+    ASSERT_FINDINGS(mov_ud2, "suboptimal MOV zero", 0);
 }
 
 int main(int argc, char *argv[])

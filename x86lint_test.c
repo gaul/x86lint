@@ -466,6 +466,102 @@ static void check_mov_modrm_imm_test(void)
     CHECK_BYTES( check_mov_modrm_imm, 0x90);                                      // nop
 }
 
+// Flag-liveness gating: check_instructions should suppress findings whose
+// suggested replacement would clobber a flag that's read downstream. These
+// tests construct two-or-three instruction sequences and assert the
+// dispatcher's response.
+static void check_flag_liveness_test(void)
+{
+    // mov eax, 0 ; ret -- ret is a flag-killing terminator, finding fires.
+    static const uint8_t mov_ret[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0xC3,
+    };
+    assert(check_instructions(mov_ret, sizeof(mov_ret)) == 1);
+
+    // mov eax, 0 ; je +0 -- JE reads ZF which xor would clobber, suppress.
+    static const uint8_t mov_je[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0x74, 0x00,
+    };
+    assert(check_instructions(mov_je, sizeof(mov_je)) == 0);
+
+    // mov eax, 0 ; mov ebx, 1 ; ret -- intermediate MOV doesn't touch
+    // flags, RET kills them, finding fires.
+    static const uint8_t mov_mov_ret[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0xBB, 0x01, 0x00, 0x00, 0x00,
+        0xC3,
+    };
+    assert(check_instructions(mov_mov_ret, sizeof(mov_mov_ret)) == 1);
+
+    // mov eax, 0 ; add ebx, 1 ; ret -- ADD overwrites all arith flags
+    // before any reader, finding fires.
+    static const uint8_t mov_add_ret[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0x83, 0xC3, 0x01,
+        0xC3,
+    };
+    assert(check_instructions(mov_add_ret, sizeof(mov_add_ret)) == 1);
+
+    // imul eax, eax, 4 ; jo +0 -- JO reads OF, LEA/SHL wouldn't produce
+    // the same OF, suppress.
+    static const uint8_t imul_jo[] = {
+        0x6B, 0xC0, 0x04,
+        0x70, 0x00,
+    };
+    assert(check_instructions(imul_jo, sizeof(imul_jo)) == 0);
+
+    // imul eax, eax, 4 ; add ebx, 1 ; ret -- CF/OF overwritten by ADD
+    // before any reader, finding fires.
+    static const uint8_t imul_add_ret[] = {
+        0x6B, 0xC0, 0x04,
+        0x83, 0xC3, 0x01,
+        0xC3,
+    };
+    assert(check_instructions(imul_add_ret, sizeof(imul_add_ret)) == 1);
+
+    // and eax, 0xff ; jz +0 -- ZF is live, suppress.
+    static const uint8_t and_jz[] = {
+        0x83, 0xE0, 0xFF,
+        0x74, 0x00,
+    };
+    assert(check_instructions(and_jz, sizeof(and_jz)) == 0);
+
+    // and eax, 0xff ; mov ebx, ecx ; ret -- MOV transparent, RET kills,
+    // finding fires.
+    static const uint8_t and_mov_ret[] = {
+        0x83, 0xE0, 0xFF,
+        0x89, 0xCB,
+        0xC3,
+    };
+    assert(check_instructions(and_mov_ret, sizeof(and_mov_ret)) == 1);
+
+    // mov eax, 0 alone at end of buffer -- we don't know what comes next,
+    // conservative LIVE, suppress.
+    static const uint8_t mov_alone[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+    };
+    assert(check_instructions(mov_alone, sizeof(mov_alone)) == 0);
+
+    // mov eax, 0 ; call rel32 -- CALL clobbers caller-save flags via the
+    // callee; we don't trace into it, conservative LIVE, suppress.
+    static const uint8_t mov_call[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0xE8, 0x00, 0x00, 0x00, 0x00,
+    };
+    assert(check_instructions(mov_call, sizeof(mov_call)) == 0);
+
+    // mov eax, 0 ; cmove ebx, ecx ; ret -- CMOV reads ZF, suppress.
+    // This is the original CMOV false positive from issue #7.
+    static const uint8_t mov_cmove[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,
+        0x0F, 0x44, 0xD9,
+        0xC3,
+    };
+    assert(check_instructions(mov_cmove, sizeof(mov_cmove)) == 0);
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -492,6 +588,7 @@ int main(int argc, char *argv[])
     check_sub_self_test();
     check_imul_to_lea_test();
     check_shift_zero_test();
+    check_flag_liveness_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

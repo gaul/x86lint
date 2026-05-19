@@ -875,6 +875,100 @@ bool check_oversized_branch(const xed_decoded_inst_t *xedd)
     return new_disp < INT8_MIN || new_disp > INT8_MAX;
 }
 
+// Bitmask of x86 arithmetic status flags. Aliased to the bit names in
+// xed_flag_set_t.s; the higher-order EFLAGS bits (DF, IF, etc.) aren't
+// tracked here because none of the optimizations below change them.
+//
+// AF is intentionally absent: the only encodable readers of AF in any
+// mode are DAA/DAS/AAA/AAS, all of which were removed from 64-bit mode.
+// (ADC/SBB read CF only, not AF.) So an AF-only divergence between an
+// original and replacement instruction is never observable in x86-64 code.
+enum {
+    FLAG_CF = 1u << 0,
+    FLAG_PF = 1u << 1,
+    FLAG_ZF = 1u << 2,
+    FLAG_SF = 1u << 3,
+    FLAG_OF = 1u << 4,
+    FLAG_ARITH = FLAG_CF | FLAG_PF | FLAG_ZF | FLAG_SF | FLAG_OF,
+};
+
+static uint32_t flag_set_to_mask(const xed_flag_set_t *fs)
+{
+    if (fs == NULL) {
+        return 0;
+    }
+    uint32_t m = 0;
+    if (fs->s.cf) m |= FLAG_CF;
+    if (fs->s.pf) m |= FLAG_PF;
+    if (fs->s.zf) m |= FLAG_ZF;
+    if (fs->s.sf) m |= FLAG_SF;
+    if (fs->s.of) m |= FLAG_OF;
+    return m;
+}
+
+// Walk forward from byte `offset` in `inst` to decide whether any flag in
+// `concerns` might be read by a downstream instruction before being
+// overwritten. Returns true (LIVE) on yes or unknown; the caller (dispatcher
+// for a flag-disturbing optimization) should suppress its finding when this
+// returns true.
+//
+// Returns false (DEAD) only after seeing every flag in `concerns` written
+// by straight-line code, or after hitting a function-exit terminator
+// (RET / IRET; neither the SysV nor Win64 ABI preserves flags across calls).
+//
+// Conservative LIVE on: decode error; any control transfer that isn't a
+// terminator (CALL, conditional or unconditional branch, SYSCALL, INTERRUPT);
+// running out of input; reaching the lookahead bound.
+//
+// "Undefined" flag writes per Intel SDM count as writes -- the original
+// value is destroyed either way, so the candidate optimization doesn't
+// worsen things relative to the unmodified code.
+static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
+                             uint32_t concerns)
+{
+    const int MAX_LOOKAHEAD = 16;
+    uint32_t live = concerns;
+
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+    for (int step = 0; step < MAX_LOOKAHEAD && offset < len && live != 0; ++step) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+            return true;
+        }
+
+        xed_category_enum_t category = xed_decoded_inst_get_category(&xedd);
+        if (category == XED_CATEGORY_RET) {
+            return false;
+        }
+        if (category == XED_CATEGORY_CALL ||
+            category == XED_CATEGORY_UNCOND_BR ||
+            category == XED_CATEGORY_COND_BR ||
+            category == XED_CATEGORY_SYSCALL ||
+            category == XED_CATEGORY_INTERRUPT) {
+            return true;
+        }
+
+        const xed_simple_flag_t *fi = xed_decoded_inst_get_rflags_info(&xedd);
+        if (fi != NULL) {
+            uint32_t r = flag_set_to_mask(xed_simple_flag_get_read_flag_set(fi));
+            uint32_t w = flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
+                         flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi));
+            if (r & live) {
+                return true;
+            }
+            live &= ~w;
+        }
+
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+
+    return live != 0;
+}
+
 static void dump_instruction(const xed_decoded_inst_t *xedd)
 {
     char buf[1024];
@@ -904,31 +998,37 @@ static void report_finding(const char *name, size_t offset,
 struct check_entry {
     bool (*fn)(const xed_decoded_inst_t *);
     const char *name;
+    // Status flags that the suggested replacement would either no longer
+    // produce or compute differently from the original instruction. The
+    // dispatcher suppresses the finding when any of these flags might be
+    // read downstream before being overwritten. 0 for checks with no flag
+    // soundness concern.
+    uint32_t flag_concerns;
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
 // (not a decoded instruction) and reports a 2-instruction window.
-// check_mov_zero is omitted pending flag-liveness analysis (see issue #7).
 static const struct check_entry checks[] = {
-    {check_oversized_immediate,     "oversized immediate"},
-    {check_oversized_add128,        "oversized ADD 128"},
-    {check_unneeded_rex,            "unneeded REX prefix"},
-    {check_cmp_zero,                "suboptimal CMP zero"},
-    {check_implicit_register,       "unneeded explicit register"},
-    {check_implicit_immediate,      "unneeded explicit immediate"},
-    {check_and_strength_reduce,     "suboptimal AND immediate"},
-    {check_missing_lock_prefix,     "missing LOCK prefix"},
-    {check_superfluous_lock_prefix, "unneeded LOCK prefix"},
-    {check_oversized_branch,        "oversized branch displacement"},
-    {check_mov_self,                "redundant MOV reg, reg"},
-    {check_add_zero,                "redundant ADD/SUB zero"},
-    {check_mov_modrm_imm,           "oversized MOV encoding"},
-    {check_unneeded_sib,            "unneeded SIB byte"},
-    {check_unneeded_zero_displacement, "unneeded zero displacement"},
-    {check_unneeded_movsxd,         "unneeded MOVSXD"},
-    {check_sub_self,                "suboptimal SUB reg, reg"},
-    {check_imul_to_lea,             "suboptimal IMUL constant"},
-    {check_shift_zero,              "redundant shift/rotate by zero"},
+    {check_oversized_immediate,        "oversized immediate",             0},
+    {check_oversized_add128,           "oversized ADD 128",               FLAG_CF},
+    {check_unneeded_rex,               "unneeded REX prefix",             0},
+    {check_cmp_zero,                   "suboptimal CMP zero",             0},
+    {check_mov_zero,                   "suboptimal MOV zero",             FLAG_ARITH},
+    {check_implicit_register,          "unneeded explicit register",      0},
+    {check_implicit_immediate,         "unneeded explicit immediate",     0},
+    {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
+    {check_missing_lock_prefix,        "missing LOCK prefix",             0},
+    {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
+    {check_oversized_branch,           "oversized branch displacement",   0},
+    {check_mov_self,                   "redundant MOV reg, reg",          0},
+    {check_add_zero,                   "redundant ADD/SUB zero",          FLAG_ARITH},
+    {check_mov_modrm_imm,              "oversized MOV encoding",          0},
+    {check_unneeded_sib,               "unneeded SIB byte",               0},
+    {check_unneeded_zero_displacement, "unneeded zero displacement",      0},
+    {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
+    {check_sub_self,                   "suboptimal SUB reg, reg",         0},
+    {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
+    {check_shift_zero,                 "redundant shift/rotate by zero",  0},
 };
 
 int check_instructions(const uint8_t *inst, size_t len)
@@ -971,14 +1071,20 @@ int check_instructions(const uint8_t *inst, size_t len)
         }
         */
 
+        size_t next = offset + xed_decoded_inst_get_length(&xedd);
         for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
-            if (!checks[i].fn(&xedd)) {
-                report_finding(checks[i].name, offset, &xedd, inst + offset);
-                ++errors;
+            if (checks[i].fn(&xedd)) {
+                continue;
             }
+            if (checks[i].flag_concerns != 0 &&
+                flags_live_after(inst, len, next, checks[i].flag_concerns)) {
+                continue;
+            }
+            report_finding(checks[i].name, offset, &xedd, inst + offset);
+            ++errors;
         }
 
-        offset += xed_decoded_inst_get_length(&xedd);
+        offset = next;
     }
 
     return errors;

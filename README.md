@@ -1,6 +1,6 @@
 # x86lint
 
-x86lint examines x86 machine code to find suboptimal encodings and sequences.
+x86lint examines x86-64 machine code to find suboptimal encodings and sequences.
 For example, `add eax, 1` can encode with either an 8- or 32-bit immediate:
 
 ```

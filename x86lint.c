@@ -95,10 +95,6 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
         return true;
     }
 
-    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
-        return true;
-    }
-
     int64_t imm = (int64_t) xed_decoded_inst_get_unsigned_immediate(xedd);
 
     switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {

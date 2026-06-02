@@ -841,12 +841,19 @@ bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd)
     return true;
 }
 
-// add reg, 0 and sub reg, 0 leave the register unchanged but set flags
-// as a side effect (CF/OF cleared, ZF/SF/PF reflect the register's
-// value). The equivalent test reg, reg has the same flag effect and is
-// 1-3 bytes shorter; the instruction can be removed entirely if the
-// flags are unused. Excludes memory operands -- those are touches that
-// may be intentional (cache line warm, MMIO trigger).
+// add reg, 0 and sub reg, 0 leave the register unchanged but set flags as
+// a side effect (CF/OF cleared, ZF/SF/PF reflect the register's value).
+// They can be removed when the flags are unused, or otherwise replaced by
+// test reg, reg, which is 1-3 bytes shorter. test reg, reg reproduces the
+// flags exactly (CF=OF=0, ZF/SF/PF per the value; only the unobservable AF
+// differs), so the substitution is valid even when the flags are live --
+// hence the dispatcher entry carries no flag concern and the finding fires
+// regardless of downstream flag liveness.
+//
+// AL is excluded: add al, 0 already fits in 2 bytes via the 04 ib
+// accumulator opcode, exactly tying test al, al, so substituting test
+// saves nothing (cf. check_cmp_zero). Memory operands are excluded too:
+// those touches may be intentional (cache-line warm, MMIO trigger).
 bool check_add_zero(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -862,6 +869,10 @@ bool check_add_zero(const xed_decoded_inst_t *xedd)
     }
 
     if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
         return true;
     }
 
@@ -1081,7 +1092,7 @@ static const struct check_entry checks[] = {
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0},
-    {check_add_zero,                   "redundant ADD/SUB zero",          FLAG_ARITH},
+    {check_add_zero,                   "redundant ADD/SUB zero",          0},
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},
     {check_unneeded_zero_displacement, "unneeded zero displacement",      0},

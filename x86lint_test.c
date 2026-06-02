@@ -401,6 +401,11 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x83, 0x00, 0x00);              // add dword ptr [rax], 0 (memory)
     CHECK_BYTES( check_add_zero, 0x83, 0xd0, 0x00);              // adc eax, 0 (not ADD/SUB)
     CHECK_BYTES( check_add_zero, 0x90);                          // nop
+    // add al, 0 / sub al, 0 already fit in 2 bytes (04/2c ib), tying
+    // test al, al -- no win, so not flagged. Other byte registers still are.
+    CHECK_BYTES( check_add_zero, 0x04, 0x00);                    // add al, 0 (accumulator form)
+    CHECK_BYTES( check_add_zero, 0x2c, 0x00);                    // sub al, 0 (accumulator form)
+    CHECK_BYTES(!check_add_zero, 0x80, 0xc3, 0x00);              // add bl, 0 (no short form; test bl, bl smaller)
 }
 
 static void check_shift_zero_test(void)
@@ -650,6 +655,22 @@ static void check_flag_liveness_test(void)
         0xC3,
     };
     ASSERT_FINDINGS(mov_cmove, "suboptimal MOV zero", 0);
+
+    // redundant ADD/SUB zero is NOT flag-gated: test reg, reg reproduces the
+    // flags exactly, so the finding fires whether or not the flags are live.
+    // add ebx, 0 ; je +0 -- ZF live, but test ebx, ebx preserves it, flag.
+    static const uint8_t addzero_je[] = {
+        0x83, 0xC3, 0x00,
+        0x74, 0x00,
+    };
+    ASSERT_FINDINGS(addzero_je, "redundant ADD/SUB zero", 1);
+
+    // add ebx, 0 ; ret -- flags dead, remove it, also flagged.
+    static const uint8_t addzero_ret[] = {
+        0x83, 0xC3, 0x00,
+        0xC3,
+    };
+    ASSERT_FINDINGS(addzero_ret, "redundant ADD/SUB zero", 1);
 }
 
 // Instruction-flavor corners for flag liveness: pin the analyzer's handling

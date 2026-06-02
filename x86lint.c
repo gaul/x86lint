@@ -592,18 +592,25 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
-// IMUL r, r, imm with imm in {2,3,4,5,8,9} can be replaced by a single
-// LEA, which on most uarches has shorter latency and uses the AGU instead
-// of the multiplier. Pure powers of two (2/4/8) also have shorter SHL
-// encodings when the source and destination match.
+// IMUL r, r, imm by a small constant can be replaced by a single LEA,
+// which on most uarches has shorter latency and uses the AGU instead of
+// the multiplier.
+//
+//   * imm in {2,3,5,9}: dst = src*{2,3,5,9} is lea [src + src*{1,2,4,8}],
+//     valid for any destination register.
+//   * imm in {4,8}: the single-LEA form would be [src*scale], which needs
+//     an absolute disp32 (SIB base=101) and is *longer* than the IMUL. The
+//     only shorter/faster replacement is SHL by {2,3}, which requires the
+//     destination and source to be the same register; a different-register
+//     imul r, r2, {4,8} has no improvement and is left alone.
 //
 // Memory-source IMUL (IMUL r, [m], imm) is not flagged: the replacement
 // would need a separate load instruction first, making the sequence
 // longer and not strictly faster.
 //
 // False positive if surrounding code reads CF or OF: IMUL sets both on
-// signed overflow; LEA and SHL do not. A subsequent JC/JNC/JO/JNO would
-// diverge.
+// signed overflow; LEA and SHL do not produce the same CF/OF. A subsequent
+// JC/JNC/JO/JNO would diverge.
 bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_IMUL) {
@@ -616,8 +623,14 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
         return true;
     }
     switch (xed_decoded_inst_get_unsigned_immediate(xedd)) {
-    case 2: case 3: case 4: case 5: case 8: case 9:
+    case 2: case 3: case 5: case 9:
         return false;
+    case 4: case 8: {
+        // Only reducible (to SHL) when destination and source coincide.
+        xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        return !(dst != XED_REG_INVALID && dst == src);
+    }
     default:
         return true;
     }

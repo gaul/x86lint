@@ -434,6 +434,16 @@ static void check_imul_to_lea_test(void)
     CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x09);                    // imul eax, eax, 9
     // imm32 form also matches.
     CHECK_BYTES(!check_imul_to_lea, 0x69, 0xc0, 0x03, 0x00, 0x00, 0x00);  // imul eax, eax, 3
+    // {2,3,5,9} reduce to lea [src + src*s] for any destination register.
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc3, 0x02);                    // imul eax, ebx, 2 (lea [ebx+ebx])
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc3, 0x03);                    // imul eax, ebx, 3 (lea [ebx+ebx*2])
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc3, 0x05);                    // imul eax, ebx, 5 (lea [ebx+ebx*4])
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc3, 0x09);                    // imul eax, ebx, 9 (lea [ebx+ebx*8])
+    // {4,8} only reduce (to SHL) when dst == src; lea [src*scale] needs a
+    // disp32 and is longer than the IMUL, so different registers are left alone.
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc3, 0x04);                    // imul eax, ebx, 4 (different regs)
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc3, 0x08);                    // imul eax, ebx, 8 (different regs)
+    CHECK_BYTES(!check_imul_to_lea, 0x48, 0x6b, 0xc0, 0x04);              // imul rax, rax, 4 (shl rax, 2)
     // Constants without a single-LEA equivalent.
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x06);                    // imul eax, eax, 6
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x07);                    // imul eax, eax, 7

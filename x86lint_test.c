@@ -303,14 +303,27 @@ static void check_implicit_immediate_test(void)
 
 static void check_and_strength_reduce_test(void)
 {
-    CHECK_BYTES(!check_and_strength_reduce, 0x83, 0xe0, 0xff);  // and eax, 0xff
-    CHECK_BYTES( check_and_strength_reduce, 0x83, 0xe0, 0xfe);  // and eax, 0xfe
-    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0x00, 0x00);  // and eax, 0xffff
-    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0xff, 0xff);  // and eax, 0xffffffff
-    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff);  // and rax, 0xffffffff (no-op via sign-ext)
-    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x83, 0xe0, 0xff);              // and rax, sign_ext(0xff) (no-op)
-    CHECK_BYTES(!check_and_strength_reduce, 0x83, 0xe0, 0xff);                    // and eax, sign_ext(0xff) (still flag)
-    CHECK_BYTES( check_and_strength_reduce, 0x83, 0xc0, 0x01);  // add eax, 1 (not AND)
+    // 83 e0 ff is and eax, sx(0xff) = and eax, 0xffffffff: a 32-bit operand
+    // whose effective mask is all-ones. It zero-extends eax into rax, so it
+    // reduces to mov eax, eax (not movzbl) -- still a finding.
+    CHECK_BYTES(!check_and_strength_reduce, 0x83, 0xe0, 0xff);                    // and eax, 0xffffffff (-> mov eax, eax)
+    CHECK_BYTES( check_and_strength_reduce, 0x83, 0xe0, 0xfe);                    // and eax, 0xfffffffe (not a mask)
+    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0x00, 0x00);        // and eax, 0xffff (-> movzwl)
+    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0xff, 0xff);        // and eax, 0xffffffff (-> mov eax, eax)
+    CHECK_BYTES(!check_and_strength_reduce, 0x48, 0x25, 0xff, 0x00, 0x00, 0x00);  // and rax, 0xff (-> movzbl, zero-extends)
+    // REX.W all-ones masks are genuine no-ops with no shorter zero-extending
+    // form -- do not flag.
+    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff);  // and rax, -1 (no-op)
+    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x83, 0xe0, 0xff);              // and rax, sx(0xff) = -1 (no-op)
+    // 8-/16-bit AND preserves the upper register bytes; movzx/mov would zero
+    // them, so the substitution is not equivalent -- do not flag.
+    CHECK_BYTES( check_and_strength_reduce, 0x66, 0x25, 0xff, 0x00);              // and ax, 0xff (preserves bits 16+)
+    CHECK_BYTES( check_and_strength_reduce, 0x66, 0x25, 0xff, 0xff);              // and ax, 0xffff (no-op on ax)
+    CHECK_BYTES( check_and_strength_reduce, 0x24, 0xff);                          // and al, 0xff (no-op)
+    // Memory destination: movzx/mov cannot target memory -- do not flag.
+    CHECK_BYTES( check_and_strength_reduce, 0x81, 0x20, 0xff, 0x00, 0x00, 0x00);  // and dword [rax], 0xff
+    CHECK_BYTES( check_and_strength_reduce, 0x81, 0x20, 0xff, 0xff, 0xff, 0xff);  // and dword [rax], 0xffffffff
+    CHECK_BYTES( check_and_strength_reduce, 0x83, 0xc0, 0x01);                    // add eax, 1 (not AND)
 }
 
 static void check_missing_lock_prefix_test(void)

@@ -497,9 +497,26 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
-// AND r/m, 0xff/0xffff/0xffffffff can be replaced by MOVZBL / MOVZWL /
-// MOV (the latter via the EAX-write zero-extension rule), all of which
-// fit the same mask operation in fewer bytes.
+// AND DST, IMM can be replaced by MOVZBL / MOVZWL / MOV (the last via the
+// EAX-write zero-extension rule) when the mask keeps a low byte/word/dword
+// and zeros everything above it -- e.g. and eax, 0xff -> movzx eax, al.
+// All three replacements produce a register zero-extended through bit 63,
+// so the substitution is valid only when:
+//
+//   * the destination is a register (movzx/mov cannot target memory); and
+//   * the AND writes a 32- or 64-bit register, so the write itself clears
+//     bits up to 63 (an 8-/16-bit AND preserves the upper register bytes,
+//     which movzx/mov would instead zero); and
+//   * the *effective* mask -- the immediate sign-extended and truncated to
+//     the operand width -- is exactly 0xff, 0xffff, or (32-bit operand
+//     only) 0xffffffff.
+//
+// Matching the effective mask rather than the raw immediate byte is what
+// separates a genuine low-byte mask (and eax, 0xff, encoded with an imm32)
+// from a sign-extended all-ones no-op (and eax, sx(0xff) = 0xffffffff,
+// encoded 83 e0 ff): the former reduces to movzbl, the latter to a plain
+// mov eax, eax. An all-ones mask on a 64-bit operand is a no-op with no
+// shorter zero-extending equivalent, so it is left alone.
 //
 // False positive if surrounding code reads ZF/SF/PF: AND sets them based
 // on the masked result and clears CF/OF; MOVZX and MOV do not touch
@@ -509,22 +526,28 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_AND) {
         return true;
     }
-
-    xed_uint64_t imm = xed_decoded_inst_get_unsigned_immediate(xedd);
-
-    // With REX.W the immediate sign-extends to 64 bits. An imm8 of 0xff
-    // (signed -1) and an imm32 of 0xffffffff both sign-extend to all-ones,
-    // making the AND a no-op. The mov eax, eax / movzbl substitutions
-    // would zero the upper 32 bits and are not equivalent.
-    if (xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd))) {
-        unsigned width = xed_decoded_inst_get_immediate_width_bits(xedd);
-        if ((width == 8 && imm == 0xff) ||
-            (width == 32 && imm == 0xffffffff)) {
-            return true;
-        }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
     }
 
-    return imm != 0xff && imm != 0xffff && imm != 0xffffffff;
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    if (width != 32 && width != 64) {
+        return true;
+    }
+
+    uint64_t opmask = (width == 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    if (eff == 0xff || eff == 0xffff) {
+        return false;
+    }
+    if (width == 32 && eff == 0xffffffff) {
+        return false;
+    }
+    return true;
 }
 
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)

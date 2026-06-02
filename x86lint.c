@@ -18,7 +18,6 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include "xed/xed-interface.h"
 
 // TODO: handle 10-15 byte NOPs
@@ -130,7 +129,8 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
         }
         break;
     default:
-        abort();
+        assert(0 && "unexpected immediate width");
+        return true;
     }
     return true;
 }
@@ -163,7 +163,8 @@ bool check_oversized_add128(const xed_decoded_inst_t *xedd)
         }
         break;
     default:
-        abort();
+        assert(0 && "unexpected immediate width");
+        return true;
     }
     return true;
 }
@@ -426,7 +427,8 @@ bool check_mov_zero(const xed_decoded_inst_t *xedd)
     case 64:
         break;
     default:
-        abort();
+        assert(0 && "unexpected immediate width");
+        return true;
     }
 
     return true;

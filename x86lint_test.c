@@ -248,6 +248,7 @@ static void check_unneeded_rex_test(void)
     CHECK_BYTES(!check_unneeded_rex, 0x40, 0x8b, 0x00);  // mov eax, [rax] with bare REX (unneeded)
     CHECK_BYTES( check_unneeded_rex, 0x48, 0x8b, 0x01);  // mov rax, [rcx] (REX.W needed for 64-bit op)
     CHECK_BYTES( check_unneeded_rex, 0x41, 0x8b, 0x00);  // mov eax, [r8] (REX.B needed for r8 base)
+    CHECK_BYTES( check_unneeded_rex, 0x48, 0x0f, 0x1f, 0x00);  // rex.w nop [rax] (REX.W kept, not flagged)
 }
 
 static void check_mov_zero_test(void)
@@ -287,6 +288,7 @@ static void check_implicit_register_test(void)
     CHECK_BYTES(!check_implicit_register, 0x48, 0x81, 0xC0, 0x01, 0x00, 0x00, 0x00);  // add rax, 1 (explicit)
     CHECK_BYTES( check_implicit_register, 0xa9, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (implicit)
     CHECK_BYTES(!check_implicit_register, 0xf7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (explicit)
+    CHECK_BYTES( check_implicit_register, 0x66, 0x81, 0xc3, 0x01, 0x00);  // add bx, 1 (16-bit, dest != AX)
 }
 
 static void check_implicit_immediate_test(void)
@@ -329,6 +331,7 @@ static void check_and_strength_reduce_test(void)
     // Memory destination: movzx/mov cannot target memory -- do not flag.
     CHECK_BYTES( check_and_strength_reduce, 0x81, 0x20, 0xff, 0x00, 0x00, 0x00);  // and dword [rax], 0xff
     CHECK_BYTES( check_and_strength_reduce, 0x81, 0x20, 0xff, 0xff, 0xff, 0xff);  // and dword [rax], 0xffffffff
+    CHECK_BYTES( check_and_strength_reduce, 0x21, 0xd8);                          // and eax, ebx (no immediate)
     CHECK_BYTES( check_and_strength_reduce, 0x83, 0xc0, 0x01);                    // add eax, 1 (not AND)
 }
 
@@ -406,6 +409,7 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x04, 0x00);                    // add al, 0 (accumulator form)
     CHECK_BYTES( check_add_zero, 0x2c, 0x00);                    // sub al, 0 (accumulator form)
     CHECK_BYTES(!check_add_zero, 0x80, 0xc3, 0x00);              // add bl, 0 (no short form; test bl, bl smaller)
+    CHECK_BYTES( check_add_zero, 0x01, 0xd8);                    // add eax, ebx (no immediate)
 }
 
 static void check_shift_zero_test(void)

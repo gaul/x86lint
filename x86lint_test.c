@@ -509,6 +509,31 @@ static void check_imul_to_lea_test(void)
     CHECK_BYTES( check_imul_to_lea, 0x90);                                // nop
 }
 
+static void check_lea_to_mov_test(void)
+{
+    // lea dst, [base] with no index and zero displacement == mov dst, base.
+    CHECK_BYTES(!check_lea_to_mov, 0x48, 0x8d, 0x03);              // lea rax, [rbx]
+    CHECK_BYTES(!check_lea_to_mov, 0x67, 0x8d, 0x03);             // lea eax, [ebx] (32/32)
+    CHECK_BYTES(!check_lea_to_mov, 0x48, 0x8d, 0x00);            // lea rax, [rax] (degenerate)
+    // RBP/R13 force a disp8=0 and RSP forces a SIB -- still a bare base, and
+    // the lea is a byte longer than the mov.
+    CHECK_BYTES(!check_lea_to_mov, 0x48, 0x8d, 0x45, 0x00);       // lea rax, [rbp+0]
+    CHECK_BYTES(!check_lea_to_mov, 0x49, 0x8d, 0x45, 0x00);       // lea rax, [r13+0]
+    CHECK_BYTES(!check_lea_to_mov, 0x48, 0x8d, 0x04, 0x24);       // lea rax, [rsp]
+    // Mixed operand/address size -- a single same-width mov does not apply.
+    CHECK_BYTES( check_lea_to_mov, 0x8d, 0x03);                  // lea eax, [rbx] (32/64)
+    CHECK_BYTES( check_lea_to_mov, 0x67, 0x48, 0x8d, 0x03);       // lea rax, [ebx] (64/32)
+    // Index, nonzero displacement, RIP-relative, and pure-index forms: not a
+    // bare base register.
+    CHECK_BYTES( check_lea_to_mov, 0x48, 0x8d, 0x04, 0x0b);       // lea rax, [rbx+rcx]
+    CHECK_BYTES( check_lea_to_mov, 0x48, 0x8d, 0x43, 0x08);       // lea rax, [rbx+8]
+    CHECK_BYTES( check_lea_to_mov, 0x48, 0x8d, 0x05, 0,0,0,0);    // lea rax, [rip+0]
+    CHECK_BYTES( check_lea_to_mov, 0x48, 0x8d, 0x04, 0x1d, 0,0,0,0); // lea rax, [rbx*1] (no base)
+    // Not LEA.
+    CHECK_BYTES( check_lea_to_mov, 0x48, 0x89, 0xd8);            // mov rax, rbx
+    CHECK_BYTES( check_lea_to_mov, 0x90);                        // nop
+}
+
 static void check_sub_self_test(void)
 {
     CHECK_BYTES(!check_sub_self, 0x29, 0xc0);              // sub eax, eax (use xor)
@@ -865,6 +890,7 @@ int main(int argc, char *argv[])
     check_unneeded_movsxd_test();
     check_sub_self_test();
     check_imul_to_lea_test();
+    check_lea_to_mov_test();
     check_shift_zero_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();

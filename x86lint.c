@@ -706,6 +706,44 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
     }
 }
 
+// lea dst, [base] with no index and a zero displacement computes exactly the
+// base register, so it is mov dst, base. MOV issues on more execution ports
+// and skips the address-generation unit, and for an RBP/R13 or RSP/R12 base
+// the lea is even a byte longer (a disp8=0 or SIB byte is forced). Both
+// instructions leave the flags untouched, so the rewrite is always valid.
+//
+// Restricted to a base whose width matches the destination: a mixed
+// operand/address size (lea rax, [ebx] or lea eax, [rbx]) would need a mov
+// of a different width and is left alone. A RIP-relative lea computes a
+// PC-relative address rather than a register copy and is excluded; so is a
+// pure index form (lea rax, [rcx*2]), which is not a bare base.
+bool check_lea_to_mov(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_LEA) {
+        return true;
+    }
+    if (xed_decoded_inst_get_index_reg(xedd, 0) != XED_REG_INVALID) {
+        return true;
+    }
+    if (xed_decoded_inst_get_memory_displacement(xedd, 0) != 0) {
+        return true;
+    }
+
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, 0);
+    if (base == XED_REG_INVALID ||
+        base == XED_REG_RIP || base == XED_REG_EIP) {
+        return true;
+    }
+
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_get_register_width_bits64(dst) !=
+        xed_get_register_width_bits64(base)) {
+        return true;
+    }
+
+    return false;
+}
+
 // Shift and rotate instructions with an immediate count of 0 are pure
 // no-ops: the destination is unchanged and per the Intel SDM the flags
 // are explicitly "not affected" when the count is 0. The CL-register
@@ -1213,6 +1251,7 @@ static const struct check_entry checks[] = {
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
+    {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},
 };
 

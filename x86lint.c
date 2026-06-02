@@ -766,6 +766,54 @@ bool check_unneeded_zero_displacement(const xed_decoded_inst_t *xedd)
     }
 }
 
+// A nonzero displacement encoded as disp32 wastes three bytes when its value
+// fits in a signed disp8:
+//   mov eax, [rbx+0x10]   8b 83 10000000   (disp32, 6 bytes)
+//   mov eax, [rbx+0x10]   8b 43 10         (disp8,  3 bytes)
+// XED returns the displacement sign-extended, so a disp32 of 0xfffffff0 reads
+// back as -16 and still fits. The zero case is left to
+// check_unneeded_zero_displacement (which can elide it entirely, not merely
+// narrow it); this check handles only nonzero displacements.
+//
+// Cannot narrow:
+//   - RIP-relative addressing: disp32 is the only form.
+//   - Absolute / no-base addressing (SIB base=101 with no base register):
+//     disp32 is mandatory in 64-bit mode.
+// Any real base register supports a disp8 -- including RBP/R13, which merely
+// require *at least* a disp8 -- so no base-specific exclusion is needed in the
+// narrowing direction. Multi-byte NOPs are skipped: their displacement width
+// is deliberate length padding (cf. check_unneeded_zero_displacement).
+bool check_oversized_displacement(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+        return true;
+    }
+
+    int iclass = xed_decoded_inst_get_iclass(xedd);
+    if (iclass >= XED_ICLASS_NOP && iclass <= XED_ICLASS_NOP9) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_memory_displacement_width_bits(xedd, 0) != 32) {
+        return true;
+    }
+
+    xed_int64_t disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
+    if (disp == 0 || disp < INT8_MIN || disp > INT8_MAX) {
+        return true;
+    }
+
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, 0);
+    if (base == XED_REG_RIP || base == XED_REG_EIP) {
+        return true;
+    }
+    if (base == XED_REG_INVALID) {
+        return true;
+    }
+
+    return false;
+}
+
 // modrm with rm=100 in 32-/64-bit addressing means "a SIB byte follows."
 // This is required when the base register's three-bit encoding overlaps
 // the SIB marker (RSP/R12, or ESP/R12D in 32-bit address mode), when
@@ -1097,6 +1145,7 @@ static const struct check_entry checks[] = {
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},
     {check_unneeded_zero_displacement, "unneeded zero displacement",      0},
+    {check_oversized_displacement,     "oversized displacement",          0},
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},

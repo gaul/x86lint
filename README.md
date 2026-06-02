@@ -18,6 +18,8 @@ compiler writers generate better code and documents the complexity of x86.
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
 * oversized branch displacement
   - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
+* oversized displacement
+  - `8B 83 10000000` instead of `8B 43 10` (MOV EAX, [RBX+0x10]; disp32 that fits in disp8)
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
   - `68 01000000` instead of `6A 01` (PUSH 1)

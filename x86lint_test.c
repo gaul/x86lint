@@ -521,6 +521,35 @@ static void check_unneeded_zero_displacement_test(void)
     CHECK_BYTES( check_unneeded_zero_displacement, 0x0f, 0x1f, 0x80, 0,0,0,0);    // 7-byte NOP [rax+0]
 }
 
+static void check_oversized_displacement_test(void)
+{
+    // disp32 holding a value that fits in a signed disp8 -- narrowable.
+    CHECK_BYTES(!check_oversized_displacement, 0x01, 0xbe, 0x10, 0,0,0);          // add [rsi+0x10], edi (disp32)
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0x7e, 0x10);                 // add [rsi+0x10], edi (already disp8)
+    // Signed disp8 boundaries: [-128, 127] narrows, just outside needs disp32.
+    CHECK_BYTES(!check_oversized_displacement, 0x01, 0xbe, 0x7f, 0,0,0);          // add [rsi+127], edi
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0xbe, 0x80, 0,0,0);          // add [rsi+128], edi (needs disp32)
+    CHECK_BYTES(!check_oversized_displacement, 0x01, 0xbe, 0xff, 0xff, 0xff, 0xff); // add [rsi-1], edi
+    CHECK_BYTES(!check_oversized_displacement, 0x01, 0xbe, 0x80, 0xff, 0xff, 0xff); // add [rsi-128], edi
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0xbe, 0x7f, 0xff, 0xff, 0xff); // add [rsi-129], edi (needs disp32)
+    // disp32=0 is the zero-displacement check's job, not this one.
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0xbe, 0,0,0,0);              // add [rsi+0], edi
+    // RBP/R13 narrow fine -- they require *at least* a disp8, not a disp32.
+    CHECK_BYTES(!check_oversized_displacement, 0x01, 0xbd, 0x10, 0,0,0);          // add [rbp+0x10], edi
+    CHECK_BYTES(!check_oversized_displacement, 0x45, 0x01, 0xbd, 0x10, 0,0,0);    // add [r13+0x10], r15d
+    // RSP keeps its SIB but the disp still narrows.
+    CHECK_BYTES(!check_oversized_displacement, 0x01, 0xbc, 0x24, 0x10, 0,0,0);    // add [rsp+0x10], edi (disp32)
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0x7c, 0x24, 0x10);           // add [rsp+0x10], edi (already disp8)
+    // RIP-relative and absolute disp32 cannot narrow (disp32 is mandatory).
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0x3d, 0x10, 0,0,0);          // add [rip+0x10], edi
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0x3c, 0x25, 0x10, 0,0,0);    // add [0x10], edi (absolute)
+    // Multi-byte NOPs use displacement width as deliberate padding.
+    CHECK_BYTES( check_oversized_displacement, 0x0f, 0x1f, 0x80, 0x10, 0,0,0);    // 7-byte NOP [rax+0x10]
+    // No memory operand -- nothing to flag.
+    CHECK_BYTES( check_oversized_displacement, 0x01, 0xd8);                       // add eax, ebx
+    CHECK_BYTES( check_oversized_displacement, 0x90);                            // nop
+}
+
 static void check_unneeded_sib_test(void)
 {
     // Issue #5: redundant SIB for [rbp+disp8] when modrm alone suffices.
@@ -794,6 +823,7 @@ int main(int argc, char *argv[])
     check_mov_modrm_imm_test();
     check_unneeded_sib_test();
     check_unneeded_zero_displacement_test();
+    check_oversized_displacement_test();
     check_unneeded_movsxd_test();
     check_sub_self_test();
     check_imul_to_lea_test();

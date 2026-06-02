@@ -91,6 +91,7 @@ x86lint is intended to be part of compiler test suites which should `#include
 * [Intel instruction set reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-instruction-set-reference-manual-325383.pdf)
 * [Intel optimization manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf)
 * [Intel x86 encoder decoder](https://github.com/intelxed/xed) - library to parse instructions
+* [armlint](https://github.com/gaul/armlint) - AArch64 equivalent of armlint
 
 ## License
 

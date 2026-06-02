@@ -793,6 +793,34 @@ bool check_sub_self(const xed_decoded_inst_t *xedd)
     return !(r0 != XED_REG_INVALID && r0 == r1);
 }
 
+// or reg, reg and and reg, reg with both operands the same register leave the
+// value unchanged (x|x == x and x&x == x); they exist only to set flags, the
+// role test reg, reg fills. All three are two bytes and set CF=OF=0 with
+// ZF/SF/PF per the value (AF is undefined in every case), so test is
+// flag-equivalent -- but, unlike or/and, it does not write the destination,
+// avoiding a redundant register write and matching the canonical idiom. (The
+// memory forms cannot have both operands the same register, so the r0 == r1
+// test excludes them, as in check_sub_self.)
+//
+// Not flag-gated (cf. check_add_zero): test reproduces the flags, so the
+// rewrite holds whether or not they are live, and when they are dead the
+// instruction can be removed outright. The 32-bit form's incidental
+// zero-extension into the upper 64 bits is treated as not relied upon, the
+// same way check_add_zero treats add eax, 0.
+bool check_or_and_self(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+        break;
+    default:
+        return true;
+    }
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    return !(r0 != XED_REG_INVALID && r0 == r1);
+}
+
 // movsxd rax, eax (48 63 c0, 3 bytes) sign-extends EAX into RAX. The
 // CDQE / cltq instruction (48 98, 2 bytes) does the same.
 // TODO: similar opportunities exist for movsx eax, ax -> cwde and
@@ -1305,6 +1333,7 @@ static const struct check_entry checks[] = {
     {check_oversized_displacement,     "oversized displacement",          0},
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
+    {check_or_and_self,                "suboptimal OR/AND reg, reg",      0},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},

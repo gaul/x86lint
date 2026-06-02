@@ -573,6 +573,29 @@ static void check_sub_self_test(void)
     CHECK_BYTES( check_sub_self, 0x90);                    // nop
 }
 
+static void check_or_and_self_test(void)
+{
+    // or/and reg, reg used as a flag test -> test reg, reg (all widths).
+    CHECK_BYTES(!check_or_and_self, 0x09, 0xc0);           // or eax, eax
+    CHECK_BYTES(!check_or_and_self, 0x21, 0xc0);           // and eax, eax
+    CHECK_BYTES(!check_or_and_self, 0x21, 0xdb);           // and ebx, ebx
+    CHECK_BYTES(!check_or_and_self, 0x48, 0x09, 0xc0);     // or rax, rax
+    CHECK_BYTES(!check_or_and_self, 0x08, 0xc0);           // or al, al
+    CHECK_BYTES(!check_or_and_self, 0x66, 0x09, 0xc0);     // or ax, ax
+    CHECK_BYTES(!check_or_and_self, 0x4d, 0x09, 0xc0);     // or r8, r8
+    // Different registers -- a real computation, not a flag test.
+    CHECK_BYTES( check_or_and_self, 0x09, 0xd8);           // or eax, ebx
+    CHECK_BYTES( check_or_and_self, 0x21, 0xd8);           // and eax, ebx
+    // Immediate and memory forms.
+    CHECK_BYTES( check_or_and_self, 0x83, 0xc8, 0x05);     // or eax, 5
+    CHECK_BYTES( check_or_and_self, 0x09, 0x00);           // or [rax], eax
+    CHECK_BYTES( check_or_and_self, 0x0b, 0x00);           // or eax, [rax]
+    // Not OR/AND.
+    CHECK_BYTES( check_or_and_self, 0x85, 0xc0);           // test eax, eax (already canonical)
+    CHECK_BYTES( check_or_and_self, 0x31, 0xc0);           // xor eax, eax
+    CHECK_BYTES( check_or_and_self, 0x90);                 // nop
+}
+
 static void check_unneeded_movsxd_test(void)
 {
     CHECK_BYTES(!check_unneeded_movsxd, 0x48, 0x63, 0xc0);  // movsxd rax, eax (use cdqe)
@@ -941,6 +964,7 @@ int main(int argc, char *argv[])
     check_oversized_displacement_test();
     check_unneeded_movsxd_test();
     check_sub_self_test();
+    check_or_and_self_test();
     check_imul_to_lea_test();
     check_lea_to_mov_test();
     check_shift_zero_test();

@@ -46,6 +46,8 @@ compiler writers generate better code and documents the complexity of x86.
   - `488D03` (LEA RAX, [RBX]) -- use MOV RAX, RBX (more ports, no AGU)
 * ~~suboptimal NOP sequence~~, see [#9](https://github.com/gaul/x86lint/issues/9)
   - multiple `90` instead of a single `66 90`, etc.
+* suboptimal OR/AND reg, reg
+  - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write)
 * suboptimal SUB reg, reg
   - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking
 * ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)

@@ -264,6 +264,12 @@ static void check_cmp_zero_test(void)
     CHECK_BYTES( check_cmp_zero, 0x83, 0xff, 0x01);  // cmp edx, 1
     CHECK_BYTES( check_cmp_zero, 0x83, 0x3f, 0x00);  // cmp dword ptr [rdi], 0 (memory exempt)
     CHECK_BYTES( check_cmp_zero, 0x83, 0xc7, 0x00);  // add edi, 0 (not cmp)
+    // cmp al, 0 ties test al, al (both 2 bytes), so it is not flagged in
+    // either encoding; every other byte register and width still is.
+    CHECK_BYTES( check_cmp_zero, 0x3c, 0x00);        // cmp al, 0 (2-byte 3C form, ties test al, al)
+    CHECK_BYTES( check_cmp_zero, 0x80, 0xf8, 0x00);  // cmp al, 0 (modrm form; test does not beat the 3C form)
+    CHECK_BYTES( check_cmp_zero, 0x3c, 0x05);        // cmp al, 5 (nonzero, unchanged)
+    CHECK_BYTES(!check_cmp_zero, 0x80, 0xfb, 0x00);  // cmp bl, 0 (no AL short form; test bl, bl is smaller)
 }
 
 static void check_implicit_register_test(void)

@@ -380,6 +380,15 @@ bool check_cmp_zero(const xed_decoded_inst_t *xedd)
         return true;
     }
 
+    // Skip cmp al, 0: its 1-byte-opcode accumulator form (3C 00) is already
+    // 2 bytes, exactly tying test al, al, so substituting test never yields
+    // smaller code. AL is the only register with both a 1-byte CMP opcode
+    // and a 1-byte immediate; every other register and width has a
+    // cmp reg, 0 encoding at least one byte larger than test reg, reg.
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 

@@ -16,6 +16,8 @@ compiler writers generate better code and documents the complexity of x86.
 * missing LOCK prefix on CMPXCHG and XADD
 * oversized ADD 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
+* oversized ADD/SUB one
+  - `83C0 01` instead of `FFC0` (ADD EAX, 1 -> INC EAX, when CF is unused)
 * oversized branch displacement
   - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
 * oversized displacement

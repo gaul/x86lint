@@ -1026,6 +1026,60 @@ bool check_add_zero(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 
+// add reg, 1 and sub reg, 1 (and their -1 counterparts) encode as inc reg /
+// dec reg, one byte shorter:
+//   add eax, 1   83 c0 01   (3 bytes)   ->   inc eax   ff c0   (2 bytes)
+//   sub eax, 1   83 e8 01   (3 bytes)   ->   dec eax   ff c8   (2 bytes)
+// (There is no shorter form in 64-bit mode: the 1-byte 40+r inc/dec opcodes
+// were reclaimed as the REX prefixes, so inc/dec take the 2-byte ff /r form.)
+//
+// inc/dec produce the identical result, so SF/ZF/AF/PF/OF match add/sub by
+// one exactly; the only difference is that inc/dec leave CF unchanged whereas
+// add/sub write it. The rewrite is therefore valid only when CF is dead
+// downstream, so the dispatcher gates this check on FLAG_CF (cf.
+// check_oversized_add128, whose ADD<->SUB flip likewise perturbs only CF).
+//
+// Caveat (not a correctness issue, so not encoded here): because inc/dec
+// write only part of the flags, a later reader of the full flags register can
+// hit a partial-flags merge stall on pre-Sandy-Bridge Intel, which is why
+// some compilers still emit add/sub by one. On current cores the merge is
+// cheap and the byte saving is a clean win.
+//
+// AL is excluded: add al, 1 already fits in 2 bytes via the 04 ib
+// accumulator opcode, exactly tying inc al, so the rewrite saves nothing (cf.
+// check_add_zero, check_cmp_zero). Memory operands are excluded too: the
+// locked read-modify-write forms decode to distinct iclasses and are left to
+// a possible future check.
+bool check_inc_dec(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+        break;
+    default:
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    int32_t imm = (int32_t) xed_decoded_inst_get_signed_immediate(xedd);
+    if (imm != 1 && imm != -1) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
+    return false;
+}
+
 // mov reg, reg with both operands the same register is a no-op, with one
 // exception: mov r32, r32 deliberately zero-extends to the corresponding
 // r64 (writing any 32-bit register clears the upper 32 bits). The 8-,
@@ -1244,6 +1298,7 @@ static const struct check_entry checks[] = {
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0},
     {check_add_zero,                   "redundant ADD/SUB zero",          0},
+    {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},
     {check_unneeded_zero_displacement, "unneeded zero displacement",      0},

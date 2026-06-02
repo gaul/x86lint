@@ -449,6 +449,32 @@ static void check_add_zero_test(void)
     CHECK_BYTES( check_add_zero, 0x01, 0xd8);                    // add eax, ebx (no immediate)
 }
 
+static void check_inc_dec_test(void)
+{
+    // add/sub reg, +/-1 -> inc/dec reg, one byte shorter.
+    CHECK_BYTES(!check_inc_dec, 0x83, 0xc0, 0x01);              // add eax, 1
+    CHECK_BYTES(!check_inc_dec, 0x83, 0xc0, 0xff);              // add eax, -1
+    CHECK_BYTES(!check_inc_dec, 0x83, 0xe8, 0x01);              // sub eax, 1
+    CHECK_BYTES(!check_inc_dec, 0x83, 0xe8, 0xff);              // sub eax, -1
+    CHECK_BYTES(!check_inc_dec, 0x48, 0x83, 0xc0, 0x01);        // add rax, 1
+    CHECK_BYTES(!check_inc_dec, 0x66, 0x83, 0xc0, 0x01);        // add ax, 1
+    CHECK_BYTES(!check_inc_dec, 0x80, 0xc3, 0x01);              // add bl, 1 (8-bit, non-AL)
+    CHECK_BYTES(!check_inc_dec, 0x05, 0x01, 0x00, 0x00, 0x00);  // add eax, 1 (imm32 form)
+    // AL accumulator form already encodes in 2 bytes (04/2c ib), tying
+    // inc/dec al -- no win.
+    CHECK_BYTES( check_inc_dec, 0x04, 0x01);                    // add al, 1
+    CHECK_BYTES( check_inc_dec, 0x2c, 0x01);                    // sub al, 1
+    // |imm| != 1.
+    CHECK_BYTES( check_inc_dec, 0x83, 0xc0, 0x02);              // add eax, 2
+    CHECK_BYTES( check_inc_dec, 0x83, 0xc0, 0x00);              // add eax, 0
+    // No immediate / memory / not ADD-SUB.
+    CHECK_BYTES( check_inc_dec, 0x01, 0xd8);                    // add eax, ebx
+    CHECK_BYTES( check_inc_dec, 0x83, 0x00, 0x01);              // add dword ptr [rax], 1 (memory)
+    CHECK_BYTES( check_inc_dec, 0x83, 0xd0, 0x01);              // adc eax, 1 (not ADD/SUB)
+    CHECK_BYTES( check_inc_dec, 0xff, 0xc0);                    // inc eax (already short)
+    CHECK_BYTES( check_inc_dec, 0x90);                          // nop
+}
+
 static void check_shift_zero_test(void)
 {
     // Immediate count of 0 -- pure no-op for every shift/rotate iclass.
@@ -685,11 +711,12 @@ static void check_flag_liveness_test(void)
     };
     ASSERT_FINDINGS(mov_mov_ret, "suboptimal MOV zero", 1);
 
-    // mov eax, 0 ; add ebx, 1 ; ret -- ADD overwrites all arith flags
-    // before any reader, finding fires.
+    // mov eax, 0 ; add ebx, 2 ; ret -- ADD overwrites all arith flags
+    // before any reader, finding fires. (imm 2, not 1, so the ADD is not
+    // itself an inc/dec candidate.)
     static const uint8_t mov_add_ret[] = {
         0xB8, 0x00, 0x00, 0x00, 0x00,
-        0x83, 0xC3, 0x01,
+        0x83, 0xC3, 0x02,
         0xC3,
     };
     ASSERT_FINDINGS(mov_add_ret, "suboptimal MOV zero", 1);
@@ -702,11 +729,12 @@ static void check_flag_liveness_test(void)
     };
     ASSERT_FINDINGS(imul_jo, "suboptimal IMUL constant", 0);
 
-    // imul eax, eax, 4 ; add ebx, 1 ; ret -- CF/OF overwritten by ADD
-    // before any reader, finding fires.
+    // imul eax, eax, 4 ; add ebx, 2 ; ret -- CF/OF overwritten by ADD
+    // before any reader, finding fires. (imm 2 so the ADD is not an
+    // inc/dec candidate.)
     static const uint8_t imul_add_ret[] = {
         0x6B, 0xC0, 0x04,
-        0x83, 0xC3, 0x01,
+        0x83, 0xC3, 0x02,
         0xC3,
     };
     ASSERT_FINDINGS(imul_add_ret, "suboptimal IMUL constant", 1);
@@ -766,6 +794,29 @@ static void check_flag_liveness_test(void)
         0xC3,
     };
     ASSERT_FINDINGS(addzero_ret, "redundant ADD/SUB zero", 1);
+
+    // add eax, 1 ; ret -- CF dead at ret, inc eax is valid, finding fires.
+    static const uint8_t addone_ret[] = {
+        0x83, 0xC0, 0x01,
+        0xC3,
+    };
+    ASSERT_FINDINGS(addone_ret, "oversized ADD/SUB one", 1);
+
+    // add eax, 1 ; jc +0 -- JC reads CF, which inc would not set, suppress.
+    static const uint8_t addone_jc[] = {
+        0x83, 0xC0, 0x01,
+        0x72, 0x00,
+    };
+    ASSERT_FINDINGS(addone_jc, "oversized ADD/SUB one", 0);
+
+    // add eax, 1 ; add ecx, 2 ; ret -- the second ADD overwrites CF before
+    // any reader (and imm 2 is not itself a candidate), finding fires once.
+    static const uint8_t addone_add_ret[] = {
+        0x83, 0xC0, 0x01,
+        0x83, 0xC1, 0x02,
+        0xC3,
+    };
+    ASSERT_FINDINGS(addone_add_ret, "oversized ADD/SUB one", 1);
 }
 
 // Instruction-flavor corners for flag liveness: pin the analyzer's handling
@@ -799,7 +850,7 @@ static void check_flag_liveness_corners_test(void)
     static const uint8_t add_inc_add[] = {
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0xFF, 0xC3,                    // inc ebx
-        0x83, 0xC1, 0x01,              // add ecx, 1
+        0x83, 0xC1, 0x02,              // add ecx, 2 (imm != 1, not an inc candidate)
         0xC3,                          // ret
     };
     ASSERT_FINDINGS(add_inc_add, "oversized ADD 128", 1);
@@ -857,7 +908,7 @@ static void check_flag_liveness_corners_test(void)
     static const uint8_t mov_sysexit[] = {
         0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
         0x0F, 0x35,                    // sysexit
-        0x83, 0xC3, 0x01,              // add ebx, 1
+        0x83, 0xC3, 0x02,              // add ebx, 2 (imm != 1, not an inc candidate)
         0xC3,                          // ret
     };
     ASSERT_FINDINGS(mov_sysexit, "suboptimal MOV zero", 0);
@@ -883,6 +934,7 @@ int main(int argc, char *argv[])
     check_oversized_branch_test();
     check_mov_self_test();
     check_add_zero_test();
+    check_inc_dec_test();
     check_mov_modrm_imm_test();
     check_unneeded_sib_test();
     check_unneeded_zero_displacement_test();

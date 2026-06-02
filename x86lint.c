@@ -664,10 +664,17 @@ bool check_shift_zero(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 
-// sub reg, reg zeros the register at the same byte cost as xor reg, reg.
-// XOR is the canonical zero idiom that CPUs recognize and break the
-// dependency chain for; SUB does not get that treatment and serializes
-// on the prior value of the register.
+// sub reg, reg zeros the register at the same size as xor reg, reg, but
+// xor is the portable dependency-breaking idiom. Mainstream cores (Intel
+// Sandy Bridge onward, AMD) recognize both xor reg, reg and sub reg, reg
+// at register rename as zeroing idioms that break the dependency on the
+// prior value, but some low-power cores -- e.g. Intel Silvermont/Atom --
+// special-case only xor, leaving sub reg, reg with a false dependency on
+// its old value. xor is never worse, so prefer it.
+//
+// Flag-safe, so no liveness gating: sub reg, reg and xor reg, reg both
+// produce 0 with CF=OF=0, ZF=1, SF=0, PF=1 identically (only AF differs,
+// and AF is unobservable in x86-64).
 bool check_sub_self(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_SUB) {

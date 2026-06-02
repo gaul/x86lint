@@ -321,6 +321,10 @@ static void check_missing_lock_prefix_test(void)
     CHECK_BYTES(!check_missing_lock_prefix, 0x0f, 0xb1, 0x18);  // cmpxchg [rax], ebx
     CHECK_BYTES( check_missing_lock_prefix, 0xf0, 0x0f, 0xc7, 0x08);  // lock cmpxchg8b [rax]
     CHECK_BYTES(!check_missing_lock_prefix, 0x0f, 0xc7, 0x08);  // cmpxchg8b [rax]
+    // Register-form cmpxchg/xadd cannot take a LOCK prefix (#UD), so a
+    // missing prefix is not a fixable finding -- do not flag.
+    CHECK_BYTES( check_missing_lock_prefix, 0x0f, 0xb1, 0xc3);  // cmpxchg ebx, eax (register dst)
+    CHECK_BYTES( check_missing_lock_prefix, 0x0f, 0xc1, 0xc3);  // xadd ebx, eax (register dst)
 }
 
 static void check_superfluous_lock_prefix_test(void)

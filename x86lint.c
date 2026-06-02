@@ -536,6 +536,14 @@ bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_CMPXCHG16B:
     case XED_ICLASS_CMPXCHG8B:
     case XED_ICLASS_XADD:
+        // LOCK is only legal with a memory destination. The register-form
+        // encodings (ModRM.mod == 11, e.g. cmpxchg ebx, eax) cannot take a
+        // LOCK prefix at all -- it would #UD -- so a missing prefix there is
+        // not a fixable finding. (CMPXCHG8B/CMPXCHG16B are memory-only and
+        // always pass this guard.)
+        if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+            return true;
+        }
         if (!has_lock) {
             return false;
         }

@@ -758,6 +758,18 @@ static void check_flag_liveness_corners_test(void)
         0x0F, 0x0B,                    // ud2
     };
     ASSERT_FINDINGS(mov_ud2, "suboptimal MOV zero", 0);
+
+    // sysexit (XED_CATEGORY_SYSRET) returns to user mode carrying the flags
+    // -- it writes none -- so the analyzer must treat it as a control
+    // transfer (LIVE) and not walk past it to the non-successor add. Before
+    // the SYSRET case was added this wrongly fired.
+    static const uint8_t mov_sysexit[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  // mov eax, 0
+        0x0F, 0x35,                    // sysexit
+        0x83, 0xC3, 0x01,              // add ebx, 1
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(mov_sysexit, "suboptimal MOV zero", 0);
 }
 
 int main(int argc, char *argv[])

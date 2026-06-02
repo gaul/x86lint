@@ -989,8 +989,10 @@ static uint32_t flag_set_to_mask(const xed_flag_set_t *fs)
 // by straight-line code, or after hitting a function-exit terminator
 // (RET / IRET; neither the SysV nor Win64 ABI preserves flags across calls).
 //
-// Conservative LIVE on: decode error; any control transfer that isn't a
-// terminator (CALL, conditional or unconditional branch, SYSCALL, INTERRUPT);
+// Conservative LIVE on: decode error; any control transfer that isn't such
+// a terminator -- CALL, conditional or unconditional branch, SYSCALL,
+// SYSRET (sysret/sysexit return to user mode; sysexit carries the flags
+// there rather than overwriting them, so they may be read), INTERRUPT;
 // running out of input; reaching the lookahead bound.
 //
 // "Undefined" flag writes per Intel SDM count as writes -- the original
@@ -1021,6 +1023,7 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
             category == XED_CATEGORY_UNCOND_BR ||
             category == XED_CATEGORY_COND_BR ||
             category == XED_CATEGORY_SYSCALL ||
+            category == XED_CATEGORY_SYSRET ||
             category == XED_CATEGORY_INTERRUPT) {
             return true;
         }

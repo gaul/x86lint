@@ -822,9 +822,9 @@ bool check_or_and_self(const xed_decoded_inst_t *xedd)
 }
 
 // movsxd rax, eax (48 63 c0, 3 bytes) sign-extends EAX into RAX. The
-// CDQE / cltq instruction (48 98, 2 bytes) does the same.
-// TODO: similar opportunities exist for movsx eax, ax -> cwde and
-// movsx ax, al -> cbw.
+// CDQE / cltq instruction (48 98, 2 bytes) does the same. The analogous
+// narrower steps -- movsx eax, ax -> cwde and movsx ax, al -> cbw -- are a
+// distinct iclass (MOVSX, not MOVSXD) and are handled by check_unneeded_movsx.
 bool check_unneeded_movsxd(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOVSXD) {
@@ -834,6 +834,31 @@ bool check_unneeded_movsxd(const xed_decoded_inst_t *xedd)
     xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
     xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
     return !(r0 == XED_REG_RAX && r1 == XED_REG_EAX);
+}
+
+// movsx eax, ax (0f bf c0, 3 bytes) sign-extends AX into EAX; cwde (98, 1
+// byte) does the same. movsx ax, al (66 0f be c0, 4 bytes) sign-extends AL
+// into AX; cbw (66 98, 2 bytes) does the same. Both are accumulator-only --
+// the operands must be exactly the AX<-AL or EAX<-AX step. The AX<-... and
+// RAX<-... widenings have no one-instruction form (cdqe covers only RAX<-EAX,
+// which is the MOVSXD case above), and a memory or non-accumulator source
+// fails the exact-register match. Sign-extension sets no flags, so the
+// rewrite is unconditional.
+bool check_unneeded_movsx(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOVSX) {
+        return true;
+    }
+
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    if (r0 == XED_REG_EAX && r1 == XED_REG_AX) {    // -> cwde
+        return false;
+    }
+    if (r0 == XED_REG_AX && r1 == XED_REG_AL) {     // -> cbw
+        return false;
+    }
+    return true;
 }
 
 // A zero displacement encoded as disp8 or disp32 wastes bytes that could
@@ -1332,6 +1357,7 @@ static const struct check_entry checks[] = {
     {check_unneeded_zero_displacement, "unneeded zero displacement",      0},
     {check_oversized_displacement,     "oversized displacement",          0},
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
+    {check_unneeded_movsx,             "unneeded MOVSX",                  0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
     {check_or_and_self,                "suboptimal OR/AND reg, reg",      0},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},

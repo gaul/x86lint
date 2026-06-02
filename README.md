@@ -57,6 +57,9 @@ compiler writers generate better code and documents the complexity of x86.
 * unneeded explicit register
   - `81C0 00010000` instead of `05 00010000` (ADD EAX, 0x100)
 * unneeded LOCK prefix on XCHG
+* unneeded MOVSX
+  - `0FBFC0` instead of `98` (MOVSX EAX, AX -> CWDE)
+  - `66 0FBEC0` instead of `66 98` (MOVSX AX, AL -> CBW)
 * unneeded MOVSXD
   - `48 63 C0` instead of `48 98` (MOVSXD RAX, EAX -> CDQE)
 * unneeded REX prefix

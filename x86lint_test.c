@@ -606,6 +606,20 @@ static void check_unneeded_movsxd_test(void)
     CHECK_BYTES( check_unneeded_movsxd, 0x90);              // nop (not MOVSXD)
 }
 
+static void check_unneeded_movsx_test(void)
+{
+    CHECK_BYTES(!check_unneeded_movsx, 0x0f, 0xbf, 0xc0);        // movsx eax, ax (use cwde)
+    CHECK_BYTES(!check_unneeded_movsx, 0x66, 0x0f, 0xbe, 0xc0);  // movsx ax, al (use cbw)
+    CHECK_BYTES( check_unneeded_movsx, 0x48, 0x0f, 0xbf, 0xc0);  // movsx rax, ax (16->64, no form)
+    CHECK_BYTES( check_unneeded_movsx, 0x0f, 0xbf, 0xc8);        // movsx ecx, ax (dst not eax)
+    CHECK_BYTES( check_unneeded_movsx, 0x0f, 0xbf, 0xc1);        // movsx eax, cx (src not ax)
+    CHECK_BYTES( check_unneeded_movsx, 0x0f, 0xbf, 0x00);        // movsx eax, [rax] (memory source)
+    CHECK_BYTES( check_unneeded_movsx, 0x48, 0x63, 0xc0);        // movsxd rax, eax (MOVSXD, not MOVSX)
+    CHECK_BYTES( check_unneeded_movsx, 0x0f, 0xb7, 0xc0);        // movzx eax, ax (MOVZX, not MOVSX)
+    CHECK_BYTES( check_unneeded_movsx, 0x98);                    // cwde (already short)
+    CHECK_BYTES( check_unneeded_movsx, 0x90);                    // nop (not MOVSX)
+}
+
 static void check_unneeded_zero_displacement_test(void)
 {
     // Issue #4: disp8=0 and disp32=0 when no displacement would suffice.
@@ -963,6 +977,7 @@ int main(int argc, char *argv[])
     check_unneeded_zero_displacement_test();
     check_oversized_displacement_test();
     check_unneeded_movsxd_test();
+    check_unneeded_movsx_test();
     check_sub_self_test();
     check_or_and_self_test();
     check_imul_to_lea_test();

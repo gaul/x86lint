@@ -93,6 +93,9 @@ bool check_oversized_displacement(const xed_decoded_inst_t *xedd);
 // return false if movsxd rax, eax could be cdqe (cltq in AT&T)
 bool check_unneeded_movsxd(const xed_decoded_inst_t *xedd);
 
+// return false if movsx eax, ax could be cwde or movsx ax, al could be cbw
+bool check_unneeded_movsx(const xed_decoded_inst_t *xedd);
+
 // return false if sub reg, reg is used as a zero idiom -- xor reg, reg is
 // the canonical form that CPUs recognize as dependency-breaking
 bool check_sub_self(const xed_decoded_inst_t *xedd);

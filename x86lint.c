@@ -337,6 +337,30 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd)
         }
         break;
     }
+    case XED_ICLASS_MOVZX: {
+        // movzx r64, r/m8 and movzx r64, r/m16 zero-extend the source through
+        // bit 63; the movzx r32 form produces the identical 64-bit value via
+        // the 32-bit-write zero-extension rule, so REX.W is redundant. (movsx
+        // is *not* equivalent: its r32 form sign-extends to 32 then
+        // zero-extends, leaving bits 32-63 clear rather than sign-filled --
+        // so MOVSX/MOVSXD keep REX.W and fall through to the scan below.)
+        //
+        // As with the xor idiom, only flag when dropping REX.W removes the
+        // whole REX byte: REX.R/X/B == 0 rules out an extended destination
+        // (REX.R), extended byte/word source (REX.B), or extended memory
+        // base/index (REX.X/B), and a SPL/BPL/SIL/DIL source still needs a
+        // bare REX to select the uniform byte register.
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        if (xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd)) &&
+            xed3_operand_get_rexr(xedd) == 0 &&
+            xed3_operand_get_rexx(xedd) == 0 &&
+            xed3_operand_get_rexb(xedd) == 0 &&
+            src != XED_REG_SPL && src != XED_REG_BPL &&
+            src != XED_REG_SIL && src != XED_REG_DIL) {
+            return false;
+        }
+        break;
+    }
     default:
         break;
     }

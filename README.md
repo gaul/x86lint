@@ -54,6 +54,7 @@ compiler writers generate better code and documents the complexity of x86.
 * unneeded REX prefix
   - XOR RAX, RAX `4831C0` instead of XOR EAX, EAX `31C0`
   - `40C9` instead of `C9` (LEAVE)
+  - `48 0FB6C3` instead of `0FB6C3` (MOVZX RAX, BL -> MOVZX EAX, BL; the r32 form zero-extends to 64)
 * unneeded SIB byte
   - `C64465 04 05` instead of `C645 04 05` (MOV byte [RBP+4], 5)
 * unneeded zero displacement

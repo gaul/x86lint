@@ -249,6 +249,19 @@ static void check_unneeded_rex_test(void)
     CHECK_BYTES( check_unneeded_rex, 0x48, 0x8b, 0x01);  // mov rax, [rcx] (REX.W needed for 64-bit op)
     CHECK_BYTES( check_unneeded_rex, 0x41, 0x8b, 0x00);  // mov eax, [r8] (REX.B needed for r8 base)
     CHECK_BYTES( check_unneeded_rex, 0x48, 0x0f, 0x1f, 0x00);  // rex.w nop [rax] (REX.W kept, not flagged)
+    // MOVZX r64, r/m8|r/m16: REX.W is redundant because the r32 form
+    // zero-extends identically through bit 63. Flagged only when dropping
+    // REX.W removes the whole REX byte.
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x0f, 0xb6, 0xc3);  // movzx rax, bl
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x0f, 0xb6, 0xc0);  // movzx rax, al
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x0f, 0xb7, 0xc3);  // movzx rax, bx (r/m16 form)
+    CHECK_BYTES(!check_unneeded_rex, 0x48, 0x0f, 0xb6, 0x00);  // movzx rax, byte [rax]
+    CHECK_BYTES( check_unneeded_rex, 0x0f, 0xb6, 0xc3);        // movzx eax, bl (no REX)
+    CHECK_BYTES( check_unneeded_rex, 0x4c, 0x0f, 0xb6, 0xc3);  // movzx r8, bl (REX.R needed for dest)
+    CHECK_BYTES( check_unneeded_rex, 0x48, 0x0f, 0xb6, 0xc6);  // movzx rax, sil (bare REX needed)
+    CHECK_BYTES( check_unneeded_rex, 0x49, 0x0f, 0xb6, 0xc0);  // movzx rax, r8b (REX.B needed)
+    CHECK_BYTES( check_unneeded_rex, 0x49, 0x0f, 0xb6, 0x00);  // movzx rax, byte [r8] (REX.B needed)
+    CHECK_BYTES( check_unneeded_rex, 0x48, 0x0f, 0xbe, 0xc3);  // movsx rax, bl (REX.W real; MOVSX sign-extends to 64)
 }
 
 static void check_mov_zero_test(void)

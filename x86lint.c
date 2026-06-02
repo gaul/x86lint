@@ -623,6 +623,45 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// xchg between a word/dword/qword accumulator (AX/EAX/RAX) and another
+// register has a one-byte 90+r form; the modrm form (87 /r) is one byte
+// longer:
+//   xchg eax, ecx   87 c8   (2 bytes)
+//   xchg ecx, eax   91      (1 byte)
+//
+// Excluded:
+//   - memory operands: there is no 90+r form for xchg r/m, r (and a
+//     memory xchg carries an implicit LOCK, so it is never a bare move).
+//   - 8-bit xchg (AL): 90+r is word-size and up, so xchg al, r8 has no
+//     short form.
+//   - xchg acc, acc (same register): the 90+r encoding would be 0x90,
+//     which is NOP and -- unlike xchg eax, eax via 87 c0 -- does not
+//     zero-extend the accumulator into its 64-bit register.
+bool check_xchg_accumulator(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_XCHG) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    // The 90+r short form carries no modrm byte; only the 87 /r form does.
+    if (!xed_operand_values_has_modrm_byte(xedd)) {
+        return true;
+    }
+
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    if (r0 == r1) {
+        return true;
+    }
+
+    bool accumulator =
+        r0 == XED_REG_AX || r0 == XED_REG_EAX || r0 == XED_REG_RAX ||
+        r1 == XED_REG_AX || r1 == XED_REG_EAX || r1 == XED_REG_RAX;
+    return !accumulator;
+}
+
 // IMUL r, r, imm by a small constant can be replaced by a single LEA,
 // which on most uarches has shorter latency and uses the AGU instead of
 // the multiplier.
@@ -1163,6 +1202,7 @@ static const struct check_entry checks[] = {
     {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
+    {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0},
     {check_add_zero,                   "redundant ADD/SUB zero",          0},

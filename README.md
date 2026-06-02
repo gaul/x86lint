@@ -26,6 +26,8 @@ compiler writers generate better code and documents the complexity of x86.
 * oversized MOV encoding
   - `C7C0 01000000` instead of `B8 01000000` (MOV EAX, 1)
   - `48 C7C0 01000000` instead of `B8 01000000` (MOV RAX, 1; the 32-bit form zero-extends)
+* oversized XCHG encoding
+  - `87C8` instead of `91` (XCHG EAX, ECX; the 90+r accumulator form is one byte)
 * redundant ADD/SUB zero
   - `83C0 00` (ADD EAX, 0) -- use TEST or remove
 * redundant MOV reg, reg

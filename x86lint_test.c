@@ -368,6 +368,30 @@ static void check_superfluous_lock_prefix_test(void)
     CHECK_BYTES( check_superfluous_lock_prefix, 0x87, 0x07);  // xchg [eax], ebx
 }
 
+static void check_xchg_accumulator_test(void)
+{
+    // modrm xchg with an accumulator operand -- shrinks to the 1-byte 90+r.
+    CHECK_BYTES(!check_xchg_accumulator, 0x87, 0xc8);              // xchg eax, ecx
+    CHECK_BYTES(!check_xchg_accumulator, 0x87, 0xc1);              // xchg ecx, eax (acc is REG0)
+    CHECK_BYTES(!check_xchg_accumulator, 0x48, 0x87, 0xc8);        // xchg rax, rcx
+    CHECK_BYTES(!check_xchg_accumulator, 0x66, 0x87, 0xc8);        // xchg ax, cx
+    CHECK_BYTES(!check_xchg_accumulator, 0x44, 0x87, 0xc0);        // xchg eax, r8d
+    // Already the 90+r short form -- nothing to flag.
+    CHECK_BYTES( check_xchg_accumulator, 0x91);                   // xchg ecx, eax (90+r)
+    CHECK_BYTES( check_xchg_accumulator, 0x90);                   // nop (xchg eax, eax short form)
+    // xchg eax, eax via modrm: 90 is NOP and does not zero-extend, so the
+    // short form is not equivalent.
+    CHECK_BYTES( check_xchg_accumulator, 0x87, 0xc0);             // xchg eax, eax
+    // No accumulator operand -- no short form exists.
+    CHECK_BYTES( check_xchg_accumulator, 0x87, 0xcb);             // xchg ebx, ecx
+    // 8-bit xchg has no 90+r form.
+    CHECK_BYTES( check_xchg_accumulator, 0x86, 0xc8);             // xchg al, cl
+    // Memory operand -- no 90+r form (and an implicit LOCK).
+    CHECK_BYTES( check_xchg_accumulator, 0x87, 0x07);            // xchg [rdi], eax
+    // Not XCHG.
+    CHECK_BYTES( check_xchg_accumulator, 0x89, 0xc8);            // mov eax, ecx
+}
+
 static void check_oversized_branch_test(void)
 {
     // JMP rel32 with small displacement -- fits in rel8.
@@ -830,6 +854,7 @@ int main(int argc, char *argv[])
     check_and_strength_reduce_test();
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
+    check_xchg_accumulator_test();
     check_oversized_branch_test();
     check_mov_self_test();
     check_add_zero_test();

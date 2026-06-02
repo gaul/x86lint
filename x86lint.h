@@ -53,6 +53,10 @@ bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
 // return false if instruction should not have a LOCK prefix
 bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd);
 
+// return false if xchg with an accumulator uses the modrm form (87 /r)
+// when the one-byte 90+r form would do
+bool check_xchg_accumulator(const xed_decoded_inst_t *xedd);
+
 // return false if a JMP or Jcc uses rel32 when rel8 would reach the target
 bool check_oversized_branch(const xed_decoded_inst_t *xedd);
 

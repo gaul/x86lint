@@ -131,18 +131,28 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
-// Check for ADD REG, 128 which encodes as 5 bytes instead of SUB REG, -128
-// which encodes in 3 bytes.
+// Check for ADD REG, 128 and SUB REG, 128, which need an imm32 (128 is one
+// past the +127 ceiling of a sign-extended imm8) and so encode in 5-6 bytes,
+// when the negated-operation form fits in 3:
+//   add reg, 128   05 80000000   ->   sub reg, -128   83 e8 80
+//   sub reg, 128   2d 80000000   ->   add reg, -128   83 c0 80
+// 128 is the only such value: any other immediate either already fits a
+// sign-extended imm8 or its negation does not either.
 //
 // False positive if surrounding code reads CF: ADD sets CF on unsigned
 // overflow, SUB sets CF on borrow, so a subsequent JC/JNC/ADC/SBB diverges.
+// The dispatcher gates this on FLAG_CF.
 bool check_oversized_add128(const xed_decoded_inst_t *xedd)
 {
     if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
         return true;
     }
 
-    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_ADD) {
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+        break;
+    default:
         return true;
     }
 
@@ -1338,7 +1348,7 @@ struct check_entry {
 // (not a decoded instruction) and reports a 2-instruction window.
 static const struct check_entry checks[] = {
     {check_oversized_immediate,        "oversized immediate",             0},
-    {check_oversized_add128,           "oversized ADD 128",               FLAG_CF},
+    {check_oversized_add128,           "oversized ADD/SUB 128",           FLAG_CF},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},
     {check_mov_zero,                   "suboptimal MOV zero",             FLAG_ARITH},

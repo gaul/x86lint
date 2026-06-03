@@ -26,7 +26,8 @@ bool check_suboptimal_nops(const uint8_t *inst, size_t len);
 // return false if instruction has an oversized immediate
 bool check_oversized_immediate(const xed_decoded_inst_t *xedd);
 
-// return false if instruction encodes ADD REG, 128 (5 bytes) instead of SUB REG, -128 (3 bytes)
+// return false if instruction encodes ADD REG, 128 / SUB REG, 128 (5-6 bytes)
+// instead of the negated SUB REG, -128 / ADD REG, -128 (3 bytes)
 bool check_oversized_add128(const xed_decoded_inst_t *xedd);
 
 // return false if instruction has an unneeded rex prefix

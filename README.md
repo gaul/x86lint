@@ -14,8 +14,9 @@ compiler writers generate better code and documents the complexity of x86.
 ## Implemented analyses
 
 * missing LOCK prefix on CMPXCHG and XADD
-* oversized ADD 128
+* oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
+  - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)
 * oversized ADD/SUB one
   - `83C0 01` instead of `FFC0` (ADD EAX, 1 -> INC EAX, when CF is unused)
 * oversized branch displacement

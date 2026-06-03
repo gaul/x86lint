@@ -203,9 +203,21 @@ static void check_oversized_immediate_test(void)
 
 static void check_oversized_add128_test(void)
 {
-    CHECK_BYTES( check_oversized_add128, 0x83, 0xC0, 0x7F);  // add eax, 0x7f
-    CHECK_BYTES(!check_oversized_add128, 0x05, 0x80, 0x00, 0x00, 0x00);  // add eax, 0x80
-    CHECK_BYTES( check_oversized_add128, 0x83, 0xE8, 0xFF);  // sub eax, -0x80
+    // ADD 128 -> SUB -128.
+    CHECK_BYTES( check_oversized_add128, 0x83, 0xC0, 0x7F);                    // add eax, 0x7f (imm8, fits)
+    CHECK_BYTES(!check_oversized_add128, 0x05, 0x80, 0x00, 0x00, 0x00);        // add eax, 128 (imm32)
+    CHECK_BYTES(!check_oversized_add128, 0x81, 0xC0, 0x80, 0x00, 0x00, 0x00);  // add eax, 128 (modrm imm32)
+    CHECK_BYTES( check_oversized_add128, 0x83, 0xC0, 0x80);                    // add eax, -128 (imm8, already short)
+    // SUB 128 -> ADD -128 (symmetric).
+    CHECK_BYTES(!check_oversized_add128, 0x2D, 0x80, 0x00, 0x00, 0x00);        // sub eax, 128 (imm32)
+    CHECK_BYTES(!check_oversized_add128, 0x81, 0xE8, 0x80, 0x00, 0x00, 0x00);  // sub eax, 128 (modrm imm32)
+    CHECK_BYTES(!check_oversized_add128, 0x48, 0x2D, 0x80, 0x00, 0x00, 0x00);  // sub rax, 128
+    CHECK_BYTES(!check_oversized_add128, 0x81, 0x28, 0x80, 0x00, 0x00, 0x00);  // sub dword [rax], 128 (memory)
+    CHECK_BYTES( check_oversized_add128, 0x83, 0xE8, 0x80);                    // sub eax, -128 (imm8, already short)
+    CHECK_BYTES( check_oversized_add128, 0x83, 0xE8, 0x7F);                    // sub eax, 127 (imm8, fits)
+    CHECK_BYTES( check_oversized_add128, 0x2D, 0x81, 0x00, 0x00, 0x00);        // sub eax, 129 (neither it nor -129 fits imm8)
+    // Not ADD/SUB.
+    CHECK_BYTES( check_oversized_add128, 0x81, 0xE0, 0x80, 0x00, 0x00, 0x00);  // and eax, 128
 }
 
 static void check_unneeded_rex_test(void)
@@ -880,7 +892,7 @@ static void check_flag_liveness_corners_test(void)
         0x11, 0xD1,                    // adc ecx, edx
         0xC3,                          // ret
     };
-    ASSERT_FINDINGS(add_inc_adc, "oversized ADD 128", 0);
+    ASSERT_FINDINGS(add_inc_adc, "oversized ADD/SUB 128", 0);
 
     // Same shape but the second ADD (not ADC) overwrites CF before any
     // reader, so the oversized_add128 finding fires.
@@ -890,7 +902,7 @@ static void check_flag_liveness_corners_test(void)
         0x83, 0xC1, 0x02,              // add ecx, 2 (imm != 1, not an inc candidate)
         0xC3,                          // ret
     };
-    ASSERT_FINDINGS(add_inc_add, "oversized ADD 128", 1);
+    ASSERT_FINDINGS(add_inc_add, "oversized ADD/SUB 128", 1);
 
     // SETcc reads a status flag and writes a byte register; treated as a
     // flag reader by the analyzer.

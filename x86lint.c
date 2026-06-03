@@ -1319,6 +1319,7 @@ struct x86lint_summary {
     } entries[X86LINT_SUMMARY_MAX];
     size_t count;
     size_t instructions;   // total decoded instructions across all runs
+    size_t skipped;        // undecodable bytes skipped during resync
 };
 
 x86lint_summary *x86lint_summary_create(void)
@@ -1334,6 +1335,11 @@ void x86lint_summary_destroy(x86lint_summary *summary)
 size_t x86lint_summary_instructions(const x86lint_summary *summary)
 {
     return summary == NULL ? 0 : summary->instructions;
+}
+
+size_t x86lint_summary_skipped(const x86lint_summary *summary)
+{
+    return summary == NULL ? 0 : summary->skipped;
 }
 
 // Tally one finding by its name (a stable string literal owned by the check
@@ -1359,37 +1365,47 @@ static void summary_add(x86lint_summary *summary, const char *name)
 
 void x86lint_summary_print(const x86lint_summary *summary)
 {
-    if (summary == NULL || summary->count == 0) {
+    if (summary == NULL) {
         return;
     }
 
-    // Order by descending count, ties broken by name for determinism.
-    size_t order[X86LINT_SUMMARY_MAX];
-    for (size_t i = 0; i < summary->count; ++i) {
-        order[i] = i;
-    }
-    for (size_t i = 0; i < summary->count; ++i) {
-        size_t best = i;
-        for (size_t j = i + 1; j < summary->count; ++j) {
-            unsigned cj = summary->entries[order[j]].count;
-            unsigned cb = summary->entries[order[best]].count;
-            if (cj > cb ||
-                (cj == cb && strcmp(summary->entries[order[j]].name,
-                                    summary->entries[order[best]].name) < 0)) {
-                best = j;
-            }
+    if (summary->count > 0) {
+        // Order by descending count, ties broken by name for determinism.
+        size_t order[X86LINT_SUMMARY_MAX];
+        for (size_t i = 0; i < summary->count; ++i) {
+            order[i] = i;
         }
-        size_t tmp = order[i];
-        order[i] = order[best];
-        order[best] = tmp;
+        for (size_t i = 0; i < summary->count; ++i) {
+            size_t best = i;
+            for (size_t j = i + 1; j < summary->count; ++j) {
+                unsigned cj = summary->entries[order[j]].count;
+                unsigned cb = summary->entries[order[best]].count;
+                if (cj > cb ||
+                    (cj == cb && strcmp(summary->entries[order[j]].name,
+                                        summary->entries[order[best]].name) < 0)) {
+                    best = j;
+                }
+            }
+            size_t tmp = order[i];
+            order[i] = order[best];
+            order[best] = tmp;
+        }
+
+        printf("Optimization opportunities by type:\n");
+        for (size_t i = 0; i < summary->count; ++i) {
+            printf("  %6u  %s\n", summary->entries[order[i]].count,
+                summary->entries[order[i]].name);
+        }
+        printf("\n");
     }
 
-    printf("Optimization opportunities by type:\n");
-    for (size_t i = 0; i < summary->count; ++i) {
-        printf("  %6u  %s\n", summary->entries[order[i]].count,
-            summary->entries[order[i]].name);
+    // Undecodable bytes mean the section interleaves data with code (common in
+    // Go binaries and jump tables); report them so incomplete coverage is not
+    // mistaken for a clean scan.
+    if (summary->skipped > 0) {
+        printf("%zu undecodable byte%s skipped (data in code section?)\n\n",
+            summary->skipped, summary->skipped == 1 ? "" : "s");
     }
-    printf("\n");
 }
 
 // In verbose mode print a finding as a one-line summary -- the offending
@@ -1474,9 +1490,19 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
-            printf("Decoding error at offset: 0x%zx: %s\n",
-                offset, xed_error_enum_t2str(err));
-            return -1;
+            // Not necessarily a real error: executable sections routinely
+            // embed data (jump tables, Go's BoringCrypto signature, alignment
+            // islands) that linear-sweep decoding walks into. Skip one byte
+            // and resync rather than abandoning the rest of the section.
+            if (verbose) {
+                printf("Decoding error at offset: 0x%zx: %s\n",
+                    offset, xed_error_enum_t2str(err));
+            }
+            if (summary != NULL) {
+                summary->skipped++;
+            }
+            offset += 1;
+            continue;
         }
 
         if (summary != NULL) {

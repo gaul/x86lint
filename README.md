@@ -102,8 +102,9 @@ found, which a test can assert is zero:
 #include "x86lint.h"
 
 // inst/len: the x86-64 bytes to check (e.g. a function the compiler just
-// emitted). Returns the opportunity count (0 == clean), or -1 on a decode
-// error.
+// emitted). Returns the opportunity count (0 == clean). An undecodable byte
+// is skipped and the scan resyncs rather than failing, since executable input
+// can interleave data with code.
 int lint(const uint8_t *inst, size_t len)
 {
     xed_tables_init();
@@ -114,6 +115,8 @@ int lint(const uint8_t *inst, size_t len)
 The optional `summary` accumulates a by-type tally across one or more runs
 (`x86lint_summary_create` / `_print` / `_destroy`; pass `NULL` to skip it),
 and `verbose` controls whether each opportunity is printed as it is found.
+`x86lint_summary_skipped` reports how many undecodable bytes were skipped, so
+incomplete coverage of a data-laden section is not mistaken for a clean scan.
 
 x86lint can also read arbitrary 64-bit ELF executables directly. By default it
 prints only a summary -- the opportunities grouped by type and sorted by

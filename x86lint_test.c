@@ -965,6 +965,26 @@ static void check_flag_liveness_corners_test(void)
     ASSERT_FINDINGS(mov_sysexit, "suboptimal MOV zero", 0);
 }
 
+// An undecodable byte (executable sections routinely embed data) must not
+// abort the scan: linear sweep skips one byte, resyncs, and still flags the
+// instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
+static void check_decode_resync_test(void)
+{
+    static const uint8_t inst[] = {
+        0x90,                          // nop (decodes, no finding)
+        0x06,                          // (bad) push es -- undecodable
+        0x68, 0x01, 0x00, 0x00, 0x00,  // push 0x1 (oversized immediate)
+    };
+
+    x86lint_summary *summary = x86lint_summary_create();
+    assert(summary != NULL);
+    int findings = check_instructions(inst, sizeof(inst), false, summary);
+    assert(findings == 1);                              // not -1; scan continued
+    assert(x86lint_summary_skipped(summary) == 1);      // the one bad byte
+    assert(x86lint_summary_instructions(summary) == 2); // nop + push, not the byte
+    x86lint_summary_destroy(summary);
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -999,6 +1019,7 @@ int main(int argc, char *argv[])
     check_shift_zero_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
+    check_decode_resync_test();
 
     static const uint8_t inst[] = {
         0x90, 0x90,  // nop ; nop

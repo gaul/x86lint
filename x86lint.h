@@ -28,7 +28,7 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd);
 
 // return false if instruction encodes ADD REG, 128 / SUB REG, 128 (5-6 bytes)
 // instead of the negated SUB REG, -128 / ADD REG, -128 (3 bytes)
-bool check_oversized_add128(const xed_decoded_inst_t *xedd);
+bool check_oversized_add_sub_128(const xed_decoded_inst_t *xedd);
 
 // return false if instruction has an unneeded rex prefix
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd);
@@ -68,7 +68,7 @@ bool check_mov_self(const xed_decoded_inst_t *xedd);
 // return false if instruction is add reg, 0 or sub reg, 0 (use TEST
 // reg, reg instead for the flag side-effect, or remove the instruction
 // if flags are unused)
-bool check_add_zero(const xed_decoded_inst_t *xedd);
+bool check_add_sub_zero(const xed_decoded_inst_t *xedd);
 
 // return false if add reg, 1 / sub reg, 1 (or the -1 forms) could be inc
 // reg / dec reg, which is one byte shorter (valid when CF is dead, since

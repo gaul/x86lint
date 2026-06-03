@@ -201,23 +201,23 @@ static void check_oversized_immediate_test(void)
     CHECK_BYTES( check_oversized_immediate, 0x6a, 0x01);                          // push 1 (imm8, already short)
 }
 
-static void check_oversized_add128_test(void)
+static void check_oversized_add_sub_128_test(void)
 {
     // ADD 128 -> SUB -128.
-    CHECK_BYTES( check_oversized_add128, 0x83, 0xC0, 0x7F);                    // add eax, 0x7f (imm8, fits)
-    CHECK_BYTES(!check_oversized_add128, 0x05, 0x80, 0x00, 0x00, 0x00);        // add eax, 128 (imm32)
-    CHECK_BYTES(!check_oversized_add128, 0x81, 0xC0, 0x80, 0x00, 0x00, 0x00);  // add eax, 128 (modrm imm32)
-    CHECK_BYTES( check_oversized_add128, 0x83, 0xC0, 0x80);                    // add eax, -128 (imm8, already short)
+    CHECK_BYTES( check_oversized_add_sub_128, 0x83, 0xC0, 0x7F);                    // add eax, 0x7f (imm8, fits)
+    CHECK_BYTES(!check_oversized_add_sub_128, 0x05, 0x80, 0x00, 0x00, 0x00);        // add eax, 128 (imm32)
+    CHECK_BYTES(!check_oversized_add_sub_128, 0x81, 0xC0, 0x80, 0x00, 0x00, 0x00);  // add eax, 128 (modrm imm32)
+    CHECK_BYTES( check_oversized_add_sub_128, 0x83, 0xC0, 0x80);                    // add eax, -128 (imm8, already short)
     // SUB 128 -> ADD -128 (symmetric).
-    CHECK_BYTES(!check_oversized_add128, 0x2D, 0x80, 0x00, 0x00, 0x00);        // sub eax, 128 (imm32)
-    CHECK_BYTES(!check_oversized_add128, 0x81, 0xE8, 0x80, 0x00, 0x00, 0x00);  // sub eax, 128 (modrm imm32)
-    CHECK_BYTES(!check_oversized_add128, 0x48, 0x2D, 0x80, 0x00, 0x00, 0x00);  // sub rax, 128
-    CHECK_BYTES(!check_oversized_add128, 0x81, 0x28, 0x80, 0x00, 0x00, 0x00);  // sub dword [rax], 128 (memory)
-    CHECK_BYTES( check_oversized_add128, 0x83, 0xE8, 0x80);                    // sub eax, -128 (imm8, already short)
-    CHECK_BYTES( check_oversized_add128, 0x83, 0xE8, 0x7F);                    // sub eax, 127 (imm8, fits)
-    CHECK_BYTES( check_oversized_add128, 0x2D, 0x81, 0x00, 0x00, 0x00);        // sub eax, 129 (neither it nor -129 fits imm8)
+    CHECK_BYTES(!check_oversized_add_sub_128, 0x2D, 0x80, 0x00, 0x00, 0x00);        // sub eax, 128 (imm32)
+    CHECK_BYTES(!check_oversized_add_sub_128, 0x81, 0xE8, 0x80, 0x00, 0x00, 0x00);  // sub eax, 128 (modrm imm32)
+    CHECK_BYTES(!check_oversized_add_sub_128, 0x48, 0x2D, 0x80, 0x00, 0x00, 0x00);  // sub rax, 128
+    CHECK_BYTES(!check_oversized_add_sub_128, 0x81, 0x28, 0x80, 0x00, 0x00, 0x00);  // sub dword [rax], 128 (memory)
+    CHECK_BYTES( check_oversized_add_sub_128, 0x83, 0xE8, 0x80);                    // sub eax, -128 (imm8, already short)
+    CHECK_BYTES( check_oversized_add_sub_128, 0x83, 0xE8, 0x7F);                    // sub eax, 127 (imm8, fits)
+    CHECK_BYTES( check_oversized_add_sub_128, 0x2D, 0x81, 0x00, 0x00, 0x00);        // sub eax, 129 (neither it nor -129 fits imm8)
     // Not ADD/SUB.
-    CHECK_BYTES( check_oversized_add128, 0x81, 0xE0, 0x80, 0x00, 0x00, 0x00);  // and eax, 128
+    CHECK_BYTES( check_oversized_add_sub_128, 0x81, 0xE0, 0x80, 0x00, 0x00, 0x00);  // and eax, 128
 }
 
 static void check_unneeded_rex_test(void)
@@ -443,22 +443,22 @@ static void check_mov_self_test(void)
     CHECK_BYTES( check_mov_self, 0x90);              // nop (not MOV)
 }
 
-static void check_add_zero_test(void)
+static void check_add_sub_zero_test(void)
 {
-    CHECK_BYTES(!check_add_zero, 0x83, 0xc0, 0x00);              // add eax, 0
-    CHECK_BYTES(!check_add_zero, 0x48, 0x83, 0xc0, 0x00);        // add rax, 0
-    CHECK_BYTES(!check_add_zero, 0x83, 0xe8, 0x00);              // sub eax, 0
-    CHECK_BYTES(!check_add_zero, 0x05, 0x00, 0x00, 0x00, 0x00);  // add eax, 0 (imm32 form)
-    CHECK_BYTES( check_add_zero, 0x83, 0xc0, 0x01);              // add eax, 1 (not zero)
-    CHECK_BYTES( check_add_zero, 0x83, 0x00, 0x00);              // add dword ptr [rax], 0 (memory)
-    CHECK_BYTES( check_add_zero, 0x83, 0xd0, 0x00);              // adc eax, 0 (not ADD/SUB)
-    CHECK_BYTES( check_add_zero, 0x90);                          // nop
+    CHECK_BYTES(!check_add_sub_zero, 0x83, 0xc0, 0x00);              // add eax, 0
+    CHECK_BYTES(!check_add_sub_zero, 0x48, 0x83, 0xc0, 0x00);        // add rax, 0
+    CHECK_BYTES(!check_add_sub_zero, 0x83, 0xe8, 0x00);              // sub eax, 0
+    CHECK_BYTES(!check_add_sub_zero, 0x05, 0x00, 0x00, 0x00, 0x00);  // add eax, 0 (imm32 form)
+    CHECK_BYTES( check_add_sub_zero, 0x83, 0xc0, 0x01);              // add eax, 1 (not zero)
+    CHECK_BYTES( check_add_sub_zero, 0x83, 0x00, 0x00);              // add dword ptr [rax], 0 (memory)
+    CHECK_BYTES( check_add_sub_zero, 0x83, 0xd0, 0x00);              // adc eax, 0 (not ADD/SUB)
+    CHECK_BYTES( check_add_sub_zero, 0x90);                          // nop
     // add al, 0 / sub al, 0 already fit in 2 bytes (04/2c ib), tying
     // test al, al -- no win, so not flagged. Other byte registers still are.
-    CHECK_BYTES( check_add_zero, 0x04, 0x00);                    // add al, 0 (accumulator form)
-    CHECK_BYTES( check_add_zero, 0x2c, 0x00);                    // sub al, 0 (accumulator form)
-    CHECK_BYTES(!check_add_zero, 0x80, 0xc3, 0x00);              // add bl, 0 (no short form; test bl, bl smaller)
-    CHECK_BYTES( check_add_zero, 0x01, 0xd8);                    // add eax, ebx (no immediate)
+    CHECK_BYTES( check_add_sub_zero, 0x04, 0x00);                    // add al, 0 (accumulator form)
+    CHECK_BYTES( check_add_sub_zero, 0x2c, 0x00);                    // sub al, 0 (accumulator form)
+    CHECK_BYTES(!check_add_sub_zero, 0x80, 0xc3, 0x00);              // add bl, 0 (no short form; test bl, bl smaller)
+    CHECK_BYTES( check_add_sub_zero, 0x01, 0xd8);                    // add eax, ebx (no immediate)
 }
 
 static void check_inc_dec_test(void)
@@ -970,7 +970,7 @@ int main(int argc, char *argv[])
 
     check_suboptimal_nops_test();
     check_oversized_immediate_test();
-    check_oversized_add128_test();
+    check_oversized_add_sub_128_test();
     check_unneeded_rex_test();
     check_cmp_zero_test();
     check_mov_zero_test();
@@ -982,7 +982,7 @@ int main(int argc, char *argv[])
     check_xchg_accumulator_test();
     check_oversized_branch_test();
     check_mov_self_test();
-    check_add_zero_test();
+    check_add_sub_zero_test();
     check_inc_dec_test();
     check_mov_modrm_imm_test();
     check_unneeded_sib_test();

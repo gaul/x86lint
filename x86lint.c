@@ -142,7 +142,7 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
 // False positive if surrounding code reads CF: ADD sets CF on unsigned
 // overflow, SUB sets CF on borrow, so a subsequent JC/JNC/ADC/SBB diverges.
 // The dispatcher gates this on FLAG_CF.
-bool check_oversized_add128(const xed_decoded_inst_t *xedd)
+bool check_oversized_add_sub_128(const xed_decoded_inst_t *xedd)
 {
     if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
         return true;
@@ -812,11 +812,11 @@ bool check_sub_self(const xed_decoded_inst_t *xedd)
 // memory forms cannot have both operands the same register, so the r0 == r1
 // test excludes them, as in check_sub_self.)
 //
-// Not flag-gated (cf. check_add_zero): test reproduces the flags, so the
+// Not flag-gated (cf. check_add_sub_zero): test reproduces the flags, so the
 // rewrite holds whether or not they are live, and when they are dead the
 // instruction can be removed outright. The 32-bit form's incidental
 // zero-extension into the upper 64 bits is treated as not relied upon, the
-// same way check_add_zero treats add eax, 0.
+// same way check_add_sub_zero treats add eax, 0.
 bool check_or_and_self(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -1064,7 +1064,7 @@ bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd)
 // accumulator opcode, exactly tying test al, al, so substituting test
 // saves nothing (cf. check_cmp_zero). Memory operands are excluded too:
 // those touches may be intentional (cache-line warm, MMIO trigger).
-bool check_add_zero(const xed_decoded_inst_t *xedd)
+bool check_add_sub_zero(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_ADD:
@@ -1100,7 +1100,7 @@ bool check_add_zero(const xed_decoded_inst_t *xedd)
 // one exactly; the only difference is that inc/dec leave CF unchanged whereas
 // add/sub write it. The rewrite is therefore valid only when CF is dead
 // downstream, so the dispatcher gates this check on FLAG_CF (cf.
-// check_oversized_add128, whose ADD<->SUB flip likewise perturbs only CF).
+// check_oversized_add_sub_128, whose ADD<->SUB flip likewise perturbs only CF).
 //
 // Caveat (not a correctness issue, so not encoded here): because inc/dec
 // write only part of the flags, a later reader of the full flags register can
@@ -1110,7 +1110,7 @@ bool check_add_zero(const xed_decoded_inst_t *xedd)
 //
 // AL is excluded: add al, 1 already fits in 2 bytes via the 04 ib
 // accumulator opcode, exactly tying inc al, so the rewrite saves nothing (cf.
-// check_add_zero, check_cmp_zero). Memory operands are excluded too: the
+// check_add_sub_zero, check_cmp_zero). Memory operands are excluded too: the
 // locked read-modify-write forms decode to distinct iclasses and are left to
 // a possible future check.
 bool check_inc_dec(const xed_decoded_inst_t *xedd)
@@ -1348,7 +1348,7 @@ struct check_entry {
 // (not a decoded instruction) and reports a 2-instruction window.
 static const struct check_entry checks[] = {
     {check_oversized_immediate,        "oversized immediate",             0},
-    {check_oversized_add128,           "oversized ADD/SUB 128",           FLAG_CF},
+    {check_oversized_add_sub_128,      "oversized ADD/SUB 128",           FLAG_CF},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},
     {check_mov_zero,                   "suboptimal MOV zero",             FLAG_ARITH},
@@ -1360,7 +1360,7 @@ static const struct check_entry checks[] = {
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0},
-    {check_add_zero,                   "redundant ADD/SUB zero",          0},
+    {check_add_sub_zero,               "redundant ADD/SUB zero",          0},
     {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},

@@ -93,12 +93,54 @@ XED_PATH=/path/to/xed make all
 
 ## Usage
 
-x86lint is intended to be part of compiler test suites which should `#include
-"x86lint.h"` and link `libx86lint.a`.  It can also read arbitrary ELF executables via:
+x86lint is intended to be part of compiler test suites, which should
+`#include "x86lint.h"` and link `libx86lint.a`. Pass the just-emitted machine
+code to `check_instructions`; its return value is the number of opportunities
+found, which a test can assert is zero:
 
+```c
+#include "x86lint.h"
+
+// inst/len: the x86-64 bytes to check (e.g. a function the compiler just
+// emitted). Returns the opportunity count (0 == clean), or -1 on a decode
+// error.
+int lint(const uint8_t *inst, size_t len)
+{
+    xed_tables_init();
+    return check_instructions(inst, len, /*verbose=*/false, /*summary=*/NULL);
+}
 ```
-./x86lint /bin/ls
+
+The optional `summary` accumulates a by-type tally across one or more runs
+(`x86lint_summary_create` / `_print` / `_destroy`; pass `NULL` to skip it),
+and `verbose` controls whether each opportunity is printed as it is found.
+
+x86lint can also read arbitrary 64-bit ELF executables directly. By default it
+prints only a summary -- the opportunities grouped by type and sorted by
+prevalence -- followed by a total and the number of instructions scanned:
+
+```console
+$ ./x86lint /bin/ls
+Optimization opportunities by type:
+     169  oversized ADD/SUB one
+     105  oversized immediate
+       8  oversized branch displacement
+
+282 optimization opportunities in 22705 instructions
 ```
+
+Pass `-v` to also print each opportunity -- its one-line disassembly plus the
+offending encoding -- ahead of the summary:
+
+```console
+$ ./x86lint -v /bin/ls
+oversized immediate at offset: 0x14: push 0x0
+  68 00 00 00 00
+...
+```
+
+The process exits non-zero when any opportunity is found, so x86lint can gate
+a compiler test suite.
 
 ## References
 

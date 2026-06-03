@@ -117,7 +117,28 @@ bool check_lea_to_mov(const xed_decoded_inst_t *xedd);
 // (pure no-op; per Intel SDM the flags are not affected when count is 0)
 bool check_shift_zero(const xed_decoded_inst_t *xedd);
 
-// return number of failed checks
-int check_instructions(const uint8_t *inst, size_t len);
+// A by-type tally of findings accumulated across one or more
+// check_instructions runs, so a driver can print a by-prevalence summary.
+// Opaque; created and destroyed by the caller. A NULL summary is accepted
+// everywhere (tallying is simply skipped).
+typedef struct x86lint_summary x86lint_summary;
+
+x86lint_summary *x86lint_summary_create(void);
+void x86lint_summary_destroy(x86lint_summary *summary);
+
+// Print the findings grouped by type, most prevalent first.
+void x86lint_summary_print(const x86lint_summary *summary);
+
+// Total instructions decoded across the runs tallied into this summary.
+// Returns 0 for a NULL summary.
+size_t x86lint_summary_instructions(const x86lint_summary *summary);
+
+// return number of failed checks (or -1 on a decode error). In verbose mode
+// each finding is printed as a one-line summary followed by its offending
+// encoding; otherwise nothing is printed per finding (the caller's summary
+// is the whole report). If summary is non-NULL, every finding is tallied
+// into it by type and the decoded instruction count is accumulated.
+int check_instructions(const uint8_t *inst, size_t len, bool verbose,
+                       x86lint_summary *summary);
 
 #endif

@@ -33,54 +33,71 @@ static bool read_at(FILE *f, long off, void *buf, size_t n)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <ELF_FILE>\n", argv[0]);
+    bool verbose = false;
+    const char *path = NULL;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-v") == 0) {
+            verbose = true;
+        } else if (path == NULL && argv[i][0] != '-') {
+            path = argv[i];
+        } else {
+            fprintf(stderr, "usage: %s [-v] <ELF_FILE>\n", argv[0]);
+            return 1;
+        }
+    }
+    if (path == NULL) {
+        fprintf(stderr, "usage: %s [-v] <ELF_FILE>\n", argv[0]);
         return 1;
     }
 
-    FILE *f = fopen(argv[1], "rb");
+    FILE *f = fopen(path, "rb");
     if (f == NULL) {
-        perror(argv[1]);
+        perror(path);
         return 1;
     }
 
     int rc = 1;
     uint8_t *buf = NULL;
+    x86lint_summary *summary = NULL;
 
     if (fseek(f, 0, SEEK_END) != 0) {
-        fprintf(stderr, "%s: failed to seek to end of file\n", argv[1]);
+        fprintf(stderr, "%s: failed to seek to end of file\n", path);
         goto out;
     }
     long file_size_signed = ftell(f);
     if (file_size_signed < 0) {
-        fprintf(stderr, "%s: failed to get file size\n", argv[1]);
+        fprintf(stderr, "%s: failed to get file size\n", path);
         goto out;
     }
     uint64_t file_size = (uint64_t) file_size_signed;
 
     Elf64_Ehdr ehdr;
     if (!read_at(f, 0, &ehdr, sizeof(ehdr))) {
-        fprintf(stderr, "%s: failed to read ELF header\n", argv[1]);
+        fprintf(stderr, "%s: failed to read ELF header\n", path);
         goto out;
     }
 
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) {
-        fprintf(stderr, "%s: not an ELF file\n", argv[1]);
+        fprintf(stderr, "%s: not an ELF file\n", path);
         goto out;
     }
     if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
-        fprintf(stderr, "%s: only 64-bit ELF files are supported\n", argv[1]);
+        fprintf(stderr, "%s: only 64-bit ELF files are supported\n", path);
         goto out;
     }
 
     xed_tables_init();
-    xed_set_verbosity(99);
+    xed_set_verbosity(0);
+
+    // A NULL summary (allocation failure) is tolerated by the API: tallying
+    // is skipped and the instruction count reads back as 0.
+    summary = x86lint_summary_create();
 
     int errors = 0;
     for (uint16_t i = 0; i < ehdr.e_shnum; ++i) {
         Elf64_Shdr shdr;
         if (!read_at(f, ehdr.e_shoff + (long) i * sizeof(shdr), &shdr, sizeof(shdr))) {
-            fprintf(stderr, "%s: failed to read section header %u\n", argv[1], i);
+            fprintf(stderr, "%s: failed to read section header %u\n", path, i);
             goto out;
         }
 
@@ -94,7 +111,7 @@ int main(int argc, char **argv)
             shdr.sh_size > file_size - shdr.sh_offset) {
             fprintf(stderr,
                 "%s: section %u out of bounds (offset %lu size %lu, file %lu)\n",
-                argv[1], i, (unsigned long) shdr.sh_offset,
+                path, i, (unsigned long) shdr.sh_offset,
                 (unsigned long) shdr.sh_size, (unsigned long) file_size);
             goto out;
         }
@@ -102,15 +119,15 @@ int main(int argc, char **argv)
         buf = malloc(shdr.sh_size);
         if (buf == NULL) {
             fprintf(stderr, "%s: failed to allocate %lu bytes\n",
-                argv[1], (unsigned long) shdr.sh_size);
+                path, (unsigned long) shdr.sh_size);
             goto out;
         }
         if (!read_at(f, shdr.sh_offset, buf, shdr.sh_size)) {
-            fprintf(stderr, "%s: failed to read section %u\n", argv[1], i);
+            fprintf(stderr, "%s: failed to read section %u\n", path, i);
             goto out;
         }
 
-        int n = check_instructions(buf, shdr.sh_size);
+        int n = check_instructions(buf, shdr.sh_size, verbose, summary);
         if (n < 0) {
             goto out;
         }
@@ -120,10 +137,13 @@ int main(int argc, char **argv)
         buf = NULL;
     }
 
-    printf("%d errors\n", errors);
+    x86lint_summary_print(summary);
+    printf("%d optimization opportunities in %zu instructions\n",
+        errors, x86lint_summary_instructions(summary));
     rc = errors != 0;
 
 out:
+    x86lint_summary_destroy(summary);
     free(buf);
     fclose(f);
     return rc;

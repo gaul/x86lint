@@ -18,7 +18,10 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "xed/xed-interface.h"
+#include "x86lint.h"
 
 // TODO: handle 10-15 byte NOPs
 bool check_suboptimal_nops(const uint8_t *inst, size_t len)
@@ -1307,30 +1310,112 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
     return live != 0;
 }
 
-static void dump_instruction(const xed_decoded_inst_t *xedd)
+#define X86LINT_SUMMARY_MAX 64
+
+struct x86lint_summary {
+    struct {
+        const char *name;
+        unsigned count;
+    } entries[X86LINT_SUMMARY_MAX];
+    size_t count;
+    size_t instructions;   // total decoded instructions across all runs
+};
+
+x86lint_summary *x86lint_summary_create(void)
 {
-    char buf[1024];
-    xed_decoded_inst_dump(xedd, buf, sizeof(buf));
-    printf("%s\n", buf);
+    return calloc(1, sizeof(struct x86lint_summary));
 }
 
-static void dump_machine_code(const xed_decoded_inst_t *xedd, const uint8_t *inst)
+void x86lint_summary_destroy(x86lint_summary *summary)
 {
-    int i;
-    int len = xed_decoded_inst_get_length(xedd);
-    for (i = 0; i < len; ++i) {
-        printf("%02x ", inst[i]);
+    free(summary);
+}
+
+size_t x86lint_summary_instructions(const x86lint_summary *summary)
+{
+    return summary == NULL ? 0 : summary->instructions;
+}
+
+// Tally one finding by its name (a stable string literal owned by the check
+// table). Linear scan -- the table is tiny. Silently ignores a NULL summary
+// and the (cannot-happen with the current check set) overflow.
+static void summary_add(x86lint_summary *summary, const char *name)
+{
+    if (summary == NULL || name == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < summary->count; ++i) {
+        if (strcmp(summary->entries[i].name, name) == 0) {
+            summary->entries[i].count++;
+            return;
+        }
+    }
+    if (summary->count < X86LINT_SUMMARY_MAX) {
+        summary->entries[summary->count].name = name;
+        summary->entries[summary->count].count = 1;
+        summary->count++;
+    }
+}
+
+void x86lint_summary_print(const x86lint_summary *summary)
+{
+    if (summary == NULL || summary->count == 0) {
+        return;
+    }
+
+    // Order by descending count, ties broken by name for determinism.
+    size_t order[X86LINT_SUMMARY_MAX];
+    for (size_t i = 0; i < summary->count; ++i) {
+        order[i] = i;
+    }
+    for (size_t i = 0; i < summary->count; ++i) {
+        size_t best = i;
+        for (size_t j = i + 1; j < summary->count; ++j) {
+            unsigned cj = summary->entries[order[j]].count;
+            unsigned cb = summary->entries[order[best]].count;
+            if (cj > cb ||
+                (cj == cb && strcmp(summary->entries[order[j]].name,
+                                    summary->entries[order[best]].name) < 0)) {
+                best = j;
+            }
+        }
+        size_t tmp = order[i];
+        order[i] = order[best];
+        order[best] = tmp;
+    }
+
+    printf("Optimization opportunities by type:\n");
+    for (size_t i = 0; i < summary->count; ++i) {
+        printf("  %6u  %s\n", summary->entries[order[i]].count,
+            summary->entries[order[i]].name);
     }
     printf("\n");
 }
 
-static void report_finding(const char *name, size_t offset,
+// In verbose mode print a finding as a one-line summary -- the offending
+// instruction disassembled at its address -- followed by the raw encoding
+// indented beneath it. Non-verbose runs print nothing per finding; the
+// caller's summary is the whole report.
+static void report_finding(const char *name, size_t offset, bool verbose,
                            const xed_decoded_inst_t *xedd, const uint8_t *bytes)
 {
-    printf("%s at offset: %zu\n", name, offset);
-    dump_instruction(xedd);
-    dump_machine_code(xedd, bytes);
-    printf("\n");
+    if (!verbose) {
+        return;
+    }
+
+    char disasm[96];
+    if (!xed_format_context(XED_SYNTAX_INTEL, xedd, disasm, sizeof(disasm),
+                            offset, NULL, NULL)) {
+        disasm[0] = '\0';
+    }
+    printf("%s at offset: 0x%zx: %s\n", name, offset, disasm);
+
+    printf("  ");
+    int insn_len = xed_decoded_inst_get_length(xedd);
+    for (int i = 0; i < insn_len; ++i) {
+        printf("%s%02x", i == 0 ? "" : " ", bytes[i]);
+    }
+    printf("\n\n");
 }
 
 struct check_entry {
@@ -1375,7 +1460,8 @@ static const struct check_entry checks[] = {
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},
 };
 
-int check_instructions(const uint8_t *inst, size_t len)
+int check_instructions(const uint8_t *inst, size_t len, bool verbose,
+                       x86lint_summary *summary)
 {
     int errors = 0;
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
@@ -1388,9 +1474,13 @@ int check_instructions(const uint8_t *inst, size_t len)
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
-            printf("Decoding error at offset: %zu: %s\n",
+            printf("Decoding error at offset: 0x%zx: %s\n",
                 offset, xed_error_enum_t2str(err));
             return -1;
+        }
+
+        if (summary != NULL) {
+            summary->instructions++;
         }
 
         // Disabled: the savings are at most one decoded uop (same byte count)
@@ -1424,7 +1514,9 @@ int check_instructions(const uint8_t *inst, size_t len)
                 flags_live_after(inst, len, next, checks[i].flag_concerns)) {
                 continue;
             }
-            report_finding(checks[i].name, offset, &xedd, inst + offset);
+            summary_add(summary, checks[i].name);
+            report_finding(checks[i].name, offset, verbose, &xedd,
+                inst + offset);
             ++errors;
         }
 

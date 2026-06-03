@@ -54,7 +54,9 @@ static int count_findings(const uint8_t *inst, size_t len,
     FILE *saved = stdout;
     fflush(stdout);
     stdout = mem;
-    int total = check_instructions(inst, len);
+    // verbose=true so each finding prints its "<name> at offset:" line into
+    // the captured buffer for the per-category count below.
+    int total = check_instructions(inst, len, true, NULL);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -966,7 +968,7 @@ static void check_flag_liveness_corners_test(void)
 int main(int argc, char *argv[])
 {
     xed_tables_init();
-    xed_set_verbosity(99);
+    xed_set_verbosity(0);
 
     check_suboptimal_nops_test();
     check_oversized_immediate_test();
@@ -1016,7 +1018,7 @@ int main(int argc, char *argv[])
         0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };
     int expected = 10;
-    int actual = check_instructions(inst, sizeof(inst));
+    int actual = check_instructions(inst, sizeof(inst), false, NULL);
     if (actual != expected) {
         printf("Expected %d errors, actual: %d\n", expected, actual);
         return 1;

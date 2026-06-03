@@ -1490,14 +1490,13 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
-            // Not necessarily a real error: executable sections routinely
-            // embed data (jump tables, Go's BoringCrypto signature, alignment
-            // islands) that linear-sweep decoding walks into. Skip one byte
-            // and resync rather than abandoning the rest of the section.
-            if (verbose) {
-                printf("Decoding error at offset: 0x%zx: %s\n",
-                    offset, xed_error_enum_t2str(err));
-            }
+            // Not a tool failure: executable sections routinely embed data
+            // (jump tables, alignment islands, GHC info tables, Go's
+            // BoringCrypto signature) that linear-sweep decoding walks into.
+            // Skip one byte and resync rather than abandoning the rest of the
+            // section. Only the aggregate is reported (via the summary); a
+            // stripped GHC binary skips hundreds of thousands of bytes, so
+            // enumerating each one would bury the actual findings.
             if (summary != NULL) {
                 summary->skipped++;
             }

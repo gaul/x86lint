@@ -139,12 +139,14 @@ size_t x86lint_summary_instructions(const x86lint_summary *summary);
 size_t x86lint_summary_skipped(const x86lint_summary *summary);
 
 // return number of failed checks. An undecodable byte is not fatal: linear
-// sweep skips it and resyncs (executable sections routinely embed data), and
-// in verbose mode the skip is noted. In verbose mode each finding is printed
-// as a one-line summary followed by its offending encoding; otherwise nothing
-// is printed per finding (the caller's summary is the whole report). If
-// summary is non-NULL, every finding is tallied into it by type and the
-// decoded-instruction and skipped-byte counts are accumulated.
+// sweep skips it and resyncs (executable sections routinely embed data).
+// Skipped bytes are only tallied into the summary, never printed -- a stripped
+// binary with data in its code section can skip hundreds of thousands of
+// bytes. In verbose mode each finding is printed as a one-line summary
+// followed by its offending encoding; otherwise nothing is printed per finding
+// (the caller's summary is the whole report). If summary is non-NULL, every
+// finding is tallied into it by type and the decoded-instruction and
+// skipped-byte counts are accumulated.
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary);
 

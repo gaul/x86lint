@@ -946,6 +946,14 @@ bool check_unneeded_zero_displacement(const xed_decoded_inst_t *xedd)
 //   - RIP-relative addressing: disp32 is the only form.
 //   - Absolute / no-base addressing (SIB base=101 with no base register):
 //     disp32 is mandatory in 64-bit mode.
+//   - EVEX-encoded instructions: disp8 is compressed (disp8*N, where N
+//     comes from the tuple type and vector length -- 64 for a full
+//     512-bit operand), so a disp32 narrows only when its value is an
+//     exact multiple of N. [rax+16] on a zmm access has no disp8 form at
+//     all. Rather than reproduce XED's tuple-type tables to compute N,
+//     skip EVEX entirely; compilers already emit compressed disp8
+//     whenever the offset divides evenly, so a small EVEX disp32 in real
+//     code is almost always there because it cannot compress.
 // Any real base register supports a disp8 -- including RBP/R13, which merely
 // require *at least* a disp8 -- so no base-specific exclusion is needed in the
 // narrowing direction. Multi-byte NOPs are skipped: their displacement width
@@ -962,6 +970,14 @@ bool check_oversized_displacement(const xed_decoded_inst_t *xedd)
     }
 
     if (xed_decoded_inst_get_memory_displacement_width_bits(xedd, 0) != 32) {
+        return true;
+    }
+
+    // vexvalid: 0=legacy, 1=VEX, 2=EVEX (no public named constants). The
+    // compressed-disp8 form itself never reaches this check: XED reports
+    // its decompressed displacement with a widened width, failing the
+    // ==32 test above.
+    if (xed3_operand_get_vexvalid(xedd) == 2) {
         return true;
     }
 

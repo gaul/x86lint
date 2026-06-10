@@ -684,6 +684,14 @@ static void check_oversized_displacement_test(void)
     CHECK_BYTES( check_oversized_displacement, 0x01, 0x3c, 0x25, 0x10, 0,0,0);    // add [0x10], edi (absolute)
     // Multi-byte NOPs use displacement width as deliberate padding.
     CHECK_BYTES( check_oversized_displacement, 0x0f, 0x1f, 0x80, 0x10, 0,0,0);    // 7-byte NOP [rax+0x10]
+    // EVEX compresses disp8 by the tuple factor N (64 for a full zmm
+    // operand): 16 is not a multiple of 64, so this disp32 has no disp8
+    // form -- it is the only encoding, don't flag.
+    CHECK_BYTES( check_oversized_displacement, 0x62, 0xf1, 0x7c, 0x48, 0x58, 0x88, 0x10, 0,0,0); // vaddps zmm1, zmm0, [rax+16] (disp32)
+    // Compressed disp8 (stored 1, scaled to 64) -- already short.
+    CHECK_BYTES( check_oversized_displacement, 0x62, 0xf1, 0x7c, 0x48, 0x58, 0x48, 0x01);        // vaddps zmm1, zmm0, [rax+64] (disp8*64)
+    // VEX disp8 is uncompressed, so a small VEX disp32 still narrows.
+    CHECK_BYTES(!check_oversized_displacement, 0xc5, 0xf8, 0x58, 0x88, 0x10, 0,0,0);             // vaddps xmm1, xmm0, [rax+16] (disp32)
     // No memory operand -- nothing to flag.
     CHECK_BYTES( check_oversized_displacement, 0x01, 0xd8);                       // add eax, ebx
     CHECK_BYTES( check_oversized_displacement, 0x90);                            // nop

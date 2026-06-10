@@ -88,7 +88,9 @@ bool check_unneeded_sib(const xed_decoded_inst_t *xedd);
 bool check_unneeded_zero_displacement(const xed_decoded_inst_t *xedd);
 
 // return false if instruction encodes a nonzero displacement as disp32
-// when its value fits in a signed disp8
+// when its value fits in a signed disp8 (EVEX instructions are skipped:
+// their disp8 is compressed by a scale factor, so most small disp32
+// values have no disp8 form)
 bool check_oversized_displacement(const xed_decoded_inst_t *xedd);
 
 // return false if movsxd rax, eax could be cdqe (cltq in AT&T)

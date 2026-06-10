@@ -818,6 +818,30 @@ static void check_sse_mov_opcode_test(void)
     CHECK_BYTES( check_sse_mov_opcode, 0x89, 0xc8);                          // mov eax, ecx
 }
 
+static void check_oversized_evex_test(void)
+{
+    // No EVEX-only feature in use -- the VEX re-encoding is 1-2 bytes
+    // shorter (renamed integer iclasses map back to their VEX ancestors).
+    CHECK_BYTES(!check_oversized_evex, 0x62, 0xf1, 0xfd, 0x28, 0x6f, 0xca);              // vmovdqa64 ymm1, ymm2 (-> vmovdqa)
+    CHECK_BYTES(!check_oversized_evex, 0x62, 0xf1, 0x7d, 0x28, 0xef, 0xca);              // vpxord ymm1, ymm0, ymm2 (-> vpxor)
+    CHECK_BYTES(!check_oversized_evex, 0x62, 0xf1, 0x7c, 0x28, 0x58, 0xca);              // vaddps ymm1, ymm0, ymm2 (shared iclass)
+    CHECK_BYTES(!check_oversized_evex, 0x62, 0xf1, 0x7c, 0x08, 0x58, 0x48, 0x04);        // vaddps xmm1, xmm0, [rax+0x40] (disp8*16)
+    CHECK_BYTES(!check_oversized_evex, 0x62, 0xf1, 0xfe, 0x28, 0x6f, 0x48, 0x02);        // vmovdqu64 ymm1, [rax+0x40] (-> vmovdqu)
+    // EVEX-only features block the demotion.
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf1, 0x7c, 0x48, 0x58, 0xca);              // vaddps zmm (512-bit)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf1, 0x7c, 0x29, 0x58, 0xca);              // vaddps ymm1{k1}, ymm0, ymm2 (opmask)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf1, 0x7c, 0x38, 0x58, 0x08);              // vaddps ymm1, ymm0, [rax]{1to8} (broadcast)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf1, 0xff, 0x78, 0x58, 0xca);              // vaddsd {rz-sae} (embedded rounding)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xe1, 0x7c, 0x08, 0x58, 0xc2);              // vaddps xmm16, xmm0, xmm2 (high reg)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf3, 0x7d, 0x28, 0x25, 0xca, 0x96);        // vpternlogd (EVEX-only iclass)
+    // The compressed disp8 makes the EVEX form shorter than VEX+disp32.
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf1, 0x7c, 0x08, 0x58, 0x48, 0x10);        // vaddps xmm1, xmm0, [rax+0x100]
+    // Already VEX or legacy -- nothing to demote.
+    CHECK_BYTES( check_oversized_evex, 0xc5, 0xfc, 0x58, 0xca);                          // vaddps ymm1, ymm0, ymm2 (VEX)
+    CHECK_BYTES( check_oversized_evex, 0x0f, 0x58, 0xca);                                // addps xmm1, xmm2 (legacy)
+    CHECK_BYTES( check_oversized_evex, 0x90);                                            // nop
+}
+
 // Flag-liveness gating: check_instructions should suppress findings whose
 // suggested replacement would clobber a flag that's read downstream. These
 // tests construct two-or-three instruction sequences and assert the
@@ -1178,6 +1202,7 @@ int main(int argc, char *argv[])
     check_lea_to_mov_test();
     check_shift_zero_test();
     check_sse_mov_opcode_test();
+    check_oversized_evex_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
     check_decode_resync_test();

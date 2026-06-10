@@ -876,6 +876,149 @@ bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd)
     }
 }
 
+// AVX-512 renamed the integer copy and bitwise iclasses with element-size
+// suffixes (the suffix only matters under an opmask, which the caller has
+// already ruled out); map them back to their VEX ancestors. Every other
+// iclass is shared between VEX and EVEX (VADDPS, VPADDD, ...) or is
+// EVEX-only (VPTERNLOGD, ...), for which the VEX re-encode below simply
+// fails.
+static xed_iclass_enum_t evex_vex_equivalent_iclass(xed_iclass_enum_t ic)
+{
+    switch (ic) {
+    case XED_ICLASS_VMOVDQA32:
+    case XED_ICLASS_VMOVDQA64: return XED_ICLASS_VMOVDQA;
+    case XED_ICLASS_VMOVDQU8:
+    case XED_ICLASS_VMOVDQU16:
+    case XED_ICLASS_VMOVDQU32:
+    case XED_ICLASS_VMOVDQU64: return XED_ICLASS_VMOVDQU;
+    case XED_ICLASS_VPANDD:
+    case XED_ICLASS_VPANDQ:    return XED_ICLASS_VPAND;
+    case XED_ICLASS_VPANDND:
+    case XED_ICLASS_VPANDNQ:   return XED_ICLASS_VPANDN;
+    case XED_ICLASS_VPORD:
+    case XED_ICLASS_VPORQ:     return XED_ICLASS_VPOR;
+    case XED_ICLASS_VPXORD:
+    case XED_ICLASS_VPXORQ:    return XED_ICLASS_VPXOR;
+    default:                   return ic;
+    }
+}
+
+// An EVEX prefix is four bytes where VEX needs two or three, so an EVEX
+// instruction that uses no EVEX-only feature usually has a shorter VEX
+// encoding (GNU as performs this exact demotion at -O1):
+//   vmovdqa64 ymm1, ymm2   62 f1 fd 28 6f ca   ->   vmovdqa ymm1, ymm2   c5 fd 6f ca
+//
+// EVEX-only features that block demotion: an opmask, embedded broadcast,
+// embedded rounding / SAE (XED reports these via the roundc/sae operands;
+// the rebuild below would silently drop the override), 512-bit vector
+// length, and xmm16-31/ymm16-31 operands.
+//
+// Rather than hand-maintain a which-iclass-has-a-VEX-form table, rebuild
+// the instruction as a fresh encoder request (high-level xed_inst API,
+// EVEX-renamed iclasses mapped back to their VEX ancestors) and let
+// xed_encode answer: given a plain request, this XED's encoder prefers
+// VEX patterns, fails on EVEX-only iclasses, and fails on registers VEX
+// cannot address -- each failure is a conservative pass. The k0 operand
+// that EVEX templates list explicitly is skipped during the rebuild, or
+// it would steer pattern matching back to EVEX.
+//
+// Flag only a strictly shorter re-encode: EVEX compresses disp8 by the
+// tuple factor, so a one-byte scaled displacement can need disp32 under
+// VEX, making the EVEX form the shorter one -- the length comparison
+// settles that per instruction. Length is also why the displacement is
+// re-narrowed here (0 / disp8 / disp32, disp32 for RIP-relative) instead
+// of copied: the decoded width of a scaled disp8 does not round-trip.
+bool check_oversized_evex(const xed_decoded_inst_t *xedd)
+{
+    if (xed3_operand_get_vexvalid(xedd) != 2) {
+        return true;
+    }
+    if (xed3_operand_get_mask(xedd) != 0 ||
+        xed3_operand_get_bcast(xedd) != 0 ||
+        xed3_operand_get_roundc(xedd) != 0 ||
+        xed3_operand_get_sae(xedd) != 0 ||
+        xed3_operand_get_vl(xedd) >= 2) {
+        return true;
+    }
+
+    xed_state_t dstate;
+    dstate.mmode = XED_MACHINE_MODE_LONG_64;
+    dstate.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+    xed_encoder_operand_t ops[4];
+    unsigned nops = 0;
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (xed_operand_operand_visibility(op) != XED_OPVIS_EXPLICIT) {
+            continue;
+        }
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (nops >= sizeof(ops) / sizeof(ops[0])) {
+            return true;
+        }
+        switch (name) {
+        case XED_OPERAND_REG0:
+        case XED_OPERAND_REG1:
+        case XED_OPERAND_REG2:
+        case XED_OPERAND_REG3: {
+            xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, name);
+            if (reg >= XED_REG_K0 && reg <= XED_REG_K7) {
+                continue;  // unmasked k0, not a VEX operand
+            }
+            ops[nops++] = xed_reg(reg);
+            break;
+        }
+        case XED_OPERAND_MEM0: {
+            xed_int64_t disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
+            xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, 0);
+            unsigned disp_bits;
+            if (base == XED_REG_RIP || base == XED_REG_EIP) {
+                disp_bits = 32;
+            } else if (disp == 0 &&
+                       base != XED_REG_RBP && base != XED_REG_R13 &&
+                       base != XED_REG_EBP && base != XED_REG_R13D) {
+                disp_bits = 0;
+            } else if (disp >= INT8_MIN && disp <= INT8_MAX) {
+                disp_bits = 8;
+            } else {
+                disp_bits = 32;
+            }
+            ops[nops++] = xed_mem_bisd(base,
+                xed_decoded_inst_get_index_reg(xedd, 0),
+                xed_decoded_inst_get_scale(xedd, 0),
+                xed_disp(disp, disp_bits),
+                xed_decoded_inst_get_memory_operand_length(xedd, 0) * 8);
+            break;
+        }
+        case XED_OPERAND_IMM0:
+            ops[nops++] = xed_imm0(xed_decoded_inst_get_unsigned_immediate(xedd),
+                xed_decoded_inst_get_immediate_width_bits(xedd));
+            break;
+        default:
+            return true;
+        }
+    }
+
+    xed_encoder_instruction_t enc;
+    xed_inst(&enc, dstate,
+        evex_vex_equivalent_iclass(xed_decoded_inst_get_iclass(xedd)),
+        0, nops, ops);
+
+    xed_encoder_request_t req;
+    xed_encoder_request_zero_set_mode(&req, &dstate);
+    if (!xed_convert_to_encoder_request(&req, &enc)) {
+        return true;
+    }
+    uint8_t out[XED_MAX_INSTRUCTION_BYTES];
+    unsigned int olen = 0;
+    if (xed_encode(&req, out, sizeof(out), &olen) != XED_ERROR_NONE) {
+        return true;
+    }
+    return olen >= xed_decoded_inst_get_length(xedd);
+}
+
 // sub reg, reg zeros the register at the same size as xor reg, reg, but
 // xor is the portable dependency-breaking idiom. Mainstream cores (Intel
 // Sandy Bridge onward, AMD) recognize both xor reg, reg and sub reg, reg
@@ -1597,6 +1740,7 @@ static const struct check_entry checks[] = {
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
+    {check_oversized_evex,             "oversized EVEX encoding",         0},
 };
 
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,

@@ -24,6 +24,10 @@ compiler writers generate better code and documents the complexity of x86.
   - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
 * oversized displacement
   - `8B 83 10000000` instead of `8B 43 10` (MOV EAX, [RBX+0x10]; disp32 that fits in disp8)
+* oversized EVEX encoding
+  - `62F1FD286FCA` instead of `C5FD6FCA` (VMOVDQA64 YMM1, YMM2 -> VMOVDQA;
+    without an opmask, broadcast, rounding, 512-bit length, or xmm16-31,
+    the 4-byte EVEX prefix wastes 1-2 bytes over VEX)
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
   - `68 01000000` instead of `6A 01` (PUSH 1)

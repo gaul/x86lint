@@ -129,6 +129,11 @@ bool check_shift_zero(const xed_decoded_inst_t *xedd);
 // movaps/movups, the identical copy without the one-byte 66/F3 prefix
 bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);
 
+// return false if an EVEX-encoded instruction uses no EVEX-only feature
+// (opmask, broadcast, rounding/SAE, 512-bit length, xmm16-31) and a VEX
+// re-encoding is strictly shorter
+bool check_oversized_evex(const xed_decoded_inst_t *xedd);
+
 // A by-type tally of findings accumulated across one or more
 // check_instructions runs, so a driver can print a by-prevalence summary.
 // Opaque; created and destroyed by the caller. A NULL summary is accepted

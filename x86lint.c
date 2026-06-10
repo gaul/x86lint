@@ -1145,10 +1145,12 @@ bool check_add_sub_zero(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 
-// add reg, 1 and sub reg, 1 (and their -1 counterparts) encode as inc reg /
-// dec reg, one byte shorter:
-//   add eax, 1   83 c0 01   (3 bytes)   ->   inc eax   ff c0   (2 bytes)
-//   sub eax, 1   83 e8 01   (3 bytes)   ->   dec eax   ff c8   (2 bytes)
+// add r/m, 1 and sub r/m, 1 (and their -1 counterparts) encode as inc /
+// dec, which drops the imm8 byte for every destination, addressing mode,
+// and operand width:
+//   add eax, 1                83 c0 01      ->   inc eax                ff c0
+//   sub eax, 1                83 e8 01      ->   dec eax                ff c8
+//   sub dword [rbx+0x10], 1   83 6b 10 01   ->   dec dword [rbx+0x10]   ff 4b 10
 // (There is no shorter form in 64-bit mode: the 1-byte 40+r inc/dec opcodes
 // were reclaimed as the REX prefixes, so inc/dec take the 2-byte ff /r form.)
 //
@@ -1166,9 +1168,11 @@ bool check_add_sub_zero(const xed_decoded_inst_t *xedd)
 //
 // AL is excluded: add al, 1 already fits in 2 bytes via the 04 ib
 // accumulator opcode, exactly tying inc al, so the rewrite saves nothing (cf.
-// check_add_sub_zero, check_cmp_zero). Memory operands are excluded too: the
-// locked read-modify-write forms decode to distinct iclasses and are left to
-// a possible future check.
+// check_add_sub_zero, check_cmp_zero). Memory destinations are included --
+// neither form is atomic without LOCK, and inc/dec perform the same-width
+// read-modify-write at the same address, so even MMIO behavior is identical.
+// The locked forms never reach here: they decode to the distinct
+// ADD_LOCK/SUB_LOCK iclasses (and inc/dec accept a LOCK prefix anyway).
 bool check_inc_dec(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -1176,10 +1180,6 @@ bool check_inc_dec(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_SUB:
         break;
     default:
-        return true;
-    }
-
-    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
         return true;
     }
 

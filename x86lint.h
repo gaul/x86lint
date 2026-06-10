@@ -71,9 +71,9 @@ bool check_mov_self(const xed_decoded_inst_t *xedd);
 // if flags are unused)
 bool check_add_sub_zero(const xed_decoded_inst_t *xedd);
 
-// return false if add reg, 1 / sub reg, 1 (or the -1 forms) could be inc
-// reg / dec reg, which is one byte shorter (valid when CF is dead, since
-// inc/dec leave CF unchanged)
+// return false if add r/m, 1 / sub r/m, 1 (or the -1 forms, register or
+// memory destination) could be inc / dec, which is one byte shorter (valid
+// when CF is dead, since inc/dec leave CF unchanged)
 bool check_inc_dec(const xed_decoded_inst_t *xedd);
 
 // return false if a mov reg, imm uses the c6/c7 modrm form with a

@@ -496,12 +496,20 @@ static void check_inc_dec_test(void)
     // inc/dec al -- no win.
     CHECK_BYTES( check_inc_dec, 0x04, 0x01);                    // add al, 1
     CHECK_BYTES( check_inc_dec, 0x2c, 0x01);                    // sub al, 1
+    // Memory destinations: inc/dec r/m drops the imm8 for every addressing
+    // mode and width. 83 6b 10 01 is glibc's refcount-decrement shape.
+    CHECK_BYTES(!check_inc_dec, 0x83, 0x00, 0x01);              // add dword ptr [rax], 1
+    CHECK_BYTES(!check_inc_dec, 0x83, 0x6b, 0x10, 0x01);        // sub dword ptr [rbx+0x10], 1
+    CHECK_BYTES(!check_inc_dec, 0x48, 0x83, 0x00, 0x01);        // add qword ptr [rax], 1
+    CHECK_BYTES(!check_inc_dec, 0x80, 0x00, 0x01);              // add byte ptr [rax], 1
+    // LOCK forms decode to the distinct ADD_LOCK/SUB_LOCK iclasses.
+    CHECK_BYTES( check_inc_dec, 0xf0, 0x83, 0x00, 0x01);        // lock add dword ptr [rax], 1
     // |imm| != 1.
     CHECK_BYTES( check_inc_dec, 0x83, 0xc0, 0x02);              // add eax, 2
     CHECK_BYTES( check_inc_dec, 0x83, 0xc0, 0x00);              // add eax, 0
-    // No immediate / memory / not ADD-SUB.
+    CHECK_BYTES( check_inc_dec, 0x83, 0x00, 0x02);              // add dword ptr [rax], 2 (memory)
+    // No immediate / not ADD-SUB.
     CHECK_BYTES( check_inc_dec, 0x01, 0xd8);                    // add eax, ebx
-    CHECK_BYTES( check_inc_dec, 0x83, 0x00, 0x01);              // add dword ptr [rax], 1 (memory)
     CHECK_BYTES( check_inc_dec, 0x83, 0xd0, 0x01);              // adc eax, 1 (not ADD/SUB)
     CHECK_BYTES( check_inc_dec, 0xff, 0xc0);                    // inc eax (already short)
     CHECK_BYTES( check_inc_dec, 0x90);                          // nop
@@ -917,6 +925,21 @@ static void check_flag_liveness_test(void)
         0xC3,
     };
     ASSERT_FINDINGS(addone_add_ret, "oversized ADD/SUB one", 1);
+
+    // sub dword [rbx+0x10], 1 ; ret -- memory destination: CF dead at ret,
+    // dec dword [rbx+0x10] is one byte shorter, finding fires.
+    static const uint8_t subonemem_ret[] = {
+        0x83, 0x6B, 0x10, 0x01,
+        0xC3,
+    };
+    ASSERT_FINDINGS(subonemem_ret, "oversized ADD/SUB one", 1);
+
+    // sub dword [rbx+0x10], 1 ; jc +0 -- CF may be read, suppress.
+    static const uint8_t subonemem_jc[] = {
+        0x83, 0x6B, 0x10, 0x01,
+        0x72, 0x00,
+    };
+    ASSERT_FINDINGS(subonemem_jc, "oversized ADD/SUB one", 0);
 }
 
 // Instruction-flavor corners for flag liveness: pin the analyzer's handling

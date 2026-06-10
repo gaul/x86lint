@@ -19,6 +19,7 @@ compiler writers generate better code and documents the complexity of x86.
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)
 * oversized ADD/SUB one
   - `83C0 01` instead of `FFC0` (ADD EAX, 1 -> INC EAX, when CF is unused)
+  - `836B10 01` instead of `FF4B10` (SUB DWORD [RBX+0x10], 1 -> DEC DWORD [RBX+0x10])
 * oversized branch displacement
   - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
 * oversized displacement

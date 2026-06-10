@@ -963,6 +963,46 @@ static void check_flag_liveness_corners_test(void)
         0xC3,                          // ret
     };
     ASSERT_FINDINGS(mov_sysexit, "suboptimal MOV zero", 0);
+
+    // A shift by CL writes its flags only when the masked runtime count is
+    // nonzero (XED may_write), so it must not retire a concern: with cl == 0
+    // the JC reads the ADD's CF, which the negated SUB -128 rewrite inverts
+    // -- suppress.
+    static const uint8_t add128_shlcl_jc[] = {
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
+        0xD3, 0xE3,                    // shl ebx, cl (conditional flag write)
+        0x72, 0x00,                    // jc +0 (reads CF)
+    };
+    ASSERT_FINDINGS(add128_shlcl_jc, "oversized ADD/SUB 128", 0);
+
+    // Same shape with an immediate count: the flag write is unconditional,
+    // CF dies at the shift, finding fires.
+    static const uint8_t add128_shlimm_jc[] = {
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
+        0xC1, 0xE3, 0x02,              // shl ebx, 2 (unconditional flag write)
+        0x72, 0x00,                    // jc +0
+    };
+    ASSERT_FINDINGS(add128_shlimm_jc, "oversized ADD/SUB 128", 1);
+
+    // REPE CMPSB compares zero times when RCX == 0, leaving the flags
+    // untouched -- another conditional writer, suppress.
+    static const uint8_t add128_repecmps_jc[] = {
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
+        0xF3, 0xA6,                    // repe cmpsb (conditional flag write)
+        0x72, 0x00,                    // jc +0
+    };
+    ASSERT_FINDINGS(add128_repecmps_jc, "oversized ADD/SUB 128", 0);
+
+    // A conditional writer keeps the concern live but does not stop the
+    // walk: a later unconditional writer still retires it and the finding
+    // fires.
+    static const uint8_t add128_shlcl_add_ret[] = {
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
+        0xD3, 0xE3,                    // shl ebx, cl (conditional flag write)
+        0x83, 0xC1, 0x02,              // add ecx, 2 (kills CF; imm != 1)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(add128_shlcl_add_ret, "oversized ADD/SUB 128", 1);
 }
 
 // An undecodable byte (executable sections routinely embed data) must not

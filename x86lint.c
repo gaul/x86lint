@@ -1250,9 +1250,10 @@ static uint32_t flag_set_to_mask(const xed_flag_set_t *fs)
 // for a flag-disturbing optimization) should suppress its finding when this
 // returns true.
 //
-// Returns false (DEAD) only after seeing every flag in `concerns` written
-// by straight-line code, or after hitting a function-exit terminator
-// (RET / IRET; neither the SysV nor Win64 ABI preserves flags across calls).
+// Returns false (DEAD) only after seeing every flag in `concerns`
+// unconditionally written by straight-line code, or after hitting a
+// function-exit terminator (RET / IRET; neither the SysV nor Win64 ABI
+// preserves flags across calls).
 //
 // Conservative LIVE on: decode error; any control transfer that isn't such
 // a terminator -- CALL, conditional or unconditional branch, SYSCALL,
@@ -1263,6 +1264,15 @@ static uint32_t flag_set_to_mask(const xed_flag_set_t *fs)
 // "Undefined" flag writes per Intel SDM count as writes -- the original
 // value is destroyed either way, so the candidate optimization doesn't
 // worsen things relative to the unmodified code.
+//
+// Conditional flag writes do NOT count: a shift/rotate by CL updates its
+// flags only when the masked runtime count is nonzero, and a REP-prefixed
+// string compare touches none when RCX is 0, so the prior flag value can
+// flow through such an instruction to a later reader. XED folds these
+// conditionally-written flags into the same written/undefined sets as
+// unconditional ones and distinguishes them only by the instruction-level
+// may_write marker, so the walk keeps a concern live across any may_write
+// instruction.
 static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
                              uint32_t concerns)
 {
@@ -1296,12 +1306,14 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
         const xed_simple_flag_t *fi = xed_decoded_inst_get_rflags_info(&xedd);
         if (fi != NULL) {
             uint32_t r = flag_set_to_mask(xed_simple_flag_get_read_flag_set(fi));
-            uint32_t w = flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
-                         flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi));
             if (r & live) {
                 return true;
             }
-            live &= ~w;
+            if (!xed_simple_flag_get_may_write(fi)) {
+                uint32_t w = flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
+                             flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi));
+                live &= ~w;
+            }
         }
 
         offset += xed_decoded_inst_get_length(&xedd);

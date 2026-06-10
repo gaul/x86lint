@@ -170,6 +170,20 @@ static void check_suboptimal_nops_test(void)
         0x0f, 0x1f, 0x00,
     };
     assert(!check_suboptimal_nops(nop3_nop3, sizeof(nop3_nop3)));
+
+    // An undecodable byte ends the NOP run without a finding: a single
+    // NOP followed by data is normal padding, not a suboptimal sequence.
+    // 0x06 (push es) is illegal in 64-bit mode.
+    static const uint8_t nop_bad[] = { 0x90, 0x06 };
+    assert(check_suboptimal_nops(nop_bad, sizeof(nop_bad)));
+
+    // Entirely undecodable input -- no NOPs at all, no finding.
+    static const uint8_t bad[] = { 0x06 };
+    assert(check_suboptimal_nops(bad, sizeof(bad)));
+
+    // Two mergeable NOPs still flag even when data follows them.
+    static const uint8_t nopnop_bad[] = { 0x90, 0x90, 0x06 };
+    assert(!check_suboptimal_nops(nopnop_bad, sizeof(nopnop_bad)));
 }
 
 static void check_oversized_immediate_test(void)

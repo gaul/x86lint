@@ -39,7 +39,12 @@ bool check_suboptimal_nops(const uint8_t *inst, size_t len)
         xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
         xed_error_enum_t err = xed_decode(&xedd, inst + i, len - i);
         if (err != XED_ERROR_NONE) {
-            return false;
+            // An undecodable byte ends the NOP run; it is not itself a
+            // finding (executable sections routinely embed data, so a
+            // NOP followed by data is normal padding, not a suboptimal
+            // sequence). A real finding requires two successfully
+            // decoded adjacent NOPs, reported inside the loop.
+            break;
         }
 
         // TODO: call xed_operand_values_is_nop?

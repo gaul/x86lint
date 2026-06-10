@@ -21,6 +21,7 @@
 #include "xed/xed-interface.h"
 
 // return false if instruction sequence contains multiple adjacent no ops
+// (an undecodable byte ends the NOP run without a finding)
 bool check_suboptimal_nops(const uint8_t *inst, size_t len);
 
 // return false if instruction has an oversized immediate

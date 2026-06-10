@@ -759,6 +759,29 @@ static void check_mov_modrm_imm_test(void)
     CHECK_BYTES( check_mov_modrm_imm, 0x90);                                      // nop
 }
 
+static void check_sse_mov_opcode_test(void)
+{
+    // Legacy 66/F3-prefixed copies -- movaps/movups is one byte shorter.
+    CHECK_BYTES(!check_sse_mov_opcode, 0x66, 0x0f, 0x6f, 0xca);              // movdqa xmm1, xmm2
+    CHECK_BYTES(!check_sse_mov_opcode, 0x66, 0x0f, 0x6f, 0x08);              // movdqa xmm1, [rax]
+    CHECK_BYTES(!check_sse_mov_opcode, 0x66, 0x0f, 0x7f, 0x08);              // movdqa [rax], xmm1 (store)
+    CHECK_BYTES(!check_sse_mov_opcode, 0xf3, 0x0f, 0x6f, 0x06);              // movdqu xmm0, [rsi]
+    CHECK_BYTES(!check_sse_mov_opcode, 0x66, 0x0f, 0x28, 0xca);              // movapd xmm1, xmm2
+    CHECK_BYTES(!check_sse_mov_opcode, 0x66, 0x0f, 0x10, 0x08);              // movupd xmm1, [rax]
+    // Already the unprefixed PS forms -- nothing to flag.
+    CHECK_BYTES( check_sse_mov_opcode, 0x0f, 0x28, 0xca);                    // movaps xmm1, xmm2
+    CHECK_BYTES( check_sse_mov_opcode, 0x0f, 0x10, 0x08);                    // movups xmm1, [rax]
+    // VEX/EVEX fold the 66/F3 selector into the prefix's pp bits (and
+    // decode to distinct V* iclasses) -- no byte to save.
+    CHECK_BYTES( check_sse_mov_opcode, 0xc5, 0xf9, 0x6f, 0xca);              // vmovdqa xmm1, xmm2
+    CHECK_BYTES( check_sse_mov_opcode, 0xc5, 0xfe, 0x6f, 0xca);              // vmovdqu ymm1, ymm2
+    CHECK_BYTES( check_sse_mov_opcode, 0x62, 0xf1, 0xfd, 0x48, 0x6f, 0xca);  // vmovdqa64 zmm1, zmm2
+    // Unprefixed 0F 6F is the MMX movq -- a different iclass, not flagged.
+    CHECK_BYTES( check_sse_mov_opcode, 0x0f, 0x6f, 0xca);                    // movq mm1, mm2
+    // Not an SSE move at all.
+    CHECK_BYTES( check_sse_mov_opcode, 0x89, 0xc8);                          // mov eax, ecx
+}
+
 // Flag-liveness gating: check_instructions should suppress findings whose
 // suggested replacement would clobber a flag that's read downstream. These
 // tests construct two-or-three instruction sequences and assert the
@@ -1083,6 +1106,7 @@ int main(int argc, char *argv[])
     check_imul_to_lea_test();
     check_lea_to_mov_test();
     check_shift_zero_test();
+    check_sse_mov_opcode_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
     check_decode_resync_test();

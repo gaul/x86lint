@@ -120,6 +120,10 @@ bool check_lea_to_mov(const xed_decoded_inst_t *xedd);
 // (pure no-op; per Intel SDM the flags are not affected when count is 0)
 bool check_shift_zero(const xed_decoded_inst_t *xedd);
 
+// return false if a legacy-encoded movapd/movdqa/movupd/movdqu could be
+// movaps/movups, the identical copy without the one-byte 66/F3 prefix
+bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);
+
 // A by-type tally of findings accumulated across one or more
 // check_instructions runs, so a driver can print a by-prevalence summary.
 // Opaque; created and destroyed by the caller. A NULL summary is accepted

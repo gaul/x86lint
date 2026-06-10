@@ -790,6 +790,38 @@ bool check_shift_zero(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 
+// movapd, movdqa, movupd, and movdqu are pure 128-bit copies that differ
+// from movaps/movups only in their mandatory 66/F3 prefix, which costs a
+// byte:
+//   movdqa xmm1, xmm2   66 0f 6f ca   ->   movaps xmm1, xmm2   0f 28 ca
+//   movdqu xmm0, [rsi]  f3 0f 6f 06   ->   movups xmm0, [rsi]  0f 10 06
+// The aligned forms (movapd/movdqa) map to movaps, keeping the
+// #GP-on-misalignment behavior; the unaligned forms (movupd/movdqu) map to
+// movups. Register, load, and store directions all carry the same saving,
+// and none of these touch flags, so the rewrite is unconditional.
+//
+// Only the legacy SSE encodings qualify: the VEX and EVEX forms decode to
+// distinct V* iclasses (VMOVDQA, VMOVDQA64, ...) and fold the 66/F3
+// selector into the prefix's pp field, so vmovaps saves nothing over
+// vmovdqa (and the EVEX forms add masking semantics besides).
+//
+// Bypass-delay caveat (cf. check_sub_self's uarch note): Nehalem-era cores
+// charged a penalty when *computation* ops crossed the int/FP domains, but
+// plain moves and loads/stores are domain-agnostic on every relevant core;
+// clang canonicalizes all of these to movaps/movups unconditionally.
+bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_MOVAPD:
+    case XED_ICLASS_MOVDQA:
+    case XED_ICLASS_MOVDQU:
+    case XED_ICLASS_MOVUPD:
+        return false;
+    default:
+        return true;
+    }
+}
+
 // sub reg, reg zeros the register at the same size as xor reg, reg, but
 // xor is the portable dependency-breaking idiom. Mainstream cores (Intel
 // Sandy Bridge onward, AMD) recognize both xor reg, reg and sub reg, reg
@@ -1509,6 +1541,7 @@ static const struct check_entry checks[] = {
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},
+    {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
 };
 
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,

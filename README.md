@@ -49,6 +49,10 @@ compiler writers generate better code and documents the complexity of x86.
   - multiple `90` instead of a single `66 90`, etc.
 * suboptimal OR/AND reg, reg
   - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write)
+* suboptimal SSE MOV opcode
+  - `660F6FCA` instead of `0F28CA` (MOVDQA XMM1, XMM2 -> MOVAPS; the legacy
+    66/F3-prefixed copies movapd/movdqa/movupd/movdqu waste a byte over
+    movaps/movups)
 * suboptimal SUB reg, reg
   - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking
 * ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)

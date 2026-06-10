@@ -217,6 +217,34 @@ static void check_oversized_immediate_test(void)
     CHECK_BYTES( check_oversized_immediate, 0x6a, 0x01);                          // push 1 (imm8, already short)
 }
 
+static void check_oversized_test_immediate_test(void)
+{
+    // Mask within the low seven bits: the byte form sets identical flags.
+    CHECK_BYTES(!check_oversized_test_immediate, 0xa9, 0x01, 0x00, 0x00, 0x00);              // test eax, 1 (-> test al, 1)
+    CHECK_BYTES(!check_oversized_test_immediate, 0xf7, 0xc3, 0x40, 0x00, 0x00, 0x00);        // test ebx, 0x40 (-> test bl, 0x40)
+    CHECK_BYTES(!check_oversized_test_immediate, 0x48, 0xf7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // test rax, 1
+    CHECK_BYTES(!check_oversized_test_immediate, 0x66, 0xf7, 0xc0, 0x01, 0x00);              // test ax, 1 (imm16)
+    CHECK_BYTES(!check_oversized_test_immediate, 0x41, 0xf7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // test r8d, 1 (-> test r8b, 1)
+    CHECK_BYTES(!check_oversized_test_immediate, 0xf7, 0xc6, 0x01, 0x00, 0x00, 0x00);        // test esi, 1 (-> test sil, 1)
+    // Bit 7 in the mask: the narrow form computes SF from a live bit.
+    CHECK_BYTES( check_oversized_test_immediate, 0xa9, 0x80, 0x00, 0x00, 0x00);              // test eax, 0x80
+    CHECK_BYTES( check_oversized_test_immediate, 0xa9, 0xff, 0x00, 0x00, 0x00);              // test eax, 0xff
+    // Bits 8-15 (the test ah, imm rewrite changes PF) -- skipped.
+    CHECK_BYTES( check_oversized_test_immediate, 0xa9, 0x00, 0x01, 0x00, 0x00);              // test eax, 0x100
+    // Negative imm32 sign-extends at 64-bit width -- high bits set.
+    CHECK_BYTES( check_oversized_test_immediate, 0x48, 0xf7, 0xc0, 0xff, 0xff, 0xff, 0xff);  // test rax, -1
+    // Already the byte form.
+    CHECK_BYTES( check_oversized_test_immediate, 0xa8, 0x01);                                // test al, 1
+    CHECK_BYTES( check_oversized_test_immediate, 0xf6, 0xc3, 0x01);                          // test bl, 1
+    // Memory operand: narrowing changes the access width (MMIO-visible).
+    CHECK_BYTES( check_oversized_test_immediate, 0xf7, 0x00, 0x01, 0x00, 0x00, 0x00);        // test dword ptr [rax], 1
+    // Degenerate mask 0 still narrows (ZF=1, PF=1, SF=0 at either width).
+    CHECK_BYTES(!check_oversized_test_immediate, 0xa9, 0x00, 0x00, 0x00, 0x00);              // test eax, 0
+    // No immediate / not TEST.
+    CHECK_BYTES( check_oversized_test_immediate, 0x85, 0xc0);                                // test eax, eax
+    CHECK_BYTES( check_oversized_test_immediate, 0x90);                                      // nop
+}
+
 static void check_oversized_add_sub_128_test(void)
 {
     // ADD 128 -> SUB -128.
@@ -940,6 +968,25 @@ static void check_flag_liveness_test(void)
         0x72, 0x00,
     };
     ASSERT_FINDINGS(subonemem_jc, "oversized ADD/SUB one", 0);
+
+    // test ebx, 1 ; jne +0 ; ret -- the oversized-TEST finding is
+    // flag-exact (mask within the low seven bits), so it fires even
+    // though a conditional branch immediately consumes the flags.
+    static const uint8_t testnarrow_jne[] = {
+        0xF7, 0xC3, 0x01, 0x00, 0x00, 0x00,  // test ebx, 1
+        0x75, 0x00,                          // jne +0
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(testnarrow_jne, "oversized TEST immediate", 1);
+
+    // test ebx, 0x80 ; jne +0 ; ret -- bit 7 in the mask would change how
+    // SF is computed; not flagged at all.
+    static const uint8_t testbit7_jne[] = {
+        0xF7, 0xC3, 0x80, 0x00, 0x00, 0x00,  // test ebx, 0x80
+        0x75, 0x00,                          // jne +0
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(testbit7_jne, "oversized TEST immediate", 0);
 }
 
 // Instruction-flavor corners for flag liveness: pin the analyzer's handling
@@ -1104,6 +1151,7 @@ int main(int argc, char *argv[])
 
     check_suboptimal_nops_test();
     check_oversized_immediate_test();
+    check_oversized_test_immediate_test();
     check_oversized_add_sub_128_test();
     check_unneeded_rex_test();
     check_cmp_zero_test();

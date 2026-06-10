@@ -139,6 +139,60 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// TEST has no sign-extended imm8 form (F7 /0 takes a full imm16/32), so
+// testing a low bit of a wide register drags a 2-4 byte immediate along:
+//   test eax, 1   a9 01000000      (5 bytes)
+//   test ebx, 1   f7 c3 01000000   (6 bytes)
+// The byte-register form performs the identical AND on the bits that
+// matter and is at least two bytes shorter for every register:
+//   test al, 1    a8 01            (2 bytes)
+//   test bl, 1    f6 c3 01         (3 bytes)
+//   test sil, 1   40 f6 c6 01      (4 bytes, REX for the uniform byte reg)
+//
+// Restricted to effective masks within the low *seven* bits so the
+// substitution is flag-exact and needs no liveness gate (essential: TEST
+// is nearly always followed by a Jcc, where the conservative liveness
+// walk would suppress a gated finding):
+//   * ZF: the mask confines the result to the low byte, so zero-ness is
+//     the same at either width.
+//   * PF: defined from the least-significant result byte, identical.
+//   * SF: 0 in both forms -- the wide result's top bit is clear because
+//     the mask's is, and bit 7 of the narrow result is clear because the
+//     mask's bit 7 is.
+//   * CF/OF: cleared by TEST at any width; AF undefined at any width.
+// A mask touching bit 7 (0x80-0xff) would make the narrow form compute SF
+// from a live bit; rather than gate on FLAG_SF -- which the following
+// branch would almost always suppress -- such masks are left unflagged.
+// Masks confined to bits 8-15 (the test ah, imm rewrite) additionally
+// change PF and only encode for the legacy A/B/C/D registers; also
+// skipped.
+//
+// Memory operands are skipped: narrowing changes the access width, which
+// is observable on MMIO (cf. check_add_sub_zero). The 64-bit form's imm32
+// sign-extends, so a negative mask has high bits set and fails the
+// low-seven-bits test naturally.
+bool check_oversized_test_immediate(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_TEST) {
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    if (xed_decoded_inst_get_immediate_width_bits(xedd) < 16) {
+        return true;
+    }
+
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    return (eff & ~(uint64_t) 0x7f) != 0;
+}
+
 // Check for ADD REG, 128 and SUB REG, 128, which need an imm32 (128 is one
 // past the +127 ceiling of a sign-extended imm8) and so encode in 5-6 bytes,
 // when the negated-operation form fits in 3:
@@ -1516,6 +1570,7 @@ struct check_entry {
 // (not a decoded instruction) and reports a 2-instruction window.
 static const struct check_entry checks[] = {
     {check_oversized_immediate,        "oversized immediate",             0},
+    {check_oversized_test_immediate,   "oversized TEST immediate",        0},
     {check_oversized_add_sub_128,      "oversized ADD/SUB 128",           FLAG_CF},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},

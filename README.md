@@ -64,6 +64,8 @@ compiler writers generate better code and documents the complexity of x86.
     movaps/movups)
 * suboptimal SUB reg, reg
   - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking
+* suboptimal XOR immediate
+  - `83F0 FF` instead of `F7D0` (XOR EAX, -1 -> NOT EAX, when flags are unused)
 * ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)
   - MOV EAX, 0 instead of XOR EAX, EAX
 * unneeded explicit immediate

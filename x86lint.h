@@ -54,6 +54,10 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd);
 // return false if instruction could use movzbl, movzwl, or mov instead of AND REG, IMM
 bool check_and_strength_reduce(const xed_decoded_inst_t *xedd);
 
+// return false if xor r/m, -1 could be not r/m, one byte shorter (valid
+// when the arithmetic flags are dead, since NOT writes none)
+bool check_xor_to_not(const xed_decoded_inst_t *xedd);
+
 // return false if instruction should have a LOCK prefix
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
 

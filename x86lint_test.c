@@ -404,6 +404,33 @@ static void check_and_strength_reduce_test(void)
     CHECK_BYTES( check_and_strength_reduce, 0x83, 0xc0, 0x01);                    // add eax, 1 (not AND)
 }
 
+static void check_xor_to_not_test(void)
+{
+    // All-ones at the effective operand width, every encoding -> not r/m.
+    CHECK_BYTES(!check_xor_to_not, 0x83, 0xf0, 0xff);                          // xor eax, -1 (sx imm8)
+    CHECK_BYTES(!check_xor_to_not, 0x81, 0xf0, 0xff, 0xff, 0xff, 0xff);        // xor eax, -1 (imm32)
+    CHECK_BYTES(!check_xor_to_not, 0x35, 0xff, 0xff, 0xff, 0xff);              // xor eax, -1 (accumulator)
+    CHECK_BYTES(!check_xor_to_not, 0x48, 0x83, 0xf0, 0xff);                    // xor rax, -1
+    CHECK_BYTES(!check_xor_to_not, 0x48, 0x81, 0xf0, 0xff, 0xff, 0xff, 0xff);  // xor rax, -1 (sx imm32)
+    CHECK_BYTES(!check_xor_to_not, 0x66, 0x83, 0xf0, 0xff);                    // xor ax, -1
+    CHECK_BYTES(!check_xor_to_not, 0x80, 0xf3, 0xff);                          // xor bl, -1 (-> not bl, 3 -> 2)
+    CHECK_BYTES(!check_xor_to_not, 0x83, 0x30, 0xff);                          // xor dword ptr [rax], -1 (memory)
+    // AL accumulator form already ties not al; the modrm form is
+    // check_implicit_register's finding.
+    CHECK_BYTES( check_xor_to_not, 0x34, 0xff);                                // xor al, -1 (accumulator)
+    CHECK_BYTES( check_xor_to_not, 0x80, 0xf0, 0xff);                          // xor al, -1 (modrm)
+    // Not all-ones at the operand width.
+    CHECK_BYTES( check_xor_to_not, 0x83, 0xf0, 0x7f);                          // xor eax, 0x7f
+    CHECK_BYTES( check_xor_to_not, 0x35, 0xfe, 0xff, 0xff, 0xff);              // xor eax, 0xfffffffe
+    // LOCK form decodes to the distinct XOR_LOCK iclass.
+    CHECK_BYTES( check_xor_to_not, 0xf0, 0x83, 0x30, 0xff);                    // lock xor dword ptr [rax], -1
+    // No immediate / not XOR.
+    CHECK_BYTES( check_xor_to_not, 0x31, 0xc0);                                // xor eax, eax
+    CHECK_BYTES( check_xor_to_not, 0xf7, 0xd0);                                // not eax (already short)
+    CHECK_BYTES( check_xor_to_not, 0x83, 0xc8, 0xff);                          // or eax, -1 (not XOR)
+    CHECK_BYTES( check_xor_to_not, 0x90);                                      // nop
+}
+
 static void check_missing_lock_prefix_test(void)
 {
     CHECK_BYTES( check_missing_lock_prefix, 0x67, 0xf0, 0x0f, 0xc1, 0x18);  // lock xadd [eax], ebx
@@ -1183,6 +1210,7 @@ int main(int argc, char *argv[])
     check_implicit_register_test();
     check_implicit_immediate_test();
     check_and_strength_reduce_test();
+    check_xor_to_not_test();
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
     check_xchg_accumulator_test();

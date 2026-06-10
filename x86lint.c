@@ -653,6 +653,41 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// xor r/m, -1 flips every bit, which is not r/m, one byte shorter in every
+// encoding:
+//   xor eax, -1   83 f0 ff      (3 bytes)   ->   not eax   f7 d0      (2 bytes)
+//   xor rax, -1   48 83 f0 ff   (4 bytes)   ->   not rax   48 f7 d0   (3 bytes)
+// The all-ones immediate is matched at the effective operand width, so the
+// sign-extended imm8/imm32 encodings count too (cf. check_and_strength_reduce).
+//
+// False positive if surrounding code reads any arithmetic flag: XOR sets
+// CF/OF/SF/ZF/PF (AF undefined); NOT writes none. The dispatcher gates this
+// on FLAG_ARITH.
+//
+// AL is excluded: xor al, -1 via the 34 ib accumulator opcode is already 2
+// bytes, tying not al; its modrm form is check_implicit_register's finding
+// (cf. check_cmp_zero). Memory destinations are included: not [mem] performs
+// the same-width read-modify-write at the same address, and the locked forms
+// decode to the distinct XOR_LOCK iclass (cf. check_inc_dec).
+bool check_xor_to_not(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_XOR) {
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    return eff != opmask;
+}
+
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
 {
     bool has_lock = xed_operand_values_has_lock_prefix(xed_decoded_inst_operands_const(xedd));
@@ -1721,6 +1756,7 @@ static const struct check_entry checks[] = {
     {check_implicit_register,          "unneeded explicit register",      0},
     {check_implicit_immediate,         "unneeded explicit immediate",     0},
     {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
+    {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},

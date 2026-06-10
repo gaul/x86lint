@@ -1229,8 +1229,10 @@ bool check_oversized_branch(const xed_decoded_inst_t *xedd)
         return true;
     }
 
+    // Computed in 64 bits: a rel32 displacement near INT32_MAX (a branch
+    // spanning a ~2 GB section) would overflow the int32 sum.
     int32_t disp = (int32_t) xed_decoded_inst_get_branch_displacement(xedd);
-    int32_t new_disp = disp + size_delta;
+    int64_t new_disp = (int64_t) disp + size_delta;
     return new_disp < INT8_MIN || new_disp > INT8_MAX;
 }
 

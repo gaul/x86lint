@@ -431,6 +431,10 @@ static void check_oversized_branch_test(void)
     CHECK_BYTES( check_oversized_branch, 0xe9, 0x7d, 0x00, 0x00, 0x00);  // jmp +125
     // JMP rel32 with large displacement -- needs rel32.
     CHECK_BYTES( check_oversized_branch, 0xe9, 0x00, 0x10, 0x00, 0x00);  // jmp +0x1000
+    // Top of the rel32 range: disp + size_delta exceeds INT32_MAX, so the
+    // sum must be computed in 64 bits (UBSan-visible overflow otherwise).
+    CHECK_BYTES( check_oversized_branch, 0xe9, 0xfd, 0xff, 0xff, 0x7f);  // jmp +0x7ffffffd
+    CHECK_BYTES( check_oversized_branch, 0x0f, 0x84, 0xfc, 0xff, 0xff, 0x7f);  // jz +0x7ffffffc
     // JMP rel8 -- already short.
     CHECK_BYTES( check_oversized_branch, 0xeb, 0x00);  // jmp +0
     // Jcc rel32 with small displacement -- fits in rel8.

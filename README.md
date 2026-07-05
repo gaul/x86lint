@@ -62,7 +62,8 @@ compiler writers generate better code and documents the complexity of x86.
 * suboptimal CMP zero
   - `83F8 00` instead of `85C0` (CMP EAX, 0 -> TEST EAX, EAX)
 * suboptimal IMUL constant
-  - `6BC0 03` (IMUL EAX, EAX, 3) -- use LEA or SHL
+  - `6BC0 03` (IMUL EAX, EAX, 3) -- use LEA
+  - `6BC0 10` (IMUL EAX, EAX, 16) -- use SHL (any power of two, same register)
 * suboptimal LEA
   - `488D03` (LEA RAX, [RBX]) -- use MOV RAX, RBX (more ports, no AGU)
 * ~~suboptimal NOP sequence~~, see [#9](https://github.com/gaul/x86lint/issues/9)

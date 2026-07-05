@@ -689,10 +689,23 @@ static void check_imul_to_lea_test(void)
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc3, 0x04);                    // imul eax, ebx, 4 (different regs)
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc3, 0x08);                    // imul eax, ebx, 8 (different regs)
     CHECK_BYTES(!check_imul_to_lea, 0x48, 0x6b, 0xc0, 0x04);              // imul rax, rax, 4 (shl rax, 2)
+    // Higher powers of two also reduce to SHL when dst == src.
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x10);                    // imul eax, eax, 16 (shl eax, 4)
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x40);                    // imul eax, eax, 64 (shl eax, 6)
+    CHECK_BYTES(!check_imul_to_lea, 0x69, 0xc0, 0x80, 0x00, 0x00, 0x00);  // imul eax, eax, 128 (shl eax, 7; imm32 -> size win)
+    CHECK_BYTES(!check_imul_to_lea, 0x69, 0xc0, 0x00, 0x00, 0x01, 0x00);  // imul eax, eax, 0x10000 (shl eax, 16)
+    CHECK_BYTES(!check_imul_to_lea, 0x69, 0xc0, 0x00, 0x00, 0x00, 0x80);  // imul eax, eax, 0x80000000 (shl eax, 31)
+    CHECK_BYTES(!check_imul_to_lea, 0x48, 0x6b, 0xc0, 0x10);              // imul rax, rax, 16 (shl rax, 4)
+    CHECK_BYTES(!check_imul_to_lea, 0x48, 0x69, 0xc0, 0x00, 0x00, 0x00, 0x40); // imul rax, rax, 0x40000000 (shl rax, 30)
+    // Power of two >= 4 with different registers has no shorter form.
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc3, 0x10);                    // imul eax, ebx, 16 (different regs)
+    // 64-bit imm32 sign-extends to -2^31, not a power of two -> not shl.
+    CHECK_BYTES( check_imul_to_lea, 0x48, 0x69, 0xc0, 0x00, 0x00, 0x00, 0x80); // imul rax, rax, 0xffffffff80000000
     // Constants without a single-LEA equivalent.
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x06);                    // imul eax, eax, 6
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x07);                    // imul eax, eax, 7
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x0a);                    // imul eax, eax, 10
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x11);                    // imul eax, eax, 17 (not a power of two)
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0xfe);                    // imul eax, eax, -2 (sign-ext, LEA can't negate)
     // Two-operand form (no immediate).
     CHECK_BYTES( check_imul_to_lea, 0x0f, 0xaf, 0xc3);                    // imul eax, ebx

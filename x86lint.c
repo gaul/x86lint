@@ -809,17 +809,23 @@ bool check_xchg_accumulator(const xed_decoded_inst_t *xedd)
     return !accumulator;
 }
 
-// IMUL r, r, imm by a small constant can be replaced by a single LEA,
-// which on most uarches has shorter latency and uses the AGU instead of
-// the multiplier.
+// IMUL r, r, imm by a small constant can be strength-reduced to a LEA or SHL,
+// which on most uarches have shorter latency and avoid the multiplier.
 //
 //   * imm in {2,3,5,9}: dst = src*{2,3,5,9} is lea [src + src*{1,2,4,8}],
 //     valid for any destination register.
-//   * imm in {4,8}: the single-LEA form would be [src*scale], which needs
-//     an absolute disp32 (SIB base=101) and is *longer* than the IMUL. The
-//     only shorter/faster replacement is SHL by {2,3}, which requires the
-//     destination and source to be the same register; a different-register
-//     imul r, r2, {4,8} has no improvement and is left alone.
+//   * imm a power of two >= 4: dst = src << log2(imm), i.e. shl by the shift
+//     amount. The single-LEA form would be [src*scale], which needs an
+//     absolute disp32 (SIB base=101) and whose scale maxes at 8, so it is
+//     never shorter; SHL requires the destination and source to coincide, and
+//     a different-register imul r, r2, 2^k is left alone. (imm 2 stays a LEA:
+//     lea [src+src] serves any destination, unlike shl.)
+//
+// The multiplier is matched at the effective operand width, so the 32-bit
+// imul eax, eax, 0x80000000 (2^31 mod 2^32 = shl eax, 31) is caught while the
+// 64-bit imul rax, rax, 0x80000000 -- whose imm32 sign-extends to -2^31, not a
+// power of two -- is not. A power of two 2^k confined to the width has
+// k < width, so the shl count is never masked.
 //
 // Memory-source IMUL (IMUL r, [m], imm) is not flagged: the replacement
 // would need a separate load instruction first, making the sequence
@@ -839,18 +845,27 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
     if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
         return true;
     }
-    switch (xed_decoded_inst_get_unsigned_immediate(xedd)) {
+
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    switch (eff) {
     case 2: case 3: case 5: case 9:
         return false;
-    case 4: case 8: {
-        // Only reducible (to SHL) when destination and source coincide.
+    default:
+        break;
+    }
+
+    // A power of two >= 4 reduces to SHL, but only when the destination and
+    // source coincide (there is no shorter LEA form).
+    if (eff >= 4 && (eff & (eff - 1)) == 0) {
         xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
         xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
         return !(dst != XED_REG_INVALID && dst == src);
     }
-    default:
-        return true;
-    }
+
+    return true;
 }
 
 // lea dst, [base] with no index and a zero displacement computes exactly the

@@ -46,6 +46,9 @@ compiler writers generate better code and documents the complexity of x86.
   - `87C8` instead of `91` (XCHG EAX, ECX; the 90+r accumulator form is one byte)
 * redundant ADD/SUB zero
   - `83C0 00` (ADD EAX, 0) -- use TEST or remove
+* redundant AND immediate
+  - `83E0 FF` instead of `85C0` (AND EAX, -1 -> TEST EAX, EAX; an all-ones mask
+    sets identical flags)
 * redundant MOV reg, reg
   - `4889C0` (MOV RAX, RAX)
 * redundant OR/XOR zero
@@ -56,7 +59,7 @@ compiler writers generate better code and documents the complexity of x86.
   - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
     mask sets identical flags)
 * suboptimal AND immediate
-  - `83E0 FF` (AND EAX, 0xFF) -- use MOVZBL
+  - `25 FF000000` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal AND zero
   - `83E0 00` (AND EAX, 0) -- use XOR EAX, EAX (same flags, fewer bytes)
 * suboptimal CMP zero

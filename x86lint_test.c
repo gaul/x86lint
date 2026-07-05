@@ -407,18 +407,18 @@ static void check_implicit_immediate_test(void)
 
 static void check_and_strength_reduce_test(void)
 {
-    // 83 e0 ff is and eax, sx(0xff) = and eax, 0xffffffff: a 32-bit operand
-    // whose effective mask is all-ones. It zero-extends eax into rax, so it
-    // reduces to mov eax, eax (not movzbl) -- still a finding.
-    CHECK_BYTES(!check_and_strength_reduce, 0x83, 0xe0, 0xff);                    // and eax, 0xffffffff (-> mov eax, eax)
+    // A low-byte/word mask keeps those bits and zero-extends into rax, so it
+    // reduces to movzbl / movzwl -- a finding here. The all-ones mask (any
+    // width) is a value no-op and is check_and_minus_one's finding instead.
+    CHECK_BYTES( check_and_strength_reduce, 0x83, 0xe0, 0xff);                    // and eax, -1 (all-ones -> and_minus_one)
     CHECK_BYTES( check_and_strength_reduce, 0x83, 0xe0, 0xfe);                    // and eax, 0xfffffffe (not a mask)
     CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0x00, 0x00);        // and eax, 0xffff (-> movzwl)
-    CHECK_BYTES(!check_and_strength_reduce, 0x25, 0xff, 0xff, 0xff, 0xff);        // and eax, 0xffffffff (-> mov eax, eax)
+    CHECK_BYTES( check_and_strength_reduce, 0x25, 0xff, 0xff, 0xff, 0xff);        // and eax, -1 (all-ones -> and_minus_one)
     CHECK_BYTES(!check_and_strength_reduce, 0x48, 0x25, 0xff, 0x00, 0x00, 0x00);  // and rax, 0xff (-> movzbl, zero-extends)
-    // REX.W all-ones masks are genuine no-ops with no shorter zero-extending
-    // form -- do not flag.
-    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff);  // and rax, -1 (no-op)
-    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x83, 0xe0, 0xff);              // and rax, sx(0xff) = -1 (no-op)
+    // REX.W all-ones: no zero-extending win (mov rax, rax is not shorter); the
+    // flag-exact test rax, rax is check_and_minus_one's finding.
+    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff);  // and rax, -1
+    CHECK_BYTES( check_and_strength_reduce, 0x48, 0x83, 0xe0, 0xff);              // and rax, sx(0xff) = -1
     // 8-/16-bit AND preserves the upper register bytes; movzx/mov would zero
     // them, so the substitution is not equivalent -- do not flag.
     CHECK_BYTES( check_and_strength_reduce, 0x66, 0x25, 0xff, 0x00);              // and ax, 0xff (preserves bits 16+)
@@ -429,6 +429,31 @@ static void check_and_strength_reduce_test(void)
     CHECK_BYTES( check_and_strength_reduce, 0x81, 0x20, 0xff, 0xff, 0xff, 0xff);  // and dword [rax], 0xffffffff
     CHECK_BYTES( check_and_strength_reduce, 0x21, 0xd8);                          // and eax, ebx (no immediate)
     CHECK_BYTES( check_and_strength_reduce, 0x83, 0xc0, 0x01);                    // add eax, 1 (not AND)
+}
+
+static void check_and_minus_one_test(void)
+{
+    // All-ones mask keeps every bit -> test reg, reg (flag-exact, fewer bytes),
+    // at any operand width including the 64-bit and 16-bit forms that
+    // check_and_strength_reduce leaves alone.
+    CHECK_BYTES(!check_and_minus_one, 0x83, 0xe0, 0xff);                    // and eax, -1 (sx imm8)
+    CHECK_BYTES(!check_and_minus_one, 0x25, 0xff, 0xff, 0xff, 0xff);        // and eax, -1 (imm32)
+    CHECK_BYTES(!check_and_minus_one, 0x48, 0x83, 0xe0, 0xff);              // and rax, -1
+    CHECK_BYTES(!check_and_minus_one, 0x48, 0x25, 0xff, 0xff, 0xff, 0xff);  // and rax, -1 (imm32 sx)
+    CHECK_BYTES(!check_and_minus_one, 0x66, 0x83, 0xe0, 0xff);              // and ax, -1
+    CHECK_BYTES(!check_and_minus_one, 0x80, 0xe3, 0xff);                    // and bl, -1 (8-bit non-AL)
+    // AL: the 24 ib accumulator form already ties test al, al; the modrm form
+    // is check_implicit_register's finding.
+    CHECK_BYTES( check_and_minus_one, 0x24, 0xff);                          // and al, -1 (accumulator)
+    CHECK_BYTES( check_and_minus_one, 0x80, 0xe0, 0xff);                    // and al, -1 (modrm)
+    // Nonzero non-all-ones masks are check_and_strength_reduce's concern.
+    CHECK_BYTES( check_and_minus_one, 0x83, 0xe0, 0xfe);                    // and eax, 0xfffffffe
+    CHECK_BYTES( check_and_minus_one, 0x25, 0xff, 0x00, 0x00, 0x00);        // and eax, 0xff (low-byte mask)
+    CHECK_BYTES( check_and_minus_one, 0x83, 0xe0, 0x00);                    // and eax, 0 (zero -> check_and_zero)
+    // Memory / not AND.
+    CHECK_BYTES( check_and_minus_one, 0x83, 0x20, 0xff);                    // and dword ptr [rax], -1 (memory)
+    CHECK_BYTES( check_and_minus_one, 0x83, 0xf0, 0xff);                    // xor eax, -1 (not AND)
+    CHECK_BYTES( check_and_minus_one, 0x90);                                // nop
 }
 
 static void check_xor_to_not_test(void)
@@ -1041,9 +1066,11 @@ static void check_flag_liveness_test(void)
     };
     ASSERT_FINDINGS(imul_add_ret, "suboptimal IMUL constant", 1);
 
-    // and eax, 0xff ; jz +0 -- ZF is live, suppress.
+    // and eax, 0xff ; jz +0 -- ZF is live, and the movzbl rewrite would drop
+    // it, so suppress. (A genuine low-byte mask, not the all-ones no-op, which
+    // check_and_minus_one handles flag-exactly and so does not gate.)
     static const uint8_t and_jz[] = {
-        0x83, 0xE0, 0xFF,
+        0x25, 0xFF, 0x00, 0x00, 0x00,
         0x74, 0x00,
     };
     ASSERT_FINDINGS(and_jz, "suboptimal AND immediate", 0);
@@ -1051,7 +1078,7 @@ static void check_flag_liveness_test(void)
     // and eax, 0xff ; mov ebx, ecx ; ret -- MOV transparent, RET kills,
     // finding fires.
     static const uint8_t and_mov_ret[] = {
-        0x83, 0xE0, 0xFF,
+        0x25, 0xFF, 0x00, 0x00, 0x00,
         0x89, 0xCB,
         0xC3,
     };
@@ -1326,6 +1353,7 @@ int main(int argc, char *argv[])
     check_implicit_register_test();
     check_implicit_immediate_test();
     check_and_strength_reduce_test();
+    check_and_minus_one_test();
     check_xor_to_not_test();
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
@@ -1367,7 +1395,7 @@ int main(int argc, char *argv[])
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
         0xc1, 0xd0, 0x01,  // rcl eax, 1
-        0x83, 0xe0, 0xff,  // and eax, 0xff
+        0x83, 0xe0, 0xff,  // and eax, -1
         0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
         0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };

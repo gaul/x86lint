@@ -55,8 +55,12 @@ bool check_implicit_register(const xed_decoded_inst_t *xedd);
 // return false if instruction could use an implicit immediate encoding
 bool check_implicit_immediate(const xed_decoded_inst_t *xedd);
 
-// return false if instruction could use movzbl, movzwl, or mov instead of AND REG, IMM
+// return false if instruction could use movzbl or movzwl instead of AND REG, IMM
 bool check_and_strength_reduce(const xed_decoded_inst_t *xedd);
+
+// return false if and reg, -1 (an all-ones mask at the operand width) could be
+// test reg, reg, which sets identical flags in fewer bytes
+bool check_and_minus_one(const xed_decoded_inst_t *xedd);
 
 // return false if xor r/m, -1 could be not r/m, one byte shorter (valid
 // when the arithmetic flags are dead, since NOT writes none)

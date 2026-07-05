@@ -640,30 +640,29 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd)
     return true;
 }
 
-// AND DST, IMM can be replaced by MOVZBL / MOVZWL / MOV (the last via the
-// EAX-write zero-extension rule) when the mask keeps a low byte/word/dword
-// and zeros everything above it -- e.g. and eax, 0xff -> movzx eax, al.
-// All three replacements produce a register zero-extended through bit 63,
+// AND DST, IMM can be replaced by MOVZBL / MOVZWL when the mask keeps a low
+// byte or word and zeros everything above it -- e.g. and eax, 0xff -> movzx
+// eax, al. Both replacements produce a register zero-extended through bit 63,
 // so the substitution is valid only when:
 //
-//   * the destination is a register (movzx/mov cannot target memory); and
+//   * the destination is a register (movzx cannot target memory); and
 //   * the AND writes a 32- or 64-bit register, so the write itself clears
 //     bits up to 63 (an 8-/16-bit AND preserves the upper register bytes,
-//     which movzx/mov would instead zero); and
+//     which movzx would instead zero); and
 //   * the *effective* mask -- the immediate sign-extended and truncated to
-//     the operand width -- is exactly 0xff, 0xffff, or (32-bit operand
-//     only) 0xffffffff.
+//     the operand width -- is exactly 0xff or 0xffff.
 //
-// Matching the effective mask rather than the raw immediate byte is what
-// separates a genuine low-byte mask (and eax, 0xff, encoded with an imm32)
-// from a sign-extended all-ones no-op (and eax, sx(0xff) = 0xffffffff,
-// encoded 83 e0 ff): the former reduces to movzbl, the latter to a plain
-// mov eax, eax. An all-ones mask on a 64-bit operand is a no-op with no
-// shorter zero-extending equivalent, so it is left alone.
+// Matching the effective mask rather than the raw immediate byte separates a
+// genuine low-byte mask (and eax, 0xff, encoded with an imm32) from a
+// sign-extended all-ones no-op (and eax, sx(0xff) = 0xffffffff, encoded
+// 83 e0 ff): only the former reduces to movzbl. The all-ones mask is a value
+// no-op with no zero-extending win, so it is check_and_minus_one's finding
+// (-> test reg, reg) instead.
 //
-// False positive if surrounding code reads ZF/SF/PF: AND sets them based
-// on the masked result and clears CF/OF; MOVZX and MOV do not touch
-// flags. A subsequent JZ/JS/JP would diverge.
+// False positive if surrounding code reads ZF/SF/PF: AND sets them based on
+// the masked result and clears CF/OF; MOVZX does not touch flags. A
+// subsequent JZ/JS/JP would diverge, so the dispatcher gates this on
+// FLAG_ARITH.
 bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_AND) {
@@ -687,10 +686,48 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
     if (eff == 0xff || eff == 0xffff) {
         return false;
     }
-    if (width == 32 && eff == 0xffffffff) {
-        return false;
-    }
     return true;
+}
+
+// and reg, -1 keeps every bit (the mask is all ones), so it changes only the
+// flags -- and test reg, reg reproduces those exactly (CF=OF=0, ZF/SF/PF from
+// reg, AF undefined in both) in fewer bytes:
+//   and eax, -1   83 e0 ff      (3 bytes)   ->   test eax, eax   85 c0     (2 bytes)
+//   and rax, -1   48 83 e0 ff   (4 bytes)   ->   test rax, rax   48 85 c0  (3 bytes)
+// The all-ones immediate is matched at the effective operand width (cf.
+// check_xor_to_not, check_test_minus_one). Flag-exact, so no liveness gate:
+// this is the flag-preserving counterpart to check_and_strength_reduce's
+// former all-ones -> mov reg, reg. That rewrite dropped the flags (so it was
+// FLAG_ARITH-gated and vanished exactly when a downstream reader made the
+// finding worth acting on); test is shorter and flag-exact, and the incidental
+// 32-bit zero-extension the mov preserved is treated as not relied upon (as in
+// check_or_and_self). The wider all-ones masks and reg is full width already
+// leave nothing for movzx/mov to shorten, so this is their only finding.
+//
+// AL is excluded: and al, -1 via the 24 ib accumulator opcode is already 2
+// bytes, tying test al, al; its modrm form is check_implicit_register's
+// finding. Memory is excluded: there is no test [mem], [mem], and a masked
+// store may be intentional.
+bool check_and_minus_one(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_AND) {
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    return eff != opmask;
 }
 
 // xor r/m, -1 flips every bit, which is not r/m, one byte shorter in every
@@ -1922,6 +1959,7 @@ static const struct check_entry checks[] = {
     {check_implicit_register,          "unneeded explicit register",      0},
     {check_implicit_immediate,         "unneeded explicit immediate",     0},
     {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
+    {check_and_minus_one,              "redundant AND immediate",         0},
     {check_and_zero,                   "suboptimal AND zero",             0},
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},

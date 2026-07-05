@@ -32,6 +32,10 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd);
 // flags in 2-4 fewer bytes
 bool check_oversized_test_immediate(const xed_decoded_inst_t *xedd);
 
+// return false if test reg, -1 (an all-ones mask at the operand width) could
+// be test reg, reg, which sets identical flags in fewer bytes
+bool check_test_minus_one(const xed_decoded_inst_t *xedd);
+
 // return false if instruction encodes ADD REG, 128 / SUB REG, 128 (5-6 bytes)
 // instead of the negated SUB REG, -128 / ADD REG, -128 (3 bytes)
 bool check_oversized_add_sub_128(const xed_decoded_inst_t *xedd);

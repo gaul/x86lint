@@ -193,6 +193,46 @@ bool check_oversized_test_immediate(const xed_decoded_inst_t *xedd)
     return (eff & ~(uint64_t) 0x7f) != 0;
 }
 
+// test reg, -1 ANDs the register with an all-ones mask, which changes nothing:
+// test reg, reg computes reg & reg = reg and sets identical flags in fewer
+// bytes.
+//   test eax, -1   a9 ffffffff        (5 bytes)   ->   test eax, eax   85 c0     (2 bytes)
+//   test rbx, -1   48 f7 c3 ffffffff  (7 bytes)   ->   test rbx, rbx   48 85 db  (3 bytes)
+// The all-ones immediate is matched at the effective operand width, so the
+// 64-bit form's sign-extended imm32 counts too (cf. check_xor_to_not). This is
+// the full-width complement of check_oversized_test_immediate, which narrows
+// masks confined to the low seven bits to the byte-register form instead.
+//
+// Flag-exact, so no liveness gate (cf. check_cmp_zero, check_add_sub_zero):
+// test reg, -1 and test reg, reg both leave the register untouched, clear
+// CF/OF, and set ZF/SF/PF from reg (AF undefined in both).
+//
+// AL is excluded: test al, -1 via the a8 ib accumulator opcode is already 2
+// bytes, tying test al, al; its modrm form is check_implicit_register's finding
+// (cf. check_xor_to_not, check_cmp_zero). Memory operands are excluded: there
+// is no test [mem], [mem] form to shrink to.
+bool check_test_minus_one(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_TEST) {
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    return eff != opmask;
+}
+
 // Check for ADD REG, 128 and SUB REG, 128, which need an imm32 (128 is one
 // past the +127 ceiling of a sign-extended imm8) and so encode in 5-6 bytes,
 // when the negated-operation form fits in 3:
@@ -1785,6 +1825,7 @@ struct check_entry {
 static const struct check_entry checks[] = {
     {check_oversized_immediate,        "oversized immediate",             0},
     {check_oversized_test_immediate,   "oversized TEST immediate",        0},
+    {check_test_minus_one,             "redundant TEST immediate",        0},
     {check_oversized_add_sub_128,      "oversized ADD/SUB 128",           FLAG_CF},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},

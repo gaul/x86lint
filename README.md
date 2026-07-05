@@ -50,6 +50,9 @@ compiler writers generate better code and documents the complexity of x86.
   - `4889C0` (MOV RAX, RAX)
 * redundant shift/rotate by zero
   - `C1E0 00` (SHL EAX, 0) -- no-op, flags also unchanged
+* redundant TEST immediate
+  - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
+    mask sets identical flags)
 * suboptimal AND immediate
   - `83E0 FF` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal CMP zero

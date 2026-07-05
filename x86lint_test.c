@@ -245,6 +245,33 @@ static void check_oversized_test_immediate_test(void)
     CHECK_BYTES( check_oversized_test_immediate, 0x90);                                      // nop
 }
 
+static void check_test_minus_one_test(void)
+{
+    // All-ones mask at the operand width -> test reg, reg.
+    CHECK_BYTES(!check_test_minus_one, 0xa9, 0xff, 0xff, 0xff, 0xff);              // test eax, -1 (accumulator)
+    CHECK_BYTES(!check_test_minus_one, 0xf7, 0xc3, 0xff, 0xff, 0xff, 0xff);        // test ebx, -1 (modrm)
+    CHECK_BYTES(!check_test_minus_one, 0x48, 0xa9, 0xff, 0xff, 0xff, 0xff);        // test rax, -1 (imm32 sign-extended)
+    CHECK_BYTES(!check_test_minus_one, 0x48, 0xf7, 0xc3, 0xff, 0xff, 0xff, 0xff);  // test rbx, -1
+    CHECK_BYTES(!check_test_minus_one, 0x66, 0xa9, 0xff, 0xff);                    // test ax, -1
+    CHECK_BYTES(!check_test_minus_one, 0xf6, 0xc3, 0xff);                          // test bl, -1 (8-bit non-AL)
+    CHECK_BYTES(!check_test_minus_one, 0x41, 0xf7, 0xc0, 0xff, 0xff, 0xff, 0xff);  // test r8d, -1
+    CHECK_BYTES(!check_test_minus_one, 0x40, 0xf6, 0xc6, 0xff);                    // test sil, -1 (uniform byte reg)
+    // AL: the a8 ib accumulator form already ties test al, al; the modrm form
+    // is check_implicit_register's finding.
+    CHECK_BYTES( check_test_minus_one, 0xa8, 0xff);                                // test al, -1 (accumulator)
+    CHECK_BYTES( check_test_minus_one, 0xf6, 0xc0, 0xff);                          // test al, -1 (modrm)
+    // Not an all-ones mask at the operand width.
+    CHECK_BYTES( check_test_minus_one, 0xa9, 0x01, 0x00, 0x00, 0x00);              // test eax, 1
+    CHECK_BYTES( check_test_minus_one, 0xa9, 0xff, 0xff, 0x00, 0x00);              // test eax, 0xffff (not full width)
+    CHECK_BYTES( check_test_minus_one, 0x66, 0xa9, 0xff, 0x7f);                    // test ax, 0x7fff
+    // Memory operand: no test [mem], [mem] form.
+    CHECK_BYTES( check_test_minus_one, 0xf7, 0x00, 0xff, 0xff, 0xff, 0xff);        // test dword ptr [rax], -1
+    // No immediate / not TEST.
+    CHECK_BYTES( check_test_minus_one, 0x85, 0xc0);                                // test eax, eax
+    CHECK_BYTES( check_test_minus_one, 0x83, 0xf0, 0xff);                          // xor eax, -1 (not TEST)
+    CHECK_BYTES( check_test_minus_one, 0x90);                                      // nop
+}
+
 static void check_oversized_add_sub_128_test(void)
 {
     // ADD 128 -> SUB -128.
@@ -1233,6 +1260,7 @@ int main(int argc, char *argv[])
     check_suboptimal_nops_test();
     check_oversized_immediate_test();
     check_oversized_test_immediate_test();
+    check_test_minus_one_test();
     check_oversized_add_sub_128_test();
     check_unneeded_rex_test();
     check_cmp_zero_test();

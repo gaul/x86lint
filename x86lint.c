@@ -1054,6 +1054,42 @@ bool check_oversized_evex(const xed_decoded_inst_t *xedd)
     return olen >= xed_decoded_inst_get_length(xedd);
 }
 
+// A VEX instruction has a compact two-byte prefix (C5) and a long three-byte
+// prefix (C4). The two-byte form can encode only opcode map 1 (0F) with
+// VEX.W == 0 and no REX.B/REX.X operand extension; opcode maps 0F38/0F3A,
+// VEX.W == 1, or an r8-r15 base/index/rm operand each force the three-byte
+// form. An instruction that satisfies the two-byte constraints yet is encoded
+// with C4 wastes one byte:
+//   vmovdqa ymm1, ymm2   c4 e1 7d 6f ca   ->   c5 fd 6f ca
+// GNU as emits the two-byte form; naive hand-rolled encoders and some JITs do
+// not. This is the VEX analogue of check_oversized_evex.
+//
+// Unlike the EVEX demotion, the rule here is exact and needs no re-encode:
+// VEX.R (the one extension the two-byte form still carries) and the vvvv/pp/L
+// fields encode identically either way, so {map 1, W 0, no B/X} is precisely
+// the set of two-byte-encodable VEX instructions. The prefix selects operands
+// only -- no semantics ride on its length -- so the shrink is value- and
+// flag-identical and unconditional.
+//
+// The current prefix length is the nominal opcode's offset minus the legacy
+// prefixes ahead of it (a segment or address-size override may precede VEX):
+// 3 is the three-byte C4 form, 2 the already-minimal C5.
+bool check_oversized_vex(const xed_decoded_inst_t *xedd)
+{
+    // vexvalid: 0=legacy, 1=VEX, 2=EVEX (cf. check_oversized_displacement).
+    if (xed3_operand_get_vexvalid(xedd) != 1) {
+        return true;
+    }
+    if (xed3_operand_get_map(xedd) != 1 ||
+        xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd)) ||
+        xed3_operand_get_rexb(xedd) != 0 ||
+        xed3_operand_get_rexx(xedd) != 0) {
+        return true;
+    }
+    return (xed3_operand_get_pos_nominal_opcode(xedd) -
+            xed3_operand_get_nprefixes(xedd)) != 3;
+}
+
 // sub reg, reg zeros the register at the same size as xor reg, reg, but
 // xor is the portable dependency-breaking idiom. Mainstream cores (Intel
 // Sandy Bridge onward, AMD) recognize both xor reg, reg and sub reg, reg
@@ -1777,6 +1813,7 @@ static const struct check_entry checks[] = {
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},
+    {check_oversized_vex,              "oversized VEX encoding",          0},
 };
 
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,

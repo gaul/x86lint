@@ -869,6 +869,36 @@ static void check_oversized_evex_test(void)
     CHECK_BYTES( check_oversized_evex, 0x90);                                            // nop
 }
 
+static void check_oversized_vex_test(void)
+{
+    // Three-byte C4 prefix where the two-byte C5 form suffices (opcode map 0F,
+    // VEX.W clear, no r8-r15 operand) -- flag.
+    CHECK_BYTES(!check_oversized_vex, 0xc4, 0xe1, 0x7d, 0x6f, 0xca);        // vmovdqa ymm1, ymm2 (C4 -> C5)
+    CHECK_BYTES(!check_oversized_vex, 0xc4, 0xe1, 0x75, 0xfe, 0xc2);        // vpaddd ymm0, ymm1, ymm2 (C4 -> C5)
+    CHECK_BYTES(!check_oversized_vex, 0xc4, 0xe1, 0x7e, 0x6f, 0x08);        // vmovdqu ymm1, [rax] (C4 -> C5)
+    // A segment override may precede the VEX prefix; the length math still holds.
+    CHECK_BYTES(!check_oversized_vex, 0x64, 0xc4, 0xe1, 0x7e, 0x6f, 0x08);  // vmovdqu ymm1, fs:[rax] (C4 -> C5)
+    // Destination is an extended reg (VEX.R only) -- the two-byte form carries
+    // R, so it is still reducible.
+    CHECK_BYTES(!check_oversized_vex, 0xc4, 0x61, 0x7d, 0x6f, 0xc0);        // vmovdqa ymm8, ymm0 (C4 -> C5)
+    // Already the minimal two-byte C5 form -- nothing to flag.
+    CHECK_BYTES( check_oversized_vex, 0xc5, 0xfd, 0x6f, 0xca);              // vmovdqa ymm1, ymm2 (C5)
+    CHECK_BYTES( check_oversized_vex, 0xc5, 0xfe, 0x6f, 0x08);              // vmovdqu ymm1, [rax] (C5)
+    CHECK_BYTES( check_oversized_vex, 0xc5, 0x7d, 0x6f, 0xc0);              // vmovdqa ymm8, ymm0 (C5, VEX.R)
+    // Genuinely needs C4: opcode map 0F38 / 0F3A.
+    CHECK_BYTES( check_oversized_vex, 0xc4, 0xe2, 0x71, 0x00, 0xc2);        // vpshufb xmm0, xmm1, xmm2 (0F38)
+    CHECK_BYTES( check_oversized_vex, 0xc4, 0xe3, 0xfd, 0x00, 0xc1, 0x1b);  // vpermq ymm0, ymm1, 0x1b (0F3A)
+    // Genuinely needs C4: VEX.W = 1.
+    CHECK_BYTES( check_oversized_vex, 0xc4, 0xe1, 0xf9, 0x6e, 0xc0);        // vmovq xmm0, rax (map 0F, W1)
+    // Genuinely needs C4: r8-r15 base/index/rm (VEX.B / VEX.X).
+    CHECK_BYTES( check_oversized_vex, 0xc4, 0xc1, 0x7d, 0x6f, 0xc0);        // vmovdqa ymm0, ymm8 (VEX.B)
+    CHECK_BYTES( check_oversized_vex, 0xc4, 0xa1, 0x7e, 0x6f, 0x04, 0x00);  // vmovdqu ymm0, [rax+r8] (VEX.X)
+    // EVEX and legacy encodings are not VEX -- not flagged here.
+    CHECK_BYTES( check_oversized_vex, 0x62, 0xf1, 0xfd, 0x28, 0x6f, 0xca);  // vmovdqa64 ymm1, ymm2 (EVEX)
+    CHECK_BYTES( check_oversized_vex, 0x0f, 0x28, 0xca);                    // movaps xmm1, xmm2 (legacy)
+    CHECK_BYTES( check_oversized_vex, 0x90);                                // nop
+}
+
 // Flag-liveness gating: check_instructions should suppress findings whose
 // suggested replacement would clobber a flag that's read downstream. These
 // tests construct two-or-three instruction sequences and assert the
@@ -1231,6 +1261,7 @@ int main(int argc, char *argv[])
     check_shift_zero_test();
     check_sse_mov_opcode_test();
     check_oversized_evex_test();
+    check_oversized_vex_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
     check_decode_resync_test();

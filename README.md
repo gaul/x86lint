@@ -38,6 +38,10 @@ compiler writers generate better code and documents the complexity of x86.
   - `A9 01000000` instead of `A8 01` (TEST EAX, 1 -> TEST AL, 1; TEST has no
     sign-extended imm8 form, and a mask within the low seven bits sets
     identical flags at byte width)
+* oversized VEX encoding
+  - `C4E17D6FCA` instead of `C5FD6FCA` (VMOVDQA YMM1, YMM2; the three-byte VEX
+    prefix wastes a byte when the two-byte form's map/W/register constraints
+    are met)
 * oversized XCHG encoding
   - `87C8` instead of `91` (XCHG EAX, ECX; the 90+r accumulator form is one byte)
 * redundant ADD/SUB zero

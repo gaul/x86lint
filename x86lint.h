@@ -138,6 +138,11 @@ bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);
 // re-encoding is strictly shorter
 bool check_oversized_evex(const xed_decoded_inst_t *xedd);
 
+// return false if a VEX-encoded instruction uses the three-byte (C4) prefix
+// where the two-byte (C5) form would do -- opcode map 0F, VEX.W clear, and no
+// r8-r15 base/index/rm operand -- which wastes one byte
+bool check_oversized_vex(const xed_decoded_inst_t *xedd);
+
 // A by-type tally of findings accumulated across one or more
 // check_instructions runs, so a driver can print a by-prevalence summary.
 // Opaque; created and destroyed by the caller. A NULL summary is accepted

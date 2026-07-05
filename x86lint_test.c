@@ -563,6 +563,51 @@ static void check_add_sub_zero_test(void)
     CHECK_BYTES( check_add_sub_zero, 0x01, 0xd8);                    // add eax, ebx (no immediate)
 }
 
+static void check_or_xor_zero_test(void)
+{
+    // or/xor reg, 0 leaves the register unchanged but sets flags -> test/remove.
+    CHECK_BYTES(!check_or_xor_zero, 0x83, 0xc8, 0x00);              // or eax, 0
+    CHECK_BYTES(!check_or_xor_zero, 0x83, 0xf0, 0x00);              // xor eax, 0
+    CHECK_BYTES(!check_or_xor_zero, 0x48, 0x83, 0xc8, 0x00);        // or rax, 0
+    CHECK_BYTES(!check_or_xor_zero, 0x66, 0x83, 0xc8, 0x00);        // or ax, 0
+    CHECK_BYTES(!check_or_xor_zero, 0x80, 0xcb, 0x00);              // or bl, 0 (8-bit non-AL)
+    CHECK_BYTES(!check_or_xor_zero, 0x0d, 0x00, 0x00, 0x00, 0x00);  // or eax, 0 (imm32 accumulator form)
+    // AL: the 0c/34 ib accumulator forms already tie test al, al; the modrm
+    // form is check_implicit_register's finding.
+    CHECK_BYTES( check_or_xor_zero, 0x0c, 0x00);                    // or al, 0 (accumulator)
+    CHECK_BYTES( check_or_xor_zero, 0x34, 0x00);                    // xor al, 0 (accumulator)
+    CHECK_BYTES( check_or_xor_zero, 0x80, 0xc8, 0x00);             // or al, 0 (modrm)
+    // Nonzero immediate / no immediate / memory / not OR-XOR.
+    CHECK_BYTES( check_or_xor_zero, 0x83, 0xc8, 0x01);             // or eax, 1
+    CHECK_BYTES( check_or_xor_zero, 0x83, 0xf0, 0xff);             // xor eax, -1 (check_xor_to_not's)
+    CHECK_BYTES( check_or_xor_zero, 0x09, 0xc0);                   // or eax, eax (no immediate)
+    CHECK_BYTES( check_or_xor_zero, 0x83, 0x08, 0x00);            // or dword ptr [rax], 0 (memory)
+    CHECK_BYTES( check_or_xor_zero, 0x83, 0xe0, 0x00);            // and eax, 0 (not OR/XOR)
+    CHECK_BYTES( check_or_xor_zero, 0x90);                         // nop
+}
+
+static void check_and_zero_test(void)
+{
+    // and reg, 0 zeroes the register -> xor reg, reg (fewer bytes, same flags).
+    CHECK_BYTES(!check_and_zero, 0x83, 0xe0, 0x00);                // and eax, 0
+    CHECK_BYTES(!check_and_zero, 0x48, 0x83, 0xe0, 0x00);          // and rax, 0
+    CHECK_BYTES(!check_and_zero, 0x66, 0x83, 0xe0, 0x00);          // and ax, 0
+    CHECK_BYTES(!check_and_zero, 0x80, 0xe3, 0x00);                // and bl, 0 (8-bit non-AL)
+    CHECK_BYTES(!check_and_zero, 0x25, 0x00, 0x00, 0x00, 0x00);    // and eax, 0 (imm32 accumulator form)
+    // AL: the 24 ib accumulator form already ties xor al, al; the modrm form
+    // is check_implicit_register's finding.
+    CHECK_BYTES( check_and_zero, 0x24, 0x00);                      // and al, 0 (accumulator)
+    CHECK_BYTES( check_and_zero, 0x80, 0xe0, 0x00);               // and al, 0 (modrm)
+    // Nonzero masks are check_and_strength_reduce's concern, not this one.
+    CHECK_BYTES( check_and_zero, 0x83, 0xe0, 0x01);               // and eax, 1
+    CHECK_BYTES( check_and_zero, 0x83, 0xe0, 0xff);               // and eax, -1 (all-ones no-op)
+    CHECK_BYTES( check_and_zero, 0x25, 0xff, 0x00, 0x00, 0x00);   // and eax, 0xff (low-byte mask)
+    // Memory / not AND.
+    CHECK_BYTES( check_and_zero, 0x83, 0x20, 0x00);              // and dword ptr [rax], 0 (memory)
+    CHECK_BYTES( check_and_zero, 0x83, 0xc8, 0x00);              // or eax, 0 (not AND)
+    CHECK_BYTES( check_and_zero, 0x90);                           // nop
+}
+
 static void check_inc_dec_test(void)
 {
     // add/sub reg, +/-1 -> inc/dec reg, one byte shorter.
@@ -1275,6 +1320,8 @@ int main(int argc, char *argv[])
     check_oversized_branch_test();
     check_mov_self_test();
     check_add_sub_zero_test();
+    check_or_xor_zero_test();
+    check_and_zero_test();
     check_inc_dec_test();
     check_mov_modrm_imm_test();
     check_unneeded_sib_test();

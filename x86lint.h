@@ -84,6 +84,14 @@ bool check_mov_self(const xed_decoded_inst_t *xedd);
 // if flags are unused)
 bool check_add_sub_zero(const xed_decoded_inst_t *xedd);
 
+// return false if instruction is or reg, 0 or xor reg, 0 (no-ops that only
+// set flags; use TEST reg, reg instead, or remove when flags are unused)
+bool check_or_xor_zero(const xed_decoded_inst_t *xedd);
+
+// return false if instruction is and reg, 0, which zeroes the register --
+// xor reg, reg does the same with identical flags in fewer bytes
+bool check_and_zero(const xed_decoded_inst_t *xedd);
+
 // return false if add r/m, 1 / sub r/m, 1 (or the -1 forms, register or
 // memory destination) could be inc / dec, which is one byte shorter (valid
 // when CF is dead, since inc/dec leave CF unchanged)

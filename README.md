@@ -48,6 +48,8 @@ compiler writers generate better code and documents the complexity of x86.
   - `83C0 00` (ADD EAX, 0) -- use TEST or remove
 * redundant MOV reg, reg
   - `4889C0` (MOV RAX, RAX)
+* redundant OR/XOR zero
+  - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove
 * redundant shift/rotate by zero
   - `C1E0 00` (SHL EAX, 0) -- no-op, flags also unchanged
 * redundant TEST immediate
@@ -55,6 +57,8 @@ compiler writers generate better code and documents the complexity of x86.
     mask sets identical flags)
 * suboptimal AND immediate
   - `83E0 FF` (AND EAX, 0xFF) -- use MOVZBL
+* suboptimal AND zero
+  - `83E0 00` (AND EAX, 0) -- use XOR EAX, EAX (same flags, fewer bytes)
 * suboptimal CMP zero
   - `83F8 00` instead of `85C0` (CMP EAX, 0 -> TEST EAX, EAX)
 * suboptimal IMUL constant

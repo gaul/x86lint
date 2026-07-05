@@ -1453,6 +1453,80 @@ bool check_add_sub_zero(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 
+// or reg, 0 and xor reg, 0 leave the register unchanged (reg | 0 == reg,
+// reg ^ 0 == reg) but set flags as a side effect, exactly like add reg, 0:
+// CF/OF cleared, ZF/SF/PF from the register's value. They can be removed when
+// the flags are unused, or replaced by test reg, reg, which is 1-3 bytes
+// shorter and reproduces the flags exactly (only the unobservable AF differs),
+// so the finding fires regardless of downstream flag liveness (cf.
+// check_add_sub_zero, whose incidental 32-bit zero-extension caveat applies
+// here identically).
+//
+// AL is excluded: or al, 0 / xor al, 0 already fit in 2 bytes via the 0c/34 ib
+// accumulator opcodes, exactly tying test al, al (cf. check_add_sub_zero,
+// check_cmp_zero). Memory operands are excluded too: the access may be
+// intentional (cache-line warm, MMIO trigger), and there is no
+// test [mem], [mem] form besides.
+bool check_or_xor_zero(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+        break;
+    default:
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
+    return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
+}
+
+// and reg, 0 forces the register to zero, which xor reg, reg does in fewer
+// bytes and -- unlike mov reg, 0 -- with identical flags: both clear CF/OF and
+// set ZF=1, SF=0, PF=1 (AF undefined in both), and both zero the full register
+// (the 32-bit forms zero-extend alike). The rewrite is thus value- and
+// flag-identical and unconditional, so it carries no flag concern (cf.
+// check_mov_zero, gated only because MOV writes no flags). A zero immediate is
+// zero at every width, so no effective-mask computation is needed.
+//
+// AL is excluded: and al, 0 via the 24 ib accumulator opcode is already 2
+// bytes, tying xor al, al; its modrm form is check_implicit_register's finding
+// (cf. check_add_sub_zero). Memory operands are excluded: a store of zero may
+// be intentional, and xor cannot target memory. A nonzero mask (including the
+// all-ones no-op and the low-byte masks) is check_and_strength_reduce's
+// concern, not this one.
+bool check_and_zero(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_AND) {
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_AL) {
+        return true;
+    }
+
+    return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
+}
+
 // add r/m, 1 and sub r/m, 1 (and their -1 counterparts) encode as inc /
 // dec, which drops the imm8 byte for every destination, addressing mode,
 // and operand width:
@@ -1833,6 +1907,7 @@ static const struct check_entry checks[] = {
     {check_implicit_register,          "unneeded explicit register",      0},
     {check_implicit_immediate,         "unneeded explicit immediate",     0},
     {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
+    {check_and_zero,                   "suboptimal AND zero",             0},
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
@@ -1840,6 +1915,7 @@ static const struct check_entry checks[] = {
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0},
     {check_add_sub_zero,               "redundant ADD/SUB zero",          0},
+    {check_or_xor_zero,                "redundant OR/XOR zero",           0},
     {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},

@@ -1847,6 +1847,75 @@ static void check_ineffective_prefix_test(void)
     ASSERT_FINDINGS(movq, "unneeded operand-size prefix", 0);
 }
 
+// Multi-instruction peephole: a narrow load feeding an in-place sign/zero
+// extension of the loaded register is a single extending load; check_instructions
+// reports it against the load. The extension must widen the loaded register in
+// place (same family), so its full write subsumes the load. The movsx/movsxd
+// fixtures avoid the eax/ax/rax accumulator forms that check_unneeded_movsx and
+// check_unneeded_movsxd flag as cwde/cbw/cdqe.
+static void check_load_extend_fold_test(void)
+{
+    // mov al, [rsi] ; movzx eax, al -> movzx eax, byte [rsi].
+    static const uint8_t byte_zx[] = {
+        0x8A, 0x06,        // mov al, [rsi]
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+    };
+    ASSERT_FINDINGS(byte_zx, "load foldable into extend", 1);
+
+    // mov al, [rsi] ; movsx eax, al -> movsx eax, byte [rsi].
+    static const uint8_t byte_sx[] = {
+        0x8A, 0x06,        // mov al, [rsi]
+        0x0F, 0xBE, 0xC0,  // movsx eax, al
+    };
+    ASSERT_FINDINGS(byte_sx, "load foldable into extend", 1);
+
+    // mov ax, [rsi] ; movzx eax, ax -> movzx eax, word [rsi].
+    static const uint8_t word_zx[] = {
+        0x66, 0x8B, 0x06,  // mov ax, [rsi]
+        0x0F, 0xB7, 0xC0,  // movzx eax, ax
+    };
+    ASSERT_FINDINGS(word_zx, "load foldable into extend", 1);
+
+    // mov ebx, [rsi] ; movsxd rbx, ebx -> movsxd rbx, [rsi]. (rbx, not rax, so
+    // not the cdqe form.)
+    static const uint8_t dword_sxd[] = {
+        0x8B, 0x1E,              // mov ebx, [rsi]
+        0x48, 0x63, 0xDB,        // movsxd rbx, ebx
+    };
+    ASSERT_FINDINGS(dword_sxd, "load foldable into extend", 1);
+
+    // mov al, [rsi] ; movzx ecx, al -- the extension writes ECX, not RAX, so
+    // dropping the load would leave RAX's low byte unset: not in place, skip.
+    static const uint8_t other_family[] = {
+        0x8A, 0x06,        // mov al, [rsi]
+        0x0F, 0xB6, 0xC8,  // movzx ecx, al
+    };
+    ASSERT_FINDINGS(other_family, "load foldable into extend", 0);
+
+    // mov al, [rsi] ; movzx eax, cl -- the extension reads CL, not the loaded
+    // AL: suppress.
+    static const uint8_t other_source[] = {
+        0x8A, 0x06,        // mov al, [rsi]
+        0x0F, 0xB6, 0xC1,  // movzx eax, cl
+    };
+    ASSERT_FINDINGS(other_source, "load foldable into extend", 0);
+
+    // mov [rsi], al ; movzx eax, al -- the mov is a store, not a load: suppress.
+    static const uint8_t store[] = {
+        0x88, 0x06,        // mov [rsi], al
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+    };
+    ASSERT_FINDINGS(store, "load foldable into extend", 0);
+
+    // mov al, cl ; movzx eax, al -- the mov is register-to-register, so there is
+    // no memory operand to fold: suppress.
+    static const uint8_t reg_move[] = {
+        0x88, 0xC8,        // mov al, cl
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+    };
+    ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -1916,6 +1985,7 @@ int main(int argc, char *argv[])
     check_lea_fold_test();
     check_mov_const_fold_test();
     check_ineffective_prefix_test();
+    check_load_extend_fold_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

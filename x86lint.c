@@ -2700,6 +2700,81 @@ static const char *ineffective_prefix(const xed_decoded_inst_t *xedd,
     return NULL;
 }
 
+// Multi-instruction peephole. A narrow load followed by a sign- or zero-
+// extension of the loaded register is a single extending load; the separate mov
+// disappears, and with it a partial-register write that can stall a later
+// full-register read:
+//
+//   mov al, [rsi]  ; movzx eax, al   -> movzx eax, byte [rsi]
+//   mov ax, [rsi]  ; movsx eax, ax   -> movsx eax, word [rsi]
+//   mov ebx, [rsi] ; movsxd rbx, ebx -> movsxd rbx, [rsi]
+//
+// `load` is the already-decoded producer ending at `ext_offset`; on a match the
+// function returns true and the caller reports against the load, the removable
+// instruction.
+//
+// Soundness needs no liveness scan. The extension must widen the loaded register
+// IN PLACE -- its register source is exactly the load's destination and its own
+// destination is the same register family -- so the extension's full-width write
+// overwrites the load's narrow write (and any prior upper bits). The register
+// therefore ends identical whether or not the load runs, and the memory is read
+// once at the same width and address either way (MMIO-safe). The in-place
+// requirement is essential: mov al, [rsi] ; movzx ecx, al writes ECX, leaving
+// RAX's low byte unset once the load is dropped, so it does not fold. The exact
+// source match also keeps the fold correct when the loaded register addresses
+// the load (mov al, [rax] ; movzx eax, al): with the mov gone the extension
+// reads [rax] at rax's pre-mov value, the very address the mov used.
+static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
+                                      size_t ext_offset,
+                                      const xed_decoded_inst_t *load)
+{
+    // Producer: mov reg, [mem] -- a GPR loaded from a single memory source at
+    // 8/16/32 bits (64 has nothing to extend into).
+    if (xed_decoded_inst_get_iclass(load) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(load) != 1 ||
+        !xed_decoded_inst_mem_read(load, 0) ||
+        xed_decoded_inst_mem_written(load, 0)) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(load, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    unsigned w = xed_get_register_width_bits64(dest);
+    if (w != 8 && w != 16 && w != 32) {
+        return false;
+    }
+
+    // Consumer: movzx/movsx/movsxd whose register source is exactly dest and
+    // whose destination is the same register family (an in-place widening).
+    if (ext_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t ext;
+    xed_decoded_inst_zero(&ext);
+    xed_decoded_inst_set_mode(&ext, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&ext, inst + ext_offset, len - ext_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(&ext)) {
+    case XED_ICLASS_MOVZX:
+    case XED_ICLASS_MOVSX:
+    case XED_ICLASS_MOVSXD:
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&ext) != 0 ||
+        xed_decoded_inst_get_reg(&ext, XED_OPERAND_REG1) != dest) {
+        return false;
+    }
+    return xed_get_largest_enclosing_register(
+               xed_decoded_inst_get_reg(&ext, XED_OPERAND_REG0)) ==
+           xed_get_largest_enclosing_register(dest);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2827,6 +2902,17 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if (mov_const_foldable(inst, len, next, &xedd)) {
             summary_add(summary, "MOV constant foldable");
             report_finding("MOV constant foldable", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a narrow load feeding an in-place sign/
+        // zero-extension is a single extending load. Reported against the load
+        // (at `offset`), the removable instruction. See
+        // load_foldable_into_extend.
+        if (load_foldable_into_extend(inst, len, next, &xedd)) {
+            summary_add(summary, "load foldable into extend");
+            report_finding("load foldable into extend", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

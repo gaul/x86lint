@@ -80,6 +80,11 @@ and only for flags -- the ABI guarantees they do not survive it.
     disappears: MOV RAX, [RDI+RSI*4]. Fires when the LEA's register is dead
     after the fold (overwritten or unused) and the combined address still fits
     one index and a 32-bit displacement (gated by register liveness)
+* load foldable into extend
+  - `8A06 0FB6C0` (MOV AL, [RSI]; MOVZX EAX, AL) -- a narrow load then an
+    in-place sign/zero-extension is a single extending load: MOVZX EAX, byte
+    [RSI]. Removes the load and its partial-register write; also MOVSX and the
+    MOVSXD (32->64) form
 * missing LOCK prefix on CMPXCHG and XADD
 * MOV constant foldable
   - `B905000000 01C8` (MOV ECX, 5; ADD EAX, ECX) -- the constant folds into the

@@ -177,10 +177,17 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `66 0FBEC0` instead of `66 98` (MOVSX AX, AL -> CBW)
 * unneeded MOVSXD
   - `48 63 C0` instead of `48 98` (MOVSXD RAX, EAX -> CDQE)
+* unneeded operand-size prefix
+  - `66 48 01C8` (66 ADD RAX, RCX) -- REX.W forces 64-bit operands, so the 66
+    (which selects 16-bit) is ignored; the mandatory 66 of SSE opcodes is
+    unaffected
 * unneeded REX prefix
   - XOR RAX, RAX `4831C0` instead of XOR EAX, EAX `31C0`
   - `40C9` instead of `C9` (LEAVE)
   - `48 0FB6C3` instead of `0FB6C3` (MOVZX RAX, BL -> MOVZX EAX, BL; the r32 form zero-extends to 64)
+* unneeded segment prefix
+  - `3E 8B00` (MOV EAX, DS:[RAX]) -- CS/DS/ES/SS bases are zero in 64-bit mode,
+    so the override changes no address (FS/GS have real bases and are kept)
 * unneeded SIB byte
   - `C64465 04 05` instead of `C645 04 05` (MOV byte [RBP+4], 5)
 * unneeded zero displacement

@@ -2655,6 +2655,51 @@ static bool mov_const_foldable(const uint8_t *inst, size_t len,
     return !reg_live_after(inst, len, after, reg_enc);
 }
 
+// Returns the name of an ineffective prefix byte -- one the CPU consumes but
+// ignores in 64-bit mode, so pure code-size waste -- or NULL if there is none.
+// Two cases:
+//   * a CS/DS/ES/SS segment override (2E/3E/26/36) on a memory operand: those
+//     four segment bases are fixed at zero in 64-bit mode, so the override
+//     changes no address. FS/GS (64/65) have real bases (TLS) and are kept. XED
+//     reports no seg_ovd for the ignored four (it already knows they do
+//     nothing), so the prefix is found by scanning the legacy prefix bytes.
+//     Branches are excluded: 2E/3E on a Jcc are branch hints and 3E on an
+//     indirect branch is the CET notrack prefix, not addressing.
+//   * a 66 operand-size prefix on an instruction that also carries REX.W, which
+//     forces 64-bit operands and, per the Intel SDM, makes the 66 (which
+//     selects 16-bit) inert. osz is set only for a true operand-size 66, not the
+//     mandatory 66 of SSE opcodes (movdqa, addpd, movq xmm, r64), so those never
+//     match. (xed3_operand accessors as in check_unneeded_rex; XED's public
+//     surface does not expose osz.)
+static const char *ineffective_prefix(const xed_decoded_inst_t *xedd,
+                                      const uint8_t *bytes, size_t len)
+{
+    if (xed3_operand_get_osz(xedd) && xed3_operand_get_rexw(xedd)) {
+        return "unneeded operand-size prefix";
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        xed_category_enum_t cat = xed_decoded_inst_get_category(xedd);
+        if (cat != XED_CATEGORY_COND_BR && cat != XED_CATEGORY_UNCOND_BR &&
+            cat != XED_CATEGORY_CALL && cat != XED_CATEGORY_RET) {
+            for (size_t i = 0; i < len; ++i) {
+                uint8_t b = bytes[i];
+                if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36) {
+                    return "unneeded segment prefix";
+                }
+                // The other legacy prefixes may precede the segment one in any
+                // order; stop at the REX byte or the opcode.
+                if (b != 0x64 && b != 0x65 && b != 0x66 && b != 0x67 &&
+                    b != 0xF0 && b != 0xF2 && b != 0xF3) {
+                    break;
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2741,6 +2786,15 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, checks[i].name);
             report_finding(checks[i].name, offset, verbose, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Single instruction, but keyed on the raw prefix bytes rather than a
+        // decoded operand, so it runs outside the check table.
+        const char *pfx = ineffective_prefix(&xedd, inst + offset, next - offset);
+        if (pfx != NULL) {
+            summary_add(summary, pfx);
+            report_finding(pfx, offset, verbose, &xedd, inst + offset);
             ++errors;
         }
 

@@ -2259,6 +2259,237 @@ static bool flags_test_redundant(const uint8_t *inst, size_t len,
     return true;
 }
 
+// The full-register analogue of reg_upper32_live_after: walk forward from
+// `offset` to decide whether the 64-bit GPR `reg64` is live -- read in whole or
+// in part before being fully overwritten. Returns true (LIVE) on yes or
+// unknown; a caller proving a value dead before dropping the instruction that
+// produced it suppresses its finding when this returns true. Where
+// reg_upper32_live_after counts only reads of the 64-bit name (which alone
+// observe bits 63:32), this counts a read of any sub-register (al/ax/eax/rax),
+// since the whole value is at stake.
+//
+// Returns false (DEAD) only on an unconditional 32- or 64-bit write
+// (reg_kill_iclass) with no intervening read: such a write replaces the entire
+// value (a 32-bit write zero-extends). 8- and 16-bit writes leave the upper bits
+// intact and are not kills. Conservative LIVE on decode error, any control
+// transfer (RET included -- the value may escape as a return or callee-saved
+// register), running out of input, or the lookahead bound.
+static bool reg_live_after(const uint8_t *inst, size_t len, size_t offset,
+                           xed_reg_enum_t reg64)
+{
+    const int MAX_LOOKAHEAD = 16;
+
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+    for (int step = 0; step < MAX_LOOKAHEAD && offset < len; ++step) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+            return true;
+        }
+
+        // A read of any sub-register of reg64 -- an explicit or implicit
+        // operand, or a memory base or index -- observes part of the value.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned nops = xed_inst_noperands(xi);
+        for (unsigned i = 0; i < nops; ++i) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t name = xed_operand_name(op);
+            if (xed_operand_is_register(name) && xed_operand_read(op) &&
+                xed_get_largest_enclosing_register(
+                    xed_decoded_inst_get_reg(&xedd, name)) == reg64) {
+                return true;
+            }
+        }
+        int nmem = xed_decoded_inst_number_of_memory_operands(&xedd);
+        for (int m = 0; m < nmem; ++m) {
+            xed_reg_enum_t b = xed_decoded_inst_get_base_reg(&xedd, m);
+            xed_reg_enum_t x = xed_decoded_inst_get_index_reg(&xedd, m);
+            if ((b != XED_REG_INVALID &&
+                 xed_get_largest_enclosing_register(b) == reg64) ||
+                (x != XED_REG_INVALID &&
+                 xed_get_largest_enclosing_register(x) == reg64)) {
+                return true;
+            }
+        }
+
+        xed_category_enum_t category = xed_decoded_inst_get_category(&xedd);
+        if (category == XED_CATEGORY_CALL ||
+            category == XED_CATEGORY_RET ||
+            category == XED_CATEGORY_UNCOND_BR ||
+            category == XED_CATEGORY_COND_BR ||
+            category == XED_CATEGORY_SYSCALL ||
+            category == XED_CATEGORY_SYSRET ||
+            category == XED_CATEGORY_INTERRUPT) {
+            return true;
+        }
+
+        // An unconditional 32- or 64-bit write replaces the whole value: DEAD.
+        if (reg_kill_iclass(xed_decoded_inst_get_iclass(&xedd))) {
+            for (unsigned i = 0; i < nops; ++i) {
+                const xed_operand_t *op = xed_inst_operand(xi, i);
+                xed_operand_enum_t name = xed_operand_name(op);
+                if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+                    continue;
+                }
+                xed_reg_enum_t wr = xed_decoded_inst_get_reg(&xedd, name);
+                if (xed_get_largest_enclosing_register(wr) == reg64 &&
+                    xed_get_register_width_bits64(wr) >= 32) {
+                    return false;
+                }
+            }
+        }
+
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+
+    return true;
+}
+
+// Multi-instruction peephole. lea reg, [addr] materializes an address in reg; if
+// the next instruction uses reg as the base of its one memory operand and reg is
+// dead afterward, the address arithmetic folds into that operand's own
+// base + index*scale + disp form and the lea disappears -- x86's rich addressing
+// does, for free in the consumer's AGU, the math the lea did:
+//
+//   lea rax, [rdi + rsi*4] ; mov ecx, [rax]      -> mov ecx, [rdi + rsi*4]
+//   lea rax, [rdi + rsi*4] ; mov ecx, [rax + 8]  -> mov ecx, [rdi + rsi*4 + 8]
+//   lea rax, [rbx + 8]     ; mov rax, [rax]       -> mov rax, [rbx + 8]
+//
+// `lea` is the already-decoded instruction ending at `consumer_offset`; the
+// function returns true when the pair folds, and the caller reports against the
+// lea (the removable instruction). A simple lea reg, [base] also draws
+// check_lea_to_mov's separate "suboptimal LEA" finding.
+//
+// Encodability. The fold substitutes the lea's base_L + index_L*scale_L + disp_L
+// for reg in the consumer's base + index*scale + disp, so the result must still
+// fit one base, one index*scale, and one disp32: at most one of the lea and the
+// consumer may carry an index (two would need two index slots), and
+// disp_L + disp_M must stay within signed 32 bits. RIP-relative and 32-bit-
+// address forms don't compose into a downstream 64-bit base and are rejected.
+//
+// Soundness. Removing the lea drops reg's definition, so reg must be dead once
+// the consumer stops referencing it. reg must therefore appear in the consumer
+// ONLY as the memory base -- never as the index, and never read as a data
+// operand (the add rax, [rax] accumulator case, where reg stays live after the
+// base folds away). Its value is then dead if the consumer fully overwrites reg
+// (mov rax, [rax]) or, failing that, if reg_live_after shows it dead past the
+// consumer (mov ecx, [rax] with rax unused after). Within one instruction the
+// base is read before the destination is written, so aliasing such as
+// lea rax, [rbx] ; mov rbx, [rax] -> mov rbx, [rbx] stays correct. A non-default
+// segment on the consumer is skipped as a needless complication.
+static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
+                                    size_t consumer_offset,
+                                    const xed_decoded_inst_t *lea)
+{
+    if (xed_decoded_inst_get_iclass(lea) != XED_ICLASS_LEA) {
+        return false;
+    }
+
+    // The address register we hope to eliminate must be a 64-bit GPR so it can
+    // serve as a memory base downstream.
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(lea, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(dest) != 64) {
+        return false;
+    }
+
+    // The lea's address components must be 64-bit GPRs or absent; RIP-relative
+    // (register class IP) and 32-bit-address (GPR32) forms fail this test.
+    xed_reg_enum_t base_l = xed_decoded_inst_get_base_reg(lea, 0);
+    xed_reg_enum_t index_l = xed_decoded_inst_get_index_reg(lea, 0);
+    if (base_l != XED_REG_INVALID &&
+        (xed_reg_class(base_l) != XED_REG_CLASS_GPR ||
+         xed_get_register_width_bits64(base_l) != 64)) {
+        return false;
+    }
+    if (index_l != XED_REG_INVALID &&
+        (xed_reg_class(index_l) != XED_REG_CLASS_GPR ||
+         xed_get_register_width_bits64(index_l) != 64)) {
+        return false;
+    }
+
+    // Decode the consumer; it must have exactly one memory operand based on
+    // dest, with dest not also its index and no fs/gs override.
+    if (consumer_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t consumer;
+    xed_decoded_inst_zero(&consumer);
+    xed_decoded_inst_set_mode(&consumer, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&consumer) != 1 ||
+        xed_decoded_inst_get_base_reg(&consumer, 0) != dest ||
+        xed_decoded_inst_get_index_reg(&consumer, 0) == dest) {
+        return false;
+    }
+    xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(&consumer, 0);
+    if (seg == XED_REG_FS || seg == XED_REG_GS) {
+        return false;
+    }
+
+    // A control-transfer consumer (jmp/call through [dest]) does not fall
+    // through to the linear next instruction, so the deadness walk below would
+    // read the wrong bytes; leave those alone.
+    xed_category_enum_t cat = xed_decoded_inst_get_category(&consumer);
+    if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_RET ||
+        cat == XED_CATEGORY_UNCOND_BR || cat == XED_CATEGORY_COND_BR ||
+        cat == XED_CATEGORY_SYSCALL || cat == XED_CATEGORY_SYSRET ||
+        cat == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+
+    // At most one index between the two, and the displacements sum within 32
+    // signed bits.
+    if (index_l != XED_REG_INVALID &&
+        xed_decoded_inst_get_index_reg(&consumer, 0) != XED_REG_INVALID) {
+        return false;
+    }
+    int64_t disp = xed_decoded_inst_get_memory_displacement(lea, 0) +
+                   xed_decoded_inst_get_memory_displacement(&consumer, 0);
+    if (disp < INT32_MIN || disp > INT32_MAX) {
+        return false;
+    }
+
+    // dest must appear only as the base: never read as a data operand (else it
+    // stays live after the base folds away). Note whether the consumer fully
+    // overwrites it.
+    const xed_inst_t *xi = xed_decoded_inst_inst(&consumer);
+    unsigned nops = xed_inst_noperands(xi);
+    bool writes_dest = false;
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) ||
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(&consumer, name)) != dest) {
+            continue;
+        }
+        if (xed_operand_read(op)) {
+            return false;
+        }
+        if (xed_operand_written(op) &&
+            xed_get_register_width_bits64(
+                xed_decoded_inst_get_reg(&consumer, name)) >= 32) {
+            writes_dest = true;
+        }
+    }
+
+    // dest's address value must be dead after the fold: overwritten by the
+    // consumer, or unread downstream.
+    if (writes_dest) {
+        return true;
+    }
+    size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
+    return !reg_live_after(inst, len, after, dest);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2344,6 +2575,17 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "redundant TEST after flags");
             report_finding("redundant TEST after flags", next, verbose,
                 &redundant_test, inst + next);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: lea reg, [addr] whose address folds into
+        // the next instruction's memory operand, leaving reg dead. Reported
+        // against the lea (at `offset`), the removable instruction. See
+        // lea_foldable_into_memop.
+        if (lea_foldable_into_memop(inst, len, next, &xedd)) {
+            summary_add(summary, "LEA foldable into memory");
+            report_finding("LEA foldable into memory", offset, verbose, &xedd,
+                inst + offset);
             ++errors;
         }
 

@@ -1536,6 +1536,133 @@ static void check_redundant_flags_test(void)
     ASSERT_FINDINGS(shl_test, "redundant TEST after flags", 0);
 }
 
+// Multi-instruction peephole: lea reg, [addr] whose address the next
+// instruction consumes as its memory base folds into that operand, so the lea
+// disappears. check_instructions reports it against the lea when reg is dead
+// after the fold. Positive fixtures use indexed or displaced leas so the simple
+// lea reg, [base] case (also check_lea_to_mov's "suboptimal LEA") does not add a
+// second finding and skew the total.
+static void check_lea_fold_test(void)
+{
+    // lea rax, [rdi+rsi*4] ; mov rax, [rax] -- the load overwrites rax, so its
+    // address value is dead; fold to mov rax, [rdi+rsi*4].
+    static const uint8_t self_load[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x48, 0x8B, 0x00,        // mov rax, [rax]
+    };
+    ASSERT_FINDINGS(self_load, "LEA foldable into memory", 1);
+
+    // lea rax, [rbx+8] ; mov rax, [rax] -- displacement-only lea; disp folds
+    // (8 + 0) into the load: mov rax, [rbx+8].
+    static const uint8_t disp_lea[] = {
+        0x48, 0x8D, 0x43, 0x08,  // lea rax, [rbx+8]
+        0x48, 0x8B, 0x00,        // mov rax, [rax]
+    };
+    ASSERT_FINDINGS(disp_lea, "LEA foldable into memory", 1);
+
+    // lea rax, [rdi+rsi*4] ; mov ecx, [rax+8] ; mov eax, edx -- different
+    // destination, so deadness is proven by the walk: mov eax, edx overwrites
+    // rax without reading it. Consumer disp 8 folds with the lea's 0.
+    static const uint8_t dead_by_scan[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x8B, 0x48, 0x08,        // mov ecx, [rax+8]
+        0x89, 0xD0,              // mov eax, edx (kills rax)
+    };
+    ASSERT_FINDINGS(dead_by_scan, "LEA foldable into memory", 1);
+
+    // lea rax, [rbx+8] ; mov rax, [rax+rsi*2] -- the index comes from the
+    // consumer (the lea has none), so the single index slot suffices:
+    // mov rax, [rbx+rsi*2+8].
+    static const uint8_t consumer_index[] = {
+        0x48, 0x8D, 0x43, 0x08,  // lea rax, [rbx+8]
+        0x48, 0x8B, 0x04, 0x70,  // mov rax, [rax+rsi*2]
+    };
+    ASSERT_FINDINGS(consumer_index, "LEA foldable into memory", 1);
+
+    // lea rax, [rdi+rsi*4] ; mov [rax], ecx ; mov eax, edx -- a store consumer;
+    // rax appears only as the base (ecx is the stored value) and is killed next.
+    static const uint8_t store_consumer[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x89, 0x08,              // mov [rax], ecx
+        0x89, 0xD0,              // mov eax, edx (kills rax)
+    };
+    ASSERT_FINDINGS(store_consumer, "LEA foldable into memory", 1);
+
+    // lea rax, [rax+rsi*4] ; mov rax, [rax] -- the lea reads its own dest as the
+    // base. Within the load the base is read before rax is written, so folding
+    // to mov rax, [rax+rsi*4] preserves the value.
+    static const uint8_t self_ref[] = {
+        0x48, 0x8D, 0x04, 0xB0,  // lea rax, [rax+rsi*4]
+        0x48, 0x8B, 0x00,        // mov rax, [rax]
+    };
+    ASSERT_FINDINGS(self_ref, "LEA foldable into memory", 1);
+
+    // lea rax, [rdi+rsi*4] ; mov ecx, [rax] ; ret -- different destination and
+    // rax is not overwritten before RET, where the walk is conservatively live
+    // (rax may be a return value): suppress.
+    static const uint8_t live_at_ret[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x8B, 0x08,              // mov ecx, [rax]
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(live_at_ret, "LEA foldable into memory", 0);
+
+    // lea rax, [rdi+rsi*4] ; add rax, [rax] -- rax is read as the accumulator,
+    // not just the base, so it stays live after the base folds away: suppress.
+    static const uint8_t accumulator[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x48, 0x03, 0x00,        // add rax, [rax]
+    };
+    ASSERT_FINDINGS(accumulator, "LEA foldable into memory", 0);
+
+    // lea rax, [rdi+rsi*4] ; mov ecx, [rax+rdx*2] -- both the lea and the
+    // consumer carry an index; the combined address needs two index slots and
+    // does not fold: suppress.
+    static const uint8_t two_indexes[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x8B, 0x0C, 0x50,        // mov ecx, [rax+rdx*2]
+    };
+    ASSERT_FINDINGS(two_indexes, "LEA foldable into memory", 0);
+
+    // lea rax, [rdi+rsi*4] ; mov ecx, [rax+rax*2] -- rax is the consumer's index
+    // (and base); substituting into an index would scale the whole address, so
+    // only a base use folds: suppress.
+    static const uint8_t dest_is_index[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x8B, 0x0C, 0x40,        // mov ecx, [rax+rax*2]
+    };
+    ASSERT_FINDINGS(dest_is_index, "LEA foldable into memory", 0);
+
+    // lea rax, [rdi+rsi*4] ; mov ecx, [rbx] -- the consumer's base is not the
+    // lea's destination, so there is nothing to fold: suppress.
+    static const uint8_t unrelated_base[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x8B, 0x0B,              // mov ecx, [rbx]
+    };
+    ASSERT_FINDINGS(unrelated_base, "LEA foldable into memory", 0);
+
+    // lea rax, [rdi+rsi*4] ; mov al, [rax] ; ret -- an 8-bit write to al leaves
+    // rax's upper bits (the address) intact, so it is not a kill; rax is then
+    // live at RET: suppress.
+    static const uint8_t partial_write[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0x8A, 0x00,              // mov al, [rax]
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(partial_write, "LEA foldable into memory", 0);
+
+    // lea rax, [rdi+rsi*4] ; jmp [rax] ; mov eax, edx -- the jmp transfers
+    // control, so the mov after it is not its successor; the deadness walk must
+    // not read it as one. Without the control-transfer guard the mov would
+    // falsely prove rax dead: suppress.
+    static const uint8_t jmp_consumer[] = {
+        0x48, 0x8D, 0x04, 0xB7,  // lea rax, [rdi+rsi*4]
+        0xFF, 0x20,              // jmp [rax]
+        0x89, 0xD0,              // mov eax, edx
+    };
+    ASSERT_FINDINGS(jmp_consumer, "LEA foldable into memory", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -1601,6 +1728,7 @@ int main(int argc, char *argv[])
     check_flag_liveness_corners_test();
     check_reg_liveness_test();
     check_redundant_flags_test();
+    check_lea_fold_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

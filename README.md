@@ -72,6 +72,12 @@ and only for flags -- the ABI guarantees they do not survive it.
 
 ## Implemented analyses
 
+* LEA foldable into memory
+  - `488D04B7 488B00` (LEA RAX, [RDI+RSI*4]; MOV RAX, [RAX]) -- the address
+    computation folds into the load's own base+index*scale+disp, so the LEA
+    disappears: MOV RAX, [RDI+RSI*4]. Fires when the LEA's register is dead
+    after the fold (overwritten or unused) and the combined address still fits
+    one index and a 32-bit displacement (gated by register liveness)
 * missing LOCK prefix on CMPXCHG and XADD
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)

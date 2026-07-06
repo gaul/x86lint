@@ -11,6 +11,65 @@ For example, `add eax, 1` can encode with either an 8- or 32-bit immediate:
 Using the former can result in smaller and faster code.  x86lint can help
 compiler writers generate better code and documents the complexity of x86.
 
+## Design and soundness model
+
+x86lint is a peephole analyzer. It walks the machine code in a single linear
+sweep -- decoding one instruction at a time in 64-bit long mode with Intel
+XED -- and matches each decoded instruction against a table of checks, every
+one recognizing a single suboptimal encoding by its opcode, operands, and
+immediate. Matching works on XED's decoded form, so aliases and alternate
+encodings of the same operation are all caught. Every check in the table
+inspects one instruction on its own; unlike its AArch64 sibling
+[armlint](https://github.com/gaul/armlint), whose folds match windows of
+adjacent instructions, the only place x86lint looks past the current
+instruction is the bounded liveness scan described below.
+
+**Linear sweep with resync.** Executable sections routinely interleave data
+with code -- jump tables, alignment islands, GHC info tables, Go's
+BoringCrypto signature. When XED cannot decode the bytes at the cursor,
+x86lint skips a single byte and resynchronizes instead of abandoning the rest
+of the section. Skipped bytes are counted (`x86lint_summary_skipped`) so that
+partial coverage of a data-laden region is not mistaken for a clean scan.
+
+**Soundness over recall.** For a tool that suggests code changes, a false
+positive -- flagging an instruction whose replacement would change behavior --
+is the worst failure, so every check errs toward false negatives: a missed
+opportunity is cheaper than a wrong one. Most rewrites are unconditionally
+equivalent (a shorter immediate, a dropped REX prefix, `movaps` for `movdqa`)
+and need no further proof. But two side effects are invisible in the lone
+instruction and would make an otherwise-redundant rewrite unsound if a later
+instruction observed them; each is guarded by a bounded forward scan (up to 16
+instructions) starting at the successor.
+
+* **Flag liveness.** Some rewrites change which flags an instruction writes:
+  `mov eax, 0` -> `xor eax, eax` saves bytes but clobbers the arithmetic flags
+  `mov` left untouched, and `add [rbx], 1` -> `inc [rbx]` reproduces every flag
+  except CF, which `add` writes and `inc` leaves alone. The rewrite is sound
+  only when the affected flags are dead, so a check declares the flags it
+  perturbs (`flag_concerns`) and `flags_live_after` suppresses the finding if
+  any is read before being overwritten. A `RET` ends the scan as dead --
+  neither the SysV nor Win64 ABI preserves flags across a call -- while a
+  branch, call, or interrupt whose path the scan cannot follow ends it
+  conservatively live.
+
+* **Register (upper-32) liveness.** Writing a 32-bit register zero-extends
+  into the upper half of its 64-bit parent, so `mov eax, eax` is redundant
+  only when that zero-extension is dead. A check names the 64-bit register at
+  stake (`reg_concern`) and `reg_upper32_live_after` suppresses the finding if
+  bits 63:32 are read -- as an explicit operand or a memory base/index --
+  before an unconditional 32- or 64-bit write redefines them. Here `RET` is
+  conservatively live: the value can escape as a return value or in a
+  callee-saved register, which a linear walk cannot rule out.
+
+Both scans share one bias: reads count inclusively and redefinitions
+exclusively, so every uncertainty -- a decode error, an unfollowable branch,
+running past the 16-instruction window, or the end of the buffer -- resolves
+toward *live*, and thus toward suppressing the finding. Neither scan follows a
+taken branch, so a rewrite is assumed sound at branch targets. That holds for
+compiler-generated code, where flags and scratch registers are defined within
+a basic block, but not necessarily for hand-written assembly that deliberately
+keeps a value live across a branch.
+
 ## Implemented analyses
 
 * missing LOCK prefix on CMPXCHG and XADD

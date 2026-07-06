@@ -79,8 +79,10 @@ bool check_xchg_accumulator(const xed_decoded_inst_t *xedd);
 // return false if a JMP or Jcc uses rel32 when rel8 would reach the target
 bool check_oversized_branch(const xed_decoded_inst_t *xedd);
 
-// return false if instruction is a no-op mov reg, reg (excluding the
-// mov r32, r32 zero-extension idiom)
+// return false if instruction is a no-op mov reg, reg. The 8/16/64-bit forms
+// are pure no-ops; the mov r32, r32 form is a no-op only when its incidental
+// zero-extension into the upper 32 bits is dead, which the dispatcher gates on
+// register liveness (reg_upper32_live_after)
 bool check_mov_self(const xed_decoded_inst_t *xedd);
 
 // return false if instruction is add reg, 0 or sub reg, 0 (use TEST

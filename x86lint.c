@@ -1633,10 +1633,21 @@ bool check_inc_dec(const xed_decoded_inst_t *xedd)
     return false;
 }
 
-// mov reg, reg with both operands the same register is a no-op, with one
-// exception: mov r32, r32 deliberately zero-extends to the corresponding
-// r64 (writing any 32-bit register clears the upper 32 bits). The 8-,
-// 16-, and 64-bit forms have no such side effect and are pure waste.
+// mov reg, reg with both operands the same register is a no-op in the 8-, 16-,
+// and 64-bit forms -- pure waste, flagged outright.
+//
+// The 32-bit form mov r32, r32 is not pure waste: it zero-extends into the
+// upper 32 bits of the enclosing 64-bit register (any write of a 32-bit
+// register clears bits 63-32). Removing it is sound only when that
+// zero-extension is dead -- those upper bits are redefined before any reader --
+// which the dispatcher decides with reg_upper32_live_after via the entry's
+// reg_concern hook (mov_self_upper_concern). So this returns a finding for
+// every same-register mov; the 32-bit case is then gated on upper-bit liveness,
+// while the 8/16/64-bit cases -- with no upper bits to disturb -- fire
+// unconditionally.
+//
+// The r0 == r1 test also excludes the memory forms (mov [mem], reg has a single
+// register operand, so r1 is INVALID) and different-register copies.
 bool check_mov_self(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV) {
@@ -1646,10 +1657,6 @@ bool check_mov_self(const xed_decoded_inst_t *xedd)
     xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
     xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
     if (r0 == XED_REG_INVALID || r0 != r1) {
-        return true;
-    }
-
-    if (xed_decoded_inst_get_operand_width(xedd) == 32) {
         return true;
     }
 
@@ -1811,6 +1818,155 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
     return live != 0;
 }
 
+// Instruction classes that unconditionally overwrite bits 32-63 of a GPR when
+// they write its 32- or 64-bit form: a 64-bit write sets those bits directly, a
+// 32-bit write zero-extends into them. reg_upper32_live_after uses this to
+// recognize a redefinition (kill) of the upper half. The list is a deliberately
+// conservative whitelist -- omitting an instruction only forgoes a DEAD
+// conclusion (and thus a finding), never soundness. Excluded on purpose: CMOVcc
+// and REP-string writes (conditional -- the prior value can survive a not-taken
+// move or a zero REP count), shifts and rotates (a count of 0 leaves the
+// destination unwritten per the Intel SDM), and BSF/BSR (the destination is
+// undefined when the source is 0).
+static bool reg_kill_iclass(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_MOV:
+    case XED_ICLASS_MOVZX:
+    case XED_ICLASS_MOVSX:
+    case XED_ICLASS_MOVSXD:
+    case XED_ICLASS_LEA:
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_SBB:
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+    case XED_ICLASS_NEG:
+    case XED_ICLASS_NOT:
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+    case XED_ICLASS_IMUL:
+    case XED_ICLASS_MUL:
+    case XED_ICLASS_POP:
+    case XED_ICLASS_BSWAP:
+    case XED_ICLASS_XCHG:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Walk forward from byte `offset` to decide whether bits 32-63 of the 64-bit
+// GPR `reg64` might be read by a downstream instruction before being redefined.
+// Returns true (LIVE) on yes or unknown; the dispatcher suppresses a finding
+// whose rewrite would disturb those bits when this returns true. This is the
+// register analogue of flags_live_after, built to answer the one register
+// question the optimizations here raise: mov r32, r32's only effect beyond
+// identity is zero-extending bits 32-63, so removing it is sound exactly when
+// those bits are dead. Only the 64-bit register name reads them -- a read of
+// eax/ax/al does not -- so the match is width-aware.
+//
+// Returns false (DEAD) only when an instruction unconditionally redefines those
+// bits with no dependence on their prior value: a 32-bit write zero-extends
+// into them, a 64-bit write sets them (see reg_kill_iclass), with no
+// intervening read.
+//
+// Conservative LIVE on: decode error; ANY control transfer, RET included (a
+// register may escape as a return value or a callee-saved register, neither of
+// which a linear forward walk can rule out -- unlike flags, which no ABI
+// preserves across RET, so flags_live_after treats RET as DEAD); running out of
+// input; reaching the lookahead bound. Reads are matched inclusively
+// (conditional reads count) and kills exclusively (only the whitelisted
+// unconditional writers), so every uncertainty resolves toward LIVE.
+static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
+                                   size_t offset, xed_reg_enum_t reg64)
+{
+    const int MAX_LOOKAHEAD = 16;
+
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+    for (int step = 0; step < MAX_LOOKAHEAD && offset < len; ++step) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+            return true;
+        }
+
+        // A read of the full 64-bit register -- as an explicit or implicit
+        // operand, or as a memory base or index -- observes bits 32-63. Matched
+        // before the kill below, since an instruction can read the register and
+        // then redefine it (e.g. add rax, rbx). Reading a 32/16/8 sub-register
+        // does not touch bits 32-63, so compare the 64-bit name exactly.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned nops = xed_inst_noperands(xi);
+        for (unsigned i = 0; i < nops; ++i) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t name = xed_operand_name(op);
+            if (xed_operand_is_register(name) && xed_operand_read(op) &&
+                xed_decoded_inst_get_reg(&xedd, name) == reg64) {
+                return true;
+            }
+        }
+        int nmem = xed_decoded_inst_number_of_memory_operands(&xedd);
+        for (int m = 0; m < nmem; ++m) {
+            if (xed_decoded_inst_get_base_reg(&xedd, m) == reg64 ||
+                xed_decoded_inst_get_index_reg(&xedd, m) == reg64) {
+                return true;
+            }
+        }
+
+        // A transfer we cannot follow leaves the bits conservatively live.
+        xed_category_enum_t category = xed_decoded_inst_get_category(&xedd);
+        if (category == XED_CATEGORY_CALL ||
+            category == XED_CATEGORY_RET ||
+            category == XED_CATEGORY_UNCOND_BR ||
+            category == XED_CATEGORY_COND_BR ||
+            category == XED_CATEGORY_SYSCALL ||
+            category == XED_CATEGORY_SYSRET ||
+            category == XED_CATEGORY_INTERRUPT) {
+            return true;
+        }
+
+        // An unconditional 32- or 64-bit write to the register redefines bits
+        // 32-63 independent of their prior value: DEAD.
+        if (reg_kill_iclass(xed_decoded_inst_get_iclass(&xedd))) {
+            for (unsigned i = 0; i < nops; ++i) {
+                const xed_operand_t *op = xed_inst_operand(xi, i);
+                xed_operand_enum_t name = xed_operand_name(op);
+                if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+                    continue;
+                }
+                xed_reg_enum_t wr = xed_decoded_inst_get_reg(&xedd, name);
+                if (xed_get_largest_enclosing_register(wr) == reg64 &&
+                    xed_get_register_width_bits64(wr) >= 32) {
+                    return false;
+                }
+            }
+        }
+
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+
+    return true;
+}
+
+// reg_concern hook for check_mov_self (see struct check_entry). Only the 32-bit
+// mov r32, r32 form disturbs any bits when removed -- the zero-extension into
+// the upper 32 bits of the enclosing 64-bit register -- so return that register
+// for the 32-bit form and XED_REG_INVALID (ungated) otherwise.
+static xed_reg_enum_t mov_self_upper_concern(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_operand_width(xedd) != 32) {
+        return XED_REG_INVALID;
+    }
+    return xed_get_largest_enclosing_register(
+        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0));
+}
+
 #define X86LINT_SUMMARY_MAX 64
 
 struct x86lint_summary {
@@ -1944,6 +2100,13 @@ struct check_entry {
     // read downstream before being overwritten. 0 for checks with no flag
     // soundness concern.
     uint32_t flag_concerns;
+    // Optional hook for a rewrite that changes only the upper 32 bits of a
+    // register (the 32-bit zero-extension). Given the decoded instruction it
+    // returns the 64-bit GPR whose bits 32-63 are at stake, or XED_REG_INVALID
+    // for none; the dispatcher then suppresses the finding when
+    // reg_upper32_live_after reports those bits live. NULL for checks with no
+    // such concern.
+    xed_reg_enum_t (*reg_concern)(const xed_decoded_inst_t *);
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
@@ -1966,7 +2129,7 @@ static const struct check_entry checks[] = {
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
-    {check_mov_self,                   "redundant MOV reg, reg",          0},
+    {check_mov_self,                   "redundant MOV reg, reg",          0, mov_self_upper_concern},
     {check_add_sub_zero,               "redundant ADD/SUB zero",          0},
     {check_or_xor_zero,                "redundant OR/XOR zero",           0},
     {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
@@ -2048,6 +2211,13 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             if (checks[i].flag_concerns != 0 &&
                 flags_live_after(inst, len, next, checks[i].flag_concerns)) {
                 continue;
+            }
+            if (checks[i].reg_concern != NULL) {
+                xed_reg_enum_t reg64 = checks[i].reg_concern(&xedd);
+                if (reg64 != XED_REG_INVALID &&
+                    reg_upper32_live_after(inst, len, next, reg64)) {
+                    continue;
+                }
             }
             summary_add(summary, checks[i].name);
             report_finding(checks[i].name, offset, verbose, &xedd,

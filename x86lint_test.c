@@ -565,7 +565,7 @@ static void check_mov_self_test(void)
     CHECK_BYTES(!check_mov_self, 0x48, 0x89, 0xdb);  // mov rbx, rbx
     CHECK_BYTES(!check_mov_self, 0x66, 0x89, 0xc0);  // mov ax, ax (no zero-ext, useless)
     CHECK_BYTES(!check_mov_self, 0x88, 0xc0);        // mov al, al (useless)
-    CHECK_BYTES( check_mov_self, 0x89, 0xc0);        // mov eax, eax (zero-ext idiom, keep)
+    CHECK_BYTES(!check_mov_self, 0x89, 0xc0);        // mov eax, eax (redundant; dispatcher gates on upper-bit liveness)
     CHECK_BYTES( check_mov_self, 0x48, 0x89, 0xc3);  // mov rbx, rax (different regs)
     CHECK_BYTES( check_mov_self, 0x90);              // nop (not MOV)
 }
@@ -1317,6 +1317,105 @@ static void check_flag_liveness_corners_test(void)
     ASSERT_FINDINGS(add128_shlcl_add_ret, "oversized ADD/SUB 128", 1);
 }
 
+// Register-liveness gating: mov r32, r32 (e.g. mov eax, eax) is a no-op only in
+// its low 32 bits -- it also zero-extends into the upper 32 bits of the
+// enclosing 64-bit register. check_instructions flags it as redundant only when
+// that zero-extension is dead: bits 63-32 are redefined before any reader.
+// These sequences pin the dispatcher's reg_upper32_live_after gate. The
+// 8/16/64-bit same-register forms have no upper bits to disturb and fire
+// regardless of what follows.
+static void check_reg_liveness_test(void)
+{
+    // mov eax, eax ; mov eax, ecx -- the second write zero-extends eax again,
+    // killing the first's upper bits before any read: redundant, flag it.
+    static const uint8_t moveax_kill[] = {
+        0x89, 0xC0,        // mov eax, eax
+        0x89, 0xC8,        // mov eax, ecx
+    };
+    ASSERT_FINDINGS(moveax_kill, "redundant MOV reg, reg", 1);
+
+    // mov eax, eax ; add eax, 5 -- add rewrites eax (zero-extending), so the
+    // upper bits are dead; it reads only eax's low half. (imm 5, not an
+    // inc/dec candidate.) Flag.
+    static const uint8_t moveax_add[] = {
+        0x89, 0xC0,        // mov eax, eax
+        0x83, 0xC0, 0x05,  // add eax, 5
+    };
+    ASSERT_FINDINGS(moveax_add, "redundant MOV reg, reg", 1);
+
+    // mov eax, eax ; ret -- RET may expose eax/rax as a return value, so the
+    // walk is conservatively LIVE at RET (unlike flags): suppress.
+    static const uint8_t moveax_ret[] = {
+        0x89, 0xC0,
+        0xC3,
+    };
+    ASSERT_FINDINGS(moveax_ret, "redundant MOV reg, reg", 0);
+
+    // mov eax, eax ; mov [rbx], rax -- the store reads the full rax, observing
+    // bits 63-32, so the zero-extension is live: suppress.
+    static const uint8_t moveax_store_rax[] = {
+        0x89, 0xC0,              // mov eax, eax
+        0x48, 0x89, 0x03,        // mov [rbx], rax
+    };
+    ASSERT_FINDINGS(moveax_store_rax, "redundant MOV reg, reg", 0);
+
+    // mov eax, eax ; add rcx, rax -- add reads the full rax (upper bits live);
+    // its destination is a different register, so it does not kill eax first.
+    // Suppress.
+    static const uint8_t moveax_read_rax[] = {
+        0x89, 0xC0,              // mov eax, eax
+        0x48, 0x01, 0xC1,        // add rcx, rax
+    };
+    ASSERT_FINDINGS(moveax_read_rax, "redundant MOV reg, reg", 0);
+
+    // mov eax, eax ; mov ecx, [rax] -- rax used as a memory base is a read of
+    // the full 64-bit register: upper bits live, suppress.
+    static const uint8_t moveax_base_rax[] = {
+        0x89, 0xC0,              // mov eax, eax
+        0x8B, 0x08,              // mov ecx, [rax]
+    };
+    ASSERT_FINDINGS(moveax_base_rax, "redundant MOV reg, reg", 0);
+
+    // mov eax, eax ; je +0 -- a conditional branch we cannot follow keeps the
+    // upper bits conservatively live, suppress.
+    static const uint8_t moveax_je[] = {
+        0x89, 0xC0,
+        0x74, 0x00,
+    };
+    ASSERT_FINDINGS(moveax_je, "redundant MOV reg, reg", 0);
+
+    // mov eax, eax ; cmove eax, ecx -- CMOV is a conditional write, excluded
+    // from the kill whitelist: the old upper bits can survive a not-taken move,
+    // so it is not a redefinition. No later kill, so suppress.
+    static const uint8_t moveax_cmov[] = {
+        0x89, 0xC0,              // mov eax, eax
+        0x0F, 0x44, 0xC1,        // cmove eax, ecx
+    };
+    ASSERT_FINDINGS(moveax_cmov, "redundant MOV reg, reg", 0);
+
+    // mov eax, eax alone at end of buffer -- unknown successor, conservative
+    // LIVE, suppress.
+    static const uint8_t moveax_alone[] = {
+        0x89, 0xC0,
+    };
+    ASSERT_FINDINGS(moveax_alone, "redundant MOV reg, reg", 0);
+
+    // The non-32-bit same-register forms are pure no-ops with no upper-bit
+    // concern, flagged regardless of a downstream reader: mov rax, rax ; je +0.
+    static const uint8_t movrax_je[] = {
+        0x48, 0x89, 0xC0,       // mov rax, rax
+        0x74, 0x00,
+    };
+    ASSERT_FINDINGS(movrax_je, "redundant MOV reg, reg", 1);
+
+    // mov al, al ; je +0 -- 8-bit no-op, likewise unconditional.
+    static const uint8_t moval_je[] = {
+        0x88, 0xC0,             // mov al, al
+        0x74, 0x00,
+    };
+    ASSERT_FINDINGS(moval_je, "redundant MOV reg, reg", 1);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -1380,6 +1479,7 @@ int main(int argc, char *argv[])
     check_oversized_vex_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
+    check_reg_liveness_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

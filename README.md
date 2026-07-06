@@ -51,6 +51,9 @@ compiler writers generate better code and documents the complexity of x86.
     sets identical flags)
 * redundant MOV reg, reg
   - `4889C0` (MOV RAX, RAX)
+  - `89C0` (MOV EAX, EAX) -- the 8/16/64-bit forms are pure no-ops; the 32-bit
+    form is flagged only when its zero-extension into the upper 32 bits is dead
+    (gated by register liveness)
 * redundant OR/XOR zero
   - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove
 * redundant shift/rotate by zero

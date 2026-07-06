@@ -64,11 +64,11 @@ instructions) starting at the successor.
 Both scans share one bias: reads count inclusively and redefinitions
 exclusively, so every uncertainty -- a decode error, an unfollowable branch,
 running past the 16-instruction window, or the end of the buffer -- resolves
-toward *live*, and thus toward suppressing the finding. Neither scan follows a
-taken branch, so a rewrite is assumed sound at branch targets. That holds for
-compiler-generated code, where flags and scratch registers are defined within
-a basic block, but not necessarily for hand-written assembly that deliberately
-keeps a value live across a branch.
+toward *live*, and thus toward suppressing the finding. A branch ends the walk
+at that conservative answer, so the analysis stays within a basic block: it
+never suggests a rewrite whose soundness would hinge on a fact about a branch
+target it cannot see. The one boundary it reads through is a function return,
+and only for flags -- the ABI guarantees they do not survive it.
 
 ## Implemented analyses
 
@@ -117,6 +117,11 @@ keeps a value live across a branch.
   - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove
 * redundant shift/rotate by zero
   - `C1E0 00` (SHL EAX, 0) -- no-op, flags also unchanged
+* redundant TEST after flags
+  - `21D8 85C0` (AND EAX, EBX; TEST EAX, EAX) -- the AND already set SF/ZF/PF,
+    so the TEST is dead. AND/OR/XOR match TEST's flags exactly (CF/OF cleared)
+    and fire unconditionally; ADD/SUB/INC/DEC and friends diverge only on CF/OF
+    and are flagged only when those are dead downstream (gated by flag liveness)
 * redundant TEST immediate
   - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
     mask sets identical flags)

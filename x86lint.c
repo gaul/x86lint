@@ -2149,6 +2149,116 @@ static const struct check_entry checks[] = {
     {check_oversized_vex,              "oversized VEX encoding",          0},
 };
 
+// Multi-instruction peephole (the first analysis to span two instructions,
+// hence the raw-stream signature rather than a check_entry). A flag-setting ALU
+// that writes a register -- ADD/SUB/ADC/SBB/AND/OR/XOR/INC/DEC/NEG -- sets
+// SF/ZF/PF from the value it stores, so an immediately following test reg, reg
+// on that same register recomputes flags the ALU already produced. The test is
+// dead: a downstream Jcc/SETcc/CMOVcc can read the ALU's flags directly.
+//
+//   dec ecx ; test ecx, ecx ; ...     ->   dec ecx ; ...
+//   and eax, ebx ; test eax, eax ; je ->   and eax, ebx ; je
+//
+// `producer` is the already-decoded instruction ending at `test_offset`; on a
+// match the redundant test is decoded into *test_out and the function returns
+// true, leaving the caller to report at test_offset (the removable
+// instruction).
+//
+// Soundness. test reg, reg sets SF/ZF/PF from reg and clears CF and OF (AF is
+// undefined and unobservable in 64-bit mode). Because the ALU wrote reg, its
+// SF/ZF/PF equal the test's exactly -- so the test's register must match the
+// ALU's destination at the same width; add eax, ..; test rax, rax would read SF
+// at bit 63 rather than bit 31 and is rejected. The only possible divergence is
+// CF/OF:
+//   * AND/OR/XOR clear CF and OF just as test does, so the test is a pure
+//     duplicate: removing it changes nothing and the finding is unconditional
+//     (it fires even through a following flag-reading branch).
+//   * ADD/SUB/ADC/SBB/NEG write CF/OF from the arithmetic, and INC/DEC write OF
+//     while leaving CF untouched; either way CF/OF may differ from the test's
+//     zeroes. Dropping the test then exposes the ALU's CF/OF downstream, so the
+//     finding is gated on flags_live_after showing CF and OF dead past the test
+//     (a following jb, seto, or adc keeps it). That walk is conservative at any
+//     branch, so an arithmetic producer whose test feeds a Jcc is left
+//     unflagged -- only its straight-line and RET cases fire.
+//
+// Only test reg, reg is matched. cmp reg, 0 sets the same flags but is already
+// check_cmp_zero's finding (rewritten to test reg, reg), after which this check
+// catches the residue -- the two compose rather than double-report. Shifts and
+// rotates are excluded from the producer set (a masked or CL count of zero
+// leaves the flags untouched, so the test would not be redundant), as are IMUL,
+// MUL, and the bit-scan ops, which leave SF/ZF/PF undefined.
+static bool flags_test_redundant(const uint8_t *inst, size_t len,
+                                 size_t test_offset,
+                                 const xed_decoded_inst_t *producer,
+                                 xed_decoded_inst_t *test_out)
+{
+    uint32_t divergent;
+    switch (xed_decoded_inst_get_iclass(producer)) {
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+        divergent = 0;
+        break;
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_SBB:
+    case XED_ICLASS_NEG:
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+        divergent = FLAG_CF | FLAG_OF;
+        break;
+    default:
+        return false;
+    }
+
+    // The ALU's destination must be a register (skip add [mem], reg and the
+    // like): the written register operand, which for these iclasses is the
+    // first operand when it is not memory.
+    xed_reg_enum_t dest = XED_REG_INVALID;
+    const xed_inst_t *xi = xed_decoded_inst_inst(producer);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (xed_operand_is_register(name) && xed_operand_written(op)) {
+            dest = xed_decoded_inst_get_reg(producer, name);
+            break;
+        }
+    }
+    if (dest == XED_REG_INVALID) {
+        return false;
+    }
+
+    // The following instruction must be test dest, dest.
+    if (test_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_zero(test_out);
+    xed_decoded_inst_set_mode(test_out, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(test_out, inst + test_offset, len - test_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_get_iclass(test_out) != XED_ICLASS_TEST ||
+        xed_decoded_inst_number_of_memory_operands(test_out) > 0 ||
+        xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG0) != dest ||
+        xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) != dest) {
+        return false;
+    }
+
+    // Arithmetic producers diverge from the test on CF/OF; suppress while
+    // either might still be read past the test.
+    if (divergent != 0) {
+        size_t after = test_offset + xed_decoded_inst_get_length(test_out);
+        if (flags_live_after(inst, len, after, divergent)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2222,6 +2332,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, checks[i].name);
             report_finding(checks[i].name, offset, verbose, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a flag-setting ALU write immediately
+        // followed by test reg, reg on the same register makes the test
+        // redundant. Reported against the test (at `next`), the removable
+        // instruction. See flags_test_redundant.
+        xed_decoded_inst_t redundant_test;
+        if (flags_test_redundant(inst, len, next, &xedd, &redundant_test)) {
+            summary_add(summary, "redundant TEST after flags");
+            report_finding("redundant TEST after flags", next, verbose,
+                &redundant_test, inst + next);
             ++errors;
         }
 

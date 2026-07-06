@@ -1416,6 +1416,126 @@ static void check_reg_liveness_test(void)
     ASSERT_FINDINGS(moval_je, "redundant MOV reg, reg", 1);
 }
 
+// Multi-instruction peephole: a flag-setting ALU (add/sub/and/or/xor/inc/dec/
+// neg/...) that writes a register sets SF/ZF/PF from the result, so an
+// immediately following test reg, reg on that same register is redundant and
+// check_instructions reports it against the test. AND/OR/XOR match test's flags
+// exactly (CF/OF cleared) and fire unconditionally; the arithmetic producers
+// diverge on CF/OF and fire only when those are dead past the test.
+static void check_redundant_flags_test(void)
+{
+    // and eax, ebx ; test eax, eax -- AND set SF/ZF/PF and cleared CF/OF, the
+    // same flags test computes, so the test is a pure duplicate. A logical
+    // producer carries no divergence and fires regardless of what follows.
+    static const uint8_t and_test[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(and_test, "redundant TEST after flags", 1);
+
+    static const uint8_t or_test[] = {
+        0x09, 0xD8,        // or eax, ebx
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(or_test, "redundant TEST after flags", 1);
+
+    static const uint8_t xor_test[] = {
+        0x31, 0xD8,        // xor eax, ebx
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(xor_test, "redundant TEST after flags", 1);
+
+    // and eax, ebx ; test eax, eax ; jb -- a logical producer fires even
+    // through a following CF reader: AND already set CF=0, exactly what the
+    // test would, so dropping the test leaves jb's CF unchanged.
+    static const uint8_t and_test_jb[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x85, 0xC0,        // test eax, eax
+        0x72, 0x00,        // jb +0
+    };
+    ASSERT_FINDINGS(and_test_jb, "redundant TEST after flags", 1);
+
+    // add eax, ebx ; test eax, eax ; ret -- an arithmetic producer diverges on
+    // CF/OF, but RET makes them dead (no ABI preserves flags across a call), so
+    // it fires.
+    static const uint8_t add_test_ret[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x85, 0xC0,        // test eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(add_test_ret, "redundant TEST after flags", 1);
+
+    // dec ecx ; test ecx, ecx ; ret -- dec sets SF/ZF/PF (and OF) and leaves
+    // CF; both are dead at ret, so the test is redundant.
+    static const uint8_t dec_test_ret[] = {
+        0xFF, 0xC9,        // dec ecx
+        0x85, 0xC9,        // test ecx, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(dec_test_ret, "redundant TEST after flags", 1);
+
+    // add eax, ebx ; test eax, eax ; jz -- an arithmetic producer whose test
+    // feeds a Jcc: the flag-liveness walk is conservative at any branch, so
+    // CF/OF are treated as possibly live and the finding is suppressed.
+    static const uint8_t add_test_jz[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x85, 0xC0,        // test eax, eax
+        0x74, 0x00,        // jz +0
+    };
+    ASSERT_FINDINGS(add_test_jz, "redundant TEST after flags", 0);
+
+    // add eax, ebx ; test eax, eax ; adc edx, 0 -- adc reads CF before it is
+    // overwritten, so removing the test (which cleared CF) is unsound: suppress.
+    static const uint8_t add_test_adc[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x85, 0xC0,        // test eax, eax
+        0x83, 0xD2, 0x00,  // adc edx, 0
+    };
+    ASSERT_FINDINGS(add_test_adc, "redundant TEST after flags", 0);
+
+    // add eax, ebx ; test edx, edx -- the test is on a different register than
+    // the ALU wrote, so its flags are unrelated: no match.
+    static const uint8_t add_test_other_reg[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x85, 0xD2,        // test edx, edx
+    };
+    ASSERT_FINDINGS(add_test_other_reg, "redundant TEST after flags", 0);
+
+    // add eax, ebx ; test rax, rax -- same register but wider: test rax reads
+    // SF at bit 63, which add eax zeroed by zero-extension rather than setting
+    // from the arithmetic. Width must match exactly: no match.
+    static const uint8_t add_test_wide[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x48, 0x85, 0xC0,  // test rax, rax
+    };
+    ASSERT_FINDINGS(add_test_wide, "redundant TEST after flags", 0);
+
+    // imul eax, ebx ; test eax, eax -- IMUL leaves SF/ZF/PF undefined, so the
+    // test is not recomputing anything the imul produced: not a producer.
+    static const uint8_t imul_test[] = {
+        0x0F, 0xAF, 0xC3,  // imul eax, ebx
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(imul_test, "redundant TEST after flags", 0);
+
+    // mov eax, ebx ; test eax, eax -- MOV writes no flags, so the test is the
+    // only thing setting them and is required.
+    static const uint8_t mov_test[] = {
+        0x89, 0xD8,        // mov eax, ebx
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(mov_test, "redundant TEST after flags", 0);
+
+    // shl eax, 3 ; test eax, eax -- shifts are excluded from the producer set
+    // (a masked or CL count of zero leaves the flags untouched), so the test is
+    // not assumed redundant.
+    static const uint8_t shl_test[] = {
+        0xC1, 0xE0, 0x03,  // shl eax, 3
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(shl_test, "redundant TEST after flags", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -1480,6 +1600,7 @@ int main(int argc, char *argv[])
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
     check_reg_liveness_test();
+    check_redundant_flags_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

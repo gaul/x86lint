@@ -81,6 +81,11 @@ and only for flags -- the ABI guarantees they do not survive it.
     after the fold (overwritten or unused) and the combined address still fits
     one index and a 32-bit displacement (gated by register liveness)
 * missing LOCK prefix on CMPXCHG and XADD
+* MOV constant foldable
+  - `B905000000 01C8` (MOV ECX, 5; ADD EAX, ECX) -- the constant folds into the
+    next instruction's immediate: ADD EAX, 5. Applies to ADD/SUB/ADC/SBB/AND/OR/
+    XOR/CMP/TEST/MOV that use the register as a source, when it is dead after the
+    fold and the constant fits the immediate (gated by register liveness)
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)

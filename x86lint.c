@@ -2525,6 +2525,136 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
     return !reg_live_after(inst, len, after, dest);
 }
 
+// Multi-instruction peephole. mov reg, imm loads a constant; when the next
+// instruction uses reg as the source operand of an add/sub/adc/sbb/and/or/xor/
+// cmp/test/mov and reg is dead afterward, the constant folds into that
+// instruction's own immediate field and the mov disappears:
+//
+//   mov ecx, 5  ; add eax, ecx  -> add eax, 5
+//   mov ecx, 5  ; cmp eax, ecx  -> cmp eax, 5
+//   mov rcx, -1 ; and rax, rcx  -> and rax, -1
+//
+// `mov_const` is the already-decoded producer ending at `consumer_offset`; on a
+// match the function returns true and the caller reports against the mov, the
+// removable instruction.
+//
+// Soundness. The immediate form of each of these ops computes the identical
+// result and flags as the register form -- only the source encoding differs --
+// so there is no value or flag concern beyond reg's own liveness. reg must
+// appear in the consumer only as the folded source (XED presents operands in
+// Intel order, so that is operand 1, read-only) and nowhere else -- not the
+// destination or first source, not a memory base or index -- so removing the mov
+// erases its every use. The constant must encode as the consumer's immediate:
+// below 64 bits the same-width field holds any value, while a 64-bit non-mov op
+// sign-extends an imm32, so a movabs source (a full imm64) folds only when its
+// value fits signed 32 bits -- a sign-extended-imm32 source always does, and mov
+// itself can spell any width via movabs. imm == 0 is skipped: folding it yields
+// an add reg, 0 / and reg, 0 that other checks own. reg is finally required dead
+// past the consumer (reg_live_after), since the fold drops its definition.
+static bool mov_const_foldable(const uint8_t *inst, size_t len,
+                               size_t consumer_offset,
+                               const xed_decoded_inst_t *mov_const)
+{
+    if (xed_decoded_inst_get_iclass(mov_const) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov_const) > 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(mov_const))) {
+        return false;
+    }
+    xed_reg_enum_t reg = xed_decoded_inst_get_reg(mov_const, XED_OPERAND_REG0);
+    if (xed_reg_class(reg) != XED_REG_CLASS_GPR ||
+        xed_decoded_inst_get_unsigned_immediate(mov_const) == 0) {
+        return false;
+    }
+
+    if (consumer_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t consumer;
+    xed_decoded_inst_zero(&consumer);
+    xed_decoded_inst_set_mode(&consumer, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&consumer);
+    switch (cic) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_SBB:
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+    case XED_ICLASS_CMP:
+    case XED_ICLASS_TEST:
+    case XED_ICLASS_MOV:
+        break;
+    default:
+        return false;
+    }
+
+    // The folded source is operand 1 (Intel order: op0 is the destination or
+    // first source, op1 the second source), which must be the read-only
+    // register reg.
+    const xed_inst_t *xi = xed_decoded_inst_inst(&consumer);
+    unsigned nops = xed_inst_noperands(xi);
+    if (nops < 2) {
+        return false;
+    }
+    const xed_operand_t *src = xed_inst_operand(xi, 1);
+    xed_operand_enum_t src_name = xed_operand_name(src);
+    if (!xed_operand_is_register(src_name) || xed_operand_written(src) ||
+        xed_decoded_inst_get_reg(&consumer, src_name) != reg) {
+        return false;
+    }
+
+    // reg must appear nowhere else -- not the kept operand, not a memory base or
+    // index -- so the fold erases its only use.
+    xed_reg_enum_t reg_enc = xed_get_largest_enclosing_register(reg);
+    for (unsigned i = 0; i < nops; ++i) {
+        if (i == 1) {
+            continue;
+        }
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (xed_operand_is_register(name) &&
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(&consumer, name)) == reg_enc) {
+            return false;
+        }
+    }
+    int nmem = xed_decoded_inst_number_of_memory_operands(&consumer);
+    for (int m = 0; m < nmem; ++m) {
+        xed_reg_enum_t b = xed_decoded_inst_get_base_reg(&consumer, m);
+        xed_reg_enum_t x = xed_decoded_inst_get_index_reg(&consumer, m);
+        if ((b != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(b) == reg_enc) ||
+            (x != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(x) == reg_enc)) {
+            return false;
+        }
+    }
+
+    // A 64-bit non-mov consumer sign-extends an imm32; a full imm64 constant
+    // (movabs, immediate width 64) folds only when it fits that. (get_signed_-
+    // immediate truncates a 64-bit immediate, so read it unsigned and range-
+    // check.) Narrower widths, and mov (which can movabs), always fit.
+    if (xed_decoded_inst_get_operand_width(&consumer) == 64 &&
+        cic != XED_ICLASS_MOV &&
+        xed_decoded_inst_get_immediate_width_bits(mov_const) == 64) {
+        int64_t v = (int64_t) xed_decoded_inst_get_unsigned_immediate(mov_const);
+        if (v < INT32_MIN || v > INT32_MAX) {
+            return false;
+        }
+    }
+
+    // reg's constant value must be dead after the fold.
+    size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
+    return !reg_live_after(inst, len, after, reg_enc);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2633,6 +2763,16 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if (lea_foldable_into_memop(inst, len, next, &xedd)) {
             summary_add(summary, "LEA foldable into memory");
             report_finding("LEA foldable into memory", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: mov reg, imm whose constant folds into the
+        // next instruction's immediate, leaving reg dead. Reported against the
+        // mov (at `offset`), the removable instruction. See mov_const_foldable.
+        if (mov_const_foldable(inst, len, next, &xedd)) {
+            summary_add(summary, "MOV constant foldable");
+            report_finding("MOV constant foldable", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

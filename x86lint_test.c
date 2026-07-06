@@ -1719,6 +1719,91 @@ static void check_lea_fold_test(void)
     ASSERT_FINDINGS(jmp_consumer, "LEA foldable into memory", 0);
 }
 
+// Multi-instruction peephole: mov reg, imm followed by an instruction that uses
+// reg as its source operand folds the constant into that instruction's own
+// immediate, so the mov disappears. check_instructions reports it against the
+// mov when reg is dead after the fold. Fixtures kill reg with a following
+// mov reg, other (a write with no read) so the deadness walk sees it die.
+static void check_mov_const_fold_test(void)
+{
+    // mov ecx, 5 ; add eax, ecx -> add eax, 5 (ecx killed next).
+    static const uint8_t add_fold[] = {
+        0xB9, 0x05, 0x00, 0x00, 0x00,  // mov ecx, 5
+        0x01, 0xC8,                    // add eax, ecx
+        0x89, 0xD1,                    // mov ecx, edx (kills ecx)
+    };
+    ASSERT_FINDINGS(add_fold, "MOV constant foldable", 1);
+
+    // mov ecx, 5 ; cmp eax, ecx -> cmp eax, 5.
+    static const uint8_t cmp_fold[] = {
+        0xB9, 0x05, 0x00, 0x00, 0x00,  // mov ecx, 5
+        0x39, 0xC8,                    // cmp eax, ecx
+        0x89, 0xD1,                    // mov ecx, edx
+    };
+    ASSERT_FINDINGS(cmp_fold, "MOV constant foldable", 1);
+
+    // mov ecx, 7 ; mov eax, ecx -> mov eax, 7.
+    static const uint8_t mov_fold[] = {
+        0xB9, 0x07, 0x00, 0x00, 0x00,  // mov ecx, 7
+        0x89, 0xC8,                    // mov eax, ecx
+        0x89, 0xD1,                    // mov ecx, edx
+    };
+    ASSERT_FINDINGS(mov_fold, "MOV constant foldable", 1);
+
+    // mov rcx, -1 ; and rax, rcx -> and rax, -1. A 64-bit consumer, but -1 is a
+    // sign-extended imm32, so it fits.
+    static const uint8_t and64_fold[] = {
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,  // mov rcx, -1
+        0x48, 0x21, 0xC8,                          // and rax, rcx
+        0x48, 0x89, 0xD1,                          // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(and64_fold, "MOV constant foldable", 1);
+
+    // mov ecx, 5 ; add eax, ecx ; ret -- ecx is live at RET (conservative), so
+    // the mov cannot be dropped: suppress.
+    static const uint8_t live_at_ret[] = {
+        0xB9, 0x05, 0x00, 0x00, 0x00,  // mov ecx, 5
+        0x01, 0xC8,                    // add eax, ecx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(live_at_ret, "MOV constant foldable", 0);
+
+    // mov ecx, 5 ; add ecx, eax -- ecx is the destination (first operand), not
+    // the folded source, and it is written: not an immediate fold.
+    static const uint8_t reg_is_dest[] = {
+        0xB9, 0x05, 0x00, 0x00, 0x00,  // mov ecx, 5
+        0x01, 0xC1,                    // add ecx, eax
+        0x89, 0xD1,                    // mov ecx, edx
+    };
+    ASSERT_FINDINGS(reg_is_dest, "MOV constant foldable", 0);
+
+    // movabs rcx, 0x100000000 ; add rax, rcx -- the 64-bit constant does not fit
+    // add's sign-extended imm32: suppress.
+    static const uint8_t imm_too_big[] = {
+        0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,  // movabs rcx, 0x100000000
+        0x48, 0x01, 0xC8,                                            // add rax, rcx
+        0x48, 0x89, 0xD1,                                            // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(imm_too_big, "MOV constant foldable", 0);
+
+    // mov ecx, 5 ; test ecx, ecx -- ecx is both operands, so folding one still
+    // leaves it read: suppress.
+    static const uint8_t reg_twice[] = {
+        0xB9, 0x05, 0x00, 0x00, 0x00,  // mov ecx, 5
+        0x85, 0xC9,                    // test ecx, ecx
+        0x89, 0xD1,                    // mov ecx, edx
+    };
+    ASSERT_FINDINGS(reg_twice, "MOV constant foldable", 0);
+
+    // mov ecx, 5 ; mov eax, [rcx] -- the source is a memory operand (ecx used as
+    // an address, not a value), so there is no immediate to fold into: suppress.
+    static const uint8_t mem_source[] = {
+        0xB9, 0x05, 0x00, 0x00, 0x00,  // mov ecx, 5
+        0x8B, 0x01,                    // mov eax, [rcx]
+    };
+    ASSERT_FINDINGS(mem_source, "MOV constant foldable", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -1786,6 +1871,7 @@ int main(int argc, char *argv[])
     check_zero_extend_mov_self_test();
     check_redundant_flags_test();
     check_lea_fold_test();
+    check_mov_const_fold_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

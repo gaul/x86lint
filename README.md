@@ -131,6 +131,11 @@ keeps a value live across a branch.
   - `6BC0 10` (IMUL EAX, EAX, 16) -- use SHL (any power of two, same register)
 * suboptimal LEA
   - `488D03` (LEA RAX, [RBX]) -- use MOV RAX, RBX (more ports, no AGU)
+* suboptimal MOV zero
+  - `B8 00000000` (MOV EAX, 0) -- use XOR EAX, EAX (fewer bytes, breaks the
+    dependency chain); flagged only when the arithmetic flags XOR would clobber
+    are dead, so the deliberate flag-preserving MOV before a CMOV
+    ([#7](https://github.com/gaul/x86lint/issues/7)) is not flagged
 * ~~suboptimal NOP sequence~~, see [#9](https://github.com/gaul/x86lint/issues/9)
   - multiple `90` instead of a single `66 90`, etc.
 * suboptimal OR/AND reg, reg
@@ -143,8 +148,6 @@ keeps a value live across a branch.
   - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking
 * suboptimal XOR immediate
   - `83F0 FF` instead of `F7D0` (XOR EAX, -1 -> NOT EAX, when flags are unused)
-* ~~suboptimal zero register~~, see [#7](https://github.com/gaul/x86lint/issues/7)
-  - MOV EAX, 0 instead of XOR EAX, EAX
 * unneeded explicit immediate
   - `C1D0 01` instead of `D1D0` (RCL EAX, 1)
 * unneeded explicit register

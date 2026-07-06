@@ -1967,6 +1967,41 @@ static xed_reg_enum_t mov_self_upper_concern(const xed_decoded_inst_t *xedd)
         xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0));
 }
 
+// True when `producer` unconditionally writes the 32-bit form of the GPR reg64,
+// zero-extending bits 63:32 to zero. Any 32-bit GPR write zero-extends
+// architecturally; this is restricted to the unconditional, defined-result
+// writers of reg_kill_iclass (excluding e.g. CMOVcc and BSF/BSR, which may
+// leave the register unwritten or undefined) and to a write of exactly the
+// 32-bit form -- a 64-bit write sets bits 63:32 to arbitrary values instead.
+//
+// check_mov_self's mov r32, r32 clears exactly those bits, so when the
+// immediately preceding instruction already zeroed them the mov is a pure
+// no-op -- removable whether or not the upper half is read downstream. That is
+// what lets the dispatcher report the finding even when reg_upper32_live_after
+// finds the bits live, the complement of the forward gate.
+static bool writes_zero_extended_32(const xed_decoded_inst_t *producer,
+                                    xed_reg_enum_t reg64)
+{
+    if (!reg_kill_iclass(xed_decoded_inst_get_iclass(producer))) {
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(producer);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+            continue;
+        }
+        xed_reg_enum_t wr = xed_decoded_inst_get_reg(producer, name);
+        if (xed_get_largest_enclosing_register(wr) == reg64 &&
+            xed_get_register_width_bits64(wr) == 32) {
+            return true;
+        }
+    }
+    return false;
+}
+
 #define X86LINT_SUMMARY_MAX 64
 
 struct x86lint_summary {
@@ -2497,6 +2532,13 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
     xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
 
+    // The immediately preceding decoded instruction, for the one backward-
+    // looking gate (check_mov_self's already-zero-extended case). have_prev is
+    // false at the start and after any resync skip, so `prev` is consulted only
+    // when it is adjacent to the current instruction.
+    xed_decoded_inst_t prev;
+    bool have_prev = false;
+
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero(&xedd);
@@ -2514,6 +2556,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             if (summary != NULL) {
                 summary->skipped++;
             }
+            have_prev = false;
             offset += 1;
             continue;
         }
@@ -2555,8 +2598,13 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             }
             if (checks[i].reg_concern != NULL) {
                 xed_reg_enum_t reg64 = checks[i].reg_concern(&xedd);
+                // Suppress only when the disturbed upper half is read
+                // downstream AND the preceding instruction did not already zero
+                // it: if it did, dropping this instruction (e.g. mov eax, eax)
+                // changes nothing regardless of any downstream read.
                 if (reg64 != XED_REG_INVALID &&
-                    reg_upper32_live_after(inst, len, next, reg64)) {
+                    reg_upper32_live_after(inst, len, next, reg64) &&
+                    !(have_prev && writes_zero_extended_32(&prev, reg64))) {
                     continue;
                 }
             }
@@ -2589,6 +2637,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             ++errors;
         }
 
+        prev = xedd;
+        have_prev = true;
         offset = next;
     }
 

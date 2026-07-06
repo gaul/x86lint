@@ -18,11 +18,13 @@ sweep -- decoding one instruction at a time in 64-bit long mode with Intel
 XED -- and matches each decoded instruction against a table of checks, every
 one recognizing a single suboptimal encoding by its opcode, operands, and
 immediate. Matching works on XED's decoded form, so aliases and alternate
-encodings of the same operation are all caught. Every check in the table
-inspects one instruction on its own; unlike its AArch64 sibling
-[armlint](https://github.com/gaul/armlint), whose folds match windows of
-adjacent instructions, the only place x86lint looks past the current
-instruction is the bounded liveness scan described below.
+encodings of the same operation are all caught. Most checks inspect a single
+instruction; a few peepholes match a short window of adjacent instructions --
+like its AArch64 sibling [armlint](https://github.com/gaul/armlint) -- such as
+a redundant test folded into the flag-setting ALU before it or a LEA folded
+into the memory operand after it. The soundness gates below then look a bounded
+distance forward (and, in one case, one instruction back) to prove a flag or
+register value dead.
 
 **Linear sweep with resync.** Executable sections routinely interleave data
 with code -- jump tables, alignment islands, GHC info tables, Go's
@@ -117,8 +119,9 @@ and only for flags -- the ABI guarantees they do not survive it.
 * redundant MOV reg, reg
   - `4889C0` (MOV RAX, RAX)
   - `89C0` (MOV EAX, EAX) -- the 8/16/64-bit forms are pure no-ops; the 32-bit
-    form is flagged only when its zero-extension into the upper 32 bits is dead
-    (gated by register liveness)
+    form clears the upper 32 bits, so it is flagged when those bits are dead
+    downstream or already zero from the preceding 32-bit write (both gated by
+    register liveness)
 * redundant OR/XOR zero
   - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove
 * redundant shift/rotate by zero

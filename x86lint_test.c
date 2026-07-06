@@ -1416,6 +1416,62 @@ static void check_reg_liveness_test(void)
     ASSERT_FINDINGS(moval_je, "redundant MOV reg, reg", 1);
 }
 
+// The backward half of check_mov_self's gate: mov r32, r32 is redundant not
+// only when its zero-extension is dead downstream but also when the immediately
+// preceding instruction already zeroed bits 63:32 with an unconditional 32-bit
+// write -- then the mov changes nothing regardless of any downstream read.
+// These pin writes_zero_extended_32.
+static void check_zero_extend_mov_self_test(void)
+{
+    // add eax, ebx ; mov eax, eax ; mov [rbx], rax -- the store reads rax, so
+    // the zero-extension is live downstream, yet add eax, ebx already zeroed
+    // bits 63:32: the mov changes nothing and is flagged.
+    static const uint8_t add_movself_store[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x89, 0xC0,        // mov eax, eax
+        0x48, 0x89, 0x03,  // mov [rbx], rax
+    };
+    ASSERT_FINDINGS(add_movself_store, "redundant MOV reg, reg", 1);
+
+    // add eax, ebx ; mov eax, eax ; ret -- rax may be a return value (upper half
+    // conservatively live at RET), but the prior write already zeroed it: flag.
+    static const uint8_t add_movself_ret[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x89, 0xC0,        // mov eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(add_movself_ret, "redundant MOV reg, reg", 1);
+
+    // movzx eax, bl ; mov eax, eax -- movzx zero-extended eax, so the following
+    // mov is redundant even at end of buffer, where the upper half is otherwise
+    // conservatively live.
+    static const uint8_t movzx_movself[] = {
+        0x0F, 0xB6, 0xC3,  // movzx eax, bl
+        0x89, 0xC0,        // mov eax, eax
+    };
+    ASSERT_FINDINGS(movzx_movself, "redundant MOV reg, reg", 1);
+
+    // add rax, rbx ; mov eax, eax ; mov [rbx], rax -- the prior write is 64-bit,
+    // so bits 63:32 are arbitrary, not zero; mov eax, eax clears them and the
+    // store observes the difference: not redundant.
+    static const uint8_t add64_movself_store[] = {
+        0x48, 0x01, 0xD8,  // add rax, rbx
+        0x89, 0xC0,        // mov eax, eax
+        0x48, 0x89, 0x03,  // mov [rbx], rax
+    };
+    ASSERT_FINDINGS(add64_movself_store, "redundant MOV reg, reg", 0);
+
+    // cmove eax, ecx ; mov eax, eax ; mov [rbx], rax -- CMOV writes eax only
+    // conditionally, so it does not guarantee bits 63:32 are zero; with the
+    // store reading rax the mov is not provably redundant: suppress.
+    static const uint8_t cmov_movself_store[] = {
+        0x0F, 0x44, 0xC1,  // cmove eax, ecx
+        0x89, 0xC0,        // mov eax, eax
+        0x48, 0x89, 0x03,  // mov [rbx], rax
+    };
+    ASSERT_FINDINGS(cmov_movself_store, "redundant MOV reg, reg", 0);
+}
+
 // Multi-instruction peephole: a flag-setting ALU (add/sub/and/or/xor/inc/dec/
 // neg/...) that writes a register sets SF/ZF/PF from the result, so an
 // immediately following test reg, reg on that same register is redundant and
@@ -1727,6 +1783,7 @@ int main(int argc, char *argv[])
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
     check_reg_liveness_test();
+    check_zero_extend_mov_self_test();
     check_redundant_flags_test();
     check_lea_fold_test();
     check_decode_resync_test();

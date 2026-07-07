@@ -59,7 +59,9 @@ bool check_implicit_immediate(const xed_decoded_inst_t *xedd);
 bool check_and_strength_reduce(const xed_decoded_inst_t *xedd);
 
 // return false if and reg, -1 (an all-ones mask at the operand width) could be
-// test reg, reg, which sets identical flags in fewer bytes
+// test reg, reg, which sets identical flags in fewer bytes. The 32-bit form
+// also zero-extends (GCC's fused zero-extend-and-test idiom), so the
+// dispatcher gates it on upper-32 register liveness (cf. check_mov_self)
 bool check_and_minus_one(const xed_decoded_inst_t *xedd);
 
 // return false if xor r/m, -1 could be not r/m, one byte shorter (valid
@@ -87,11 +89,14 @@ bool check_mov_self(const xed_decoded_inst_t *xedd);
 
 // return false if instruction is add reg, 0 or sub reg, 0 (use TEST
 // reg, reg instead for the flag side-effect, or remove the instruction
-// if flags are unused)
+// if flags are unused). The 32-bit form also zero-extends, so the
+// dispatcher gates it on upper-32 register liveness (cf. check_mov_self)
 bool check_add_sub_zero(const xed_decoded_inst_t *xedd);
 
 // return false if instruction is or reg, 0 or xor reg, 0 (no-ops that only
-// set flags; use TEST reg, reg instead, or remove when flags are unused)
+// set flags; use TEST reg, reg instead, or remove when flags are unused).
+// The 32-bit form also zero-extends, so the dispatcher gates it on upper-32
+// register liveness (cf. check_mov_self)
 bool check_or_xor_zero(const xed_decoded_inst_t *xedd);
 
 // return false if instruction is and reg, 0, which zeroes the register --
@@ -132,7 +137,9 @@ bool check_unneeded_movsx(const xed_decoded_inst_t *xedd);
 bool check_sub_self(const xed_decoded_inst_t *xedd);
 
 // return false if or reg, reg or and reg, reg is used as a flag test --
-// test reg, reg is the canonical form and does not write the register
+// test reg, reg is the canonical form and does not write the register.
+// The 32-bit form's write also zero-extends, so the dispatcher gates it on
+// upper-32 register liveness (cf. check_mov_self)
 bool check_or_and_self(const xed_decoded_inst_t *xedd);
 
 // return false if IMUL by a constant in {2,3,4,5,8,9} could be replaced
@@ -149,7 +156,9 @@ bool check_lea_to_mov(const xed_decoded_inst_t *xedd);
 bool check_lea_to_add(const xed_decoded_inst_t *xedd);
 
 // return false if a shift or rotate instruction has an immediate count of 0
-// (pure no-op; per Intel SDM the flags are not affected when count is 0)
+// (value- and flag-preserving per the Intel SDM; hardware still zero-extends
+// a 32-bit destination even at count 0, so the dispatcher gates that form on
+// upper-32 register liveness, cf. check_mov_self)
 bool check_shift_zero(const xed_decoded_inst_t *xedd);
 
 // return false if a legacy-encoded movapd/movdqa/movupd/movdqu could be

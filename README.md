@@ -23,8 +23,8 @@ instruction; a few peepholes match a short window of adjacent instructions --
 like its AArch64 sibling [armlint](https://github.com/gaul/armlint) -- such as
 a redundant test folded into the flag-setting ALU before it or a LEA folded
 into the memory operand after it. The soundness gates below then look a bounded
-distance forward (and, in one case, one instruction back) to prove a flag or
-register value dead.
+distance forward (and, for the 32-bit identity rewrites, one instruction back)
+to prove a flag or register value dead.
 
 **Linear sweep with resync.** Executable sections routinely interleave data
 with code -- jump tables, alignment islands, GHC info tables, Go's
@@ -55,13 +55,22 @@ instructions) starting at the successor.
   conservatively live.
 
 * **Register (upper-32) liveness.** Writing a 32-bit register zero-extends
-  into the upper half of its 64-bit parent, so `mov eax, eax` is redundant
-  only when that zero-extension is dead. A check names the 64-bit register at
-  stake (`reg_concern`) and `reg_upper32_live_after` suppresses the finding if
-  bits 63:32 are read -- as an explicit operand or a memory base/index --
-  before an unconditional 32- or 64-bit write redefines them. Here `RET` is
-  conservatively live: the value can escape as a return value or in a
-  callee-saved register, which a linear walk cannot rule out.
+  into the upper half of its 64-bit parent, so a 32-bit identity operation
+  whose rewrite writes nothing -- `mov eax, eax` removed; `add eax, 0`,
+  `or eax, eax`, or `and eax, -1` turned into `test`; `shl eax, 0` removed
+  (hardware zero-extends even at count 0, whatever the SDM's count-0
+  pseudocode suggests) -- is redundant only when that zero-extension is dead.
+  This is not hypothetical: GCC emits `and ebx, -1` as a fused
+  zero-extend-and-test whose full 64-bit register is read right after the
+  branch, so the ungated rewrite would corrupt it. A check names the 64-bit
+  register at stake (`reg_concern`) and `reg_upper32_live_after` suppresses
+  the finding if bits 63:32 are read -- as an explicit operand or a memory
+  base/index -- before an unconditional 32- or 64-bit write redefines them.
+  Here `RET` is conservatively live: the value can escape as a return value
+  or in a callee-saved register, which a linear walk cannot rule out. One
+  backward escape reinstates the finding: when the immediately preceding
+  instruction already zero-extended the register, the identity op changes
+  nothing regardless of downstream reads.
 
 Both scans share one bias: reads count inclusively and redefinitions
 exclusively, so every uncertainty -- a decode error, an unfollowable branch,
@@ -126,10 +135,12 @@ and only for flags -- the ABI guarantees they do not survive it.
 * oversized XCHG encoding
   - `87C8` instead of `91` (XCHG EAX, ECX; the 90+r accumulator form is one byte)
 * redundant ADD/SUB zero
-  - `83C0 00` (ADD EAX, 0) -- use TEST or remove
+  - `83C0 00` (ADD EAX, 0) -- use TEST or remove (flag-exact; the 32-bit
+    form's zero-extension is gated by register liveness)
 * redundant AND immediate
   - `83E0 FF` instead of `85C0` (AND EAX, -1 -> TEST EAX, EAX; an all-ones mask
-    sets identical flags)
+    sets identical flags; the 32-bit form's zero-extension -- GCC's fused
+    zero-extend-and-test -- is gated by register liveness)
 * redundant MOV reg, reg
   - `4889C0` (MOV RAX, RAX)
   - `89C0` (MOV EAX, EAX) -- the 8/16/64-bit forms are pure no-ops; the 32-bit
@@ -137,9 +148,12 @@ and only for flags -- the ABI guarantees they do not survive it.
     downstream or already zero from the preceding 32-bit write (both gated by
     register liveness)
 * redundant OR/XOR zero
-  - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove
+  - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove (the
+    32-bit form's zero-extension is gated by register liveness)
 * redundant shift/rotate by zero
-  - `C1E0 00` (SHL EAX, 0) -- no-op, flags also unchanged
+  - `C1E0 00` (SHL EAX, 0) -- value and flags unchanged; hardware still
+    zero-extends the 32-bit form even at count 0, so it is gated by register
+    liveness
 * redundant TEST after flags
   - `21D8 85C0` (AND EAX, EBX; TEST EAX, EAX) -- the AND already set SF/ZF/PF,
     so the TEST is dead. AND/OR/XOR match TEST's flags exactly (CF/OF cleared)
@@ -177,7 +191,8 @@ and only for flags -- the ABI guarantees they do not survive it.
 * ~~suboptimal NOP sequence~~, see [#9](https://github.com/gaul/x86lint/issues/9)
   - multiple `90` instead of a single `66 90`, etc.
 * suboptimal OR/AND reg, reg
-  - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write)
+  - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write;
+    the 32-bit form's zero-extension is gated by register liveness)
 * suboptimal SSE MOV opcode
   - `660F6FCA` instead of `0F28CA` (MOVDQA XMM1, XMM2 -> MOVAPS; the legacy
     66/F3-prefixed copies movapd/movdqa/movupd/movdqu waste a byte over

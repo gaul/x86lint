@@ -1141,20 +1141,42 @@ static void check_flag_liveness_test(void)
     ASSERT_FINDINGS(mov_cmove, "suboptimal MOV zero", 0);
 
     // redundant ADD/SUB zero is NOT flag-gated: test reg, reg reproduces the
-    // flags exactly, so the finding fires whether or not the flags are live.
-    // add ebx, 0 ; je +0 -- ZF live, but test ebx, ebx preserves it, flag.
+    // flags exactly, so flag liveness never suppresses it -- here it fires
+    // straight into the flag-reading je. It IS register-gated in its 32-bit
+    // form (the add zero-extends, test does not), which the mov ebx, ecx
+    // satisfies backward: the upper bits are already zero, so the add changes
+    // nothing even though the je blocks the forward walk.
     static const uint8_t addzero_je[] = {
-        0x83, 0xC3, 0x00,
-        0x74, 0x00,
+        0x89, 0xCB,        // mov ebx, ecx (already zero-extends rbx)
+        0x83, 0xC3, 0x00,  // add ebx, 0
+        0x74, 0x00,        // je +0 (reads the flags; upper-32 walk blocked)
     };
     ASSERT_FINDINGS(addzero_je, "redundant ADD/SUB zero", 1);
 
-    // add ebx, 0 ; ret -- flags dead, remove it, also flagged.
+    // add ebx, 0 ; ret -- flags dead, but rbx's upper bits are conservatively
+    // live at RET (the value can escape as a callee-saved register), so the
+    // 32-bit form is suppressed.
     static const uint8_t addzero_ret[] = {
         0x83, 0xC3, 0x00,
         0xC3,
     };
-    ASSERT_FINDINGS(addzero_ret, "redundant ADD/SUB zero", 1);
+    ASSERT_FINDINGS(addzero_ret, "redundant ADD/SUB zero", 0);
+
+    // add rbx, 0 ; ret -- the 64-bit form is a full-width identity write with
+    // no upper-bit concern: fires.
+    static const uint8_t addzero64_ret[] = {
+        0x48, 0x83, 0xC3, 0x00,
+        0xC3,
+    };
+    ASSERT_FINDINGS(addzero64_ret, "redundant ADD/SUB zero", 1);
+
+    // add ebx, 0 ; mov ebx, ecx -- the following 32-bit write redefines the
+    // upper bits before any read: fires.
+    static const uint8_t addzero_kill[] = {
+        0x83, 0xC3, 0x00,
+        0x89, 0xCB,
+    };
+    ASSERT_FINDINGS(addzero_kill, "redundant ADD/SUB zero", 1);
 
     // add eax, 1 ; ret -- CF dead at ret, inc eax is valid, finding fires.
     static const uint8_t addone_ret[] = {
@@ -1502,6 +1524,115 @@ static void check_zero_extend_mov_self_test(void)
         0x48, 0x89, 0x03,  // mov [rbx], rax
     };
     ASSERT_FINDINGS(cmov_movself_store, "redundant MOV reg, reg", 0);
+}
+
+// The other 32-bit identity operations -- and reg, -1 / or reg, reg /
+// or-xor reg, 0 / shl reg, 0 (add reg, 0 is pinned alongside the flag tests)
+// -- share check_mov_self's register gate: their rewrite is a non-writing test
+// or outright removal, dropping the 32-bit form's incidental zero-extension,
+// so the dispatcher suppresses that form while bits 63:32 may be live, with
+// the same backward escape when the preceding instruction already zeroed
+// them. Other widths fire unconditionally. Hardware zero-extends even for the
+// count-0 shift, so it is gated alike.
+static void check_upper32_identity_gate_test(void)
+{
+    // movabs rax, 2^32 ; and eax, -1 ; mov rdx, rax ; ret -- GCC's fused
+    // zero-extend-and-test shape: the full-register read observes the
+    // zero-extension a test rewrite would drop. Suppress.
+    static const uint8_t and_m1_upper_read[] = {
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x83, 0xE0, 0xFF,        // and eax, -1
+        0x48, 0x89, 0xC2,        // mov rdx, rax
+        0xC3,
+    };
+    ASSERT_FINDINGS(and_m1_upper_read, "redundant AND immediate", 0);
+
+    // and eax, -1 ; mov eax, ecx -- the following 32-bit write redefines the
+    // upper bits before any read: fires.
+    static const uint8_t and_m1_kill[] = {
+        0x83, 0xE0, 0xFF,        // and eax, -1
+        0x89, 0xC8,              // mov eax, ecx
+    };
+    ASSERT_FINDINGS(and_m1_kill, "redundant AND immediate", 1);
+
+    // mov ebx, [rsi] ; or ebx, ebx ; je +0 -- the classic flag-test idiom:
+    // the load already zero-extended rbx, so the backward escape fires the
+    // finding even though the je blocks the forward walk.
+    static const uint8_t or_self_after_load[] = {
+        0x8B, 0x1E,              // mov ebx, [rsi]
+        0x09, 0xDB,              // or ebx, ebx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(or_self_after_load, "suboptimal OR/AND reg, reg", 1);
+
+    // or ebx, ebx ; je +0 -- cold rbx: nothing proves the upper bits dead or
+    // already zero, so the 32-bit form is suppressed.
+    static const uint8_t or_self_cold[] = {
+        0x09, 0xDB,              // or ebx, ebx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(or_self_cold, "suboptimal OR/AND reg, reg", 0);
+
+    // or rbx, rbx ; je +0 -- the 64-bit form is a full-width identity write;
+    // the rewrite drops nothing: fires.
+    static const uint8_t or_self_64[] = {
+        0x48, 0x09, 0xDB,        // or rbx, rbx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(or_self_64, "suboptimal OR/AND reg, reg", 1);
+
+    // xor ebx, 0 ; mov ebx, ecx -- killed upper bits: fires.
+    static const uint8_t xor_zero_kill[] = {
+        0x83, 0xF3, 0x00,        // xor ebx, 0
+        0x89, 0xCB,              // mov ebx, ecx
+    };
+    ASSERT_FINDINGS(xor_zero_kill, "redundant OR/XOR zero", 1);
+
+    // xor ebx, 0 ; ret -- conservative at RET: suppress.
+    static const uint8_t xor_zero_ret[] = {
+        0x83, 0xF3, 0x00,        // xor ebx, 0
+        0xC3,
+    };
+    ASSERT_FINDINGS(xor_zero_ret, "redundant OR/XOR zero", 0);
+
+    // movabs rax, 2^32 ; shl eax, 0 ; mov rdx, rax ; ret -- count-0 shifts
+    // zero-extend on real hardware, so removal is gated like the others:
+    // suppress while the upper bits are read.
+    static const uint8_t shl_zero_upper_read[] = {
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0xC1, 0xE0, 0x00,        // shl eax, 0
+        0x48, 0x89, 0xC2,        // mov rdx, rax
+        0xC3,
+    };
+    ASSERT_FINDINGS(shl_zero_upper_read, "redundant shift/rotate by zero", 0);
+
+    // shl eax, 0 ; mov eax, ebx -- killed: fires.
+    static const uint8_t shl_zero_kill[] = {
+        0xC1, 0xE0, 0x00,        // shl eax, 0
+        0x89, 0xD8,              // mov eax, ebx
+    };
+    ASSERT_FINDINGS(shl_zero_kill, "redundant shift/rotate by zero", 1);
+
+    // The 64- and 8-bit forms have no upper-32 concern: fire even at ret.
+    static const uint8_t shl_zero_64[] = {
+        0x48, 0xC1, 0xE0, 0x00,  // shl rax, 0
+        0xC3,
+    };
+    ASSERT_FINDINGS(shl_zero_64, "redundant shift/rotate by zero", 1);
+    static const uint8_t shl_zero_8[] = {
+        0xC0, 0xE0, 0x00,        // shl al, 0
+        0xC3,
+    };
+    ASSERT_FINDINGS(shl_zero_8, "redundant shift/rotate by zero", 1);
+
+    // shl dword [rax], 0 ; ret -- a memory destination writes no register (its
+    // REG0 slot holds the suppressed RFLAGS operand, which the hook's GPR test
+    // rejects): no concern, fires as before.
+    static const uint8_t shl_zero_mem[] = {
+        0xC1, 0x20, 0x00,        // shl dword [rax], 0
+        0xC3,
+    };
+    ASSERT_FINDINGS(shl_zero_mem, "redundant shift/rotate by zero", 1);
 }
 
 // Multi-instruction peephole: a flag-setting ALU (add/sub/and/or/xor/inc/dec/
@@ -2184,6 +2315,7 @@ int main(int argc, char *argv[])
     check_flag_liveness_corners_test();
     check_reg_liveness_test();
     check_zero_extend_mov_self_test();
+    check_upper32_identity_gate_test();
     check_redundant_flags_test();
     check_lea_fold_test();
     check_mov_const_fold_test();
@@ -2202,6 +2334,7 @@ int main(int argc, char *argv[])
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
         0xc1, 0xd0, 0x01,  // rcl eax, 1
         0x83, 0xe0, 0xff,  // and eax, -1
+        0x89, 0xc8,  // mov eax, ecx (32-bit kill: keeps the gated and eax, -1 firing)
         0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
         0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
     };

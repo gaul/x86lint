@@ -695,13 +695,16 @@ bool check_and_strength_reduce(const xed_decoded_inst_t *xedd)
 //   and eax, -1   83 e0 ff      (3 bytes)   ->   test eax, eax   85 c0     (2 bytes)
 //   and rax, -1   48 83 e0 ff   (4 bytes)   ->   test rax, rax   48 85 c0  (3 bytes)
 // The all-ones immediate is matched at the effective operand width (cf.
-// check_xor_to_not, check_test_minus_one). Flag-exact, so no liveness gate:
-// this is the flag-preserving counterpart to check_and_strength_reduce's
-// former all-ones -> mov reg, reg. That rewrite dropped the flags (so it was
-// FLAG_ARITH-gated and vanished exactly when a downstream reader made the
-// finding worth acting on); test is shorter and flag-exact, and the incidental
-// 32-bit zero-extension the mov preserved is treated as not relied upon (as in
-// check_or_and_self). The wider all-ones masks and reg is full width already
+// check_xor_to_not, check_test_minus_one). Flag-exact, so no flag-liveness
+// gate: this is the flag-preserving counterpart to check_and_strength_reduce's
+// former all-ones -> mov reg, reg (FLAG_ARITH-gated, so it vanished exactly
+// when a downstream reader made the finding worth acting on). What test does
+// drop is the 32-bit form's write: and eax, -1 zero-extends bits 63:32 where
+// test writes nothing -- GCC emits exactly this shape as a fused
+// zero-extend-and-test, branching and then reading the full register -- so the
+// dispatcher gates that form on upper-32 liveness (reg0_upper32_concern, cf.
+// check_mov_self). The other widths are value-identical and fire
+// unconditionally. The wider all-ones masks and reg is full width already
 // leave nothing for movzx/mov to shorten, so this is their only finding.
 //
 // AL is excluded: and al, -1 via the 24 ib accumulator opcode is already 2
@@ -984,10 +987,16 @@ bool check_lea_to_add(const xed_decoded_inst_t *xedd)
     return false;
 }
 
-// Shift and rotate instructions with an immediate count of 0 are pure
-// no-ops: the destination is unchanged and per the Intel SDM the flags
-// are explicitly "not affected" when the count is 0. The CL-register
-// form cannot be checked statically.
+// Shift and rotate instructions with an immediate count of 0 are value- and
+// flag-preserving: the destination keeps its value and per the Intel SDM the
+// flags are explicitly "not affected" when the count is 0. Removal is still
+// not unconditional for the 32-bit register forms: the SDM's count-0
+// pseudocode skips the destination write, but measured hardware (AMD Zen 5)
+// performs it anyway, zero-extending bits 63:32 -- so the dispatcher gates
+// those on upper-32 liveness (reg0_upper32_concern, cf. check_mov_self).
+// The other widths and memory destinations change no register state under
+// either reading and fire unconditionally. The CL-register form cannot be
+// checked statically.
 bool check_shift_zero(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -1255,9 +1264,12 @@ bool check_sub_self(const xed_decoded_inst_t *xedd)
 //
 // Not flag-gated (cf. check_add_sub_zero): test reproduces the flags, so the
 // rewrite holds whether or not they are live, and when they are dead the
-// instruction can be removed outright. The 32-bit form's incidental
-// zero-extension into the upper 64 bits is treated as not relied upon, the
-// same way check_add_sub_zero treats add eax, 0.
+// instruction can be removed outright. It is register-gated: the 32-bit form
+// zero-extends into the upper 64 bits where test writes nothing, so the
+// dispatcher suppresses it while those bits may be live (reg0_upper32_concern,
+// cf. check_mov_self). The common shape -- a 32-bit load or ALU result tested
+// right where it is produced -- still fires via the already-zero-extended
+// escape (writes_zero_extended_32).
 bool check_or_and_self(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -1515,7 +1527,10 @@ bool check_mov_modrm_imm(const xed_decoded_inst_t *xedd)
 // flags exactly (CF=OF=0, ZF/SF/PF per the value; only the unobservable AF
 // differs), so the substitution is valid even when the flags are live --
 // hence the dispatcher entry carries no flag concern and the finding fires
-// regardless of downstream flag liveness.
+// regardless of downstream flag liveness. It does carry a register concern:
+// the 32-bit forms zero-extend bits 63:32 where test (or removal) leaves
+// them, so those are gated on upper-32 liveness (reg0_upper32_concern, cf.
+// check_mov_self).
 //
 // AL is excluded: add al, 0 already fits in 2 bytes via the 04 ib
 // accumulator opcode, exactly tying test al, al, so substituting test
@@ -1682,7 +1697,7 @@ bool check_inc_dec(const xed_decoded_inst_t *xedd)
 // register clears bits 63-32). Removing it is sound only when that
 // zero-extension is dead -- those upper bits are redefined before any reader --
 // which the dispatcher decides with reg_upper32_live_after via the entry's
-// reg_concern hook (mov_self_upper_concern). So this returns a finding for
+// reg_concern hook (reg0_upper32_concern). So this returns a finding for
 // every same-register mov; the 32-bit case is then gated on upper-bit liveness,
 // while the 8/16/64-bit cases -- with no upper bits to disturb -- fire
 // unconditionally.
@@ -1866,9 +1881,11 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
 // conservative whitelist -- omitting an instruction only forgoes a DEAD
 // conclusion (and thus a finding), never soundness. Excluded on purpose: CMOVcc
 // and REP-string writes (conditional -- the prior value can survive a not-taken
-// move or a zero REP count), shifts and rotates (a count of 0 leaves the
-// destination unwritten per the Intel SDM), and BSF/BSR (the destination is
-// undefined when the source is 0).
+// move or a zero REP count), shifts and rotates (the SDM's count-0 pseudocode
+// performs no destination write, so the zero-extension cannot be assumed here
+// -- observed hardware zero-extends even at count 0, but a kill must rest on
+// the weaker guarantee), and BSF/BSR (the destination is undefined when the
+// source is 0).
 static bool reg_kill_iclass(xed_iclass_enum_t iclass)
 {
     switch (iclass) {
@@ -1995,17 +2012,28 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
     return true;
 }
 
-// reg_concern hook for check_mov_self (see struct check_entry). Only the 32-bit
-// mov r32, r32 form disturbs any bits when removed -- the zero-extension into
-// the upper 32 bits of the enclosing 64-bit register -- so return that register
-// for the 32-bit form and XED_REG_INVALID (ungated) otherwise.
-static xed_reg_enum_t mov_self_upper_concern(const xed_decoded_inst_t *xedd)
+// reg_concern hook (see struct check_entry) shared by the checks whose rewrite
+// drops an incidental 32-bit identity write: removing mov eax, eax or
+// shl eax, 0, or replacing add eax, 0 / or eax, eax / and eax, -1 with a
+// non-writing test. Only the 32-bit register forms disturb any bits when
+// rewritten -- the zero-extension into the upper 32 bits of the enclosing
+// 64-bit register (measured on hardware even for the count-0 shift, whose SDM
+// pseudocode suggests no write) -- so return that register for those and
+// XED_REG_INVALID (ungated) otherwise: an 8-/16-bit write leaves the
+// surrounding bytes untouched just as its rewrite does, a 64-bit identity
+// write changes nothing, and a memory destination (a shift's, say) writes no
+// register at all -- its REG0 slot holds a suppressed non-GPR like RFLAGS,
+// which the class test rejects.
+static xed_reg_enum_t reg0_upper32_concern(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_operand_width(xedd) != 32) {
         return XED_REG_INVALID;
     }
-    return xed_get_largest_enclosing_register(
-        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0));
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_reg_class(r0) != XED_REG_CLASS_GPR) {
+        return XED_REG_INVALID;
+    }
+    return xed_get_largest_enclosing_register(r0);
 }
 
 // True when `producer` unconditionally writes the 32-bit form of the GPR reg64,
@@ -2015,11 +2043,13 @@ static xed_reg_enum_t mov_self_upper_concern(const xed_decoded_inst_t *xedd)
 // leave the register unwritten or undefined) and to a write of exactly the
 // 32-bit form -- a 64-bit write sets bits 63:32 to arbitrary values instead.
 //
-// check_mov_self's mov r32, r32 clears exactly those bits, so when the
-// immediately preceding instruction already zeroed them the mov is a pure
-// no-op -- removable whether or not the upper half is read downstream. That is
-// what lets the dispatcher report the finding even when reg_upper32_live_after
-// finds the bits live, the complement of the forward gate.
+// The 32-bit identity ops sharing reg0_upper32_concern (mov eax, eax;
+// add eax, 0; or eax, eax; and eax, -1; shl eax, 0; ...) clear exactly those
+// bits, so when the immediately preceding instruction already zeroed them the
+// instruction is a pure no-op -- removable whether or not the upper half is
+// read downstream. That is what lets the dispatcher report the finding even
+// when reg_upper32_live_after finds the bits live, the complement of the
+// forward gate.
 static bool writes_zero_extended_32(const xed_decoded_inst_t *producer,
                                     xed_reg_enum_t reg64)
 {
@@ -2198,16 +2228,16 @@ static const struct check_entry checks[] = {
     {check_implicit_register,          "unneeded explicit register",      0},
     {check_implicit_immediate,         "unneeded explicit immediate",     0},
     {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
-    {check_and_minus_one,              "redundant AND immediate",         0},
+    {check_and_minus_one,              "redundant AND immediate",         0, reg0_upper32_concern},
     {check_and_zero,                   "suboptimal AND zero",             0},
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
-    {check_mov_self,                   "redundant MOV reg, reg",          0, mov_self_upper_concern},
-    {check_add_sub_zero,               "redundant ADD/SUB zero",          0},
-    {check_or_xor_zero,                "redundant OR/XOR zero",           0},
+    {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern},
+    {check_add_sub_zero,               "redundant ADD/SUB zero",          0, reg0_upper32_concern},
+    {check_or_xor_zero,                "redundant OR/XOR zero",           0, reg0_upper32_concern},
     {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},
@@ -2216,11 +2246,11 @@ static const struct check_entry checks[] = {
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
     {check_unneeded_movsx,             "unneeded MOVSX",                  0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
-    {check_or_and_self,                "suboptimal OR/AND reg, reg",      0},
+    {check_or_and_self,                "suboptimal OR/AND reg, reg",      0, reg0_upper32_concern},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_lea_to_add,                 "suboptimal LEA",                  FLAG_ARITH},
-    {check_shift_zero,                 "redundant shift/rotate by zero",  0},
+    {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},
     {check_oversized_vex,              "oversized VEX encoding",          0},

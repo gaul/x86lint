@@ -3306,26 +3306,70 @@ int main(int argc, char *argv[])
     check_setcc_branch_test();
     check_decode_resync_test();
 
+    // Integration sweep: one buffer through check_instructions, asserted per
+    // category rather than as a bare total (a total alone lets one check
+    // regress while another starts firing on the same bytes). The two NOPs
+    // pin the disabled state of the in-sweep NOP check: re-enabling it shows
+    // up as an unexpected extra finding.
     static const uint8_t inst[] = {
-        0x90, 0x90,  // nop ; nop
-        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
-        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
-        0x40, 0xc9,  // leave
-        0x83, 0xff, 0x00,  // cmp edi, 0
-        0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100
-        0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1
-        0xc1, 0xd0, 0x01,  // rcl eax, 1
-        0x83, 0xe0, 0xff,  // and eax, -1
+        0x90, 0x90,  // nop ; nop (no finding: the NOP check is disabled)
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0 (imm64 fits imm32; mov_zero flags only the composed imm32 form)
+        0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80 (-> sub eax, -128; CF dies at the cmp below)
+        0x40, 0xc9,  // rex leave (the prefix does nothing)
+        0x83, 0xff, 0x00,  // cmp edi, 0 (-> test edi, edi)
+        0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100 (modrm -> accumulator form)
+        0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1 (imm32 -> imm8; the inc rewrite stays gated: rcl reads CF)
+        0xc1, 0xd0, 0x01,  // rcl eax, 1 (C1 ib -> D1)
+        0x83, 0xe0, 0xff,  // and eax, -1 (-> test eax, eax)
         0x89, 0xc8,  // mov eax, ecx (32-bit kill: keeps the gated and eax, -1 firing)
-        0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx
-        0xf0, 0x87, 0x07,  // lock xchg [eax], ebx
+        0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx (missing LOCK)
+        0xf0, 0x87, 0x07,  // lock xchg [rdi], eax (LOCK is implicit in XCHG)
+        0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8] (-> lea eax, [rdi+8])
+        0x89, 0xc8,  // mov eax, ecx (kills rax's bits 32-63 for the lea)
+        0x66, 0x0f, 0xef, 0xc0,  // pxor xmm0, xmm0 (-> xorps xmm0, xmm0)
+        0x66, 0x0f, 0x6f, 0xca,  // movdqa xmm1, xmm2 (-> movaps xmm1, xmm2)
+        0xc4, 0xe1, 0x7d, 0x6f, 0xca,  // vmovdqa ymm1, ymm2 (C4 -> C5)
+        0x62, 0xf1, 0xfd, 0x28, 0x6f, 0xca,  // vmovdqa64 ymm1, ymm2 (-> VEX vmovdqa)
     };
-    int expected = 10;
-    int actual = check_instructions(inst, sizeof(inst), false, NULL);
-    if (actual != expected) {
-        printf("Expected %d errors, actual: %d\n", expected, actual);
-        return 1;
+    static const struct {
+        const char *name;
+        int count;
+    } expected[] = {
+        {"oversized immediate",         2},  // mov rax, 0 and add eax, 1
+        {"oversized ADD/SUB 128",       1},
+        {"unneeded REX prefix",         1},
+        {"suboptimal CMP zero",         1},
+        {"unneeded explicit register",  1},
+        {"unneeded explicit immediate", 1},
+        {"redundant AND immediate",     1},
+        {"missing LOCK prefix",         1},
+        {"unneeded LOCK prefix",        1},
+        {"oversized LEA width",         1},
+        {"suboptimal SSE zero idiom",   1},
+        {"suboptimal SSE MOV opcode",   1},
+        {"oversized VEX encoding",      1},
+        {"oversized EVEX encoding",     1},
+    };
+    int status = 0;
+    int expected_total = 0;
+    int total = 0;
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        int count = count_findings(inst, sizeof(inst), expected[i].name,
+                                   &total);
+        if (count != expected[i].count) {
+            printf("Expected %d \"%s\" finding(s), actual: %d\n",
+                   expected[i].count, expected[i].name, count);
+            status = 1;
+        }
+        expected_total += expected[i].count;
+    }
+    // The total matching the per-category sum proves no unlisted category
+    // fired anywhere in the buffer.
+    if (total != expected_total) {
+        printf("Expected %d findings in total, actual: %d\n",
+               expected_total, total);
+        status = 1;
     }
 
-    return 0;
+    return status;
 }

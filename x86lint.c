@@ -2793,8 +2793,9 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
 // which the fold, reading dest's pre-mov value, would get wrong. dest, srcA, and
 // srcB share a width from the mov and add; the lea addresses through their
 // enclosing 64-bit registers, exact because low-width arithmetic is closed (a
-// 32-bit pair folds too). The one unencodable result, [rsp + rsp] (RSP is not a
-// legal SIB index), is excluded.
+// 32- or 16-bit pair folds too). The unencodable forms are excluded: an 8-bit
+// pair, since LEA has no byte-width destination (8D encodes r16/r32/r64 only),
+// and [rsp + rsp], since RSP is not a legal SIB index.
 static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
                                     size_t add_offset,
                                     const xed_decoded_inst_t *mov_rr)
@@ -2810,6 +2811,12 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
     xed_reg_enum_t src_a = xed_decoded_inst_get_reg(mov_rr, XED_OPERAND_REG1);
     if (xed_reg_class(dest) != XED_REG_CLASS_GPR ||
         xed_reg_class(src_a) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    // LEA has no byte-width destination, so an 8-bit pair (mov al, bl ;
+    // add al, cl) has no single-LEA rewrite. dest's width is the pair's:
+    // the add's destination must match it exactly below.
+    if (xed_get_register_width_bits64(dest) == 8) {
         return false;
     }
     xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(dest);

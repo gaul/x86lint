@@ -1954,6 +1954,32 @@ static void check_mov_add_lea_test(void)
     };
     ASSERT_FINDINGS(doubled, "MOV+ADD foldable to LEA", 1);
 
+    // 16-bit form: mov dx, si ; add dx, di -> lea dx, [rsi + rdi]. LEA takes
+    // any non-byte destination width.
+    static const uint8_t word[] = {
+        0x66, 0x89, 0xF2,  // mov dx, si
+        0x66, 0x01, 0xFA,  // add dx, di
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(word, "MOV+ADD foldable to LEA", 1);
+
+    // mov al, bl ; add al, cl -- LEA has no byte-width destination, so an
+    // 8-bit pair has no single-LEA rewrite: suppress.
+    static const uint8_t byte_low[] = {
+        0x88, 0xD8,        // mov al, bl
+        0x00, 0xC8,        // add al, cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(byte_low, "MOV+ADD foldable to LEA", 0);
+
+    // Same with a high-byte destination: mov ah, bl ; add ah, cl.
+    static const uint8_t byte_high[] = {
+        0x88, 0xDC,        // mov ah, bl
+        0x00, 0xCC,        // add ah, cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(byte_high, "MOV+ADD foldable to LEA", 0);
+
     // mov edx, esi ; add edx, edi ; jz -- the add's flags feed the branch, and
     // lea would not set them: suppress.
     static const uint8_t flags_live[] = {

@@ -280,6 +280,15 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `660F6FCA` instead of `0F28CA` (MOVDQA XMM1, XMM2 -> MOVAPS; the legacy
     66/F3-prefixed copies movapd/movdqa/movupd/movdqu waste a byte over
     movaps/movups)
+* suboptimal SSE zero idiom
+  - `660FEFC0` instead of `0F57C0` (PXOR XMM0, XMM0 -> XORPS XMM0, XMM0; XOR
+    is typeless, and the self forms write identical bits -- 128 zeros, upper
+    YMM and flags untouched, no exceptions -- while every recent core zeroes
+    them at rename, so the integer/float domain choice cannot matter. XORPD's
+    self form wastes the same 66 prefix. Legacy SSE only: under VEX the
+    prefix rides in the pp field and vpxor/vxorps are the same length. Only
+    the self form is flagged -- a data XOR really executes, where the domain
+    can matter on older cores)
 * suboptimal SUB reg, reg
   - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking
 * suboptimal XOR immediate

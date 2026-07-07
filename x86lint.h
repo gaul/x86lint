@@ -189,6 +189,12 @@ bool check_shl_one(const xed_decoded_inst_t *xedd);
 // movaps/movups, the identical copy without the one-byte 66/F3 prefix
 bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);
 
+// return false if a legacy-encoded self-XOR zeroing idiom -- pxor xmm, xmm or
+// xorpd xmm, xmm -- could be xorps xmm, xmm, the identical zeroing without
+// the one-byte 66 prefix (XOR is typeless; all three are rename-time zeroing
+// idioms on every recent core, so no domain-bypass concern applies)
+bool check_sse_zero_idiom(const xed_decoded_inst_t *xedd);
+
 // return false if an EVEX-encoded instruction uses no EVEX-only feature
 // (opmask, broadcast, rounding/SAE, 512-bit length, xmm16-31) and a VEX
 // re-encoding is strictly shorter

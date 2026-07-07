@@ -1250,6 +1250,35 @@ bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd)
     }
 }
 
+// The self-XOR zeroing idiom spelled pxor xmm, xmm (66 0F EF, 4 bytes) or
+// xorpd xmm, xmm (66 0F 57, 4 bytes) is xorps xmm, xmm (0F 57, 3 bytes) with
+// a wasted 66 prefix: XOR is typeless -- the mnemonic suffix only picks the
+// execution domain, not the result -- and the self forms all write 128 zero
+// bits, leave the upper YMM/ZMM bits and the flags alone, and raise no
+// exceptions. Every recent core (Intel since Sandy Bridge, AMD since
+// Bulldozer) recognizes all three as rename-time zeroing idioms: no uop
+// executes, so the integer-versus-float domain folklore that made compilers
+// prefer pxor cannot apply. Only the self form is flagged: a data XOR really
+// executes, and routing it through the float domain between integer
+// consumers can cost bypass latency on older cores -- bytes for arguable
+// cycles is not this tool's trade. Legacy SSE only, which the iclass test
+// gives for free (VEX/EVEX decode as VPXOR/VPXORD/VXORPD, and under VEX the
+// 66 moves into the pp field, making vpxor and vxorps the same length). The
+// prefixless MMX form of pxor shares the iclass and has no xorps twin, so
+// the destination must be an XMM register.
+bool check_sse_zero_idiom(const xed_decoded_inst_t *xedd)
+{
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    if (iclass != XED_ICLASS_PXOR && iclass != XED_ICLASS_XORPD) {
+        return true;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (dst != xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1)) {
+        return true;
+    }
+    return xed_reg_class(dst) != XED_REG_CLASS_XMM;
+}
+
 // AVX-512 renamed the integer copy and bitwise iclasses with element-size
 // suffixes (the suffix only matters under an opmask, which the caller has
 // already ruled out); map them back to their VEX ancestors. Every other
@@ -2608,6 +2637,7 @@ static const struct check_entry checks[] = {
     {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern, true},
     {check_shl_one,                    "suboptimal SHL one",              0},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
+    {check_sse_zero_idiom,             "suboptimal SSE zero idiom",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},
     {check_oversized_vex,              "oversized VEX encoding",          0},
 };

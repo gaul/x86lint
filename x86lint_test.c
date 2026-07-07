@@ -1233,6 +1233,42 @@ static void check_sse_mov_opcode_test(void)
     CHECK_BYTES( check_sse_mov_opcode, 0x89, 0xc8);                          // mov eax, ecx
 }
 
+static void check_sse_zero_idiom_test(void)
+{
+    // 66-prefixed self-XOR zeroing idioms -- xorps is one byte shorter.
+    CHECK_BYTES(!check_sse_zero_idiom, 0x66, 0x0f, 0xef, 0xc0);        // pxor xmm0, xmm0
+    CHECK_BYTES(!check_sse_zero_idiom, 0x66, 0x0f, 0xef, 0xff);        // pxor xmm7, xmm7
+    CHECK_BYTES(!check_sse_zero_idiom, 0x66, 0x45, 0x0f, 0xef, 0xc0);  // pxor xmm8, xmm8 (REX)
+    CHECK_BYTES(!check_sse_zero_idiom, 0x66, 0x0f, 0x57, 0xc0);        // xorpd xmm0, xmm0
+    // Already the unprefixed form.
+    CHECK_BYTES( check_sse_zero_idiom, 0x0f, 0x57, 0xc0);              // xorps xmm0, xmm0
+    // Not the self form: a data XOR really executes, and the domain choice
+    // can matter on older cores.
+    CHECK_BYTES( check_sse_zero_idiom, 0x66, 0x0f, 0xef, 0xc1);        // pxor xmm0, xmm1
+    CHECK_BYTES( check_sse_zero_idiom, 0x66, 0x0f, 0x57, 0xc1);        // xorpd xmm0, xmm1
+    CHECK_BYTES( check_sse_zero_idiom, 0x66, 0x0f, 0xef, 0x00);        // pxor xmm0, [rax]
+    // The prefixless MMX pxor shares the iclass but has no xorps twin.
+    CHECK_BYTES( check_sse_zero_idiom, 0x0f, 0xef, 0xc0);              // pxor mm0, mm0
+    // VEX/EVEX decode as distinct iclasses, and the 66 rides in the VEX pp
+    // bits for free -- no byte to save.
+    CHECK_BYTES( check_sse_zero_idiom, 0xc5, 0xf9, 0xef, 0xc0);        // vpxor xmm0, xmm0, xmm0
+    CHECK_BYTES( check_sse_zero_idiom, 0xc5, 0xf8, 0x57, 0xc0);        // vxorps xmm0, xmm0, xmm0
+    CHECK_BYTES( check_sse_zero_idiom, 0x90);                          // nop
+
+    // Dispatcher: unconditional -- no flag or register gate.
+    static const uint8_t pxor_self[] = {
+        0x66, 0x0f, 0xef, 0xc0,  // pxor xmm0, xmm0
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(pxor_self, "suboptimal SSE zero idiom", 1);
+
+    static const uint8_t xorpd_self[] = {
+        0x66, 0x0f, 0x57, 0xc0,  // xorpd xmm0, xmm0
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(xorpd_self, "suboptimal SSE zero idiom", 1);
+}
+
 static void check_oversized_evex_test(void)
 {
     // No EVEX-only feature in use -- the VEX re-encoding is 1-2 bytes
@@ -3064,6 +3100,7 @@ int main(int argc, char *argv[])
     check_shift_zero_test();
     check_shl_one_test();
     check_sse_mov_opcode_test();
+    check_sse_zero_idiom_test();
     check_oversized_evex_test();
     check_oversized_vex_test();
     check_flag_liveness_test();

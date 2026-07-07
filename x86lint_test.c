@@ -765,6 +765,38 @@ static void check_lea_to_mov_test(void)
     CHECK_BYTES( check_lea_to_mov, 0x90);                        // nop
 }
 
+static void check_lea_to_add_test(void)
+{
+    // Destination is one of the two address registers (an in-place add).
+    CHECK_BYTES(!check_lea_to_add, 0x48, 0x8d, 0x04, 0x08);  // lea rax, [rax+rcx]
+    CHECK_BYTES(!check_lea_to_add, 0x8d, 0x04, 0x08);        // lea eax, [rax+rcx] (mixed size)
+    CHECK_BYTES(!check_lea_to_add, 0x48, 0x8d, 0x04, 0x00);  // lea rax, [rax+rax]
+    CHECK_BYTES(!check_lea_to_add, 0x48, 0x8d, 0x04, 0x01);  // lea rax, [rcx+rax] (dest is index)
+
+    // Destination is neither address register: a genuine three-operand add.
+    CHECK_BYTES( check_lea_to_add, 0x8d, 0x04, 0x11);            // lea eax, [rcx+rdx]
+    // A scale, a displacement, or no index is not a plain two-register add.
+    CHECK_BYTES( check_lea_to_add, 0x48, 0x8d, 0x04, 0x48);      // lea rax, [rax+rcx*2]
+    CHECK_BYTES( check_lea_to_add, 0x48, 0x8d, 0x44, 0x08, 0x08); // lea rax, [rax+rcx+8]
+    CHECK_BYTES( check_lea_to_add, 0x48, 0x8d, 0x03);            // lea rax, [rbx] (no index)
+    CHECK_BYTES( check_lea_to_add, 0x48, 0x8d, 0x05, 0,0,0,0);   // lea rax, [rip+0]
+    CHECK_BYTES( check_lea_to_add, 0x48, 0x89, 0xd8);           // mov rax, rbx (not LEA)
+
+    // Flag gating: add writes the arithmetic flags the lea preserves, so the
+    // dispatcher fires only when they are dead downstream.
+    static const uint8_t flags_dead[] = {
+        0x48, 0x8d, 0x04, 0x08,  // lea rax, [rax+rcx]
+        0xc3,                    // ret (no ABI preserves flags)
+    };
+    ASSERT_FINDINGS(flags_dead, "suboptimal LEA", 1);
+
+    static const uint8_t flags_live[] = {
+        0x48, 0x8d, 0x04, 0x08,  // lea rax, [rax+rcx]
+        0x74, 0x00,              // jz +0 (reads ZF)
+    };
+    ASSERT_FINDINGS(flags_live, "suboptimal LEA", 0);
+}
+
 static void check_sub_self_test(void)
 {
     CHECK_BYTES(!check_sub_self, 0x29, 0xc0);              // sub eax, eax (use xor)
@@ -1973,6 +2005,7 @@ int main(int argc, char *argv[])
     check_or_and_self_test();
     check_imul_to_lea_test();
     check_lea_to_mov_test();
+    check_lea_to_add_test();
     check_shift_zero_test();
     check_sse_mov_opcode_test();
     check_oversized_evex_test();

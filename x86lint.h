@@ -143,6 +143,11 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd);
 // matching the destination) could be mov dst, base
 bool check_lea_to_mov(const xed_decoded_inst_t *xedd);
 
+// return false if lea dst, [reg + reg2] (unit scale, no displacement,
+// destination one of the two address registers) could be add dst, reg2, which
+// is a byte shorter and issues on more ports (flag-gated: add writes flags)
+bool check_lea_to_add(const xed_decoded_inst_t *xedd);
+
 // return false if a shift or rotate instruction has an immediate count of 0
 // (pure no-op; per Intel SDM the flags are not affected when count is 0)
 bool check_shift_zero(const xed_decoded_inst_t *xedd);

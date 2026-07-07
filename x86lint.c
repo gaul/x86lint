@@ -943,6 +943,47 @@ bool check_lea_to_mov(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// lea dst, [reg + reg2] with unit scale and no displacement adds two registers;
+// when dst is one of those two registers the add is in place, so add dst, other
+// computes the same value a byte shorter (no SIB byte) and on more execution
+// ports. lea leaves the flags untouched while add writes them, so the dispatcher
+// gates this on FLAG_ARITH (cf. check_lea_to_mov, the no-index [base] case, and
+// check_mov_zero's mov reg, 0 -> xor). When dst matches neither address register
+// (lea eax, [rcx + rdx]) the lea is a genuine three-operand add that add cannot
+// express, and is kept.
+//
+// The registers are compared by enclosing register, so a mixed operand/address
+// size folds too: lea eax, [rax + rcx] is add eax, ecx because low-width
+// arithmetic is closed (the low W bits of base + index equal the sum of their
+// low W bits). A scale (lea rax, [rax + rcx*2]) or a displacement is not a plain
+// two-register add and is excluded, as is the pure base or RIP-relative form
+// (no index), which check_lea_to_mov owns.
+bool check_lea_to_add(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_LEA) {
+        return true;
+    }
+
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, 0);
+    xed_reg_enum_t index = xed_decoded_inst_get_index_reg(xedd, 0);
+    if (base == XED_REG_INVALID || index == XED_REG_INVALID ||
+        xed_decoded_inst_get_scale(xedd, 0) != 1 ||
+        xed_decoded_inst_get_memory_displacement(xedd, 0) != 0) {
+        return true;
+    }
+
+    // The destination must be one of the two address registers, so the add is
+    // in place rather than a three-operand sum.
+    xed_reg_enum_t dst = xed_get_largest_enclosing_register(
+        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0));
+    if (dst != xed_get_largest_enclosing_register(base) &&
+        dst != xed_get_largest_enclosing_register(index)) {
+        return true;
+    }
+
+    return false;
+}
+
 // Shift and rotate instructions with an immediate count of 0 are pure
 // no-ops: the destination is unchanged and per the Intel SDM the flags
 // are explicitly "not affected" when the count is 0. The CL-register
@@ -2178,6 +2219,7 @@ static const struct check_entry checks[] = {
     {check_or_and_self,                "suboptimal OR/AND reg, reg",      0},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
+    {check_lea_to_add,                 "suboptimal LEA",                  FLAG_ARITH},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},

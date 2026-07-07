@@ -155,6 +155,9 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `6BC0 10` (IMUL EAX, EAX, 16) -- use SHL (any power of two, same register)
 * suboptimal LEA
   - `488D03` (LEA RAX, [RBX]) -- use MOV RAX, RBX (more ports, no AGU)
+  - `488D0408` (LEA RAX, [RAX+RCX]) -- an in-place two-register LEA is ADD RAX,
+    RCX, a byte shorter (no SIB) and on more ports, when the arithmetic flags
+    are dead (gated by flag liveness)
 * suboptimal MOV zero
   - `B8 00000000` (MOV EAX, 0) -- use XOR EAX, EAX (fewer bytes, breaks the
     dependency chain); flagged only when the arithmetic flags XOR would clobber

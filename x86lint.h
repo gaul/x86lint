@@ -68,6 +68,12 @@ bool check_and_minus_one(const xed_decoded_inst_t *xedd);
 // when the arithmetic flags are dead, since NOT writes none)
 bool check_xor_to_not(const xed_decoded_inst_t *xedd);
 
+// return false if or/xor reg, imm sets or flips -- or and reg, imm clears --
+// a single bit at position 7 or above, where bts/btc/btr reg, imm8 is
+// strictly shorter (valid when the arithmetic flags are dead: the bt family
+// sets CF to the bit's original value and leaves SF/ZF/PF alone or undefined)
+bool check_single_bit_immediate(const xed_decoded_inst_t *xedd);
+
 // return false if instruction should have a LOCK prefix
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
 

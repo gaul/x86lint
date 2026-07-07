@@ -768,6 +768,65 @@ bool check_xor_to_not(const xed_decoded_inst_t *xedd)
     return eff != opmask;
 }
 
+// or/xor reg, imm whose mask sets or flips a single bit at position 7 or
+// above -- and and reg, imm whose mask clears one -- drag a 2-4 byte
+// immediate along for a one-bit operation the bt family encodes in one byte:
+//   or eax, 0x100     0d 00010000     (5 bytes)   ->   bts eax, 8    0f ba e8 08     (4 bytes)
+//   xor ecx, 0x8000   81 f1 00800000  (6 bytes)   ->   btc ecx, 15   0f ba f9 0f     (4 bytes)
+//   and rax, ~0x100   48 25 fffeffff  (6 bytes)   ->   btr rax, 8    48 0f ba f0 08  (5 bytes)
+// Bits 0-6 are excluded: those masks fit the sign-extended imm8 ALU form
+// (83 /r ib, 3-4 bytes), which beats the bt encoding -- and a low-bit mask
+// dressed up as an imm32 is check_oversized_immediate's finding. From bit 7
+// up no imm8 form exists (a positive bit 7 is out of sign-extended-imm8
+// reach for or/xor, and the matching clear mask is below it for and), so the
+// ALU op needs imm32 and bts/btr/btc is strictly shorter for every register,
+// accumulator forms included. Masks are matched at the effective operand
+// width, which excludes the 64-bit sign-extension artifacts naturally
+// (or rax with imm32 0x80000000 smears bits 32-63: not a single bit).
+// bts/btr/btc r, imm8 execute as a single uop on current Intel and AMD, and
+// both forms write the register at full operand width, so there is no
+// register-liveness concern.
+//
+// 16-bit operands are excluded (or ax, imm16 via the accumulator opcode is 4
+// bytes, beating bts ax's 5) and so are memory destinations: the bt family's
+// memory forms micro-code as 3+ uops on several cores, so the byte saved is
+// not a clean win there.
+//
+// False positive if surrounding code reads any arithmetic flag: and/or/xor
+// define SF/ZF/PF and clear CF/OF, while the bt family sets CF to the
+// selected bit's ORIGINAL value, preserves ZF, and leaves OF/SF/PF
+// undefined. The dispatcher gates this on FLAG_ARITH.
+bool check_single_bit_immediate(const xed_decoded_inst_t *xedd)
+{
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    switch (iclass) {
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+        break;
+    default:
+        return true;
+    }
+    if (!xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd))) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    if (width != 32 && width != 64) {
+        return true;
+    }
+
+    uint64_t opmask = (width == 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
+
+    // The bit the operation touches: set/flipped by or/xor, cleared by and.
+    uint64_t bit = (iclass == XED_ICLASS_AND) ? ~eff & opmask : eff;
+    return bit == 0 || (bit & (bit - 1)) != 0 || bit < 0x80;
+}
+
 bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
 {
     bool has_lock = xed_operand_values_has_lock_prefix(xed_decoded_inst_operands_const(xedd));
@@ -2231,6 +2290,7 @@ static const struct check_entry checks[] = {
     {check_and_minus_one,              "redundant AND immediate",         0, reg0_upper32_concern},
     {check_and_zero,                   "suboptimal AND zero",             0},
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
+    {check_single_bit_immediate,       "suboptimal single-bit immediate", FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},

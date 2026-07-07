@@ -483,6 +483,66 @@ static void check_xor_to_not_test(void)
     CHECK_BYTES( check_xor_to_not, 0x90);                                      // nop
 }
 
+static void check_single_bit_immediate_test(void)
+{
+    // Single bit at position 7+ set/flipped/cleared -> bts/btc/btr, shorter
+    // at every register and width.
+    CHECK_BYTES(!check_single_bit_immediate, 0x0d, 0x00, 0x01, 0x00, 0x00);              // or eax, 0x100 (accumulator)
+    CHECK_BYTES(!check_single_bit_immediate, 0x81, 0xc9, 0x00, 0x01, 0x00, 0x00);        // or ecx, 0x100 (modrm)
+    CHECK_BYTES(!check_single_bit_immediate, 0x0d, 0x80, 0x00, 0x00, 0x00);              // or eax, 0x80 (bit 7 boundary)
+    CHECK_BYTES(!check_single_bit_immediate, 0x35, 0x00, 0x01, 0x00, 0x00);              // xor eax, 0x100
+    CHECK_BYTES(!check_single_bit_immediate, 0x81, 0xf1, 0x00, 0x80, 0x00, 0x00);        // xor ecx, 0x8000
+    CHECK_BYTES(!check_single_bit_immediate, 0x25, 0xff, 0xfe, 0xff, 0xff);              // and eax, ~0x100
+    CHECK_BYTES(!check_single_bit_immediate, 0x48, 0x25, 0xff, 0xfe, 0xff, 0xff);        // and rax, ~0x100 (imm32 sx)
+    CHECK_BYTES(!check_single_bit_immediate, 0x48, 0x0d, 0x00, 0x01, 0x00, 0x00);        // or rax, 0x100
+    // Bits 0-6: the sign-extended imm8 ALU form (3-4 bytes) beats the bt
+    // family; when such a mask is padded to imm32 the narrowing is
+    // check_oversized_immediate's finding.
+    CHECK_BYTES( check_single_bit_immediate, 0x83, 0xc8, 0x40);                          // or eax, 0x40
+    CHECK_BYTES( check_single_bit_immediate, 0x83, 0xe0, 0xbf);                          // and eax, ~0x40
+    CHECK_BYTES( check_single_bit_immediate, 0x0d, 0x40, 0x00, 0x00, 0x00);              // or eax, 0x40 (imm32)
+    // Multi-bit masks, all-ones, zero.
+    CHECK_BYTES( check_single_bit_immediate, 0x0d, 0x80, 0x01, 0x00, 0x00);              // or eax, 0x180
+    CHECK_BYTES( check_single_bit_immediate, 0x25, 0xff, 0xfc, 0xff, 0xff);              // and eax, ~0x300
+    CHECK_BYTES( check_single_bit_immediate, 0x83, 0xf0, 0xff);                          // xor eax, -1 (check_xor_to_not's)
+    CHECK_BYTES( check_single_bit_immediate, 0x83, 0xc8, 0x00);                          // or eax, 0 (check_or_xor_zero's)
+    // 64-bit sign-extension artifacts are not single bits.
+    CHECK_BYTES( check_single_bit_immediate, 0x48, 0x0d, 0x00, 0x00, 0x00, 0x80);        // or rax, imm32 -2^31
+    // 16-bit width: the accumulator imm16 form already beats bts ax.
+    CHECK_BYTES( check_single_bit_immediate, 0x66, 0x0d, 0x00, 0x80);                    // or ax, 0x8000
+    // Memory, no immediate, wrong iclass.
+    CHECK_BYTES( check_single_bit_immediate, 0x81, 0x08, 0x00, 0x01, 0x00, 0x00);        // or dword ptr [rax], 0x100
+    CHECK_BYTES( check_single_bit_immediate, 0x09, 0xc8);                                // or eax, ecx
+    CHECK_BYTES( check_single_bit_immediate, 0x05, 0x00, 0x01, 0x00, 0x00);              // add eax, 0x100
+    CHECK_BYTES( check_single_bit_immediate, 0x90);                                      // nop
+
+    // Dispatcher gating: the bt family's flags diverge from the ALU's in
+    // every arithmetic flag, so the finding needs them dead.
+    // or ebx, 0x100 ; ret -- dead at ret: fires.
+    static const uint8_t or_bit_ret[] = {
+        0x81, 0xCB, 0x00, 0x01, 0x00, 0x00,  // or ebx, 0x100
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(or_bit_ret, "suboptimal single-bit immediate", 1);
+
+    // or ebx, 0x100 ; jz +0 -- a branch keeps the flags conservatively live:
+    // suppress.
+    static const uint8_t or_bit_jz[] = {
+        0x81, 0xCB, 0x00, 0x01, 0x00, 0x00,  // or ebx, 0x100
+        0x74, 0x00,                          // jz +0
+    };
+    ASSERT_FINDINGS(or_bit_jz, "suboptimal single-bit immediate", 0);
+
+    // or ebx, 0x100 ; add ecx, 2 ; ret -- the add overwrites every arithmetic
+    // flag before any reader: fires.
+    static const uint8_t or_bit_kill[] = {
+        0x81, 0xCB, 0x00, 0x01, 0x00, 0x00,  // or ebx, 0x100
+        0x83, 0xC1, 0x02,                    // add ecx, 2 (kills the flags)
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(or_bit_kill, "suboptimal single-bit immediate", 1);
+}
+
 static void check_missing_lock_prefix_test(void)
 {
     CHECK_BYTES( check_missing_lock_prefix, 0x67, 0xf0, 0x0f, 0xc1, 0x18);  // lock xadd [eax], ebx
@@ -2529,6 +2589,7 @@ int main(int argc, char *argv[])
     check_and_strength_reduce_test();
     check_and_minus_one_test();
     check_xor_to_not_test();
+    check_single_bit_immediate_test();
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
     check_xchg_accumulator_test();

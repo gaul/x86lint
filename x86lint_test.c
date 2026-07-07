@@ -1658,6 +1658,25 @@ static void check_redundant_flags_test(void)
     };
     ASSERT_FINDINGS(or_test, "redundant TEST after flags", 1);
 
+    // An incoming direct edge onto the test reaches it without the producer,
+    // so dropping it would break that path: suppress. (The window guard is
+    // shared by every multi-instruction peephole.)
+    static const uint8_t and_test_edge_on_test[] = {
+        0x21, 0xD8,        // 0: and eax, ebx
+        0x85, 0xC0,        // 2: test eax, eax  <- branch target
+        0xEB, 0xFC,        // 4: jmp 2
+    };
+    ASSERT_FINDINGS(and_test_edge_on_test, "redundant TEST after flags", 0);
+
+    // An edge onto the producer (the window head) executes the whole pattern:
+    // fires.
+    static const uint8_t and_test_edge_on_head[] = {
+        0x21, 0xD8,        // 0: and eax, ebx   <- branch target
+        0x85, 0xC0,        // 2: test eax, eax
+        0xEB, 0xFA,        // 4: jmp 0
+    };
+    ASSERT_FINDINGS(and_test_edge_on_head, "redundant TEST after flags", 1);
+
     static const uint8_t xor_test[] = {
         0x31, 0xD8,        // xor eax, ebx
         0x85, 0xC0,        // test eax, eax
@@ -2093,6 +2112,120 @@ static void check_mov_add_lea_test(void)
         0xC3,              // ret
     };
     ASSERT_FINDINGS(word, "MOV+ADD foldable to LEA", 1);
+
+    // Immediate addend: mov edx, esi ; add edx, 5 -> lea edx, [rsi + 5].
+    static const uint8_t imm_add[] = {
+        0x89, 0xF2,              // mov edx, esi
+        0x83, 0xC2, 0x05,        // add edx, 5
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(imm_add, "MOV+ADD foldable to LEA", 1);
+
+    // Subtraction negates the displacement: mov rdx, rsi ; sub rdx, 8 ->
+    // lea rdx, [rsi - 8].
+    static const uint8_t imm_sub64[] = {
+        0x48, 0x89, 0xF2,        // mov rdx, rsi
+        0x48, 0x83, 0xEA, 0x08,  // sub rdx, 8
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(imm_sub64, "MOV+ADD foldable to LEA", 1);
+
+    // inc is add by an implied 1: mov edx, esi ; inc edx -> lea edx, [rsi+1].
+    static const uint8_t imm_inc[] = {
+        0x89, 0xF2,              // mov edx, esi
+        0xFF, 0xC2,              // inc edx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(imm_inc, "MOV+ADD foldable to LEA", 1);
+
+    // dec -- like lea -- leaves CF untouched, so a CF reader does not gate
+    // it: the adc reads CF, which flows through dec and lea identically, and
+    // overwrites the flags dec does write. Fires.
+    static const uint8_t imm_dec_adc[] = {
+        0x89, 0xF2,              // mov edx, esi
+        0xFF, 0xCA,              // dec edx
+        0x11, 0xD8,              // adc eax, ebx (reads CF, kills the rest)
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(imm_dec_adc, "MOV+ADD foldable to LEA", 1);
+
+    // sub edx, 1 writes CF, which the adc reads: suppress. (check_inc_dec is
+    // likewise CF-gated on these bytes, so nothing else fires.)
+    static const uint8_t imm_sub_adc[] = {
+        0x89, 0xF2,              // mov edx, esi
+        0x83, 0xEA, 0x01,        // sub edx, 1
+        0x11, 0xD8,              // adc eax, ebx (reads CF)
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(imm_sub_adc, "MOV+ADD foldable to LEA", 0);
+
+    // add edx, 0 is check_add_sub_zero's finding -- the mov alone already
+    // computes the result -- so the fold defers. The trailing mov kills edx's
+    // upper bits so the gated add-zero finding fires, and the total of one
+    // proves the fold stayed quiet.
+    static const uint8_t imm_zero[] = {
+        0x89, 0xF2,              // mov edx, esi
+        0x83, 0xC2, 0x00,        // add edx, 0
+        0x89, 0xCA,              // mov edx, ecx
+    };
+    ASSERT_FINDINGS(imm_zero, "redundant ADD/SUB zero", 1);
+
+    // A 64-bit pair uses the displacement at full value: sub rdx, INT32_MIN
+    // would need disp32 = +2^31, which does not exist. Suppress.
+    static const uint8_t imm_sub_int32min[] = {
+        0x48, 0x89, 0xF2,                          // mov rdx, rsi
+        0x48, 0x81, 0xEA, 0x00, 0x00, 0x00, 0x80,  // sub rdx, -2^31
+        0xC3,                                      // ret
+    };
+    ASSERT_FINDINGS(imm_sub_int32min, "MOV+ADD foldable to LEA", 0);
+
+    // The same immediate folds at 32 bits, where the address truncates to the
+    // destination width: lea edx, [rsi - 2^31] computes esi + 2^31 mod 2^32.
+    static const uint8_t imm_sub_int32min_32[] = {
+        0x89, 0xF2,                          // mov edx, esi
+        0x81, 0xEA, 0x00, 0x00, 0x00, 0x80,  // sub edx, -2^31
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(imm_sub_int32min_32, "MOV+ADD foldable to LEA", 1);
+
+    // Width mismatch: add dx, 5 writes only the low word of the edx the mov
+    // defined, so the pair is not one lea. Suppress.
+    static const uint8_t imm_width_mismatch[] = {
+        0x89, 0xF2,              // mov edx, esi
+        0x66, 0x83, 0xC2, 0x05,  // add dx, 5
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(imm_width_mismatch, "MOV+ADD foldable to LEA", 0);
+
+    // The canonical scan loop (observed in bash and git): the je's back edge
+    // enters the window at the add, so folding the pair would turn the loop
+    // increment into a per-iteration reset. Suppress.
+    static const uint8_t loop_into_add[] = {
+        0x48, 0x89, 0xC3,        // 0: mov rbx, rax
+        0x48, 0x83, 0xC3, 0x05,  // 3: add rbx, 5    <- branch target
+        0x80, 0x3B, 0x2D,        // 7: cmp byte [rbx], 0x2d
+        0x74, 0xF7,              // a: je 3
+    };
+    ASSERT_FINDINGS(loop_into_add, "MOV+ADD foldable to LEA", 0);
+
+    // A back edge to the window HEAD executes the whole pattern, which the
+    // lea reproduces: fires.
+    static const uint8_t loop_into_mov[] = {
+        0x48, 0x89, 0xC3,        // 0: mov rbx, rax  <- branch target
+        0x48, 0x83, 0xC3, 0x05,  // 3: add rbx, 5
+        0x80, 0x3B, 0x2D,        // 7: cmp byte [rbx], 0x2d
+        0x74, 0xF4,              // a: je 0
+    };
+    ASSERT_FINDINGS(loop_into_mov, "MOV+ADD foldable to LEA", 1);
+
+    // A target just past the window (the cmp) does not poison it: fires.
+    static const uint8_t loop_past_window[] = {
+        0x48, 0x89, 0xC3,        // 0: mov rbx, rax
+        0x48, 0x83, 0xC3, 0x05,  // 3: add rbx, 5
+        0x80, 0x3B, 0x2D,        // 7: cmp byte [rbx], 0x2d  <- branch target
+        0x74, 0xFB,              // a: je 7
+    };
+    ASSERT_FINDINGS(loop_past_window, "MOV+ADD foldable to LEA", 1);
 
     // mov al, bl ; add al, cl -- LEA has no byte-width destination, so an
     // 8-bit pair has no single-LEA rewrite: suppress.

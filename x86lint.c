@@ -2294,7 +2294,77 @@ static const struct check_entry checks[] = {
 // rotates are excluded from the producer set (a masked or CL count of zero
 // leaves the flags untouched, so the test would not be redundant), as are IMUL,
 // MUL, and the bit-scan ops, which leave SF/ZF/PF undefined.
+// Bitmap of direct branch targets, one bit per byte offset of the scanned
+// buffer: the target of every decoded jmp/jcc/call/loop with a relative
+// displacement that lands inside the buffer. Built by a first pass walking the
+// same decode-and-resync sweep as the scan proper (so it sees the identical
+// instruction boundaries) and consulted by the multi-instruction peepholes:
+// their rewrite replaces a WINDOW of instructions, which is sound only if
+// control cannot enter the window's interior -- an incoming edge executes just
+// the tail. The canonical trap is the scan loop
+//
+//   mov rbx, rax ; L: add rbx, 1 ; cmp byte [rbx], '-' ; je L
+//
+// where folding mov+add into lea rbx, [rax + 1] turns the loop increment into
+// a per-iteration reset (observed in /usr/bin/bash and /usr/bin/git; four of
+// the first five real-binary mov+add-imm findings were this shape). An edge to
+// the window HEAD is harmless -- it executes the whole pattern, which the
+// rewrite reproduces -- so only interior offsets suppress. Edges the sweep
+// cannot see -- indirect branches, jump tables, entries from another section --
+// remain a documented residual risk of operating on raw bytes (README,
+// "Linear sweep with resync").
+static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len)
+{
+    uint8_t *targets = calloc((len + 7) / 8, 1);
+    if (targets == NULL) {
+        return NULL;    // branch_target_in treats this as every-offset-hit
+    }
+
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+    for (size_t offset = 0; offset < len;) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+            offset += 1;    // resync exactly as the scan proper does
+            continue;
+        }
+        size_t next = offset + xed_decoded_inst_get_length(&xedd);
+        // A nonzero branch-displacement width marks every direct relative
+        // transfer (jmp/jcc rel8/rel32, call rel32, loop/jrcxz); indirect
+        // forms carry none.
+        if (xed_decoded_inst_get_branch_displacement_width_bits(&xedd) != 0) {
+            int64_t target = (int64_t) next +
+                xed_decoded_inst_get_branch_displacement(&xedd);
+            if (target >= 0 && (uint64_t) target < (uint64_t) len) {
+                targets[target >> 3] |= (uint8_t) (1u << (target & 7));
+            }
+        }
+        offset = next;
+    }
+    return targets;
+}
+
+// True when any collected direct branch target lands in [lo, hi) -- for a
+// multi-instruction window, the offsets after its head. Conservatively true
+// when the map failed to allocate.
+static bool branch_target_in(const uint8_t *targets, size_t lo, size_t hi)
+{
+    if (targets == NULL) {
+        return true;
+    }
+    for (size_t t = lo; t < hi; ++t) {
+        if (targets[t >> 3] & (1u << (t & 7))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool flags_test_redundant(const uint8_t *inst, size_t len,
+                                 const uint8_t *branch_targets,
                                  size_t test_offset,
                                  const xed_decoded_inst_t *producer,
                                  xed_decoded_inst_t *test_out)
@@ -2352,6 +2422,13 @@ static bool flags_test_redundant(const uint8_t *inst, size_t len,
         xed_decoded_inst_number_of_memory_operands(test_out) > 0 ||
         xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG0) != dest ||
         xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) != dest) {
+        return false;
+    }
+
+    // An incoming direct edge onto the test reaches it without the producer;
+    // dropping the test would break that path.
+    if (branch_target_in(branch_targets, test_offset,
+            test_offset + xed_decoded_inst_get_length(test_out))) {
         return false;
     }
 
@@ -2488,6 +2565,7 @@ static bool reg_live_after(const uint8_t *inst, size_t len, size_t offset,
 // lea rax, [rbx] ; mov rbx, [rax] -> mov rbx, [rbx] stays correct. A non-default
 // segment on the consumer is skipped as a needless complication.
 static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
+                                    const uint8_t *branch_targets,
                                     size_t consumer_offset,
                                     const xed_decoded_inst_t *lea)
 {
@@ -2538,6 +2616,13 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
     }
     xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(&consumer, 0);
     if (seg == XED_REG_FS || seg == XED_REG_GS) {
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the lea;
+    // folding the address into it would break that path.
+    if (branch_target_in(branch_targets, consumer_offset,
+            consumer_offset + xed_decoded_inst_get_length(&consumer))) {
         return false;
     }
 
@@ -2624,6 +2709,7 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
 // an add reg, 0 / and reg, 0 that other checks own. reg is finally required dead
 // past the consumer (reg_live_after), since the fold drops its definition.
 static bool mov_const_foldable(const uint8_t *inst, size_t len,
+                               const uint8_t *branch_targets,
                                size_t consumer_offset,
                                const xed_decoded_inst_t *mov_const)
 {
@@ -2664,6 +2750,13 @@ static bool mov_const_foldable(const uint8_t *inst, size_t len,
     case XED_ICLASS_MOV:
         break;
     default:
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the mov;
+    // folding the constant into it would break that path.
+    if (branch_target_in(branch_targets, consumer_offset,
+            consumer_offset + xed_decoded_inst_get_length(&consumer))) {
         return false;
     }
 
@@ -2755,6 +2848,7 @@ static bool mov_const_foldable(const uint8_t *inst, size_t len,
 // the load (mov al, [rax] ; movzx eax, al): with the mov gone the extension
 // reads [rax] at rax's pre-mov value, the very address the mov used.
 static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
+                                      const uint8_t *branch_targets,
                                       size_t ext_offset,
                                       const xed_decoded_inst_t *load)
 {
@@ -2800,33 +2894,53 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
         xed_decoded_inst_get_reg(&ext, XED_OPERAND_REG1) != dest) {
         return false;
     }
+    // An incoming direct edge onto the extension reaches it without the load;
+    // folding the load into it would break that path.
+    if (branch_target_in(branch_targets, ext_offset,
+            ext_offset + xed_decoded_inst_get_length(&ext))) {
+        return false;
+    }
     return xed_get_largest_enclosing_register(
                xed_decoded_inst_get_reg(&ext, XED_OPERAND_REG0)) ==
            xed_get_largest_enclosing_register(dest);
 }
 
-// Multi-instruction peephole. mov dest, srcA followed by add dest, srcB computes
-// srcA + srcB into dest; lea dest, [srcA + srcB] does the same in one
-// instruction -- the non-destructive three-operand add -- saving the mov:
+// Multi-instruction peephole. mov dest, srcA followed by an add into dest
+// computes srcA + addend into dest; lea does the same in one instruction --
+// the non-destructive three-operand add -- saving the mov. The addend may be a
+// register or an immediate (inc/dec are add/sub by an implied 1):
 //
 //   mov edx, esi ; add edx, edi  ->  lea edx, [rsi + rdi]
+//   mov edx, esi ; add edx, 5    ->  lea edx, [rsi + 5]
+//   mov rdx, rsi ; sub rdx, 8    ->  lea rdx, [rsi - 8]
+//   mov edx, esi ; inc edx       ->  lea edx, [rsi + 1]
 //
 // `mov_rr` is the already-decoded producer ending at `add_offset`; on a match
 // the function returns true and the caller reports against the mov, the start of
 // the pair.
 //
-// Soundness. lea reproduces srcA + srcB but, unlike add, writes no flags, so the
-// finding is suppressed when the arithmetic flags are read past the add. srcA
-// and srcB must both differ from dest: srcA == dest makes the mov a self-move
-// (better simply dropped -- check_mov_self's finding -- than folded to a longer
-// lea), and srcB == dest means the add's source was just written by the mov,
-// which the fold, reading dest's pre-mov value, would get wrong. dest, srcA, and
-// srcB share a width from the mov and add; the lea addresses through their
+// Soundness. lea reproduces the sum but writes no flags, so the finding is
+// suppressed while any flag the consumer writes may be read: every arithmetic
+// flag for add/sub, and every one but CF for inc/dec, which -- exactly like
+// lea -- leave CF untouched (so a following adc gates the sub 1 form but not
+// the dec form). srcA must differ from dest (srcA == dest makes the mov a
+// self-move, check_mov_self's finding), and a register addend must too:
+// add dest, dest would double the value the mov just wrote, which the fold,
+// reading dest's pre-mov value, would get wrong. dest, srcA, and the addend
+// share a width from the mov and its consumer; the lea addresses through the
 // enclosing 64-bit registers, exact because low-width arithmetic is closed (a
-// 32- or 16-bit pair folds too). The unencodable forms are excluded: an 8-bit
-// pair, since LEA has no byte-width destination (8D encodes r16/r32/r64 only),
-// and [rsp + rsp], since RSP is not a legal SIB index.
+// 32- or 16-bit pair folds too). An immediate addend becomes the lea
+// displacement, negated for sub/dec: a 16/32-bit lea truncates the address to
+// the destination width, so any immediate folds mod 2^w, while a 64-bit pair
+// uses the displacement at full value and must fit signed 32 bits --
+// everything but sub rdx, INT32_MIN, whose negation disp32 cannot hold.
+// add/sub dest, 0 is left to check_add_sub_zero: the mov alone already
+// computes the result (cf. mov_const_foldable's imm == 0 skip). The
+// unencodable forms are excluded: an 8-bit pair, since LEA has no byte-width
+// destination (8D encodes r16/r32/r64 only), and [rsp + rsp], since RSP is
+// not a legal SIB index (a lone RSP base with a displacement encodes fine).
 static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
+                                    const uint8_t *branch_targets,
                                     size_t add_offset,
                                     const xed_decoded_inst_t *mov_rr)
 {
@@ -2854,7 +2968,8 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
         return false;
     }
 
-    // Consumer: add dest, srcB -- an integer register add into the same dest.
+    // Consumer: an add into the same dest -- add dest, srcB, add/sub dest,
+    // imm, or inc/dec dest (add/sub by an implied 1).
     if (add_offset >= len) {
         return false;
     }
@@ -2866,27 +2981,83 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
             XED_ERROR_NONE) {
         return false;
     }
-    if (xed_decoded_inst_get_iclass(&add) != XED_ICLASS_ADD ||
-        xed_decoded_inst_number_of_memory_operands(&add) != 0 ||
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&add);
+    uint32_t divergent;
+    switch (cic) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+        divergent = FLAG_ARITH;
+        break;
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+        // inc/dec leave CF untouched exactly as lea does, so only the flags
+        // they do write can diverge.
+        divergent = FLAG_ARITH & ~FLAG_CF;
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&add) != 0 ||
         xed_decoded_inst_get_reg(&add, XED_OPERAND_REG0) != dest) {
         return false;
     }
-    xed_reg_enum_t src_b = xed_decoded_inst_get_reg(&add, XED_OPERAND_REG1);
-    if (xed_reg_class(src_b) != XED_REG_CLASS_GPR ||
-        xed_get_largest_enclosing_register(src_b) == dest_enc) {
+
+    // An incoming direct edge onto the consumer reaches it without the mov --
+    // the canonical scan loop enters at its increment (mov rbx, rax ; L: add
+    // rbx, 1 ; ... ; je L), where the fold would turn the increment into a
+    // per-iteration reset. Suppress.
+    if (branch_target_in(branch_targets, add_offset,
+            add_offset + xed_decoded_inst_get_length(&add))) {
         return false;
     }
 
-    // [rsp + rsp] cannot be encoded: RSP is not a legal SIB index.
-    if (xed_get_largest_enclosing_register(src_a) == XED_REG_RSP &&
-        xed_get_largest_enclosing_register(src_b) == XED_REG_RSP) {
-        return false;
+    if (cic == XED_ICLASS_ADD &&
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&add))) {
+        // Register addend: add dest, srcB -> lea dest, [srcA + srcB].
+        xed_reg_enum_t src_b = xed_decoded_inst_get_reg(&add, XED_OPERAND_REG1);
+        if (xed_reg_class(src_b) != XED_REG_CLASS_GPR ||
+            xed_get_largest_enclosing_register(src_b) == dest_enc) {
+            return false;
+        }
+        // [rsp + rsp] cannot be encoded: RSP is not a legal SIB index.
+        if (xed_get_largest_enclosing_register(src_a) == XED_REG_RSP &&
+            xed_get_largest_enclosing_register(src_b) == XED_REG_RSP) {
+            return false;
+        }
+    } else {
+        // Immediate addend: add/sub dest, imm or inc/dec dest ->
+        // lea dest, [srcA + disp], the displacement negated for sub/dec.
+        int64_t disp;
+        if (cic == XED_ICLASS_INC) {
+            disp = 1;
+        } else if (cic == XED_ICLASS_DEC) {
+            disp = -1;
+        } else {
+            if (!xed_operand_values_has_immediate(
+                    xed_decoded_inst_operands_const(&add))) {
+                return false;   // sub dest, srcB: lea cannot subtract a register
+            }
+            int64_t imm = xed_decoded_inst_get_signed_immediate(&add);
+            if (imm == 0) {
+                return false;   // the add/sub is check_add_sub_zero's finding
+            }
+            disp = (cic == XED_ICLASS_SUB) ? -imm : imm;
+        }
+        // A 16/32-bit lea truncates the address to the destination width, so
+        // any immediate folds mod 2^w; a 64-bit pair uses the displacement at
+        // full value, which must fit disp32 -- everything but the negation of
+        // sub rdx, INT32_MIN.
+        if (xed_get_register_width_bits64(dest) == 64 &&
+            (disp < INT32_MIN || disp > INT32_MAX)) {
+            return false;
+        }
     }
 
-    // lea writes no flags; suppress if the arithmetic flags the add sets are
-    // read before being overwritten.
+    // lea writes no flags; suppress while any flag the consumer sets
+    // diverges -- i.e. may be read before being overwritten.
     size_t after = add_offset + xed_decoded_inst_get_length(&add);
-    return !flags_live_after(inst, len, after, FLAG_ARITH);
+    return !flags_live_after(inst, len, after, divergent);
 }
 
 // Multi-instruction peephole (three instructions). setcc X ; test X, X ; je/jne
@@ -2923,6 +3094,7 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
 // and jne (JNZ) match: after test X, X they read ZF alone, where the negation is
 // exact; the other conditions fold in the always-clear SF/OF/CF and are skipped.
 static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
+                                       const uint8_t *branch_targets,
                                        size_t test_offset,
                                        const xed_decoded_inst_t *setcc)
 {
@@ -2969,10 +3141,17 @@ static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
         return false;
     }
 
+    // An incoming direct edge onto the test or the branch reaches them without
+    // the setcc; dropping the test and flipping the branch's condition would
+    // break such a path (it arrives expecting the original je/jne on X).
+    size_t fall = jcc_offset + xed_decoded_inst_get_length(&jcc);
+    if (branch_target_in(branch_targets, test_offset, fall)) {
+        return false;
+    }
+
     // Dropping the test replaces its residual flags with the compare's on both
     // successors, so every arithmetic flag must be dead on each: the
     // fall-through and the taken target.
-    size_t fall = jcc_offset + xed_decoded_inst_get_length(&jcc);
     if (flags_live_after(inst, len, fall, FLAG_ARITH)) {
         return false;
     }
@@ -2997,6 +3176,13 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
     // when it is adjacent to the current instruction.
     xed_decoded_inst_t prev;
     bool have_prev = false;
+
+    // Direct branch targets for the multi-instruction windows (see
+    // collect_branch_targets). NULL on allocation failure, which
+    // branch_target_in treats as every-offset-targeted: the multi-instruction
+    // findings are then conservatively suppressed while the single-instruction
+    // checks proceed.
+    uint8_t *branch_targets = collect_branch_targets(inst, len);
 
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
@@ -3078,7 +3264,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // redundant. Reported against the test (at `next`), the removable
         // instruction. See flags_test_redundant.
         xed_decoded_inst_t redundant_test;
-        if (flags_test_redundant(inst, len, next, &xedd, &redundant_test)) {
+        if (flags_test_redundant(inst, len, branch_targets, next, &xedd,
+                                 &redundant_test)) {
             summary_add(summary, "redundant TEST after flags");
             report_finding("redundant TEST after flags", next, verbose,
                 &redundant_test, inst + next);
@@ -3089,7 +3276,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // the next instruction's memory operand, leaving reg dead. Reported
         // against the lea (at `offset`), the removable instruction. See
         // lea_foldable_into_memop.
-        if (lea_foldable_into_memop(inst, len, next, &xedd)) {
+        if (lea_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
             summary_add(summary, "LEA foldable into memory");
             report_finding("LEA foldable into memory", offset, verbose, &xedd,
                 inst + offset);
@@ -3099,7 +3286,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // Multi-instruction peephole: mov reg, imm whose constant folds into the
         // next instruction's immediate, leaving reg dead. Reported against the
         // mov (at `offset`), the removable instruction. See mov_const_foldable.
-        if (mov_const_foldable(inst, len, next, &xedd)) {
+        if (mov_const_foldable(inst, len, branch_targets, next, &xedd)) {
             summary_add(summary, "MOV constant foldable");
             report_finding("MOV constant foldable", offset, verbose, &xedd,
                 inst + offset);
@@ -3110,17 +3297,19 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // zero-extension is a single extending load. Reported against the load
         // (at `offset`), the removable instruction. See
         // load_foldable_into_extend.
-        if (load_foldable_into_extend(inst, len, next, &xedd)) {
+        if (load_foldable_into_extend(inst, len, branch_targets, next,
+                                      &xedd)) {
             summary_add(summary, "load foldable into extend");
             report_finding("load foldable into extend", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
 
-        // Multi-instruction peephole: mov dest, srcA ; add dest, srcB is the
-        // three-operand lea dest, [srcA + srcB], saving the mov. Reported
-        // against the mov (at `offset`). See mov_add_foldable_to_lea.
-        if (mov_add_foldable_to_lea(inst, len, next, &xedd)) {
+        // Multi-instruction peephole: mov dest, srcA followed by an add into
+        // dest -- add dest, srcB, add/sub dest, imm, or inc/dec dest -- is
+        // the three-operand lea dest, [srcA + addend], saving the mov.
+        // Reported against the mov (at `offset`). See mov_add_foldable_to_lea.
+        if (mov_add_foldable_to_lea(inst, len, branch_targets, next, &xedd)) {
             summary_add(summary, "MOV+ADD foldable to LEA");
             report_finding("MOV+ADD foldable to LEA", offset, verbose, &xedd,
                 inst + offset);
@@ -3130,7 +3319,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // Multi-instruction peephole: setcc X ; test X, X ; je/jne branches on a
         // condition the compare flags still hold, so the test is redundant.
         // Reported against the setcc (at `offset`). See redundant_test_after_setcc.
-        if (redundant_test_after_setcc(inst, len, next, &xedd)) {
+        if (redundant_test_after_setcc(inst, len, branch_targets, next,
+                                       &xedd)) {
             summary_add(summary, "redundant TEST after SETcc");
             report_finding("redundant TEST after SETcc", offset, verbose, &xedd,
                 inst + offset);
@@ -3142,5 +3332,6 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         offset = next;
     }
 
+    free(branch_targets);
     return errors;
 }

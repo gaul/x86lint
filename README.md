@@ -33,6 +33,19 @@ x86lint skips a single byte and resynchronizes instead of abandoning the rest
 of the section. Skipped bytes are counted (`x86lint_summary_skipped`) so that
 partial coverage of a data-laden region is not mistaken for a clean scan.
 
+A first pass over the same sweep also collects every direct branch and call
+target. A multi-instruction peephole rewrites a *window* of instructions,
+which is sound only if control cannot enter the window's interior -- an
+incoming edge executes just the tail. The canonical trap is the scan loop
+`mov rbx, rax ; L: add rbx, 1 ; cmp byte [rbx], '-' ; je L` (this exact shape
+appears in bash and git), where folding the pair into `lea rbx, [rax + 1]`
+would turn the loop increment into a per-iteration reset. Each
+multi-instruction finding is therefore suppressed when a collected target
+lands inside its window; a target on the window's head is fine, since that
+edge executes the whole pattern. Edges the sweep cannot see -- indirect
+branches, jump tables, entries from another section -- remain a residual risk
+of judging raw bytes, accepted and documented here.
+
 **Soundness over recall.** For a tool that suggests code changes, a false
 positive -- flagging an instruction whose replacement would change behavior --
 is the worst failure, so every check errs toward false negatives: a missed
@@ -104,6 +117,10 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `89F2 01FA` (MOV EDX, ESI; ADD EDX, EDI) -- the two are the non-destructive
     three-operand LEA EDX, [RSI+RDI], saving the MOV, when the arithmetic flags
     ADD would set are dead (gated by flag liveness)
+  - `89F2 83C205` (MOV EDX, ESI; ADD EDX, 5) -- an immediate addend folds the
+    same way, as LEA EDX, [RSI+5]; SUB negates the displacement and INC/DEC
+    are the implied +/-1 forms, which -- like LEA -- leave CF untouched, so
+    only the flags they do write gate them
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)

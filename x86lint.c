@@ -2817,6 +2817,83 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
            xed_get_largest_enclosing_register(dest);
 }
 
+// Multi-instruction peephole. mov dest, srcA followed by add dest, srcB computes
+// srcA + srcB into dest; lea dest, [srcA + srcB] does the same in one
+// instruction -- the non-destructive three-operand add -- saving the mov:
+//
+//   mov edx, esi ; add edx, edi  ->  lea edx, [rsi + rdi]
+//
+// `mov_rr` is the already-decoded producer ending at `add_offset`; on a match
+// the function returns true and the caller reports against the mov, the start of
+// the pair.
+//
+// Soundness. lea reproduces srcA + srcB but, unlike add, writes no flags, so the
+// finding is suppressed when the arithmetic flags are read past the add. srcA
+// and srcB must both differ from dest: srcA == dest makes the mov a self-move
+// (better simply dropped -- check_mov_self's finding -- than folded to a longer
+// lea), and srcB == dest means the add's source was just written by the mov,
+// which the fold, reading dest's pre-mov value, would get wrong. dest, srcA, and
+// srcB share a width from the mov and add; the lea addresses through their
+// enclosing 64-bit registers, exact because low-width arithmetic is closed (a
+// 32-bit pair folds too). The one unencodable result, [rsp + rsp] (RSP is not a
+// legal SIB index), is excluded.
+static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
+                                    size_t add_offset,
+                                    const xed_decoded_inst_t *mov_rr)
+{
+    // Producer: mov dest, srcA -- register to register.
+    if (xed_decoded_inst_get_iclass(mov_rr) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov_rr) != 0 ||
+        xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(mov_rr))) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(mov_rr, XED_OPERAND_REG0);
+    xed_reg_enum_t src_a = xed_decoded_inst_get_reg(mov_rr, XED_OPERAND_REG1);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR ||
+        xed_reg_class(src_a) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(dest);
+    if (xed_get_largest_enclosing_register(src_a) == dest_enc) {
+        return false;
+    }
+
+    // Consumer: add dest, srcB -- an integer register add into the same dest.
+    if (add_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t add;
+    xed_decoded_inst_zero(&add);
+    xed_decoded_inst_set_mode(&add, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&add, inst + add_offset, len - add_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_get_iclass(&add) != XED_ICLASS_ADD ||
+        xed_decoded_inst_number_of_memory_operands(&add) != 0 ||
+        xed_decoded_inst_get_reg(&add, XED_OPERAND_REG0) != dest) {
+        return false;
+    }
+    xed_reg_enum_t src_b = xed_decoded_inst_get_reg(&add, XED_OPERAND_REG1);
+    if (xed_reg_class(src_b) != XED_REG_CLASS_GPR ||
+        xed_get_largest_enclosing_register(src_b) == dest_enc) {
+        return false;
+    }
+
+    // [rsp + rsp] cannot be encoded: RSP is not a legal SIB index.
+    if (xed_get_largest_enclosing_register(src_a) == XED_REG_RSP &&
+        xed_get_largest_enclosing_register(src_b) == XED_REG_RSP) {
+        return false;
+    }
+
+    // lea writes no flags; suppress if the arithmetic flags the add sets are
+    // read before being overwritten.
+    size_t after = add_offset + xed_decoded_inst_get_length(&add);
+    return !flags_live_after(inst, len, after, FLAG_ARITH);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2955,6 +3032,16 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if (load_foldable_into_extend(inst, len, next, &xedd)) {
             summary_add(summary, "load foldable into extend");
             report_finding("load foldable into extend", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: mov dest, srcA ; add dest, srcB is the
+        // three-operand lea dest, [srcA + srcB], saving the mov. Reported
+        // against the mov (at `offset`). See mov_add_foldable_to_lea.
+        if (mov_add_foldable_to_lea(inst, len, next, &xedd)) {
+            summary_add(summary, "MOV+ADD foldable to LEA");
+            report_finding("MOV+ADD foldable to LEA", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

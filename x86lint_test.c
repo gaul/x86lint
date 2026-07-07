@@ -1948,6 +1948,71 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
 }
 
+// Multi-instruction peephole: mov dest, srcA ; add dest, srcB is the
+// three-operand lea dest, [srcA + srcB]. check_instructions reports it against
+// the mov when the arithmetic flags the add would set are dead.
+static void check_mov_add_lea_test(void)
+{
+    // mov edx, esi ; add edx, edi -> lea edx, [rsi + rdi].
+    static const uint8_t basic[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x01, 0xFA,        // add edx, edi
+        0xC3,              // ret (flags dead)
+    };
+    ASSERT_FINDINGS(basic, "MOV+ADD foldable to LEA", 1);
+
+    // 64-bit form.
+    static const uint8_t wide[] = {
+        0x48, 0x89, 0xF2,  // mov rdx, rsi
+        0x48, 0x01, 0xFA,  // add rdx, rdi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(wide, "MOV+ADD foldable to LEA", 1);
+
+    // mov edx, esi ; add edx, esi -> lea edx, [rsi + rsi]. srcA == srcB is fine
+    // as long as neither is the destination.
+    static const uint8_t doubled[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x01, 0xF2,        // add edx, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(doubled, "MOV+ADD foldable to LEA", 1);
+
+    // mov edx, esi ; add edx, edi ; jz -- the add's flags feed the branch, and
+    // lea would not set them: suppress.
+    static const uint8_t flags_live[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x01, 0xFA,        // add edx, edi
+        0x74, 0x00,        // jz +0
+    };
+    ASSERT_FINDINGS(flags_live, "MOV+ADD foldable to LEA", 0);
+
+    // mov edx, esi ; add edx, edx -- the add's source is the destination, set by
+    // the mov; lea [rsi + rdx] would read dest's pre-mov value: suppress.
+    static const uint8_t src_is_dest[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x01, 0xD2,        // add edx, edx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(src_is_dest, "MOV+ADD foldable to LEA", 0);
+
+    // mov edx, esi ; add edx, [rdi] -- a memory addend is not a lea index
+    // register: suppress.
+    static const uint8_t mem_addend[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x03, 0x17,        // add edx, [rdi]
+    };
+    ASSERT_FINDINGS(mem_addend, "MOV+ADD foldable to LEA", 0);
+
+    // mov edx, esi ; sub edx, edi -- lea cannot subtract: suppress.
+    static const uint8_t sub_consumer[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x29, 0xFA,        // sub edx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(sub_consumer, "MOV+ADD foldable to LEA", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -2019,6 +2084,7 @@ int main(int argc, char *argv[])
     check_mov_const_fold_test();
     check_ineffective_prefix_test();
     check_load_extend_fold_test();
+    check_mov_add_lea_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

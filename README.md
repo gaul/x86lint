@@ -91,6 +91,10 @@ and only for flags -- the ABI guarantees they do not survive it.
     next instruction's immediate: ADD EAX, 5. Applies to ADD/SUB/ADC/SBB/AND/OR/
     XOR/CMP/TEST/MOV that use the register as a source, when it is dead after the
     fold and the constant fits the immediate (gated by register liveness)
+* MOV+ADD foldable to LEA
+  - `89F2 01FA` (MOV EDX, ESI; ADD EDX, EDI) -- the two are the non-destructive
+    three-operand LEA EDX, [RSI+RDI], saving the MOV, when the arithmetic flags
+    ADD would set are dead (gated by flag liveness)
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)

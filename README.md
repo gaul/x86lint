@@ -290,8 +290,10 @@ oversized immediate at offset: 0x14: push 0x0
 ...
 ```
 
-The process exits non-zero when any opportunity is found, so x86lint can gate
-a compiler test suite.
+The exit status follows the grep convention -- 0 for a clean scan, 1 when any
+opportunity is found, 2 on a tool failure (unreadable or malformed input) --
+so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
+broken run.
 
 ## References
 

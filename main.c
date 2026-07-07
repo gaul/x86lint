@@ -33,6 +33,9 @@ static bool read_at(FILE *f, long off, void *buf, size_t n)
 
 int main(int argc, char **argv)
 {
+    // Exit status follows the grep convention so a gating CI can tell a
+    // dirty scan from a broken run: 0 = clean scan, 1 = opportunities
+    // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
     bool verbose = false;
     const char *path = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -42,21 +45,22 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr, "usage: %s [-v] <ELF_FILE>\n", argv[0]);
-            return 1;
+            return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr, "usage: %s [-v] <ELF_FILE>\n", argv[0]);
-        return 1;
+        return 2;
     }
 
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
         perror(path);
-        return 1;
+        return 2;
     }
 
-    int rc = 1;
+    // Every goto-out path below is an error, so failure is the default.
+    int rc = 2;
     uint8_t *buf = NULL;
     x86lint_summary *summary = NULL;
 

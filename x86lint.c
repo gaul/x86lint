@@ -3324,6 +3324,100 @@ static bool shift_pair_foldable_to_extend(const uint8_t *inst, size_t len,
     return !flags_live_after(inst, len, after, FLAG_ARITH);
 }
 
+// Multi-instruction peephole. cmp reg, 1 followed by jb or jae branches on the
+// unsigned comparison against 1 -- but unsigned "< 1" is exactly "== 0" and
+// ">= 1" is "!= 0", conditions test reg, reg answers one byte shorter (two for
+// an imm32-encoded cmp; the re-spelled branch is the same length):
+//
+//   cmp eax, 1 ; jb L    ->   test eax, eax ; jz L
+//   cmp rcx, 1 ; jae L   ->   test rcx, rcx ; jnz L
+//
+// `cmp` is the already-decoded instruction ending at `jcc_offset`; on a match
+// the function returns true and the caller reports against the cmp, the head
+// of the pair. This is check_cmp_zero's conditional sibling: cmp reg, 0 is
+// flag-exact under test and needs no gate, while cmp reg, 1 preserves only the
+// branch DECISION, not the flags.
+//
+// Soundness. jb reads CF = (reg < 1 unsigned) = (reg == 0); after
+// test reg, reg, jz reads ZF = (reg == 0): the taken/fall-through decision is
+// identical for every value of reg, with no assumption about how reg was
+// produced (jae/jnz likewise, negated). What changes is the residual flags
+// past the branch: cmp leaves ZF = (reg == 1), CF from the borrow, and
+// SF/OF/PF/AF from reg - 1, where test leaves CF = OF = 0 and ZF/SF/PF from
+// reg. So every arithmetic flag must be dead on BOTH successors, each scanned
+// with flags_live_after exactly as in redundant_test_after_setcc (an
+// out-of-buffer target is conservatively rejected). An incoming direct edge
+// onto the branch arrives expecting jb-on-CF semantics the rewritten jz does
+// not reproduce, so the window guard rejects it; an edge onto the cmp executes
+// the whole rewritten pair and is fine. Only jb/jae qualify: ja and jbe fold
+// ZF into the condition (a comparison against 2), and the signed conditions
+// answer a different question.
+//
+// AL is excluded: cmp al, 1 via the 3c ib accumulator opcode is already 2
+// bytes, tying test al, al (cf. check_cmp_zero; its modrm form is
+// check_implicit_register's finding). Memory operands are excluded: there is
+// no test [mem], [mem] to shrink to (also as in check_cmp_zero). The
+// immediate is matched at the effective operand width.
+static bool cmp_one_branch_foldable(const uint8_t *inst, size_t len,
+                                    const uint8_t *branch_targets,
+                                    size_t jcc_offset,
+                                    const xed_decoded_inst_t *cmp)
+{
+    if (xed_decoded_inst_get_iclass(cmp) != XED_ICLASS_CMP ||
+        xed_decoded_inst_number_of_memory_operands(cmp) > 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(cmp))) {
+        return false;
+    }
+    if (xed_decoded_inst_get_reg(cmp, XED_OPERAND_REG0) == XED_REG_AL) {
+        return false;
+    }
+
+    unsigned width = xed_decoded_inst_get_operand_width(cmp);
+    uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
+    uint64_t eff = (uint64_t) (int64_t)
+        xed_decoded_inst_get_signed_immediate(cmp) & opmask;
+    if (eff != 1) {
+        return false;
+    }
+
+    // The consumer: jb (taken iff reg == 0 -> jz) or jae (-> jnz).
+    if (jcc_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t jcc;
+    xed_decoded_inst_zero(&jcc);
+    xed_decoded_inst_set_mode(&jcc, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&jcc, inst + jcc_offset, len - jcc_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t jc = xed_decoded_inst_get_iclass(&jcc);
+    if (jc != XED_ICLASS_JB && jc != XED_ICLASS_JNB) {
+        return false;
+    }
+
+    // An incoming direct edge onto the branch expects the jb/jae reading of
+    // the cmp's flags, which the rewritten jz/jnz does not reproduce.
+    size_t fall = jcc_offset + xed_decoded_inst_get_length(&jcc);
+    if (branch_target_in(branch_targets, jcc_offset, fall)) {
+        return false;
+    }
+
+    // The residual flags differ in every arithmetic flag; both successors
+    // must have them dead (cf. redundant_test_after_setcc).
+    if (flags_live_after(inst, len, fall, FLAG_ARITH)) {
+        return false;
+    }
+    int64_t target = (int64_t) fall +
+        xed_decoded_inst_get_branch_displacement(&jcc);
+    if (target < 0 || (uint64_t) target >= (uint64_t) len) {
+        return false;
+    }
+    return !flags_live_after(inst, len, (size_t) target, FLAG_ARITH);
+}
+
 // Multi-instruction peephole (three instructions). setcc X ; test X, X ; je/jne
 // materializes a condition into a byte register and then branches on that
 // register -- but SETcc writes no flags, so the flags the branch needs are the
@@ -3589,6 +3683,17 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "shift pair foldable into extend");
             report_finding("shift pair foldable into extend", offset, verbose,
                 &xedd, inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: cmp reg, 1 ; jb/jae branches on
+        // "unsigned < 1", which is "== 0" -- test reg, reg ; jz/jnz answers it
+        // a byte shorter. Reported against the cmp (at `offset`). See
+        // cmp_one_branch_foldable.
+        if (cmp_one_branch_foldable(inst, len, branch_targets, next, &xedd)) {
+            summary_add(summary, "suboptimal CMP one");
+            report_finding("suboptimal CMP one", offset, verbose, &xedd,
+                inst + offset);
             ++errors;
         }
 

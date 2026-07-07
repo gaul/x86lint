@@ -202,6 +202,12 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `83E0 00` (AND EAX, 0) -- use XOR EAX, EAX (same flags, fewer bytes)
 * suboptimal CMP zero
   - `83F8 00` instead of `85C0` (CMP EAX, 0 -> TEST EAX, EAX)
+* suboptimal CMP one
+  - `83F8 01 72xx` (CMP EAX, 1; JB) -- unsigned "< 1" is "== 0": TEST EAX,
+    EAX; JZ answers it a byte shorter (JAE -> JNZ). Only the branch decision
+    survives the rewrite, not the flags, so every arithmetic flag must be
+    dead on both successors (gated by flag liveness, cf. redundant TEST
+    after SETcc)
 * suboptimal IMUL constant
   - `6BC0 03` (IMUL EAX, EAX, 3) -- use LEA
   - `6BC0 10` (IMUL EAX, EAX, 16) -- use SHL (any power of two, same register)

@@ -2563,6 +2563,119 @@ static void check_shift_pair_extend_test(void)
     ASSERT_FINDINGS(edge_on_shl, "shift pair foldable into extend", 1);
 }
 
+// Multi-instruction peephole: cmp reg, 1 ; jb/jae branches on unsigned
+// "< 1", i.e. "== 0", which test reg, reg ; jz/jnz answers a byte shorter.
+// Only the branch decision survives -- the residual flags differ in every
+// arithmetic flag -- so both successors must have them dead, and an incoming
+// edge onto the branch (which expects jb-on-CF semantics) rejects the fold.
+static void check_cmp_one_branch_test(void)
+{
+    // cmp ebx, 1 ; jb +0 ; ret -- both successors are the ret: fires.
+    static const uint8_t jb_ret[] = {
+        0x83, 0xFB, 0x01,        // cmp ebx, 1
+        0x72, 0x00,              // jb +0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(jb_ret, "suboptimal CMP one", 1);
+
+    // The jae twin (-> jnz).
+    static const uint8_t jae_ret[] = {
+        0x83, 0xFB, 0x01,        // cmp ebx, 1
+        0x73, 0x00,              // jae +0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(jae_ret, "suboptimal CMP one", 1);
+
+    // 64- and 16-bit widths fold alike.
+    static const uint8_t jb_ret64[] = {
+        0x48, 0x83, 0xFB, 0x01,  // cmp rbx, 1
+        0x72, 0x00,              // jb +0
+        0xC3,
+    };
+    ASSERT_FINDINGS(jb_ret64, "suboptimal CMP one", 1);
+    static const uint8_t jb_ret16[] = {
+        0x66, 0x83, 0xF9, 0x01,  // cmp cx, 1
+        0x72, 0x00,              // jb +0
+        0xC3,
+    };
+    ASSERT_FINDINGS(jb_ret16, "suboptimal CMP one", 1);
+
+    // je reads ZF = (reg == 1), a condition test cannot answer: suppress.
+    static const uint8_t je_wrong_cc[] = {
+        0x83, 0xFB, 0x01,        // cmp ebx, 1
+        0x74, 0x00,              // je +0
+        0xC3,
+    };
+    ASSERT_FINDINGS(je_wrong_cc, "suboptimal CMP one", 0);
+
+    // cmp ebx, 2 ; jb is "< 2", not "== 0": suppress.
+    static const uint8_t imm_two[] = {
+        0x83, 0xFB, 0x02,        // cmp ebx, 2
+        0x72, 0x00,              // jb +0
+        0xC3,
+    };
+    ASSERT_FINDINGS(imm_two, "suboptimal CMP one", 0);
+
+    // The adc at the shared successor reads CF, which the rewrite replaces
+    // with test's 0: suppress.
+    static const uint8_t flags_live_fall[] = {
+        0x83, 0xFB, 0x01,        // cmp ebx, 1
+        0x72, 0x00,              // jb +0
+        0x11, 0xD8,              // adc eax, ebx (reads CF)
+        0xC3,
+    };
+    ASSERT_FINDINGS(flags_live_fall, "suboptimal CMP one", 0);
+
+    // Flags dead on the fall-through (ret) but read on the taken target
+    // (lahf): the taken-side scan suppresses.
+    static const uint8_t flags_live_target[] = {
+        0x83, 0xFB, 0x01,        // 0: cmp ebx, 1
+        0x72, 0x01,              // 3: jb +1 (target 6)
+        0xC3,                    // 5: ret (fall-through: dead)
+        0x9F,                    // 6: lahf (reads SF/ZF/AF/PF/CF)
+        0xC3,                    // 7: ret
+    };
+    ASSERT_FINDINGS(flags_live_target, "suboptimal CMP one", 0);
+
+    // An incoming direct edge onto the branch expects jb-on-CF semantics:
+    // suppress. (The trailing jmp is dead code, but the linear sweep records
+    // its target.)
+    static const uint8_t edge_on_branch[] = {
+        0x83, 0xFB, 0x01,        // 0: cmp ebx, 1
+        0x72, 0x00,              // 3: jb +0  <- branch target
+        0xC3,                    // 5: ret
+        0xEB, 0xFB,              // 6: jmp 3
+    };
+    ASSERT_FINDINGS(edge_on_branch, "suboptimal CMP one", 0);
+
+    // An edge onto the cmp (the window head) executes the whole rewritten
+    // pair: fires.
+    static const uint8_t edge_on_cmp[] = {
+        0x83, 0xFB, 0x01,        // 0: cmp ebx, 1  <- branch target
+        0x72, 0x00,              // 3: jb +0
+        0xC3,                    // 5: ret
+        0xEB, 0xF8,              // 6: jmp 0
+    };
+    ASSERT_FINDINGS(edge_on_cmp, "suboptimal CMP one", 1);
+
+    // cmp al, 1 via the accumulator opcode is 2 bytes, tying test al, al:
+    // suppress.
+    static const uint8_t al_tie[] = {
+        0x3C, 0x01,              // cmp al, 1
+        0x72, 0x00,              // jb +0
+        0xC3,
+    };
+    ASSERT_FINDINGS(al_tie, "suboptimal CMP one", 0);
+
+    // Memory operands have no test [mem], [mem] to shrink to: suppress.
+    static const uint8_t mem_cmp[] = {
+        0x83, 0x3B, 0x01,        // cmp dword [rbx], 1
+        0x72, 0x00,              // jb +0
+        0xC3,
+    };
+    ASSERT_FINDINGS(mem_cmp, "suboptimal CMP one", 0);
+}
+
 // Multi-instruction peephole: setcc X ; test X, X ; je/jne branches on a
 // condition the preceding compare's flags already hold (setcc preserves them),
 // so the test is redundant. check_instructions reports it against the setcc. The
@@ -2741,6 +2854,7 @@ int main(int argc, char *argv[])
     check_load_extend_fold_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
+    check_cmp_one_branch_test();
     check_setcc_branch_test();
     check_decode_resync_test();
 

@@ -163,6 +163,15 @@ bool check_lea_to_mov(const xed_decoded_inst_t *xedd);
 // is a byte shorter and issues on more ports (flag-gated: add writes flags)
 bool check_lea_to_add(const xed_decoded_inst_t *xedd);
 
+// return false if lea r64, [...] could be lea r32: the address's low 32 bits
+// come out identical and dropping REX.W saves its byte (flagged only when W
+// is the sole REX payload, so the prefix disappears). The narrowed form
+// zeroes bits 32-63 of the destination where the original stores the
+// address's upper half, so the dispatcher gates the finding on those bits
+// being dead -- with no backward zero-extension escape: a predecessor's
+// zeroing of the destination says nothing about the new address's upper half
+bool check_oversized_lea_width(const xed_decoded_inst_t *xedd);
+
 // return false if a shift or rotate instruction has an immediate count of 0
 // (value- and flag-preserving per the Intel SDM; hardware still zero-extends
 // a 32-bit destination even at count 0, so the dispatcher gates that form on

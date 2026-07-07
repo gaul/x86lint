@@ -972,6 +972,71 @@ static void check_lea_to_add_test(void)
     ASSERT_FINDINGS(flags_live, "suboptimal LEA", 0);
 }
 
+static void check_oversized_lea_width_test(void)
+{
+    // Shape: only a 64-bit LEA whose REX carries nothing but W -- so the
+    // narrowed form actually drops the byte -- is flagged. The upper-32
+    // deadness gate is the dispatcher's, exercised below.
+    CHECK_BYTES(!check_oversized_lea_width, 0x48, 0x8d, 0x47, 0x08);  // lea rax, [rdi+8]
+    CHECK_BYTES(!check_oversized_lea_width, 0x48, 0x8d, 0x04, 0x0b);  // lea rax, [rbx+rcx]
+    CHECK_BYTES(!check_oversized_lea_width, 0x48, 0x8d, 0x05, 0x10, 0, 0, 0);  // lea rax, [rip+0x10]
+    CHECK_BYTES(!check_oversized_lea_width, 0x67, 0x48, 0x8d, 0x40, 0x08);  // lea rax, [eax+8]
+    CHECK_BYTES( check_oversized_lea_width, 0x8d, 0x47, 0x08);        // lea eax, [rdi+8] (already 32-bit)
+    CHECK_BYTES( check_oversized_lea_width, 0x66, 0x8d, 0x47, 0x08);  // lea ax, [rdi+8] (16-bit)
+    CHECK_BYTES( check_oversized_lea_width, 0x4c, 0x8d, 0x47, 0x08);  // lea r8, [rdi+8] (REX.R stays)
+    CHECK_BYTES( check_oversized_lea_width, 0x49, 0x8d, 0x40, 0x08);  // lea rax, [r8+8] (REX.B stays)
+    CHECK_BYTES( check_oversized_lea_width, 0x4a, 0x8d, 0x04, 0x4f);  // lea rax, [rdi+r9*2] (REX.X stays)
+    CHECK_BYTES( check_oversized_lea_width, 0x48, 0x89, 0xc8);        // mov rax, rcx (not LEA)
+
+    // Dispatcher gate: flagged only when the destination's bits 32-63 die
+    // before being read.
+    static const uint8_t killed[] = {
+        0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8]
+        0x89, 0xc8,              // mov eax, ecx (kills bits 32-63)
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(killed, "oversized LEA width", 1);
+
+    // A 32-bit read consumes the address without touching bits 32-63; the
+    // later overwrite still kills them.
+    static const uint8_t low_read_then_killed[] = {
+        0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8]
+        0x89, 0xc2,              // mov edx, eax (reads only the low half)
+        0x89, 0xc8,              // mov eax, ecx (kills bits 32-63)
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(low_read_then_killed, "oversized LEA width", 1);
+
+    // A 64-bit read observes the address's upper half: suppress.
+    static const uint8_t live[] = {
+        0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8]
+        0x48, 0x89, 0x06,        // mov [rsi], rax
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(live, "oversized LEA width", 0);
+
+    // RET leaves the register conservatively live: suppress.
+    static const uint8_t ret_after[] = {
+        0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8]
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(ret_after, "oversized LEA width", 0);
+
+    // The backward zero-extension escape must NOT apply here (reg_zx_escape
+    // is unset for this check): mov eax, edx zeroes rax's bits 32-63, but the
+    // 64-bit lea then stores the address's upper half in them -- the narrowed
+    // form would store zeros instead, and the 64-bit read observes the
+    // difference. The identity family's escape licenses deleting a re-zeroing
+    // write, not narrowing a fresh one.
+    static const uint8_t no_escape[] = {
+        0x89, 0xd0,              // mov eax, edx (zero-extends rax)
+        0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8]
+        0x48, 0x89, 0x06,        // mov [rsi], rax
+        0xc3,                    // ret
+    };
+    ASSERT_FINDINGS(no_escape, "oversized LEA width", 0);
+}
+
 static void check_sub_self_test(void)
 {
     CHECK_BYTES(!check_sub_self, 0x29, 0xc0);              // sub eax, eax (use xor)
@@ -2987,6 +3052,7 @@ int main(int argc, char *argv[])
     check_imul_to_lea_test();
     check_lea_to_mov_test();
     check_lea_to_add_test();
+    check_oversized_lea_width_test();
     check_shift_zero_test();
     check_shl_one_test();
     check_sse_mov_opcode_test();

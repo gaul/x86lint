@@ -1087,6 +1087,38 @@ bool check_lea_to_add(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// lea r64 and lea r32 compute the same effective address and store the same
+// low 32 bits of it -- the destination width only selects how much of the
+// address survives: the 64-bit form stores its upper half into bits 32-63,
+// the 32-bit form zeroes them. (Under a 32-bit address override the two agree
+// in all 64 bits -- the 32-bit address zero-extends either way -- so the gate
+// below is merely sufficient there.) When bits 32-63 of the destination are
+// dead the forms are interchangeable and the narrow one is shorter by exactly
+// the REX.W byte, so flag only when W is the sole REX payload: an extended
+// register in any slot (destination, base, or index) keeps the prefix and the
+// narrowed form would be the same length. LEA has no byte-register operand,
+// so no other REX dependence exists. The dispatcher gates the finding on the
+// upper half being dead (lea_width_upper_concern) WITHOUT the backward
+// zero-extension escape (reg_zx_escape stays false in the checks table): this
+// rewrite still writes the register, so a predecessor's zeroing of the
+// destination is overwritten either way and proves nothing about the
+// address's upper half.
+bool check_oversized_lea_width(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_LEA) {
+        return true;
+    }
+    if (xed_decoded_inst_get_operand_width(xedd) != 64) {
+        return true;
+    }
+    if (xed3_operand_get_rexr(xedd) != 0 ||
+        xed3_operand_get_rexx(xedd) != 0 ||
+        xed3_operand_get_rexb(xedd) != 0) {
+        return true;
+    }
+    return false;
+}
+
 // shl reg, 1 doubles the register exactly as add reg, reg does, with
 // IDENTICAL flags: CF receives the shifted-out MSB either way (add's carry
 // out is that same bit); OF -- defined for a 1-bit shift -- is
@@ -2206,6 +2238,18 @@ static xed_reg_enum_t imul_identity_upper_concern(const xed_decoded_inst_t *xedd
     return xed_get_largest_enclosing_register(dst);
 }
 
+// reg_concern hook for check_oversized_lea_width (see struct check_entry).
+// Every shape that check flags is a 64-bit LEA, and narrowing it to a 32-bit
+// destination replaces bits 32-63 of the result -- the address's upper half
+// -- with zeros, so the destination register is always at stake. Unlike the
+// identity family's rewrites this one still writes the register, so its table
+// entry leaves reg_zx_escape false: the backward escape would be unsound.
+static xed_reg_enum_t lea_width_upper_concern(const xed_decoded_inst_t *xedd)
+{
+    return xed_get_largest_enclosing_register(
+        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0));
+}
+
 // True when `producer` unconditionally writes the 32-bit form of the GPR reg64,
 // zero-extending bits 63:32 to zero. Any 32-bit GPR write zero-extends
 // architecturally; this is restricted to the unconditional, defined-result
@@ -2491,6 +2535,16 @@ struct check_entry {
     // reg_upper32_live_after reports those bits live. NULL for checks with no
     // such concern.
     xed_reg_enum_t (*reg_concern)(const xed_decoded_inst_t *);
+    // Whether writes_zero_extended_32's backward escape may override a live
+    // reg_concern verdict: when the immediately preceding instruction already
+    // zeroed the register's bits 32-63, the identity family's rewrite --
+    // DELETING the instruction -- makes the deletion state-preserving, so the
+    // finding stands even with those bits live downstream. True for exactly
+    // those checks. It must stay false for a rewrite that still writes the
+    // register (lea r64 -> lea r32 swaps the address's upper half for zeros):
+    // there the predecessor's zeros are overwritten either way and prove
+    // nothing.
+    bool reg_zx_escape;
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
@@ -2506,7 +2560,7 @@ static const struct check_entry checks[] = {
     {check_implicit_register,          "unneeded explicit register",      0},
     {check_implicit_immediate,         "unneeded explicit immediate",     0},
     {check_and_strength_reduce,        "suboptimal AND immediate",        FLAG_ARITH},
-    {check_and_minus_one,              "redundant AND immediate",         0, reg0_upper32_concern},
+    {check_and_minus_one,              "redundant AND immediate",         0, reg0_upper32_concern, true},
     {check_and_zero,                   "suboptimal AND zero",             0},
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_single_bit_immediate,       "suboptimal single-bit immediate", FLAG_ARITH},
@@ -2514,9 +2568,9 @@ static const struct check_entry checks[] = {
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
-    {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern},
-    {check_add_sub_zero,               "redundant ADD/SUB zero",          0, reg0_upper32_concern},
-    {check_or_xor_zero,                "redundant OR/XOR zero",           0, reg0_upper32_concern},
+    {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern, true},
+    {check_add_sub_zero,               "redundant ADD/SUB zero",          0, reg0_upper32_concern, true},
+    {check_or_xor_zero,                "redundant OR/XOR zero",           0, reg0_upper32_concern, true},
     {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
     {check_mov_modrm_imm,              "oversized MOV encoding",          0},
     {check_unneeded_sib,               "unneeded SIB byte",               0},
@@ -2525,11 +2579,12 @@ static const struct check_entry checks[] = {
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
     {check_unneeded_movsx,             "unneeded MOVSX",                  0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
-    {check_or_and_self,                "suboptimal OR/AND reg, reg",      0, reg0_upper32_concern},
-    {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF, imul_identity_upper_concern},
+    {check_or_and_self,                "suboptimal OR/AND reg, reg",      0, reg0_upper32_concern, true},
+    {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF, imul_identity_upper_concern, true},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_lea_to_add,                 "suboptimal LEA",                  FLAG_ARITH},
-    {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern},
+    {check_oversized_lea_width,        "oversized LEA width",             0, lea_width_upper_concern},
+    {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern, true},
     {check_shl_one,                    "suboptimal SHL one",              0},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},
@@ -3710,16 +3765,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             if (checks[i].reg_concern != NULL) {
                 xed_reg_enum_t reg64 = checks[i].reg_concern(&xedd);
                 // Suppress only when the disturbed upper half is read
-                // downstream AND the backward escape does not apply: when the
-                // preceding instruction already zeroed those bits, dropping
-                // this instruction (e.g. mov eax, eax) changes nothing
+                // downstream AND the backward escape does not apply: for a
+                // check whose rewrite deletes the instruction (reg_zx_escape),
+                // a preceding instruction that already zeroed those bits makes
+                // the deletion (e.g. of mov eax, eax) state-preserving
                 // regardless of any downstream read. The escape holds only if
                 // every path here runs through that predecessor, so a direct
                 // branch targeting this instruction -- arriving with unknown
                 // upper bits -- cancels it.
                 if (reg64 != XED_REG_INVALID &&
                     reg_upper32_live_after(inst, len, next, reg64) &&
-                    !(have_prev && writes_zero_extended_32(&prev, reg64) &&
+                    !(checks[i].reg_zx_escape && have_prev &&
+                      writes_zero_extended_32(&prev, reg64) &&
                       !branch_target_in(branch_targets, offset, offset + 1))) {
                     continue;
                 }

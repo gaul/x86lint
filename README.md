@@ -86,7 +86,12 @@ instructions) starting at the successor.
   nothing regardless of downstream reads. The escape holds only if every
   path to the instruction runs through that predecessor, so a direct branch
   targeting the instruction itself -- arriving with unknown upper bits --
-  cancels it.
+  cancels it. The escape is licensed per check, because it is sound only for
+  rewrites that *delete* the write: narrowing `lea rax, [...]` to
+  `lea eax, [...]` (oversized LEA width) still writes the register, swapping
+  the address's upper half for zeros, so a predecessor's zeroing of the
+  destination -- overwritten either way -- proves nothing, and that check
+  runs the forward gate alone.
 
 Both scans share one bias: reads count inclusively and redefinitions
 exclusively, so every uncertainty -- a decode error, an unfollowable branch,
@@ -144,6 +149,17 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `66 81C1 1200` instead of `66 83C1 12` (ADD CX, 0x12; imm16 narrows to the
     sign-extended imm8 the same way, except for AX, whose accumulator form
     already ties it)
+* oversized LEA width
+  - `48 8D0411` instead of `8D0411` (LEA RAX, [RCX+RDX] -> LEA EAX, [RCX+RDX]) --
+    both forms store the same low 32 address bits; they differ only in bits
+    63:32, which the 64-bit form fills with the address's upper half and the
+    32-bit form zeroes. When those bits are dead (gated by register liveness,
+    with no backward zero-extension escape -- the rewrite still writes the
+    register, so a predecessor's zeroing proves nothing about the new
+    address's upper half) the REX.W byte is pure waste. Flagged only when W is
+    the sole REX payload; an extended register in any slot keeps the prefix.
+    Compilers emit this constantly for arithmetic that is immediately
+    truncated: `lea rdx, [rax+5]; and edx, 0x3f`
 * oversized MOV encoding
   - `C7C0 01000000` instead of `B8 01000000` (MOV EAX, 1)
   - `48 C7C0 01000000` instead of `B8 01000000` (MOV RAX, 1; the 32-bit form zero-extends)

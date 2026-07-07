@@ -329,9 +329,22 @@ and `verbose` controls whether each opportunity is printed as it is found.
 `x86lint_summary_skipped` reports how many undecodable bytes were skipped, so
 incomplete coverage of a data-laden section is not mistaken for a clean scan.
 
-x86lint can also read arbitrary 64-bit ELF executables directly. By default it
-prints only a summary -- the opportunities grouped by type and sorted by
-prevalence -- followed by a total and the number of instructions scanned:
+x86lint can also read arbitrary 64-bit ELF executables directly. When the
+binary kept its symbol table (`.symtab`), the scan is restricted to the byte
+ranges of its function symbols: executable sections routinely interleave
+non-code that *decodes* cleanly -- GHC info tables, LLVM's constexpr tables,
+jump tables -- which linear sweep would otherwise report pseudo-instruction
+findings from, and which the undecodable-bytes counter cannot flag. Excluded
+bytes are tallied into that skipped count, and a summary line reports the
+restriction; pass `-a` to scan every byte anyway. The dynamic symbol table is
+never used for this -- it survives stripping but lists only exports, and
+scanning just those would silently miss almost all code -- so stripped
+binaries scan whole sections exactly as before. An unsized assembly label
+extends to the next function's start, keeping coverage conservative.
+
+By default x86lint prints only a summary -- the opportunities grouped by type
+and sorted by prevalence -- followed by a total and the number of
+instructions scanned:
 
 ```console
 $ ./x86lint /bin/ls

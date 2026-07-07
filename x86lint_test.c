@@ -1989,6 +1989,81 @@ static void check_mov_add_lea_test(void)
     ASSERT_FINDINGS(sub_consumer, "MOV+ADD foldable to LEA", 0);
 }
 
+// Multi-instruction peephole: setcc X ; test X, X ; je/jne materializes a
+// condition into a byte register only to branch on it, and collapses to a single
+// conditional branch. check_instructions reports it against the setcc, and only
+// when X is dead on BOTH the fall-through and the taken target (a direct branch's
+// target is a known offset, so both are scanned). Fixtures kill eax on the
+// relevant path(s) with mov eax, imm so the deadness walk sees it die.
+static void check_setcc_branch_test(void)
+{
+    // sete al ; test al, al ; je +5 -- both successors overwrite eax, so al is
+    // dead on each: the sequence is a single (inverted) branch.
+    static const uint8_t fold_je[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x84, 0xC0,                    // test al, al
+        0x74, 0x05,                    // je +5 (to the second mov)
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1   (fall-through, kills al)
+        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2   (target, kills al)
+    };
+    ASSERT_FINDINGS(fold_je, "SETcc foldable into branch", 1);
+
+    // setne al ; test al, al ; jne +5 -- the jne form folds identically.
+    static const uint8_t fold_jne[] = {
+        0x0F, 0x95, 0xC0,              // setne al
+        0x84, 0xC0,                    // test al, al
+        0x75, 0x05,                    // jne +5
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
+        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2
+    };
+    ASSERT_FINDINGS(fold_jne, "SETcc foldable into branch", 1);
+
+    // sete al ; test al, al ; je +2 ; mov [rbx], al -- the fall-through stores
+    // al, so the boolean is live there: suppress.
+    static const uint8_t live_fallthrough[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x84, 0xC0,                    // test al, al
+        0x74, 0x02,                    // je +2 (to the second mov)
+        0x88, 0x03,                    // mov [rbx], al   (fall-through reads al)
+        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2      (target)
+    };
+    ASSERT_FINDINGS(live_fallthrough, "SETcc foldable into branch", 0);
+
+    // sete al ; test al, al ; je +5 ; mov eax,1 ; mov [rbx], al -- the taken
+    // target stores al, so the boolean is live on that path even though the
+    // fall-through kills it. The two-successor check catches this: suppress.
+    static const uint8_t live_target[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x84, 0xC0,                    // test al, al
+        0x74, 0x05,                    // je +5 (to mov [rbx], al)
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1      (fall-through kills al)
+        0x88, 0x03,                    // mov [rbx], al   (target reads al)
+    };
+    ASSERT_FINDINGS(live_target, "SETcc foldable into branch", 0);
+
+    // sete al ; test al, al ; jg +5 -- jg reads more than ZF after test al, al;
+    // only je/jne fold cleanly: suppress.
+    static const uint8_t wrong_cc[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x84, 0xC0,                    // test al, al
+        0x7F, 0x05,                    // jg +5
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
+        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2
+    };
+    ASSERT_FINDINGS(wrong_cc, "SETcc foldable into branch", 0);
+
+    // sete al ; test cl, cl ; je +5 -- the test is on a different register than
+    // the setcc wrote: suppress.
+    static const uint8_t wrong_reg[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x84, 0xC9,                    // test cl, cl
+        0x74, 0x05,                    // je +5
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
+        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2
+    };
+    ASSERT_FINDINGS(wrong_reg, "SETcc foldable into branch", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -2060,6 +2135,7 @@ int main(int argc, char *argv[])
     check_mov_const_fold_test();
     check_load_extend_fold_test();
     check_mov_add_lea_test();
+    check_setcc_branch_test();
     check_decode_resync_test();
 
     static const uint8_t inst[] = {

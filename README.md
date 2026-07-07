@@ -148,7 +148,14 @@ and only for flags -- the ABI guarantees they do not survive it.
 * redundant TEST immediate
   - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
     mask sets identical flags)
-* suboptimal AND immediate
+* SETcc foldable into branch
+  - `0F94C0 84C0 74xx` (SETZ AL; TEST AL, AL; JE) -- the condition is
+    materialized into a byte register only to branch on it; the three collapse
+    to a single conditional branch on the original flags (SETcc writes none),
+    when AL is dead on both the fall-through and the taken target. Only JE/JNE
+    fold, since after TEST AL, AL they read ZF alone (gated by register liveness
+    on each successor; a direct branch's target is a known offset, so both are
+    scanned)
   - `25 FF000000` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal AND zero
   - `83E0 00` (AND EAX, 0) -- use XOR EAX, EAX (same flags, fewer bytes)

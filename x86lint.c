@@ -2852,6 +2852,91 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
     return !flags_live_after(inst, len, after, FLAG_ARITH);
 }
 
+// Multi-instruction peephole (three instructions). setcc X ; test X, X ; je/jne
+// materializes a condition into a byte register only to branch on it; the whole
+// sequence is a single conditional branch on the original flags:
+//
+//   setb r11b ; test r11b, r11b ; je L   ->   jae L
+//   setz al   ; test al, al     ; jne L  ->   jnz L
+//
+// `setcc` is the already-decoded instruction ending at `test_offset`; on a match
+// the function returns true and the caller reports against the setcc, the start
+// of the collapsible sequence.
+//
+// Soundness. je/jne after test X, X (X is 0 or 1) tests exactly the condition
+// setcc captured; setcc writes no flags and test's flag write is dropped, so a
+// single branch on the pre-setcc flags -- unchanged across the three adjacent
+// instructions -- reproduces the control flow. The remaining effect is X's
+// value, which the fold no longer sets, so X must be dead. A branch has two
+// successors, so X must be dead on BOTH the fall-through and the taken target;
+// a direct je/jne's target is a known offset, so both are scanned with
+// reg_live_after (this is not a branch-target assumption -- the target is read
+// from the displacement). A target outside the section is unscannable and
+// conservatively rejected. Only je (JZ) and jne (JNZ) match: after test X, X
+// they read ZF alone, where the fold is exact; the other conditions fold in the
+// always-clear SF/OF/CF and are left alone.
+static bool setcc_test_branch_foldable(const uint8_t *inst, size_t len,
+                                       size_t test_offset,
+                                       const xed_decoded_inst_t *setcc)
+{
+    if (xed_decoded_inst_get_category(setcc) != XED_CATEGORY_SETCC) {
+        return false;
+    }
+    xed_reg_enum_t x = xed_decoded_inst_get_reg(setcc, XED_OPERAND_REG0);
+    if (xed_reg_class(x) != XED_REG_CLASS_GPR) {
+        return false;   // setcc to memory has no register destination
+    }
+    xed_reg_enum_t x_enc = xed_get_largest_enclosing_register(x);
+
+    // test X, X.
+    if (test_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t test;
+    xed_decoded_inst_zero(&test);
+    xed_decoded_inst_set_mode(&test, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&test, inst + test_offset, len - test_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&test) != XED_ICLASS_TEST ||
+        xed_decoded_inst_number_of_memory_operands(&test) > 0 ||
+        xed_decoded_inst_get_reg(&test, XED_OPERAND_REG0) != x ||
+        xed_decoded_inst_get_reg(&test, XED_OPERAND_REG1) != x) {
+        return false;
+    }
+
+    // je (JZ) or jne (JNZ).
+    size_t jcc_offset = test_offset + xed_decoded_inst_get_length(&test);
+    if (jcc_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t jcc;
+    xed_decoded_inst_zero(&jcc);
+    xed_decoded_inst_set_mode(&jcc, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&jcc, inst + jcc_offset, len - jcc_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t jc = xed_decoded_inst_get_iclass(&jcc);
+    if (jc != XED_ICLASS_JZ && jc != XED_ICLASS_JNZ) {
+        return false;
+    }
+
+    // X must be dead on both successors of the branch, since the fold leaves it
+    // at its prior value on each: the fall-through and the taken target.
+    size_t fall = jcc_offset + xed_decoded_inst_get_length(&jcc);
+    if (reg_live_after(inst, len, fall, x_enc)) {
+        return false;
+    }
+    int64_t target = (int64_t) fall +
+        xed_decoded_inst_get_branch_displacement(&jcc);
+    if (target < 0 || (uint64_t) target >= (uint64_t) len) {
+        return false;
+    }
+    return !reg_live_after(inst, len, (size_t) target, x_enc);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -2991,6 +3076,16 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if (mov_add_foldable_to_lea(inst, len, next, &xedd)) {
             summary_add(summary, "MOV+ADD foldable to LEA");
             report_finding("MOV+ADD foldable to LEA", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: setcc X ; test X, X ; je/jne collapses to
+        // a single conditional branch. Reported against the setcc (at `offset`).
+        // See setcc_test_branch_foldable.
+        if (setcc_test_branch_foldable(inst, len, next, &xedd)) {
+            summary_add(summary, "SETcc foldable into branch");
+            report_finding("SETcc foldable into branch", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

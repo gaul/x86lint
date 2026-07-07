@@ -2853,29 +2853,39 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
 }
 
 // Multi-instruction peephole (three instructions). setcc X ; test X, X ; je/jne
-// materializes a condition into a byte register only to branch on it; the whole
-// sequence is a single conditional branch on the original flags:
+// materializes a condition into a byte register and then branches on that
+// register -- but SETcc writes no flags, so the flags the branch needs are the
+// ones the preceding compare already left in place. The intervening test merely
+// recomputes ZF = (X == 0), the negated condition those flags still hold, so the
+// test is redundant: branch on the flags directly.
 //
-//   setb r11b ; test r11b, r11b ; je L   ->   jae L
-//   setz al   ; test al, al     ; jne L  ->   jnz L
+//   setb r11b ; test r11b, r11b ; je L   ->   setb r11b ; jae L
+//   setz al   ; test al, al     ; jne L  ->   setz al   ; jnz L
 //
-// `setcc` is the already-decoded instruction ending at `test_offset`; on a match
-// the function returns true and the caller reports against the setcc, the start
-// of the collapsible sequence.
+// (The setcc stays when X is live and is dropped when X is dead; either way the
+// test goes.) `setcc` is the already-decoded instruction ending at
+// `test_offset`; on a match the function returns true and the caller reports
+// against the setcc, the head of the sequence.
 //
-// Soundness. je/jne after test X, X (X is 0 or 1) tests exactly the condition
-// setcc captured; setcc writes no flags and test's flag write is dropped, so a
-// single branch on the pre-setcc flags -- unchanged across the three adjacent
-// instructions -- reproduces the control flow. The remaining effect is X's
-// value, which the fold no longer sets, so X must be dead. A branch has two
-// successors, so X must be dead on BOTH the fall-through and the taken target;
-// a direct je/jne's target is a known offset, so both are scanned with
-// reg_live_after (this is not a branch-target assumption -- the target is read
-// from the displacement). A target outside the section is unscannable and
-// conservatively rejected. Only je (JZ) and jne (JNZ) match: after test X, X
-// they read ZF alone, where the fold is exact; the other conditions fold in the
-// always-clear SF/OF/CF and are left alone.
-static bool setcc_test_branch_foldable(const uint8_t *inst, size_t len,
+// Soundness. je/jne read ZF alone. After test X, X, ZF = (X == 0) = (cc false),
+// so je L is j(not cc) and jne L is j(cc) -- exactly the branch the compare
+// flags support. setcc preserves those flags and nothing sits between the two,
+// so branching on them reproduces the control flow for ANY prior flags value; no
+// assumption about the compare is needed. The one state the rewrite changes is
+// the flags left live PAST the branch: test leaves ZF set with CF/OF cleared and
+// SF/PF from X, whereas the compare's flags now flow through instead. These can
+// differ in any arithmetic flag, so every one must be dead on BOTH successors --
+// the fall-through and the taken target. A direct je/jne's target is a known
+// offset (read from the displacement, not assumed), so both are scanned with
+// flags_live_after; a target outside the section is unscannable and
+// conservatively rejected. Register liveness does not gate the finding: X is
+// untouched by the rewrite, so the sequence is suboptimal whether or not X is
+// live. Only exact-width test X, X matches (REG0 == REG1 == the setcc's byte
+// register); a wider test eax, eax after setcc al would depend on the upper bits
+// of X, which this three-instruction window cannot show are zero. Only je (JZ)
+// and jne (JNZ) match: after test X, X they read ZF alone, where the negation is
+// exact; the other conditions fold in the always-clear SF/OF/CF and are skipped.
+static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
                                        size_t test_offset,
                                        const xed_decoded_inst_t *setcc)
 {
@@ -2886,7 +2896,6 @@ static bool setcc_test_branch_foldable(const uint8_t *inst, size_t len,
     if (xed_reg_class(x) != XED_REG_CLASS_GPR) {
         return false;   // setcc to memory has no register destination
     }
-    xed_reg_enum_t x_enc = xed_get_largest_enclosing_register(x);
 
     // test X, X.
     if (test_offset >= len) {
@@ -2923,10 +2932,11 @@ static bool setcc_test_branch_foldable(const uint8_t *inst, size_t len,
         return false;
     }
 
-    // X must be dead on both successors of the branch, since the fold leaves it
-    // at its prior value on each: the fall-through and the taken target.
+    // Dropping the test replaces its residual flags with the compare's on both
+    // successors, so every arithmetic flag must be dead on each: the
+    // fall-through and the taken target.
     size_t fall = jcc_offset + xed_decoded_inst_get_length(&jcc);
-    if (reg_live_after(inst, len, fall, x_enc)) {
+    if (flags_live_after(inst, len, fall, FLAG_ARITH)) {
         return false;
     }
     int64_t target = (int64_t) fall +
@@ -2934,7 +2944,7 @@ static bool setcc_test_branch_foldable(const uint8_t *inst, size_t len,
     if (target < 0 || (uint64_t) target >= (uint64_t) len) {
         return false;
     }
-    return !reg_live_after(inst, len, (size_t) target, x_enc);
+    return !flags_live_after(inst, len, (size_t) target, FLAG_ARITH);
 }
 
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
@@ -3080,12 +3090,12 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             ++errors;
         }
 
-        // Multi-instruction peephole: setcc X ; test X, X ; je/jne collapses to
-        // a single conditional branch. Reported against the setcc (at `offset`).
-        // See setcc_test_branch_foldable.
-        if (setcc_test_branch_foldable(inst, len, next, &xedd)) {
-            summary_add(summary, "SETcc foldable into branch");
-            report_finding("SETcc foldable into branch", offset, verbose, &xedd,
+        // Multi-instruction peephole: setcc X ; test X, X ; je/jne branches on a
+        // condition the compare flags still hold, so the test is redundant.
+        // Reported against the setcc (at `offset`). See redundant_test_after_setcc.
+        if (redundant_test_after_setcc(inst, len, next, &xedd)) {
+            summary_add(summary, "redundant TEST after SETcc");
+            report_finding("redundant TEST after SETcc", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

@@ -145,17 +145,16 @@ and only for flags -- the ABI guarantees they do not survive it.
     so the TEST is dead. AND/OR/XOR match TEST's flags exactly (CF/OF cleared)
     and fire unconditionally; ADD/SUB/INC/DEC and friends diverge only on CF/OF
     and are flagged only when those are dead downstream (gated by flag liveness)
+* redundant TEST after SETcc
+  - `0F94C0 84C0 74xx` (SETZ AL; TEST AL, AL; JE) -- SETcc preserves the
+    compare's flags, so the TEST only recomputes a condition they still hold;
+    branch on them directly (JE -> negated Jcc, JNE -> same). Drop the TEST
+    always, and the SETcc too when AL is dead. Only JE/JNE and an exact-width
+    TEST AL, AL match, gated on every arithmetic flag being dead on both
+    successors (a direct branch's target is a known offset, so both are scanned)
 * redundant TEST immediate
   - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
     mask sets identical flags)
-* SETcc foldable into branch
-  - `0F94C0 84C0 74xx` (SETZ AL; TEST AL, AL; JE) -- the condition is
-    materialized into a byte register only to branch on it; the three collapse
-    to a single conditional branch on the original flags (SETcc writes none),
-    when AL is dead on both the fall-through and the taken target. Only JE/JNE
-    fold, since after TEST AL, AL they read ZF alone (gated by register liveness
-    on each successor; a direct branch's target is a known offset, so both are
-    scanned)
 * suboptimal AND immediate
   - `25 FF000000` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal AND zero

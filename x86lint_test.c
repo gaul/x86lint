@@ -1989,79 +1989,107 @@ static void check_mov_add_lea_test(void)
     ASSERT_FINDINGS(sub_consumer, "MOV+ADD foldable to LEA", 0);
 }
 
-// Multi-instruction peephole: setcc X ; test X, X ; je/jne materializes a
-// condition into a byte register only to branch on it, and collapses to a single
-// conditional branch. check_instructions reports it against the setcc, and only
-// when X is dead on BOTH the fall-through and the taken target (a direct branch's
-// target is a known offset, so both are scanned). Fixtures kill eax on the
-// relevant path(s) with mov eax, imm so the deadness walk sees it die.
+// Multi-instruction peephole: setcc X ; test X, X ; je/jne branches on a
+// condition the preceding compare's flags already hold (setcc preserves them),
+// so the test is redundant. check_instructions reports it against the setcc. The
+// gate is flags, not registers: dropping the test swaps its residual flags for
+// the compare's, so every arithmetic flag must be dead on BOTH the fall-through
+// and the taken target. X's own liveness is irrelevant -- the rewrite keeps
+// setcc when X is live -- so the check fires even when X is stored. Fixtures end
+// paths in ret (flags dead) or adc al, 0 (reads CF, flags live) to steer the
+// flag-liveness walk.
 static void check_setcc_branch_test(void)
 {
-    // sete al ; test al, al ; je +5 -- both successors overwrite eax, so al is
-    // dead on each: the sequence is a single (inverted) branch.
+    // sete al ; test al, al ; je +1 -- both successors are ret, so the flags are
+    // dead on each: the test is redundant.
     static const uint8_t fold_je[] = {
         0x0F, 0x94, 0xC0,              // sete al
         0x84, 0xC0,                    // test al, al
-        0x74, 0x05,                    // je +5 (to the second mov)
-        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1   (fall-through, kills al)
-        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2   (target, kills al)
+        0x74, 0x01,                    // je +1 (to the second ret)
+        0xC3,                          // ret   (fall-through)
+        0xC3,                          // ret   (target)
     };
-    ASSERT_FINDINGS(fold_je, "SETcc foldable into branch", 1);
+    ASSERT_FINDINGS(fold_je, "redundant TEST after SETcc", 1);
 
-    // setne al ; test al, al ; jne +5 -- the jne form folds identically.
+    // setne al ; test al, al ; jne +1 -- the jne form is redundant identically.
     static const uint8_t fold_jne[] = {
         0x0F, 0x95, 0xC0,              // setne al
         0x84, 0xC0,                    // test al, al
-        0x75, 0x05,                    // jne +5
-        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
-        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2
+        0x75, 0x01,                    // jne +1
+        0xC3,                          // ret
+        0xC3,                          // ret
     };
-    ASSERT_FINDINGS(fold_jne, "SETcc foldable into branch", 1);
+    ASSERT_FINDINGS(fold_jne, "redundant TEST after SETcc", 1);
 
-    // sete al ; test al, al ; je +2 ; mov [rbx], al -- the fall-through stores
-    // al, so the boolean is live there: suppress.
-    static const uint8_t live_fallthrough[] = {
+    // sete al ; test al, al ; je +2 ; mov [rbx], al ; ret -- the fall-through
+    // stores al, so the boolean is LIVE, yet the flags are dead on both paths.
+    // The test is still redundant (keep the setcc, drop the test): fire. This is
+    // the case the old register-liveness gate wrongly suppressed.
+    static const uint8_t live_x_flags_dead[] = {
         0x0F, 0x94, 0xC0,              // sete al
         0x84, 0xC0,                    // test al, al
-        0x74, 0x02,                    // je +2 (to the second mov)
-        0x88, 0x03,                    // mov [rbx], al   (fall-through reads al)
-        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2      (target)
+        0x74, 0x02,                    // je +2 (to ret)
+        0x88, 0x03,                    // mov [rbx], al   (fall-through: al live)
+        0xC3,                          // ret             (target)
     };
-    ASSERT_FINDINGS(live_fallthrough, "SETcc foldable into branch", 0);
+    ASSERT_FINDINGS(live_x_flags_dead, "redundant TEST after SETcc", 1);
 
-    // sete al ; test al, al ; je +5 ; mov eax,1 ; mov [rbx], al -- the taken
-    // target stores al, so the boolean is live on that path even though the
-    // fall-through kills it. The two-successor check catches this: suppress.
-    static const uint8_t live_target[] = {
+    // sete al ; test al, al ; je +2 ; adc al, 0 ; ret -- the fall-through's adc
+    // reads CF, so the compare's flags would be observable there: suppress.
+    static const uint8_t flags_live_fallthrough[] = {
         0x0F, 0x94, 0xC0,              // sete al
         0x84, 0xC0,                    // test al, al
-        0x74, 0x05,                    // je +5 (to mov [rbx], al)
-        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1      (fall-through kills al)
-        0x88, 0x03,                    // mov [rbx], al   (target reads al)
+        0x74, 0x02,                    // je +2 (to ret)
+        0x14, 0x00,                    // adc al, 0    (fall-through reads CF)
+        0xC3,                          // ret          (target)
     };
-    ASSERT_FINDINGS(live_target, "SETcc foldable into branch", 0);
+    ASSERT_FINDINGS(flags_live_fallthrough, "redundant TEST after SETcc", 0);
 
-    // sete al ; test al, al ; jg +5 -- jg reads more than ZF after test al, al;
-    // only je/jne fold cleanly: suppress.
+    // sete al ; test al, al ; je +1 ; ret ; adc al, 0 -- the fall-through is dead
+    // (ret) but the taken target's adc reads CF. The two-successor flags check
+    // catches the target: suppress.
+    static const uint8_t flags_live_target[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x84, 0xC0,                    // test al, al
+        0x74, 0x01,                    // je +1 (to adc)
+        0xC3,                          // ret          (fall-through dead)
+        0x14, 0x00,                    // adc al, 0    (target reads CF)
+    };
+    ASSERT_FINDINGS(flags_live_target, "redundant TEST after SETcc", 0);
+
+    // sete al ; test al, al ; jg +1 -- jg reads more than ZF after test al, al;
+    // only je/jne are exact: suppress.
     static const uint8_t wrong_cc[] = {
         0x0F, 0x94, 0xC0,              // sete al
         0x84, 0xC0,                    // test al, al
-        0x7F, 0x05,                    // jg +5
-        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
-        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2
+        0x7F, 0x01,                    // jg +1
+        0xC3,                          // ret
+        0xC3,                          // ret
     };
-    ASSERT_FINDINGS(wrong_cc, "SETcc foldable into branch", 0);
+    ASSERT_FINDINGS(wrong_cc, "redundant TEST after SETcc", 0);
 
-    // sete al ; test cl, cl ; je +5 -- the test is on a different register than
+    // sete al ; test cl, cl ; je +1 -- the test is on a different register than
     // the setcc wrote: suppress.
     static const uint8_t wrong_reg[] = {
         0x0F, 0x94, 0xC0,              // sete al
         0x84, 0xC9,                    // test cl, cl
-        0x74, 0x05,                    // je +5
-        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
-        0xB8, 0x02, 0x00, 0x00, 0x00,  // mov eax, 2
+        0x74, 0x01,                    // je +1
+        0xC3,                          // ret
+        0xC3,                          // ret
     };
-    ASSERT_FINDINGS(wrong_reg, "SETcc foldable into branch", 0);
+    ASSERT_FINDINGS(wrong_reg, "redundant TEST after SETcc", 0);
+
+    // sete al ; test eax, eax ; je +1 -- the test is a wider alias of the setcc
+    // register; its ZF folds in the upper 24 bits of eax, which this window
+    // cannot show are zero, so only exact-width test al, al matches: suppress.
+    static const uint8_t widened_test[] = {
+        0x0F, 0x94, 0xC0,              // sete al
+        0x85, 0xC0,                    // test eax, eax
+        0x74, 0x01,                    // je +1
+        0xC3,                          // ret
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(widened_test, "redundant TEST after SETcc", 0);
 }
 
 // An undecodable byte (executable sections routinely embed data) must not

@@ -331,6 +331,9 @@ cd x86lint
 XED_PATH=/path/to/xed make all
 ```
 
+Run the unit suite and the ELF-driver smoke test with
+`XED_PATH=/path/to/xed make check`.
+
 ## Usage
 
 x86lint is intended to be part of compiler test suites, which should

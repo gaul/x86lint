@@ -24,4 +24,4 @@ jobs:
         run: XED_PATH=${PWD}/xed make all
 
       - name: Run tests
-        run: ./x86lint_test
+        run: XED_PATH=${PWD}/xed make check

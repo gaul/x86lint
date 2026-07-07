@@ -25,6 +25,11 @@ test: x86lint.o x86lint_test.o
 
 all: lib x86lint test
 
+# Run the unit suite and the ELF-driver smoke test.
+check: all
+	./x86lint_test
+	./driver_test.sh
+
 clean:
 	rm -f \
 		x86lint \

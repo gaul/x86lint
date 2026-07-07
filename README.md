@@ -217,6 +217,12 @@ and only for flags -- the ABI guarantees they do not survive it.
 * suboptimal OR/AND reg, reg
   - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write;
     the 32-bit form's zero-extension is gated by register liveness)
+* suboptimal SHL one
+  - `D1E0` (SHL EAX, 1) -- ADD EAX, EAX computes the same value with identical
+    flags (CF gets the shifted-out bit either way, and OF matches too) in the
+    same two bytes but on roughly twice the execution ports; the C1 imm8 form
+    of a 1-count shift is a byte longer besides. Value- and flag-exact at
+    every width, so unconditional
 * suboptimal single-bit immediate
   - `0D 00010000` (OR EAX, 0x100) -- use BTS EAX, 8 (4 bytes vs 5-7 for every
     register and width); AND with a single-bit-clear mask -> BTR, XOR -> BTC.

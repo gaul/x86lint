@@ -167,6 +167,11 @@ bool check_lea_to_add(const xed_decoded_inst_t *xedd);
 // upper-32 register liveness, cf. check_mov_self)
 bool check_shift_zero(const xed_decoded_inst_t *xedd);
 
+// return false if shl reg, 1 could be add reg, reg -- the same value with
+// identical flags (CF and OF included) in the same or fewer bytes, on more
+// execution ports; unconditional
+bool check_shl_one(const xed_decoded_inst_t *xedd);
+
 // return false if a legacy-encoded movapd/movdqa/movupd/movdqu could be
 // movaps/movups, the identical copy without the one-byte 66/F3 prefix
 bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);

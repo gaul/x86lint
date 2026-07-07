@@ -753,6 +753,37 @@ static void check_shift_zero_test(void)
     CHECK_BYTES( check_shift_zero, 0x90);                          // nop
 }
 
+static void check_shl_one_test(void)
+{
+    // shl reg, 1 -> add reg, reg: value- and flag-exact, more ports, and the
+    // imm8 encodings are a byte longer besides. Every width fires, both the
+    // implicit-one (D0/D1) and imm8 (C0/C1) encodings.
+    CHECK_BYTES(!check_shl_one, 0xd1, 0xe0);              // shl eax, 1 (D1 /4)
+    CHECK_BYTES(!check_shl_one, 0xc1, 0xe0, 0x01);        // shl eax, 1 (C1 /4 ib)
+    CHECK_BYTES(!check_shl_one, 0x48, 0xd1, 0xe0);        // shl rax, 1
+    CHECK_BYTES(!check_shl_one, 0x66, 0xd1, 0xe0);        // shl ax, 1
+    CHECK_BYTES(!check_shl_one, 0xd0, 0xe0);              // shl al, 1
+    CHECK_BYTES(!check_shl_one, 0xc0, 0xe0, 0x01);        // shl al, 1 (imm8)
+    CHECK_BYTES(!check_shl_one, 0x41, 0xd1, 0xe0);        // shl r8d, 1
+    // Other counts, the CL form, memory, and the shifts with no ALU twin.
+    CHECK_BYTES( check_shl_one, 0xc1, 0xe0, 0x02);        // shl eax, 2
+    CHECK_BYTES( check_shl_one, 0xc1, 0xe0, 0x00);        // shl eax, 0 (check_shift_zero's)
+    CHECK_BYTES( check_shl_one, 0xd3, 0xe0);              // shl eax, cl
+    CHECK_BYTES( check_shl_one, 0xd1, 0x23);              // shl dword ptr [rbx], 1
+    CHECK_BYTES( check_shl_one, 0xd1, 0xe8);              // shr eax, 1
+    CHECK_BYTES( check_shl_one, 0xd1, 0xf8);              // sar eax, 1
+    CHECK_BYTES( check_shl_one, 0xd1, 0xc0);              // rol eax, 1
+    CHECK_BYTES( check_shl_one, 0x90);                    // nop
+
+    // Flag-exactness makes the finding unconditional: it fires straight into
+    // a CF reader, since add reg, reg produces the identical CF (and OF).
+    static const uint8_t shl_jc[] = {
+        0xD1, 0xE3,        // shl ebx, 1
+        0x72, 0x00,        // jc +0 (reads CF; add ebx, ebx sets the same one)
+    };
+    ASSERT_FINDINGS(shl_jc, "suboptimal SHL one", 1);
+}
+
 static void check_imul_to_lea_test(void)
 {
     // imm8 form, all the LEA/SHL-friendly constants.
@@ -2611,6 +2642,7 @@ int main(int argc, char *argv[])
     check_lea_to_mov_test();
     check_lea_to_add_test();
     check_shift_zero_test();
+    check_shl_one_test();
     check_sse_mov_opcode_test();
     check_oversized_evex_test();
     check_oversized_vex_test();

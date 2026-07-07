@@ -1046,6 +1046,52 @@ bool check_lea_to_add(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// shl reg, 1 doubles the register exactly as add reg, reg does, with
+// IDENTICAL flags: CF receives the shifted-out MSB either way (add's carry
+// out is that same bit); OF -- defined for a 1-bit shift -- is
+// MSB(result) XOR CF for the shift and in-sign XOR out-sign for the add, the
+// same two bits of the same values; SF/ZF/PF derive from the same result.
+// (AF: undefined for the shift, defined for the add -- unobservable in 64-bit
+// mode either way.) The add matches the D0/D1 encodings byte for byte
+//   shl eax, 1   d1 e0   ->   add eax, eax   01 c0
+// while issuing on roughly twice the execution ports (p0156 vs p06 on recent
+// Intel, similarly on AMD), and beats the C0/C1 imm8 encodings of a 1-count
+// shift by a byte besides. Value- and flag-exact at every width, 8-bit
+// included, so the rewrite is unconditional -- it fires even into a
+// following CF reader.
+//
+// Only SHL qualifies: shr/sar and the rotates by 1 have no two-operand ALU
+// twin. Memory destinations are excluded -- there is no add [mem], [mem] --
+// and so is the CL form, whose runtime count is not statically 1; its count
+// register CL rides in REG1, which the ONE and IMMb register forms never
+// populate with CL. (check_implicit_immediate deliberately leaves SHL's
+// C1 -> D1 narrowing disabled; this finding subsumes it with the stronger
+// rewrite.)
+bool check_shl_one(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_SHL) {
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    if (xed_reg_class(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0)) !=
+            XED_REG_CLASS_GPR) {
+        return true;
+    }
+    // shl reg, cl carries the count register as REG1.
+    if (xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1) == XED_REG_CL) {
+        return true;
+    }
+    // The D0/D1 forms encode the 1 implicitly; the C0/C1 forms carry an imm8
+    // that must be exactly 1.
+    if (xed_operand_values_has_immediate(xed_decoded_inst_operands_const(xedd)) &&
+        xed_decoded_inst_get_unsigned_immediate(xedd) != 1) {
+        return true;
+    }
+    return false;
+}
+
 // Shift and rotate instructions with an immediate count of 0 are value- and
 // flag-preserving: the destination keeps its value and per the Intel SDM the
 // flags are explicitly "not affected" when the count is 0. Removal is still
@@ -2311,6 +2357,7 @@ static const struct check_entry checks[] = {
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_lea_to_add,                 "suboptimal LEA",                  FLAG_ARITH},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern},
+    {check_shl_one,                    "suboptimal SHL one",              0},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},
     {check_oversized_vex,              "oversized VEX encoding",          0},

@@ -37,6 +37,39 @@ do { \
     assert(_result); \
 } while (0)
 
+// Like CHECK_BYTES, but first pins what the fixture actually encodes: the
+// bytes must decode to exactly `asm_str` (XED Intel syntax, trailing pad
+// spaces trimmed). Plain CHECK_BYTES only asserts that the bytes decode at
+// all, so a hand-encoding typo yields a fixture that tests its check against
+// some other instruction -- and passes vacuously whenever the check ignores
+// that instruction. Prefer this form for new fixtures whose encoding details
+// (REX bits, operand forms, prefixes) carry the test's meaning.
+#define CHECK_BYTES_ASM(func, asm_str, ...) \
+do { \
+    static const uint8_t bytes[] = { __VA_ARGS__ }; \
+    xed_decoded_inst_t xedd; \
+    decode_instruction(&xedd, bytes, sizeof(bytes)); \
+    char _disasm[128]; \
+    if (!xed_format_context(XED_SYNTAX_INTEL, &xedd, _disasm, \
+                            sizeof(_disasm), 0, NULL, NULL)) { \
+        _disasm[0] = '\0'; \
+    } \
+    for (size_t _n = strlen(_disasm); _n > 0 && _disasm[_n - 1] == ' ';) { \
+        _disasm[--_n] = '\0'; \
+    } \
+    if (strcmp(_disasm, asm_str) != 0) { \
+        fprintf(stderr, "%s:%d: fixture encodes \"%s\", not \"%s\"\n", \
+                __FILE__, __LINE__, _disasm, asm_str); \
+    } \
+    assert(strcmp(_disasm, asm_str) == 0); \
+    bool _result = func(&xedd); \
+    if (!_result) { \
+        fprintf(stderr, "%s:%d: " #func " failed on: %s\n", \
+                __FILE__, __LINE__, asm_str); \
+    } \
+    assert(_result); \
+} while (0)
+
 // Runs check_instructions(inst, len) with stdout captured to a memory
 // buffer so we can count per-category findings rather than just the total.
 // Returns the number of `name at offset:` reports (i.e., findings produced
@@ -395,8 +428,8 @@ static void check_mov_zero_test(void)
 
 static void check_cmp_zero_test(void)
 {
-    CHECK_BYTES(!check_cmp_zero, 0x83, 0xff, 0x00);  // cmp edx, 0
-    CHECK_BYTES( check_cmp_zero, 0x83, 0xff, 0x01);  // cmp edx, 1
+    CHECK_BYTES(!check_cmp_zero, 0x83, 0xff, 0x00);  // cmp edi, 0
+    CHECK_BYTES( check_cmp_zero, 0x83, 0xff, 0x01);  // cmp edi, 1
     CHECK_BYTES( check_cmp_zero, 0x83, 0x3f, 0x00);  // cmp dword ptr [rdi], 0 (memory exempt)
     CHECK_BYTES( check_cmp_zero, 0x83, 0xc7, 0x00);  // add edi, 0 (not cmp)
     // cmp al, 0 ties test al, al (both 2 bytes), so it is not flagged in
@@ -644,8 +677,8 @@ static void check_missing_lock_prefix_test(void)
 
 static void check_superfluous_lock_prefix_test(void)
 {
-    CHECK_BYTES(!check_superfluous_lock_prefix, 0xf0, 0x87, 0x07);  // lock xchg [eax], ebx
-    CHECK_BYTES( check_superfluous_lock_prefix, 0x87, 0x07);  // xchg [eax], ebx
+    CHECK_BYTES(!check_superfluous_lock_prefix, 0xf0, 0x87, 0x07);  // lock xchg [rdi], eax
+    CHECK_BYTES( check_superfluous_lock_prefix, 0x87, 0x07);  // xchg [rdi], eax
 
     // Dispatcher wiring: unconditional finding, end-to-end (the memory form
     // has no 90+r alternative, so check_xchg_accumulator stays quiet).
@@ -1094,16 +1127,28 @@ static void check_oversized_lea_width_test(void)
     // Shape: only a 64-bit LEA whose REX carries nothing but W -- so the
     // narrowed form actually drops the byte -- is flagged. The upper-32
     // deadness gate is the dispatcher's, exercised below.
-    CHECK_BYTES(!check_oversized_lea_width, 0x48, 0x8d, 0x47, 0x08);  // lea rax, [rdi+8]
-    CHECK_BYTES(!check_oversized_lea_width, 0x48, 0x8d, 0x04, 0x0b);  // lea rax, [rbx+rcx]
-    CHECK_BYTES(!check_oversized_lea_width, 0x48, 0x8d, 0x05, 0x10, 0, 0, 0);  // lea rax, [rip+0x10]
-    CHECK_BYTES(!check_oversized_lea_width, 0x67, 0x48, 0x8d, 0x40, 0x08);  // lea rax, [eax+8]
-    CHECK_BYTES( check_oversized_lea_width, 0x8d, 0x47, 0x08);        // lea eax, [rdi+8] (already 32-bit)
-    CHECK_BYTES( check_oversized_lea_width, 0x66, 0x8d, 0x47, 0x08);  // lea ax, [rdi+8] (16-bit)
-    CHECK_BYTES( check_oversized_lea_width, 0x4c, 0x8d, 0x47, 0x08);  // lea r8, [rdi+8] (REX.R stays)
-    CHECK_BYTES( check_oversized_lea_width, 0x49, 0x8d, 0x40, 0x08);  // lea rax, [r8+8] (REX.B stays)
-    CHECK_BYTES( check_oversized_lea_width, 0x4a, 0x8d, 0x04, 0x4f);  // lea rax, [rdi+r9*2] (REX.X stays)
-    CHECK_BYTES( check_oversized_lea_width, 0x48, 0x89, 0xc8);        // mov rax, rcx (not LEA)
+    // CHECK_BYTES_ASM: every REX bit here is load-bearing (W-only REX flags,
+    // any of R/X/B suppresses), so pin what each fixture actually encodes.
+    CHECK_BYTES_ASM(!check_oversized_lea_width, "lea rax, ptr [rdi+0x8]",
+                    0x48, 0x8d, 0x47, 0x08);
+    CHECK_BYTES_ASM(!check_oversized_lea_width, "lea rax, ptr [rbx+rcx*1]",
+                    0x48, 0x8d, 0x04, 0x0b);
+    CHECK_BYTES_ASM(!check_oversized_lea_width, "lea rax, ptr [rip+0x10]",
+                    0x48, 0x8d, 0x05, 0x10, 0, 0, 0);
+    CHECK_BYTES_ASM(!check_oversized_lea_width, "lea rax, ptr [eax+0x8]",
+                    0x67, 0x48, 0x8d, 0x40, 0x08);
+    CHECK_BYTES_ASM( check_oversized_lea_width, "lea eax, ptr [rdi+0x8]",   // already 32-bit
+                    0x8d, 0x47, 0x08);
+    CHECK_BYTES_ASM( check_oversized_lea_width, "lea ax, ptr [rdi+0x8]",    // 16-bit
+                    0x66, 0x8d, 0x47, 0x08);
+    CHECK_BYTES_ASM( check_oversized_lea_width, "lea r8, ptr [rdi+0x8]",    // REX.R stays
+                    0x4c, 0x8d, 0x47, 0x08);
+    CHECK_BYTES_ASM( check_oversized_lea_width, "lea rax, ptr [r8+0x8]",    // REX.B stays
+                    0x49, 0x8d, 0x40, 0x08);
+    CHECK_BYTES_ASM( check_oversized_lea_width, "lea rax, ptr [rdi+r9*2]",  // REX.X stays
+                    0x4a, 0x8d, 0x04, 0x4f);
+    CHECK_BYTES_ASM( check_oversized_lea_width, "mov rax, rcx",             // not LEA
+                    0x48, 0x89, 0xc8);
 
     // Dispatcher gate: flagged only when the destination's bits 32-63 die
     // before being read.

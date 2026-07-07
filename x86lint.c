@@ -107,7 +107,22 @@ bool check_oversized_immediate(const xed_decoded_inst_t *xedd)
 
     switch (xed_decoded_inst_get_immediate_width_bits(xedd)) {
     case 8:
+        return true;
     case 16:
+        // The same shrink at 16-bit operand size: 66 81 /r iw -> 66 83 /r ib
+        // saves a byte when the value fits a sign-extended imm8 (push imm16
+        // -> 66 6A ib and imul -> 66 6B /r ib likewise; MOV has no such
+        // form). AX is excluded: its 66 05 iw accumulator form is already 4
+        // bytes, exactly tying the imm8 form -- the imm16 twin of
+        // check_cmp_zero's AL rule -- and the 5-byte modrm encoding of an
+        // AX-immediate op is check_implicit_register's finding.
+        if (iclass != XED_ICLASS_MOV &&
+            xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) != XED_REG_AX) {
+            int16_t i16 = (int16_t) imm;
+            if (i16 >= INT8_MIN && i16 <= INT8_MAX) {
+                return false;
+            }
+        }
         return true;
     case 32:
         if (iclass != XED_ICLASS_MOV) {

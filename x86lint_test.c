@@ -215,6 +215,21 @@ static void check_oversized_immediate_test(void)
     CHECK_BYTES(!check_oversized_immediate, 0x68, 0xff, 0xff, 0xff, 0xff);        // push -1 (sign-ext imm8=0xff)
     CHECK_BYTES( check_oversized_immediate, 0x68, 0x00, 0x01, 0x00, 0x00);        // push 0x100 (needs imm32)
     CHECK_BYTES( check_oversized_immediate, 0x6a, 0x01);                          // push 1 (imm8, already short)
+    // 16-bit operand size: 66 81 /r iw -> 66 83 /r ib saves a byte the same
+    // way (push and imul included); MOV has no imm8 form and AX's
+    // accumulator encoding already ties it.
+    CHECK_BYTES(!check_oversized_immediate, 0x66, 0x81, 0xC1, 0x12, 0x00);        // add cx, 0x12
+    CHECK_BYTES(!check_oversized_immediate, 0x66, 0x81, 0xC1, 0xF0, 0xFF);        // add cx, -16
+    CHECK_BYTES(!check_oversized_immediate, 0x66, 0x81, 0xC1, 0x80, 0xFF);        // add cx, -128 (boundary)
+    CHECK_BYTES( check_oversized_immediate, 0x66, 0x81, 0xC1, 0x7F, 0xFF);        // add cx, -129 (past imm8)
+    CHECK_BYTES( check_oversized_immediate, 0x66, 0x81, 0xC1, 0x00, 0x01);        // add cx, 0x100 (needs imm16)
+    CHECK_BYTES(!check_oversized_immediate, 0x66, 0x81, 0x03, 0x12, 0x00);        // add word ptr [rbx], 0x12
+    CHECK_BYTES(!check_oversized_immediate, 0x66, 0x68, 0x12, 0x00);              // push 0x12 (imm16 -> 66 6A 12)
+    CHECK_BYTES(!check_oversized_immediate, 0x66, 0x69, 0xCA, 0x12, 0x00);        // imul cx, dx, 0x12 (-> 66 6B)
+    CHECK_BYTES( check_oversized_immediate, 0x66, 0x83, 0xC1, 0x12);              // add cx, 0x12 (already imm8)
+    CHECK_BYTES( check_oversized_immediate, 0x66, 0xB9, 0x12, 0x00);              // mov cx, 0x12 (no imm8 form)
+    CHECK_BYTES( check_oversized_immediate, 0x66, 0x05, 0x12, 0x00);              // add ax, 0x12 (accumulator, 4 bytes: ties imm8 form)
+    CHECK_BYTES( check_oversized_immediate, 0x66, 0x81, 0xC0, 0x12, 0x00);        // add ax, 0x12 (modrm: check_implicit_register's finding)
 }
 
 static void check_oversized_test_immediate_test(void)

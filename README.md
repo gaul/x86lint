@@ -138,6 +138,9 @@ and only for flags -- the ABI guarantees they do not survive it.
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
   - `68 01000000` instead of `6A 01` (PUSH 1)
+  - `66 81C1 1200` instead of `66 83C1 12` (ADD CX, 0x12; imm16 narrows to the
+    sign-extended imm8 the same way, except for AX, whose accumulator form
+    already ties it)
 * oversized MOV encoding
   - `C7C0 01000000` instead of `B8 01000000` (MOV EAX, 1)
   - `48 C7C0 01000000` instead of `B8 01000000` (MOV RAX, 1; the 32-bit form zero-extends)

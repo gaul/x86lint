@@ -924,7 +924,9 @@ bool check_xchg_accumulator(const xed_decoded_inst_t *xedd)
 }
 
 // IMUL r, r, imm by a small constant can be strength-reduced to a LEA or SHL,
-// which on most uarches have shorter latency and avoid the multiplier.
+// which on most uarches have shorter latency and avoid the multiplier --
+// and the degenerate multipliers, JIT constant-folding residue, need no
+// multiply at all.
 //
 //   * imm in {2,3,5,9}: dst = src*{2,3,5,9} is lea [src + src*{1,2,4,8}],
 //     valid for any destination register.
@@ -934,6 +936,20 @@ bool check_xchg_accumulator(const xed_decoded_inst_t *xedd)
 //     never shorter; SHL requires the destination and source to coincide, and
 //     a different-register imul r, r2, 2^k is left alone. (imm 2 stays a LEA:
 //     lea [src+src] serves any destination, unlike shl.)
+//   * imm 0: the product is always zero -- xor dst, dst, shorter and
+//     dependency-free. A zero product cannot overflow, so imul leaves
+//     CF=OF=0 exactly as xor does; the shared CF/OF gate below is merely
+//     conservative here.
+//   * imm 1: the product is the source -- mov dst, src, or nothing at all
+//     when they coincide. The bare removal is the one rewrite here that
+//     drops a register write, so its 32-bit form loses the zero-extension
+//     into bits 63:32; imul_identity_upper_concern gates exactly that form
+//     on upper-32 liveness (cf. check_mov_self).
+//   * imm -1 with dst == src: negation in place -- neg dst, one byte
+//     shorter. neg's OF (set only for the minimum value) matches imul's
+//     overflow condition exactly; its CF = (src != 0) does diverge, covered
+//     by the CF/OF gate. A different-register imul r, r2, -1 (3 bytes) beats
+//     mov + neg (4) and stays.
 //
 // The multiplier is matched at the effective operand width, so the 32-bit
 // imul eax, eax, 0x80000000 (2^31 mod 2^32 = shl eax, 31) is caught while the
@@ -941,13 +957,15 @@ bool check_xchg_accumulator(const xed_decoded_inst_t *xedd)
 // power of two -- is not. A power of two 2^k confined to the width has
 // k < width, so the shl count is never masked.
 //
-// Memory-source IMUL (IMUL r, [m], imm) is not flagged: the replacement
-// would need a separate load instruction first, making the sequence
-// longer and not strictly faster.
+// Memory-source IMUL (IMUL r, [m], imm) is not flagged: for the strength
+// reductions the replacement would need a separate load first, and for the
+// degenerate multipliers it would drop the load -- a memory read that may be
+// intentional (cf. check_add_sub_zero's MMIO note).
 //
 // False positive if surrounding code reads CF or OF: IMUL sets both on
-// signed overflow; LEA and SHL do not produce the same CF/OF. A subsequent
-// JC/JNC/JO/JNO would diverge.
+// signed overflow, which none of the replacements reproduces in general (see
+// the per-constant notes above). SF/ZF/PF go from SDM-undefined to defined,
+// destroyed either way. The dispatcher gates on FLAG_CF | FLAG_OF.
 bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_IMUL) {
@@ -964,6 +982,16 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
     uint64_t opmask = (width >= 64) ? UINT64_MAX : (((uint64_t) 1 << width) - 1);
     uint64_t eff = (uint64_t) (int64_t) xed_decoded_inst_get_signed_immediate(xedd) & opmask;
 
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    bool in_place = dst != XED_REG_INVALID && dst == src;
+
+    // Degenerate multipliers: 0 -> xor, 1 -> mov or removal, -1 -> neg
+    // (in place only; the different-register form is already minimal).
+    if (eff == 0 || eff == 1 || (eff == opmask && in_place)) {
+        return false;
+    }
+
     switch (eff) {
     case 2: case 3: case 5: case 9:
         return false;
@@ -974,9 +1002,7 @@ bool check_imul_to_lea(const xed_decoded_inst_t *xedd)
     // A power of two >= 4 reduces to SHL, but only when the destination and
     // source coincide (there is no shorter LEA form).
     if (eff >= 4 && (eff & (eff - 1)) == 0) {
-        xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
-        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
-        return !(dst != XED_REG_INVALID && dst == src);
+        return !in_place;
     }
 
     return true;
@@ -2156,6 +2182,30 @@ static xed_reg_enum_t reg0_upper32_concern(const xed_decoded_inst_t *xedd)
     return xed_get_largest_enclosing_register(r0);
 }
 
+// reg_concern hook for check_imul_to_lea (see struct check_entry). Of its
+// rewrites, only imul reg, reg, 1 -> nothing drops a register write -- the
+// lea/shl/xor/mov/neg replacements all write the destination at the original
+// width -- so only that form's 32-bit zero-extension is at stake (cf.
+// reg0_upper32_concern). Return the enclosing register for it and
+// XED_REG_INVALID (ungated) for every other multiplier, width, or shape.
+static xed_reg_enum_t imul_identity_upper_concern(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_operand_width(xedd) != 32) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (dst == XED_REG_INVALID ||
+        dst != xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1)) {
+        return XED_REG_INVALID;
+    }
+    uint64_t eff = (uint64_t) (int64_t)
+        xed_decoded_inst_get_signed_immediate(xedd) & UINT32_MAX;
+    if (eff != 1) {
+        return XED_REG_INVALID;
+    }
+    return xed_get_largest_enclosing_register(dst);
+}
+
 // True when `producer` unconditionally writes the 32-bit form of the GPR reg64,
 // zero-extending bits 63:32 to zero. Any 32-bit GPR write zero-extends
 // architecturally; this is restricted to the unconditional, defined-result
@@ -2368,7 +2418,7 @@ static const struct check_entry checks[] = {
     {check_unneeded_movsx,             "unneeded MOVSX",                  0},
     {check_sub_self,                   "suboptimal SUB reg, reg",         0},
     {check_or_and_self,                "suboptimal OR/AND reg, reg",      0, reg0_upper32_concern},
-    {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF},
+    {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF, imul_identity_upper_concern},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
     {check_lea_to_add,                 "suboptimal LEA",                  FLAG_ARITH},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern},

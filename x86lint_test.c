@@ -838,12 +838,81 @@ static void check_imul_to_lea_test(void)
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x0a);                    // imul eax, eax, 10
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0x11);                    // imul eax, eax, 17 (not a power of two)
     CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc0, 0xfe);                    // imul eax, eax, -2 (sign-ext, LEA can't negate)
+    // Degenerate multipliers: 0 -> xor, 1 -> mov or removal, -1 -> neg.
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc1, 0x00);                    // imul eax, ecx, 0 (xor eax, eax)
+    CHECK_BYTES(!check_imul_to_lea, 0x69, 0xc1, 0x00, 0x00, 0x00, 0x00);  // imul eax, ecx, 0 (imm32 form)
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc1, 0x01);                    // imul eax, ecx, 1 (mov eax, ecx)
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0x01);                    // imul eax, eax, 1 (removable identity)
+    CHECK_BYTES(!check_imul_to_lea, 0x6b, 0xc0, 0xff);                    // imul eax, eax, -1 (neg eax)
+    CHECK_BYTES(!check_imul_to_lea, 0x48, 0x6b, 0xc0, 0xff);              // imul rax, rax, -1 (neg rax)
+    // -1 across registers: the 3-byte imul already beats mov + neg (4).
+    CHECK_BYTES( check_imul_to_lea, 0x6b, 0xc1, 0xff);                    // imul eax, ecx, -1
     // Two-operand form (no immediate).
     CHECK_BYTES( check_imul_to_lea, 0x0f, 0xaf, 0xc3);                    // imul eax, ebx
-    // Memory-source IMUL: LEA replacement needs extra load, would be longer.
+    // Memory-source IMUL: LEA replacement needs extra load, would be longer
+    // (and the degenerate rewrites would drop the load entirely).
     CHECK_BYTES( check_imul_to_lea, 0x48, 0x6b, 0x43, 0x08, 0x03);        // imul rax, [rbx+8], 3
     // Not IMUL.
     CHECK_BYTES( check_imul_to_lea, 0x90);                                // nop
+
+    // Dispatcher gating. imul ebx, ebx, 1 -> removal drops both the CF=OF=0
+    // write and the 32-bit zero-extension, so it needs the flags AND the
+    // upper half dead: a following 32-bit write satisfies both here.
+    static const uint8_t identity_kill[] = {
+        0x6B, 0xDB, 0x01,        // imul ebx, ebx, 1
+        0x89, 0xCB,              // mov ebx, ecx (kills the upper bits)
+        0xC3,                    // ret (flags dead)
+    };
+    ASSERT_FINDINGS(identity_kill, "suboptimal IMUL constant", 1);
+
+    // Same with the full register read downstream: the removal would leave
+    // rbx's upper half stale, so the register gate suppresses it even though
+    // the add killed the flags.
+    static const uint8_t identity_upper_read[] = {
+        0x6B, 0xDB, 0x01,        // imul ebx, ebx, 1
+        0x83, 0xC1, 0x02,        // add ecx, 2 (kills CF/OF)
+        0x48, 0x89, 0x1F,        // mov [rdi], rbx (reads the upper half)
+        0xC3,
+    };
+    ASSERT_FINDINGS(identity_upper_read, "suboptimal IMUL constant", 0);
+
+    // The backward escape: the preceding 32-bit write already zeroed the
+    // upper half, so the identity imul changes nothing despite the read.
+    static const uint8_t identity_prev_zeroed[] = {
+        0x89, 0xCB,              // mov ebx, ecx (zero-extends rbx)
+        0x6B, 0xDB, 0x01,        // imul ebx, ebx, 1
+        0x48, 0x89, 0x1F,        // mov [rdi], rbx
+        0xC3,
+    };
+    ASSERT_FINDINGS(identity_prev_zeroed, "suboptimal IMUL constant", 1);
+
+    // imul by 0 -> xor: fires when CF/OF are dead...
+    static const uint8_t zero_ret[] = {
+        0x6B, 0xD9, 0x00,        // imul ebx, ecx, 0
+        0xC3,
+    };
+    ASSERT_FINDINGS(zero_ret, "suboptimal IMUL constant", 1);
+
+    // ...and stays suppressed past a CF reader, though the xor rewrite is
+    // CF/OF-exact for a zero product (both leave them 0): the shared gate is
+    // conservative here.
+    static const uint8_t zero_jc[] = {
+        0x6B, 0xD9, 0x00,        // imul ebx, ecx, 0
+        0x72, 0x00,              // jc +0
+    };
+    ASSERT_FINDINGS(zero_jc, "suboptimal IMUL constant", 0);
+
+    // imul by 1 across registers -> mov, and by -1 in place -> neg.
+    static const uint8_t one_mov_ret[] = {
+        0x6B, 0xD9, 0x01,        // imul ebx, ecx, 1
+        0xC3,
+    };
+    ASSERT_FINDINGS(one_mov_ret, "suboptimal IMUL constant", 1);
+    static const uint8_t minus_one_neg_ret[] = {
+        0x6B, 0xDB, 0xFF,        // imul ebx, ebx, -1
+        0xC3,
+    };
+    ASSERT_FINDINGS(minus_one_neg_ret, "suboptimal IMUL constant", 1);
 }
 
 static void check_lea_to_mov_test(void)

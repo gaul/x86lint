@@ -205,6 +205,11 @@ and only for flags -- the ABI guarantees they do not survive it.
 * suboptimal IMUL constant
   - `6BC0 03` (IMUL EAX, EAX, 3) -- use LEA
   - `6BC0 10` (IMUL EAX, EAX, 16) -- use SHL (any power of two, same register)
+  - `6BC1 00` (IMUL EAX, ECX, 0) -- the product is always zero: use XOR
+  - `6BC1 01` (IMUL EAX, ECX, 1) -- the product is the source: use MOV, or
+    remove the same-register form outright (its dropped zero-extension is
+    gated by register liveness)
+  - `6BC0 FF` (IMUL EAX, EAX, -1) -- in-place negation: use NEG
 * suboptimal LEA
   - `488D03` (LEA RAX, [RBX]) -- use MOV RAX, RBX (more ports, no AGU)
   - `488D0408` (LEA RAX, [RAX+RCX]) -- an in-place two-register LEA is ADD RAX,

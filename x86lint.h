@@ -148,8 +148,10 @@ bool check_sub_self(const xed_decoded_inst_t *xedd);
 // upper-32 register liveness (cf. check_mov_self)
 bool check_or_and_self(const xed_decoded_inst_t *xedd);
 
-// return false if IMUL by a constant in {2,3,4,5,8,9} could be replaced
-// by a single LEA (or SHL for powers of two)
+// return false if IMUL by a constant in {2,3,5,9} or a power of two could be
+// replaced by a single LEA or SHL, or if the multiplier is degenerate:
+// 0 -> XOR, 1 -> MOV (or removal when destination and source coincide,
+// gated on upper-32 register liveness by the dispatcher), -1 in place -> NEG
 bool check_imul_to_lea(const xed_decoded_inst_t *xedd);
 
 // return false if lea dst, [base] (no index, zero displacement, base width

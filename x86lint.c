@@ -3060,6 +3060,98 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
     return !flags_live_after(inst, len, after, divergent);
 }
 
+// Multi-instruction peephole. shl reg, k followed by sar reg, k on the same
+// register shifts the low m = width - k bits to the top and arithmetic-shifts
+// them back: it sign-extends the low m bits in place. When m is a register
+// boundary -- 8, 16, or 32 -- a single movsx (movsxd for the 32 -> 64 case)
+// computes the same value at half the bytes, replacing a two-shift dependency
+// chain with one uop; shr instead of sar is the zero-extending twin, a movzx
+// (for 32 -> 64: mov reg32, reg32, whose write zero-extends):
+//
+//   shl eax, 24 ; sar eax, 24   ->   movsx eax, al
+//   shl rax, 32 ; sar rax, 32   ->   movsxd rax, eax
+//   shl eax, 24 ; shr eax, 24   ->   movzx eax, al
+//
+// `shl` is the already-decoded producer ending at `sar_offset`; on a match the
+// function returns true and the caller reports against the shl, the head of
+// the pair.
+//
+// Soundness. The replacement writes the same register at the same width (the
+// 32-bit forms zero-extend the enclosing register alike), so no register gate
+// is needed, and it reads the same low m bits the pair read. But movsx/movzx
+// write no flags where the second shift set CF and SF/ZF/PF from the result
+// (OF is undefined at these counts, AF always), so the finding is gated on
+// the arithmetic flags being dead past the pair -- and, like every
+// multi-instruction window, on no direct edge entering at the second shift.
+// Both counts must be exactly width - m with m in {8, 16, 32}: every count in
+// that set is below the hardware's 5/6-bit count mask, so the raw immediate
+// is the effective count (an over-encoded count that masks into range is left
+// unmatched, a false negative only). A mismatched or off-boundary count
+// computes something movsx cannot. Only the immediate forms match (a CL count
+// is not statically knowable, cf. check_shift_zero) and only register
+// destinations: a memory pair would need a load-extend-store rewrite with a
+// different access pattern.
+static bool shift_pair_foldable_to_extend(const uint8_t *inst, size_t len,
+                                          const uint8_t *branch_targets,
+                                          size_t sar_offset,
+                                          const xed_decoded_inst_t *shl)
+{
+    if (xed_decoded_inst_get_iclass(shl) != XED_ICLASS_SHL ||
+        xed_decoded_inst_number_of_memory_operands(shl) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(shl))) {
+        return false;
+    }
+    xed_reg_enum_t reg = xed_decoded_inst_get_reg(shl, XED_OPERAND_REG0);
+    if (xed_reg_class(reg) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    unsigned width = xed_get_register_width_bits64(reg);
+    uint64_t count = xed_decoded_inst_get_unsigned_immediate(shl);
+    if (count == 0 || count >= width) {
+        return false;
+    }
+    unsigned m = width - (unsigned) count;
+    if (m != 8 && m != 16 && m != 32) {
+        return false;
+    }
+
+    // Consumer: sar (sign) or shr (zero) of the same register by the same
+    // count.
+    if (sar_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t sar;
+    xed_decoded_inst_zero(&sar);
+    xed_decoded_inst_set_mode(&sar, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&sar, inst + sar_offset, len - sar_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&sar);
+    if (cic != XED_ICLASS_SAR && cic != XED_ICLASS_SHR) {
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&sar) != 0 ||
+        xed_decoded_inst_get_reg(&sar, XED_OPERAND_REG0) != reg ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&sar)) ||
+        xed_decoded_inst_get_unsigned_immediate(&sar) != count) {
+        return false;
+    }
+
+    // An incoming direct edge onto the second shift reaches it without the
+    // first; the fold would break that path.
+    size_t after = sar_offset + xed_decoded_inst_get_length(&sar);
+    if (branch_target_in(branch_targets, sar_offset, after)) {
+        return false;
+    }
+
+    // movsx/movzx write no flags; the second shift's must be dead.
+    return !flags_live_after(inst, len, after, FLAG_ARITH);
+}
+
 // Multi-instruction peephole (three instructions). setcc X ; test X, X ; je/jne
 // materializes a condition into a byte register and then branches on that
 // register -- but SETcc writes no flags, so the flags the branch needs are the
@@ -3313,6 +3405,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "MOV+ADD foldable to LEA");
             report_finding("MOV+ADD foldable to LEA", offset, verbose, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: shl reg, k ; sar/shr reg, k sign- or
+        // zero-extends the low width-k bits in place, which a single movsx/
+        // movzx computes. Reported against the shl (at `offset`). See
+        // shift_pair_foldable_to_extend.
+        if (shift_pair_foldable_to_extend(inst, len, branch_targets, next,
+                                          &xedd)) {
+            summary_add(summary, "shift pair foldable into extend");
+            report_finding("shift pair foldable into extend", offset, verbose,
+                &xedd, inst + offset);
             ++errors;
         }
 

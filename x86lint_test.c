@@ -2279,6 +2279,115 @@ static void check_mov_add_lea_test(void)
     ASSERT_FINDINGS(sub_consumer, "MOV+ADD foldable to LEA", 0);
 }
 
+// Multi-instruction peephole: shl reg, k ; sar reg, k sign-extends the low
+// width-k bits in place (shr zero-extends), which a single movsx/movzx
+// computes. check_instructions reports it against the shl. Gated on the
+// arithmetic flags being dead past the pair (movsx/movzx write none) and on
+// no direct edge entering at the second shift.
+static void check_shift_pair_extend_test(void)
+{
+    // shl eax, 24 ; sar eax, 24 -> movsx eax, al.
+    static const uint8_t byte_sign[] = {
+        0xC1, 0xE0, 0x18,        // shl eax, 24
+        0xC1, 0xF8, 0x18,        // sar eax, 24
+        0xC3,                    // ret (flags dead)
+    };
+    ASSERT_FINDINGS(byte_sign, "shift pair foldable into extend", 1);
+
+    // shl eax, 24 ; shr eax, 24 -> movzx eax, al (the zero-extending twin).
+    static const uint8_t byte_zero[] = {
+        0xC1, 0xE0, 0x18,        // shl eax, 24
+        0xC1, 0xE8, 0x18,        // shr eax, 24
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(byte_zero, "shift pair foldable into extend", 1);
+
+    // shl rax, 32 ; sar rax, 32 -> movsxd rax, eax.
+    static const uint8_t dword_sign64[] = {
+        0x48, 0xC1, 0xE0, 0x20,  // shl rax, 32
+        0x48, 0xC1, 0xF8, 0x20,  // sar rax, 32
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(dword_sign64, "shift pair foldable into extend", 1);
+
+    // 16-bit form: shl ax, 8 ; sar ax, 8 -> movsx ax, al.
+    static const uint8_t word_sign[] = {
+        0x66, 0xC1, 0xE0, 0x08,  // shl ax, 8
+        0x66, 0xC1, 0xF8, 0x08,  // sar ax, 8
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(word_sign, "shift pair foldable into extend", 1);
+
+    // Mismatched counts compute a shifted extension, not an extension.
+    static const uint8_t mismatch[] = {
+        0xC1, 0xE0, 0x18,        // shl eax, 24
+        0xC1, 0xF8, 0x10,        // sar eax, 16
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(mismatch, "shift pair foldable into extend", 0);
+
+    // A low remainder off the register boundaries (32 - 20 = 12 bits) has no
+    // movsx source.
+    static const uint8_t off_boundary[] = {
+        0xC1, 0xE0, 0x14,        // shl eax, 20
+        0xC1, 0xF8, 0x14,        // sar eax, 20
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(off_boundary, "shift pair foldable into extend", 0);
+
+    // Different registers are unrelated shifts.
+    static const uint8_t different_reg[] = {
+        0xC1, 0xE0, 0x18,        // shl eax, 24
+        0xC1, 0xF9, 0x18,        // sar ecx, 24
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(different_reg, "shift pair foldable into extend", 0);
+
+    // A CL count is not statically knowable.
+    static const uint8_t cl_count[] = {
+        0xD3, 0xE0,              // shl eax, cl
+        0xD3, 0xF8,              // sar eax, cl
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(cl_count, "shift pair foldable into extend", 0);
+
+    // Memory destinations would need a load-extend-store rewrite: suppress.
+    static const uint8_t memory_pair[] = {
+        0xC1, 0x23, 0x18,        // shl dword [rbx], 24
+        0xC1, 0x3B, 0x18,        // sar dword [rbx], 24
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(memory_pair, "shift pair foldable into extend", 0);
+
+    // The sar's flags feed the branch; movsx would not set them: suppress.
+    static const uint8_t flags_live[] = {
+        0xC1, 0xE0, 0x18,        // shl eax, 24
+        0xC1, 0xF8, 0x18,        // sar eax, 24
+        0x74, 0x00,              // jz +0
+    };
+    ASSERT_FINDINGS(flags_live, "shift pair foldable into extend", 0);
+
+    // An incoming direct edge onto the sar (from the dead je after the ret)
+    // reaches it without the shl: suppress. The flags are dead at the ret, so
+    // only the window guard is at work here.
+    static const uint8_t edge_on_sar[] = {
+        0xC1, 0xE0, 0x18,        // 0: shl eax, 24
+        0xC1, 0xF8, 0x18,        // 3: sar eax, 24  <- branch target
+        0xC3,                    // 6: ret
+        0x74, 0xFA,              // 7: je 3
+    };
+    ASSERT_FINDINGS(edge_on_sar, "shift pair foldable into extend", 0);
+
+    // An edge onto the shl (the window head) executes the whole pair: fires.
+    static const uint8_t edge_on_shl[] = {
+        0xC1, 0xE0, 0x18,        // 0: shl eax, 24  <- branch target
+        0xC1, 0xF8, 0x18,        // 3: sar eax, 24
+        0xC3,                    // 6: ret
+        0x74, 0xF7,              // 7: je 0
+    };
+    ASSERT_FINDINGS(edge_on_shl, "shift pair foldable into extend", 1);
+}
+
 // Multi-instruction peephole: setcc X ; test X, X ; je/jne branches on a
 // condition the preceding compare's flags already hold (setcc preserves them),
 // so the test is redundant. check_instructions reports it against the setcc. The
@@ -2454,6 +2563,7 @@ int main(int argc, char *argv[])
     check_mov_const_fold_test();
     check_load_extend_fold_test();
     check_mov_add_lea_test();
+    check_shift_pair_extend_test();
     check_setcc_branch_test();
     check_decode_resync_test();
 

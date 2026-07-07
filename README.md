@@ -186,6 +186,13 @@ and only for flags -- the ABI guarantees they do not survive it.
 * redundant TEST immediate
   - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
     mask sets identical flags)
+* shift pair foldable into extend
+  - `C1E018 C1F818` (SHL EAX, 24; SAR EAX, 24) -- shifting the low byte to the
+    top and arithmetic-shifting it back sign-extends it in place; MOVSX EAX, AL
+    computes that in one instruction at half the bytes (MOVSXD RAX, EAX for the
+    64-bit shift by 32). SHR instead of SAR is the zero-extending twin -> MOVZX
+    (MOV EAX, EAX for 32 -> 64). Fires when the low remainder is 8/16/32 bits
+    and the second shift's flags are dead (gated by flag liveness)
 * suboptimal AND immediate
   - `25 FF000000` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal AND zero

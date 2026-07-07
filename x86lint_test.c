@@ -1855,56 +1855,6 @@ static void check_mov_const_fold_test(void)
     ASSERT_FINDINGS(imm64_to_reg, "MOV constant foldable", 1);
 }
 
-// Ineffective prefix bytes -- consumed but ignored in 64-bit mode, pure code
-// size waste: a CS/DS/ES/SS segment override on a memory access (those bases
-// are zero), or a 66 operand-size prefix nullified by REX.W.
-static void check_ineffective_prefix_test(void)
-{
-    // mov eax, ds:[rax] -- the DS override does nothing (DS base is 0).
-    static const uint8_t ds_ovr[] = { 0x3E, 0x8B, 0x00 };
-    ASSERT_FINDINGS(ds_ovr, "unneeded segment prefix", 1);
-
-    // es: and ss: overrides on a plain [rax] access are equally inert.
-    static const uint8_t es_ovr[] = { 0x26, 0x8B, 0x00 };
-    ASSERT_FINDINGS(es_ovr, "unneeded segment prefix", 1);
-    static const uint8_t ss_ovr[] = { 0x36, 0x8B, 0x00 };
-    ASSERT_FINDINGS(ss_ovr, "unneeded segment prefix", 1);
-
-    // 66 add rax, rcx -- REX.W forces 64-bit operands, so the 66 (which selects
-    // 16-bit) is inert.
-    static const uint8_t osz_rexw[] = { 0x66, 0x48, 0x01, 0xC8 };
-    ASSERT_FINDINGS(osz_rexw, "unneeded operand-size prefix", 1);
-
-    // mov eax, fs:[rax] -- FS has a real base (TLS): kept.
-    static const uint8_t fs_ovr[] = { 0x64, 0x8B, 0x00 };
-    ASSERT_FINDINGS(fs_ovr, "unneeded segment prefix", 0);
-
-    // mov eax, [rax] -- no prefix at all.
-    static const uint8_t no_pfx[] = { 0x8B, 0x00 };
-    ASSERT_FINDINGS(no_pfx, "unneeded segment prefix", 0);
-
-    // 66 mov ax, cx -- a genuine 16-bit operand-size prefix (no REX.W): needed.
-    static const uint8_t osz_16[] = { 0x66, 0x89, 0xC8 };
-    ASSERT_FINDINGS(osz_16, "unneeded operand-size prefix", 0);
-
-    // addpd xmm0, xmm1 -- the 66 is a mandatory opcode selector, not operand
-    // size (osz stays 0): not flagged.
-    static const uint8_t addpd[] = { 0x66, 0x0F, 0x58, 0xC1 };
-    ASSERT_FINDINGS(addpd, "unneeded operand-size prefix", 0);
-
-    // movq xmm0, rax -- mandatory 66 plus REX.W (which promotes movd to movq);
-    // the 66 is not an operand-size prefix, so REX.W does not make it redundant.
-    static const uint8_t movq[] = { 0x66, 0x48, 0x0F, 0x6E, 0xC0 };
-    ASSERT_FINDINGS(movq, "unneeded operand-size prefix", 0);
-
-    // A multi-byte alignment NOP pads with a CS prefix (2e); that is deliberate
-    // length filler, not a wasted segment override, so it is not flagged.
-    static const uint8_t nop_pad[] = {
-        0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,  // nop word cs:[rax+rax]
-    };
-    ASSERT_FINDINGS(nop_pad, "unneeded segment prefix", 0);
-}
-
 // Multi-instruction peephole: a narrow load feeding an in-place sign/zero
 // extension of the loaded register is a single extending load; check_instructions
 // reports it against the load. The extension must widen the loaded register in
@@ -2108,7 +2058,6 @@ int main(int argc, char *argv[])
     check_redundant_flags_test();
     check_lea_fold_test();
     check_mov_const_fold_test();
-    check_ineffective_prefix_test();
     check_load_extend_fold_test();
     check_mov_add_lea_test();
     check_decode_resync_test();

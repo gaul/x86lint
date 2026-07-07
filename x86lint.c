@@ -2243,6 +2243,114 @@ static bool writes_zero_extended_32(const xed_decoded_inst_t *producer,
     return false;
 }
 
+// Backward peephole (the sub-32 sibling of writes_zero_extended_32's
+// mov r32, r32 escape). An in-place movzx/movsx/movsxd re-establishing bits
+// the immediately preceding extension already provided is a pure no-op:
+//
+//   movzx eax, byte [rsi] ; movzx eax, al   -- bits 8-63 are already zero
+//   movsx rax, bl         ; movsx rax, al   -- bits 8-63 already the sign
+//   movsx rcx, bl         ; movsxd rcx, ecx -- bits 32-63 already the sign
+//
+// The consumer must extend IN PLACE -- its register source is the low part of
+// the same register the producer wrote (a high-byte source like movzx eax, ah
+// reads bits the producer just cleared, not the value) -- with the SAME kind
+// as the producer: a zero-extension after a sign-extension, or vice versa,
+// changes bits whenever the value is negative. The producer must extend from
+// the same or a narrower source, so its guarantee covers the bit the consumer
+// extends from, and its established range must cover every bit the consumer
+// writes:
+//
+//   * zero-extensions: a 32- or 64-bit destination zeroes through bit 63
+//     alike (the 32-bit write zero-extends), so either serves any consumer; a
+//     16-bit destination (movzx cx, al) guarantees nothing above bit 15 and
+//     serves only a 16-bit consumer.
+//   * sign-extensions: the 32- and 64-bit destinations DIFFER through bit 63
+//     -- movsx eax, bl zeroes bits 63:32 where movsx rax, bl sign-fills them
+//     -- so a 32- or 64-bit consumer needs the producer destination width to
+//     match exactly; a 16-bit consumer writes only bits 8-15, which any wider
+//     sign-extension already filled.
+//
+// A producer's own source may be memory or a high byte: only its resulting
+// state matters, an extension-from-w-bits pattern either way. Neither
+// instruction touches flags and every bit the consumer writes already holds
+// that value, so removal needs no liveness gate -- only the dispatcher's
+// direct-edge rejection, since the justification is solely the predecessor.
+static bool redundant_reextension(const xed_decoded_inst_t *prev,
+                                  const xed_decoded_inst_t *xedd)
+{
+    // Consumer: an in-place register extension of the low bits.
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(xedd);
+    bool c_sign;
+    switch (cic) {
+    case XED_ICLASS_MOVZX:
+        c_sign = false;
+        break;
+    case XED_ICLASS_MOVSX:
+    case XED_ICLASS_MOVSXD:
+        c_sign = true;
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) != 0) {
+        return false;
+    }
+    xed_reg_enum_t c_dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t c_src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    if (c_src == XED_REG_AH || c_src == XED_REG_CH ||
+        c_src == XED_REG_DH || c_src == XED_REG_BH) {
+        return false;
+    }
+    xed_reg_enum_t family = xed_get_largest_enclosing_register(c_dst);
+    if (xed_get_largest_enclosing_register(c_src) != family) {
+        return false;
+    }
+
+    // Producer: an extension of the same register with the same kind.
+    bool p_sign;
+    switch (xed_decoded_inst_get_iclass(prev)) {
+    case XED_ICLASS_MOVZX:
+        p_sign = false;
+        break;
+    case XED_ICLASS_MOVSX:
+    case XED_ICLASS_MOVSXD:
+        p_sign = true;
+        break;
+    default:
+        return false;
+    }
+    if (p_sign != c_sign) {
+        return false;
+    }
+    xed_reg_enum_t p_dst = xed_decoded_inst_get_reg(prev, XED_OPERAND_REG0);
+    if (xed_get_largest_enclosing_register(p_dst) != family) {
+        return false;
+    }
+
+    // The producer's guarantee starts at its source width, register or
+    // memory.
+    unsigned p_ws = xed_decoded_inst_number_of_memory_operands(prev) != 0
+        ? xed_decoded_inst_get_memory_operand_length(prev, 0) * 8
+        : xed_get_register_width_bits64(
+              xed_decoded_inst_get_reg(prev, XED_OPERAND_REG1));
+    unsigned c_ws = xed_get_register_width_bits64(c_src);
+    if (p_ws == 0 || p_ws > c_ws) {
+        return false;
+    }
+
+    unsigned p_wd = xed_get_register_width_bits64(p_dst);
+    unsigned c_wd = xed_get_register_width_bits64(c_dst);
+    if (!c_sign) {
+        // Zeroes reach bit 63 from either a 32- or 64-bit destination.
+        unsigned p_end = p_wd >= 32 ? 64 : p_wd;
+        unsigned c_end = c_wd >= 32 ? 64 : c_wd;
+        return p_end >= c_end;
+    }
+    // Sign fills: 16-bit consumers are covered by any wider producer; wider
+    // consumers need the exact destination width.
+    return c_wd == 16 ? p_wd >= 16 : p_wd == c_wd;
+}
+
 #define X86LINT_SUMMARY_MAX 64
 
 struct x86lint_summary {
@@ -3602,12 +3710,17 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             if (checks[i].reg_concern != NULL) {
                 xed_reg_enum_t reg64 = checks[i].reg_concern(&xedd);
                 // Suppress only when the disturbed upper half is read
-                // downstream AND the preceding instruction did not already zero
-                // it: if it did, dropping this instruction (e.g. mov eax, eax)
-                // changes nothing regardless of any downstream read.
+                // downstream AND the backward escape does not apply: when the
+                // preceding instruction already zeroed those bits, dropping
+                // this instruction (e.g. mov eax, eax) changes nothing
+                // regardless of any downstream read. The escape holds only if
+                // every path here runs through that predecessor, so a direct
+                // branch targeting this instruction -- arriving with unknown
+                // upper bits -- cancels it.
                 if (reg64 != XED_REG_INVALID &&
                     reg_upper32_live_after(inst, len, next, reg64) &&
-                    !(have_prev && writes_zero_extended_32(&prev, reg64))) {
+                    !(have_prev && writes_zero_extended_32(&prev, reg64) &&
+                      !branch_target_in(branch_targets, offset, offset + 1))) {
                     continue;
                 }
             }
@@ -3704,6 +3817,21 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                                        &xedd)) {
             summary_add(summary, "redundant TEST after SETcc");
             report_finding("redundant TEST after SETcc", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Backward peephole: an in-place movzx/movsx/movsxd re-establishing
+        // bits the immediately preceding extension already provided is a pure
+        // no-op. Justified solely by `prev`, so a direct edge onto this
+        // instruction -- a path that skips the producer -- rejects it (the
+        // same condition guarding the writes_zero_extended_32 escape above).
+        // Reported against the re-extension (at `offset`), the removable
+        // instruction. See redundant_reextension.
+        if (have_prev && redundant_reextension(&prev, &xedd) &&
+            !branch_target_in(branch_targets, offset, offset + 1)) {
+            summary_add(summary, "redundant re-extension");
+            report_finding("redundant re-extension", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

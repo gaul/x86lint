@@ -1699,6 +1699,19 @@ static void check_zero_extend_mov_self_test(void)
         0x48, 0x89, 0x03,  // mov [rbx], rax
     };
     ASSERT_FINDINGS(cmov_movself_store, "redundant MOV reg, reg", 0);
+
+    // The escape holds only when every path runs through the zero-extending
+    // predecessor: a direct edge onto the mov itself (from the dead je after
+    // the ret) arrives with unknown upper bits, so with the store keeping
+    // them live the finding is suppressed despite the escape.
+    static const uint8_t edge_on_movself[] = {
+        0x89, 0xCB,        // 0: mov ebx, ecx (zero-extends rbx)
+        0x89, 0xDB,        // 2: mov ebx, ebx  <- branch target
+        0x48, 0x89, 0x18,  // 4: mov [rax], rbx (upper half live)
+        0xC3,              // 7: ret
+        0x74, 0xF8,        // 8: je 2
+    };
+    ASSERT_FINDINGS(edge_on_movself, "redundant MOV reg, reg", 0);
 }
 
 // The other 32-bit identity operations -- and reg, -1 / or reg, reg /
@@ -1808,6 +1821,142 @@ static void check_upper32_identity_gate_test(void)
         0xC3,
     };
     ASSERT_FINDINGS(shl_zero_mem, "redundant shift/rotate by zero", 1);
+}
+
+// Backward peephole: an in-place movzx/movsx/movsxd re-establishing bits the
+// immediately preceding extension already provided is a pure no-op --
+// removable with no liveness gate, since neither instruction touches flags
+// and every written bit already holds its value. The one rejection is a
+// direct edge onto the re-extension, a path that skips the producer.
+static void check_redundant_reextension_test(void)
+{
+    // movzx eax, byte [rsi] ; movzx eax, al -- bits 8-63 already zero: fires.
+    static const uint8_t zx_after_load[] = {
+        0x0F, 0xB6, 0x06,        // movzx eax, byte [rsi]
+        0x0F, 0xB6, 0xC0,        // movzx eax, al
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(zx_after_load, "redundant re-extension", 1);
+
+    // Register-source producer: movzx eax, bl ; movzx eax, al.
+    static const uint8_t zx_after_zx[] = {
+        0x0F, 0xB6, 0xC3,        // movzx eax, bl
+        0x0F, 0xB6, 0xC0,        // movzx eax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(zx_after_zx, "redundant re-extension", 1);
+
+    // A wider in-place re-extension is covered too: bits 16-63 are already
+    // zero because bits 8-63 are.
+    static const uint8_t zx16_after_zx8[] = {
+        0x0F, 0xB6, 0xC3,        // movzx eax, bl
+        0x0F, 0xB7, 0xC0,        // movzx eax, ax
+        0xC3,
+    };
+    ASSERT_FINDINGS(zx16_after_zx8, "redundant re-extension", 1);
+
+    // A 16-bit consumer needs only bits 8-15, which any wider producer set.
+    static const uint8_t zx16dest_after_zx[] = {
+        0x0F, 0xB6, 0xC3,        // movzx eax, bl
+        0x66, 0x0F, 0xB6, 0xC0,  // movzx ax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(zx16dest_after_zx, "redundant re-extension", 1);
+
+    // Sign twins: movsx rax, bl ; movsx rax, al (bits 8-63 already the sign),
+    // and movsx rcx, bl ; movsxd rcx, ecx (bits 32-63 already the sign).
+    static const uint8_t sx_after_sx64[] = {
+        0x48, 0x0F, 0xBE, 0xC3,  // movsx rax, bl
+        0x48, 0x0F, 0xBE, 0xC0,  // movsx rax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(sx_after_sx64, "redundant re-extension", 1);
+    static const uint8_t sxd_after_sx64[] = {
+        0x48, 0x0F, 0xBE, 0xCB,  // movsx rcx, bl
+        0x48, 0x63, 0xC9,        // movsxd rcx, ecx
+        0xC3,
+    };
+    ASSERT_FINDINGS(sxd_after_sx64, "redundant re-extension", 1);
+
+    // Kind mismatch: after a zero-extension, movsx would sign-fill bits the
+    // producer cleared whenever the byte is negative.
+    static const uint8_t sx_after_zx[] = {
+        0x0F, 0xB6, 0xC3,        // movzx eax, bl
+        0x0F, 0xBE, 0xC0,        // movsx eax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(sx_after_zx, "redundant re-extension", 0);
+
+    // Producer from a wider source: bits 8-15 hold data, and the consumer
+    // would clear them.
+    static const uint8_t zx8_after_zx16[] = {
+        0x0F, 0xB7, 0xC3,        // movzx eax, bx
+        0x0F, 0xB6, 0xC0,        // movzx eax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(zx8_after_zx16, "redundant re-extension", 0);
+
+    // Sign-extension destination widths must match: the 64-bit producer
+    // sign-filled bits 63:32, which the 32-bit consumer would zero...
+    static const uint8_t sx32_after_sx64[] = {
+        0x48, 0x0F, 0xBE, 0xC3,  // movsx rax, bl
+        0x0F, 0xBE, 0xC0,        // movsx eax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(sx32_after_sx64, "redundant re-extension", 0);
+
+    // ...and the 32-bit producer zeroed bits the 64-bit consumer would
+    // sign-fill.
+    static const uint8_t sx64_after_sx32[] = {
+        0x0F, 0xBE, 0xC3,        // movsx eax, bl
+        0x48, 0x0F, 0xBE, 0xC0,  // movsx rax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(sx64_after_sx32, "redundant re-extension", 0);
+
+    // A 16-bit producer guarantees nothing above bit 15.
+    static const uint8_t zx32_after_zx16dest[] = {
+        0x66, 0x0F, 0xB6, 0xC3,  // movzx ax, bl
+        0x0F, 0xB6, 0xC0,        // movzx eax, al
+        0xC3,
+    };
+    ASSERT_FINDINGS(zx32_after_zx16dest, "redundant re-extension", 0);
+
+    // Different register families are unrelated.
+    static const uint8_t different_family[] = {
+        0x0F, 0xB6, 0xC3,        // movzx eax, bl
+        0x0F, 0xB6, 0xC9,        // movzx ecx, cl
+        0xC3,
+    };
+    ASSERT_FINDINGS(different_family, "redundant re-extension", 0);
+
+    // A high-byte consumer source reads bits the producer cleared, not the
+    // value: movzx eax, ah is not a re-extension.
+    static const uint8_t high_byte_source[] = {
+        0x0F, 0xB6, 0xC3,        // movzx eax, bl
+        0x0F, 0xB6, 0xC4,        // movzx eax, ah
+        0xC3,
+    };
+    ASSERT_FINDINGS(high_byte_source, "redundant re-extension", 0);
+
+    // An incoming direct edge onto the re-extension skips the producer:
+    // suppress. (The trailing je is dead code; the sweep records its target.)
+    static const uint8_t edge_on_reextension[] = {
+        0x0F, 0xB6, 0xC3,        // 0: movzx eax, bl
+        0x0F, 0xB6, 0xC0,        // 3: movzx eax, al  <- branch target
+        0xC3,                    // 6: ret
+        0x74, 0xFA,              // 7: je 3
+    };
+    ASSERT_FINDINGS(edge_on_reextension, "redundant re-extension", 0);
+
+    // An edge onto the producer (the pair's head) is fine: fires.
+    static const uint8_t edge_on_producer[] = {
+        0x0F, 0xB6, 0xC3,        // 0: movzx eax, bl  <- branch target
+        0x0F, 0xB6, 0xC0,        // 3: movzx eax, al
+        0xC3,                    // 6: ret
+        0x74, 0xF7,              // 7: je 0
+    };
+    ASSERT_FINDINGS(edge_on_producer, "redundant re-extension", 1);
 }
 
 // Multi-instruction peephole: a flag-setting ALU (add/sub/and/or/xor/inc/dec/
@@ -2847,6 +2996,7 @@ int main(int argc, char *argv[])
     check_flag_liveness_corners_test();
     check_reg_liveness_test();
     check_zero_extend_mov_self_test();
+    check_redundant_reextension_test();
     check_upper32_identity_gate_test();
     check_redundant_flags_test();
     check_lea_fold_test();

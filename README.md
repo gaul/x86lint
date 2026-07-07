@@ -83,7 +83,10 @@ instructions) starting at the successor.
   or in a callee-saved register, which a linear walk cannot rule out. One
   backward escape reinstates the finding: when the immediately preceding
   instruction already zero-extended the register, the identity op changes
-  nothing regardless of downstream reads.
+  nothing regardless of downstream reads. The escape holds only if every
+  path to the instruction runs through that predecessor, so a direct branch
+  targeting the instruction itself -- arriving with unknown upper bits --
+  cancels it.
 
 Both scans share one bias: reads count inclusively and redefinitions
 exclusively, so every uncertainty -- a decode error, an unfollowable branch,
@@ -170,6 +173,15 @@ and only for flags -- the ABI guarantees they do not survive it.
 * redundant OR/XOR zero
   - `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove (the
     32-bit form's zero-extension is gated by register liveness)
+* redundant re-extension
+  - `0FB606 0FB6C0` (MOVZX EAX, byte [RSI]; MOVZX EAX, AL) -- the second
+    extension re-establishes bits the first already made zero (or, for
+    MOVSX/MOVSXD, already made the sign): a pure no-op when the kinds match,
+    the producer extends from the same or a narrower source, and its
+    established range covers every bit the consumer writes (sign-extensions
+    must agree on destination width, since the 32-bit form zeroes bits 63:32
+    where the 64-bit form sign-fills them). Rejected when a direct branch
+    targets the re-extension -- a path that skips the producer
 * redundant shift/rotate by zero
   - `C1E0 00` (SHL EAX, 0) -- value and flags unchanged; hardware still
     zero-extends the 32-bit form even at count 0, so it is gated by register

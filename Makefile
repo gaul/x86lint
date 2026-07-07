@@ -1,5 +1,10 @@
+# XED_PATH locates the Intel XED headers and library and is required to compile
+# and link, but not to clean -- so `make clean` works without it (and a
+# `make clean && make ...` chain does not short-circuit when it is unset).
 ifndef XED_PATH
-$(error "must provide XED_PATH")
+ifneq ($(MAKECMDGOALS),clean)
+$(error must provide XED_PATH)
+endif
 endif
 
 CFLAGS = -g -Wall -fPIC

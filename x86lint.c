@@ -2679,12 +2679,15 @@ static bool mov_const_foldable(const uint8_t *inst, size_t len,
         }
     }
 
-    // A 64-bit non-mov consumer sign-extends an imm32; a full imm64 constant
-    // (movabs, immediate width 64) folds only when it fits that. (get_signed_-
-    // immediate truncates a 64-bit immediate, so read it unsigned and range-
-    // check.) Narrower widths, and mov (which can movabs), always fit.
-    if (xed_decoded_inst_get_operand_width(&consumer) == 64 &&
-        cic != XED_ICLASS_MOV &&
+    // A 64-bit consumer sign-extends an imm32; a full imm64 constant (movabs,
+    // immediate width 64) folds only when it fits that -- EXCEPT a mov to a
+    // register, whose imm64 movabs form holds any value. A mov to memory takes
+    // only imm32 like every other memory form, so an imm64 constant does not
+    // fold into it. (get_signed_immediate truncates a 64-bit immediate, so read
+    // it unsigned and range-check.)
+    bool reg_dest_mov = cic == XED_ICLASS_MOV &&
+        xed_decoded_inst_number_of_memory_operands(&consumer) == 0;
+    if (xed_decoded_inst_get_operand_width(&consumer) == 64 && !reg_dest_mov &&
         xed_decoded_inst_get_immediate_width_bits(mov_const) == 64) {
         int64_t v = (int64_t) xed_decoded_inst_get_unsigned_immediate(mov_const);
         if (v < INT32_MIN || v > INT32_MAX) {
@@ -2716,6 +2719,13 @@ static bool mov_const_foldable(const uint8_t *inst, size_t len,
 static const char *ineffective_prefix(const xed_decoded_inst_t *xedd,
                                       const uint8_t *bytes, size_t len)
 {
+    // Multi-byte NOPs pad to an alignment boundary with prefix bytes (a CS
+    // override, extra 66s); those bytes are deliberate length filler, not waste,
+    // and the tool does not flag alignment NOPs (issue #9). Skip them.
+    if (xed_decoded_inst_get_category(xedd) == XED_CATEGORY_WIDENOP) {
+        return NULL;
+    }
+
     if (xed3_operand_get_osz(xedd) && xed3_operand_get_rexw(xedd)) {
         return "unneeded operand-size prefix";
     }

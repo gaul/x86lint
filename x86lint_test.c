@@ -1834,6 +1834,25 @@ static void check_mov_const_fold_test(void)
         0x8B, 0x01,                    // mov eax, [rcx]
     };
     ASSERT_FINDINGS(mem_source, "MOV constant foldable", 0);
+
+    // movabs rdx, big ; mov [rbp-0x30], rdx -- a memory-store mov takes only a
+    // sign-extended imm32, so a full imm64 constant does not fold into it (there
+    // is no mov qword ptr, imm64): suppress.
+    static const uint8_t imm64_to_mem[] = {
+        0x48, 0xBA, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // movabs rdx, 0x1122334455667788
+        0x48, 0x89, 0x55, 0xD0,        // mov [rbp-0x30], rdx
+        0x48, 0x89, 0xCA,              // mov rdx, rcx (kills rdx)
+    };
+    ASSERT_FINDINGS(imm64_to_mem, "MOV constant foldable", 0);
+
+    // movabs rdx, big ; mov rbx, rdx -- a register-destination mov spells any
+    // imm64 via movabs, so this folds.
+    static const uint8_t imm64_to_reg[] = {
+        0x48, 0xBA, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // movabs rdx, 0x1122334455667788
+        0x48, 0x89, 0xD3,              // mov rbx, rdx
+        0x48, 0x89, 0xCA,              // mov rdx, rcx (kills rdx)
+    };
+    ASSERT_FINDINGS(imm64_to_reg, "MOV constant foldable", 1);
 }
 
 // Ineffective prefix bytes -- consumed but ignored in 64-bit mode, pure code
@@ -1877,6 +1896,13 @@ static void check_ineffective_prefix_test(void)
     // the 66 is not an operand-size prefix, so REX.W does not make it redundant.
     static const uint8_t movq[] = { 0x66, 0x48, 0x0F, 0x6E, 0xC0 };
     ASSERT_FINDINGS(movq, "unneeded operand-size prefix", 0);
+
+    // A multi-byte alignment NOP pads with a CS prefix (2e); that is deliberate
+    // length filler, not a wasted segment override, so it is not flagged.
+    static const uint8_t nop_pad[] = {
+        0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,  // nop word cs:[rax+rax]
+    };
+    ASSERT_FINDINGS(nop_pad, "unneeded segment prefix", 0);
 }
 
 // Multi-instruction peephole: a narrow load feeding an in-place sign/zero

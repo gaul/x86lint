@@ -201,7 +201,11 @@ and only for flags -- the ABI guarantees they do not survive it.
 * redundant shift/rotate by zero
   - `C1E0 00` (SHL EAX, 0) -- value and flags unchanged; hardware still
     zero-extends the 32-bit form even at count 0, so it is gated by register
-    liveness
+    liveness. Register destinations only: removing `SHL dword [RDI], 0` would
+    delete a memory access, which is observable in itself (it can fault, has
+    MMIO side effects regardless of the value, and its non-atomic write-back
+    can overwrite a racing store) -- and in practice the memory form is what
+    data bytes (`C0 00 00`) decode to, not what compilers emit
 * redundant TEST after flags
   - `21D8 85C0` (AND EAX, EBX; TEST EAX, EAX) -- the AND already set SF/ZF/PF,
     so the TEST is dead. AND/OR/XOR match TEST's flags exactly (CF/OF cleared)

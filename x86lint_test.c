@@ -764,6 +764,12 @@ static void check_shift_zero_test(void)
     CHECK_BYTES( check_shift_zero, 0xd1, 0xe0);                    // shl eax, 1
     // CL-register form -- count not statically knowable, not flagged.
     CHECK_BYTES( check_shift_zero, 0xd3, 0xe0);                    // shl eax, cl
+    // Memory destinations -- removal would delete an observable memory
+    // access (fault, MMIO side effect, racing write-back), not flagged. The
+    // byte form is also what a run of C0/00 data bytes decodes to.
+    CHECK_BYTES( check_shift_zero, 0xc1, 0x20, 0x00);              // shl dword [rax], 0
+    CHECK_BYTES( check_shift_zero, 0xc0, 0x00, 0x00);              // rol byte [rax], 0
+    CHECK_BYTES( check_shift_zero, 0x0f, 0xa4, 0x18, 0x00);        // shld [rax], ebx, 0
     // Not a shift.
     CHECK_BYTES( check_shift_zero, 0x90);                          // nop
 }
@@ -1878,14 +1884,16 @@ static void check_upper32_identity_gate_test(void)
     };
     ASSERT_FINDINGS(shl_zero_8, "redundant shift/rotate by zero", 1);
 
-    // shl dword [rax], 0 ; ret -- a memory destination writes no register (its
-    // REG0 slot holds the suppressed RFLAGS operand, which the hook's GPR test
-    // rejects): no concern, fires as before.
+    // shl dword [rax], 0 ; ret -- a memory destination is excluded by the
+    // check itself: removal would delete a memory access, observable through
+    // faults, MMIO side effects, and its racing write-back regardless of the
+    // unchanged value. (The hook's GPR test never mattered here beyond not
+    // crashing on the suppressed RFLAGS in the REG0 slot.)
     static const uint8_t shl_zero_mem[] = {
         0xC1, 0x20, 0x00,        // shl dword [rax], 0
         0xC3,
     };
-    ASSERT_FINDINGS(shl_zero_mem, "redundant shift/rotate by zero", 1);
+    ASSERT_FINDINGS(shl_zero_mem, "redundant shift/rotate by zero", 0);
 }
 
 // Backward peephole: an in-place movzx/movsx/movsxd re-establishing bits the

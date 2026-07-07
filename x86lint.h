@@ -175,7 +175,9 @@ bool check_oversized_lea_width(const xed_decoded_inst_t *xedd);
 // return false if a shift or rotate instruction has an immediate count of 0
 // (value- and flag-preserving per the Intel SDM; hardware still zero-extends
 // a 32-bit destination even at count 0, so the dispatcher gates that form on
-// upper-32 register liveness, cf. check_mov_self)
+// upper-32 register liveness, cf. check_mov_self). Memory destinations are
+// excluded: deleting the instruction deletes a memory access, whose faults,
+// MMIO side effects, and write-back are observable regardless of the value
 bool check_shift_zero(const xed_decoded_inst_t *xedd);
 
 // return false if shl reg, 1 could be add reg, reg -- the same value with

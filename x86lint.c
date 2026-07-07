@@ -1172,9 +1172,24 @@ bool check_shl_one(const xed_decoded_inst_t *xedd)
 // pseudocode skips the destination write, but measured hardware (AMD Zen 5)
 // performs it anyway, zero-extending bits 63:32 -- so the dispatcher gates
 // those on upper-32 liveness (reg0_upper32_concern, cf. check_mov_self).
-// The other widths and memory destinations change no register state under
-// either reading and fire unconditionally. The CL-register form cannot be
-// checked statically.
+// The other register widths change no state under either reading and fire
+// unconditionally. The CL-register form cannot be checked statically.
+//
+// Memory destinations are excluded: removing shl dword [rdi], 0 deletes a
+// memory ACCESS, which is architecturally observable in itself -- the RMW
+// form loads its operand even at count 0 (the pseudocode's tempDEST <- DEST
+// precedes the count loop), requires a writable mapping and can fault, has
+// read and write side effects on MMIO regardless of the value, and its
+// non-atomic write-back can overwrite a racing store. Whether the store
+// cycle fires at count 0 is not architecturally settled (cf. CMPXCHG, whose
+// destination is documented to receive a write cycle regardless of the
+// comparison), and no forward walk can prove any of this dead. This is the
+// same standard the rest of the tool holds: no other finding suggests a
+// rewrite that changes the set of memory accesses. In practice the excluded
+// form is data, not code: every memory-destination count-0 shift in a
+// 2,583-binary /bin sweep was a GHC info table decoding as instructions
+// (c0 00 00 = rol byte [rax], 0), while every genuine finding was a
+// register form.
 bool check_shift_zero(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -1189,6 +1204,10 @@ bool check_shift_zero(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_SHRD:
         break;
     default:
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) != 0) {
         return true;
     }
 
@@ -2198,10 +2217,12 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
 // 64-bit register (measured on hardware even for the count-0 shift, whose SDM
 // pseudocode suggests no write) -- so return that register for those and
 // XED_REG_INVALID (ungated) otherwise: an 8-/16-bit write leaves the
-// surrounding bytes untouched just as its rewrite does, a 64-bit identity
-// write changes nothing, and a memory destination (a shift's, say) writes no
-// register at all -- its REG0 slot holds a suppressed non-GPR like RFLAGS,
-// which the class test rejects.
+// surrounding bytes untouched just as its rewrite does, and a 64-bit identity
+// write changes nothing. The GPR class test is defensive: every sharing check
+// now rejects memory destinations itself (check_shift_zero was the last to
+// pass them through), but a shape that slipped by with no register write
+// would put a suppressed non-GPR like RFLAGS in the REG0 slot, and gating on
+// garbage must fail toward INVALID.
 static xed_reg_enum_t reg0_upper32_concern(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_operand_width(xedd) != 32) {

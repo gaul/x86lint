@@ -230,6 +230,14 @@ static void check_oversized_immediate_test(void)
     CHECK_BYTES( check_oversized_immediate, 0x66, 0xB9, 0x12, 0x00);              // mov cx, 0x12 (no imm8 form)
     CHECK_BYTES( check_oversized_immediate, 0x66, 0x05, 0x12, 0x00);              // add ax, 0x12 (accumulator, 4 bytes: ties imm8 form)
     CHECK_BYTES( check_oversized_immediate, 0x66, 0x81, 0xC0, 0x12, 0x00);        // add ax, 0x12 (modrm: check_implicit_register's finding)
+
+    // Dispatcher wiring: unconditional finding, end-to-end. imm 2 (not 1)
+    // so the CF-gated inc/dec rewrite does not co-fire after the ret.
+    static const uint8_t add2_imm32[] = {
+        0x05, 0x02, 0x00, 0x00, 0x00,  // add eax, 2 (imm32; fits imm8)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(add2_imm32, "oversized immediate", 1);
 }
 
 static void check_oversized_test_immediate_test(void)
@@ -285,6 +293,14 @@ static void check_test_minus_one_test(void)
     CHECK_BYTES( check_test_minus_one, 0x85, 0xc0);                                // test eax, eax
     CHECK_BYTES( check_test_minus_one, 0x83, 0xf0, 0xff);                          // xor eax, -1 (not TEST)
     CHECK_BYTES( check_test_minus_one, 0x90);                                      // nop
+
+    // Dispatcher wiring: flag-exact, so unconditional. Bit 7 is set in the
+    // all-ones mask, keeping check_oversized_test_immediate quiet.
+    static const uint8_t test_allones[] = {
+        0xA9, 0xFF, 0xFF, 0xFF, 0xFF,  // test eax, -1
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(test_allones, "redundant TEST immediate", 1);
 }
 
 static void check_oversized_add_sub_128_test(void)
@@ -360,6 +376,13 @@ static void check_unneeded_rex_test(void)
     CHECK_BYTES( check_unneeded_rex, 0x49, 0x0f, 0xb6, 0xc0);  // movzx rax, r8b (REX.B needed)
     CHECK_BYTES( check_unneeded_rex, 0x49, 0x0f, 0xb6, 0x00);  // movzx rax, byte [r8] (REX.B needed)
     CHECK_BYTES( check_unneeded_rex, 0x48, 0x0f, 0xbe, 0xc3);  // movsx rax, bl (REX.W real; MOVSX sign-extends to 64)
+
+    // Dispatcher wiring: unconditional finding, end-to-end.
+    static const uint8_t rex_leave[] = {
+        0x40, 0xC9,  // rex leave (the prefix does nothing)
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(rex_leave, "unneeded REX prefix", 1);
 }
 
 static void check_mov_zero_test(void)
@@ -382,6 +405,14 @@ static void check_cmp_zero_test(void)
     CHECK_BYTES( check_cmp_zero, 0x80, 0xf8, 0x00);  // cmp al, 0 (modrm form; test does not beat the 3C form)
     CHECK_BYTES( check_cmp_zero, 0x3c, 0x05);        // cmp al, 5 (nonzero, unchanged)
     CHECK_BYTES(!check_cmp_zero, 0x80, 0xfb, 0x00);  // cmp bl, 0 (no AL short form; test bl, bl is smaller)
+
+    // Dispatcher wiring: test edi, edi is flag-exact for cmp edi, 0 (AF is
+    // unobservable in 64-bit mode), so the finding is unconditional.
+    static const uint8_t cmp0_ret[] = {
+        0x83, 0xFF, 0x00,  // cmp edi, 0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(cmp0_ret, "suboptimal CMP zero", 1);
 }
 
 static void check_implicit_register_test(void)
@@ -400,6 +431,15 @@ static void check_implicit_register_test(void)
     CHECK_BYTES( check_implicit_register, 0xa9, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (implicit)
     CHECK_BYTES(!check_implicit_register, 0xf7, 0xc0, 0x01, 0x00, 0x00, 0x00);  // test eax, 1 (explicit)
     CHECK_BYTES( check_implicit_register, 0x66, 0x81, 0xc3, 0x01, 0x00);  // add bx, 1 (16-bit, dest != AX)
+
+    // Dispatcher wiring: unconditional finding, end-to-end. imm 0x100 does
+    // not fit imm8, keeping check_oversized_immediate quiet (and ADD is not
+    // a bit op, keeping check_single_bit_immediate quiet).
+    static const uint8_t add_modrm_acc[] = {
+        0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100 (modrm form)
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(add_modrm_acc, "unneeded explicit register", 1);
 }
 
 static void check_implicit_immediate_test(void)
@@ -418,6 +458,14 @@ static void check_implicit_immediate_test(void)
     CHECK_BYTES(!check_implicit_immediate, 0xc1, 0xf8, 0x01);  // sar eax, 1
     CHECK_BYTES( check_implicit_immediate, 0xc1, 0xe0, 0x01);  // shl eax, 1 (excluded from check)
     CHECK_BYTES( check_implicit_immediate, 0xc1, 0xd0, 0x02);  // rcl eax, 2 (imm != 1)
+
+    // Dispatcher wiring: unconditional finding, end-to-end. RCL (not SHL)
+    // so check_shl_one does not co-fire on the count of 1.
+    static const uint8_t rcl_imm1[] = {
+        0xC1, 0xD0, 0x01,  // rcl eax, 1 (C1 /2 ib; D1 /2 is a byte shorter)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(rcl_imm1, "unneeded explicit immediate", 1);
 }
 
 static void check_and_strength_reduce_test(void)
@@ -496,6 +544,21 @@ static void check_xor_to_not_test(void)
     CHECK_BYTES( check_xor_to_not, 0xf7, 0xd0);                                // not eax (already short)
     CHECK_BYTES( check_xor_to_not, 0x83, 0xc8, 0xff);                          // or eax, -1 (not XOR)
     CHECK_BYTES( check_xor_to_not, 0x90);                                      // nop
+
+    // Dispatcher gating: NOT writes no flags where XOR writes them all, so
+    // the finding needs the arithmetic flags dead -- ret satisfies that.
+    static const uint8_t xornot_ret[] = {
+        0x83, 0xF0, 0xFF,  // xor eax, -1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(xornot_ret, "suboptimal XOR immediate", 1);
+
+    // A downstream ZF reader keeps the XOR's flags live: suppress.
+    static const uint8_t xornot_jz[] = {
+        0x83, 0xF0, 0xFF,  // xor eax, -1
+        0x74, 0x00,        // jz +0
+    };
+    ASSERT_FINDINGS(xornot_jz, "suboptimal XOR immediate", 0);
 }
 
 static void check_single_bit_immediate_test(void)
@@ -570,12 +633,27 @@ static void check_missing_lock_prefix_test(void)
     // missing prefix is not a fixable finding -- do not flag.
     CHECK_BYTES( check_missing_lock_prefix, 0x0f, 0xb1, 0xc3);  // cmpxchg ebx, eax (register dst)
     CHECK_BYTES( check_missing_lock_prefix, 0x0f, 0xc1, 0xc3);  // xadd ebx, eax (register dst)
+
+    // Dispatcher wiring: unconditional finding, end-to-end.
+    static const uint8_t xadd_nolock[] = {
+        0x0F, 0xC1, 0x18,  // xadd [rax], ebx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(xadd_nolock, "missing LOCK prefix", 1);
 }
 
 static void check_superfluous_lock_prefix_test(void)
 {
     CHECK_BYTES(!check_superfluous_lock_prefix, 0xf0, 0x87, 0x07);  // lock xchg [eax], ebx
     CHECK_BYTES( check_superfluous_lock_prefix, 0x87, 0x07);  // xchg [eax], ebx
+
+    // Dispatcher wiring: unconditional finding, end-to-end (the memory form
+    // has no 90+r alternative, so check_xchg_accumulator stays quiet).
+    static const uint8_t lock_xchg[] = {
+        0xF0, 0x87, 0x07,  // lock xchg [rdi], eax (XCHG locks implicitly)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(lock_xchg, "unneeded LOCK prefix", 1);
 }
 
 static void check_xchg_accumulator_test(void)
@@ -600,6 +678,14 @@ static void check_xchg_accumulator_test(void)
     CHECK_BYTES( check_xchg_accumulator, 0x87, 0x07);            // xchg [rdi], eax
     // Not XCHG.
     CHECK_BYTES( check_xchg_accumulator, 0x89, 0xc8);            // mov eax, ecx
+
+    // Dispatcher wiring: unconditional finding, end-to-end (both encodings
+    // zero-extend both registers identically, so no gate applies).
+    static const uint8_t xchg_modrm[] = {
+        0x87, 0xC8,  // xchg eax, ecx (modrm; 91 is one byte)
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(xchg_modrm, "oversized XCHG encoding", 1);
 }
 
 static void check_oversized_branch_test(void)
@@ -632,6 +718,13 @@ static void check_oversized_branch_test(void)
     CHECK_BYTES( check_oversized_branch, 0xe8, 0x00, 0x00, 0x00, 0x00);  // call +0
     // JRCXZ has only rel8 form -- no shorter option exists.
     CHECK_BYTES( check_oversized_branch, 0xe3, 0x00);  // jrcxz +0
+
+    // Dispatcher wiring: unconditional finding, end-to-end.
+    static const uint8_t jmp_rel32[] = {
+        0xE9, 0x00, 0x00, 0x00, 0x00,  // jmp +0 (rel32; rel8 reaches)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(jmp_rel32, "oversized branch displacement", 1);
 }
 
 static void check_mov_self_test(void)
@@ -706,6 +799,14 @@ static void check_and_zero_test(void)
     CHECK_BYTES( check_and_zero, 0x83, 0x20, 0x00);              // and dword ptr [rax], 0 (memory)
     CHECK_BYTES( check_and_zero, 0x83, 0xc8, 0x00);              // or eax, 0 (not AND)
     CHECK_BYTES( check_and_zero, 0x90);                           // nop
+
+    // Dispatcher wiring: xor eax, eax zeroes, zero-extends, and sets flags
+    // exactly as and eax, 0 does, so the finding is unconditional.
+    static const uint8_t and0_ret[] = {
+        0x83, 0xE0, 0x00,  // and eax, 0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(and0_ret, "suboptimal AND zero", 1);
 }
 
 static void check_inc_dec_test(void)
@@ -944,6 +1045,16 @@ static void check_lea_to_mov_test(void)
     // Not LEA.
     CHECK_BYTES( check_lea_to_mov, 0x48, 0x89, 0xd8);            // mov rax, rbx
     CHECK_BYTES( check_lea_to_mov, 0x90);                        // nop
+
+    // Dispatcher wiring: the mov rewrite preserves value and flags exactly,
+    // so it fires unconditionally -- while the same bytes' oversized-LEA-width
+    // candidate stays suppressed (rax's upper half is conservatively live at
+    // ret), pinning that the two checks do not double-report.
+    static const uint8_t lea_bare_base[] = {
+        0x48, 0x8D, 0x03,  // lea rax, [rbx] (mov rax, rbx)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(lea_bare_base, "suboptimal LEA", 1);
 }
 
 static void check_lea_to_add_test(void)
@@ -1054,6 +1165,15 @@ static void check_sub_self_test(void)
     CHECK_BYTES( check_sub_self, 0x31, 0xc0);              // xor eax, eax (not SUB)
     CHECK_BYTES( check_sub_self, 0x29, 0x00);              // sub [rax], eax (memory)
     CHECK_BYTES( check_sub_self, 0x90);                    // nop
+
+    // Dispatcher wiring: xor reg, reg matches sub reg, reg in value, flags
+    // (AF aside, unobservable in 64-bit mode), and zero-extension, so the
+    // finding is unconditional.
+    static const uint8_t sub_self_ret[] = {
+        0x29, 0xC0,  // sub eax, eax
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(sub_self_ret, "suboptimal SUB reg, reg", 1);
 }
 
 static void check_or_and_self_test(void)
@@ -1087,6 +1207,13 @@ static void check_unneeded_movsxd_test(void)
     CHECK_BYTES( check_unneeded_movsxd, 0x48, 0x63, 0x00);  // movsxd rax, [rax] (memory source)
     CHECK_BYTES( check_unneeded_movsxd, 0x48, 0x98);        // cdqe (already short)
     CHECK_BYTES( check_unneeded_movsxd, 0x90);              // nop (not MOVSXD)
+
+    // Dispatcher wiring: cdqe is the identical operation, unconditional.
+    static const uint8_t movsxd_rax[] = {
+        0x48, 0x63, 0xC0,  // movsxd rax, eax (cdqe is 2 bytes)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(movsxd_rax, "unneeded MOVSXD", 1);
 }
 
 static void check_unneeded_movsx_test(void)
@@ -1101,6 +1228,13 @@ static void check_unneeded_movsx_test(void)
     CHECK_BYTES( check_unneeded_movsx, 0x0f, 0xb7, 0xc0);        // movzx eax, ax (MOVZX, not MOVSX)
     CHECK_BYTES( check_unneeded_movsx, 0x98);                    // cwde (already short)
     CHECK_BYTES( check_unneeded_movsx, 0x90);                    // nop (not MOVSX)
+
+    // Dispatcher wiring: cwde is the identical operation, unconditional.
+    static const uint8_t movsx_cwde[] = {
+        0x0F, 0xBF, 0xC0,  // movsx eax, ax (cwde is 1 byte)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(movsx_cwde, "unneeded MOVSX", 1);
 }
 
 static void check_unneeded_zero_displacement_test(void)
@@ -1127,6 +1261,13 @@ static void check_unneeded_zero_displacement_test(void)
     // Multi-byte NOPs deliberately use zero displacement for padding.
     CHECK_BYTES( check_unneeded_zero_displacement, 0x0f, 0x1f, 0x40, 0x00);       // 4-byte NOP [rax+0]
     CHECK_BYTES( check_unneeded_zero_displacement, 0x0f, 0x1f, 0x80, 0,0,0,0);    // 7-byte NOP [rax+0]
+
+    // Dispatcher wiring: same instruction, shorter encoding, unconditional.
+    static const uint8_t disp8_zero[] = {
+        0x01, 0x7E, 0x00,  // add [rsi+0], edi (disp8=0; [rsi] needs none)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(disp8_zero, "unneeded zero displacement", 1);
 }
 
 static void check_oversized_displacement_test(void)
@@ -1164,6 +1305,13 @@ static void check_oversized_displacement_test(void)
     // No memory operand -- nothing to flag.
     CHECK_BYTES( check_oversized_displacement, 0x01, 0xd8);                       // add eax, ebx
     CHECK_BYTES( check_oversized_displacement, 0x90);                            // nop
+
+    // Dispatcher wiring: same instruction, shorter encoding, unconditional.
+    static const uint8_t disp32_small[] = {
+        0x01, 0xBE, 0x10, 0x00, 0x00, 0x00,  // add [rsi+0x10], edi (disp32)
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(disp32_small, "oversized displacement", 1);
 }
 
 static void check_unneeded_sib_test(void)
@@ -1183,6 +1331,15 @@ static void check_unneeded_sib_test(void)
     CHECK_BYTES( check_unneeded_sib, 0xc6, 0x04, 0x05, 0x00, 0x10, 0x00, 0x00, 0x05); // mov [rax+disp32], 5 with index=rax (base=none)
     // No SIB -- nothing to flag.
     CHECK_BYTES( check_unneeded_sib, 0xc6, 0x00, 0x05);                    // mov [rax], 5
+
+    // Dispatcher wiring: same instruction, shorter encoding, unconditional.
+    // The nonzero disp8 keeps the displacement checks quiet, and the memory
+    // destination keeps check_mov_modrm_imm quiet.
+    static const uint8_t sib_rbp[] = {
+        0xC6, 0x44, 0x65, 0x04, 0x05,  // mov byte [rbp+4], 5 (SIB redundant)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(sib_rbp, "unneeded SIB byte", 1);
 }
 
 static void check_mov_modrm_imm_test(void)
@@ -1208,6 +1365,14 @@ static void check_mov_modrm_imm_test(void)
     CHECK_BYTES( check_mov_modrm_imm, 0x89, 0xc3);                                // mov ebx, eax
     // Not a MOV, pass.
     CHECK_BYTES( check_mov_modrm_imm, 0x90);                                      // nop
+
+    // Dispatcher wiring: same instruction, shorter encoding, unconditional.
+    // imm 1 (not 0) keeps check_mov_zero quiet.
+    static const uint8_t mov_modrm[] = {
+        0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1 (C7 /0; B8 saves a byte)
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(mov_modrm, "oversized MOV encoding", 1);
 }
 
 static void check_sse_mov_opcode_test(void)
@@ -1231,6 +1396,13 @@ static void check_sse_mov_opcode_test(void)
     CHECK_BYTES( check_sse_mov_opcode, 0x0f, 0x6f, 0xca);                    // movq mm1, mm2
     // Not an SSE move at all.
     CHECK_BYTES( check_sse_mov_opcode, 0x89, 0xc8);                          // mov eax, ecx
+
+    // Dispatcher wiring: movaps is the identical copy, unconditional.
+    static const uint8_t movdqa_reg[] = {
+        0x66, 0x0F, 0x6F, 0xCA,  // movdqa xmm1, xmm2
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(movdqa_reg, "suboptimal SSE MOV opcode", 1);
 }
 
 static void check_sse_zero_idiom_test(void)
@@ -1291,6 +1463,13 @@ static void check_oversized_evex_test(void)
     CHECK_BYTES( check_oversized_evex, 0xc5, 0xfc, 0x58, 0xca);                          // vaddps ymm1, ymm0, ymm2 (VEX)
     CHECK_BYTES( check_oversized_evex, 0x0f, 0x58, 0xca);                                // addps xmm1, xmm2 (legacy)
     CHECK_BYTES( check_oversized_evex, 0x90);                                            // nop
+
+    // Dispatcher wiring: the VEX re-encoding is identical, unconditional.
+    static const uint8_t evex_ymm[] = {
+        0x62, 0xF1, 0xFD, 0x28, 0x6F, 0xCA,  // vmovdqa64 ymm1, ymm2 (-> vmovdqa)
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(evex_ymm, "oversized EVEX encoding", 1);
 }
 
 static void check_oversized_vex_test(void)
@@ -1321,6 +1500,14 @@ static void check_oversized_vex_test(void)
     CHECK_BYTES( check_oversized_vex, 0x62, 0xf1, 0xfd, 0x28, 0x6f, 0xca);  // vmovdqa64 ymm1, ymm2 (EVEX)
     CHECK_BYTES( check_oversized_vex, 0x0f, 0x28, 0xca);                    // movaps xmm1, xmm2 (legacy)
     CHECK_BYTES( check_oversized_vex, 0x90);                                // nop
+
+    // Dispatcher wiring: the two-byte prefix encodes the same instruction,
+    // unconditional.
+    static const uint8_t vex_c4[] = {
+        0xC4, 0xE1, 0x7D, 0x6F, 0xCA,  // vmovdqa ymm1, ymm2 (C4 -> C5)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(vex_c4, "oversized VEX encoding", 1);
 }
 
 // Flag-liveness gating: check_instructions should suppress findings whose

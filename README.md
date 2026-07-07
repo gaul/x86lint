@@ -156,6 +156,7 @@ and only for flags -- the ABI guarantees they do not survive it.
     fold, since after TEST AL, AL they read ZF alone (gated by register liveness
     on each successor; a direct branch's target is a known offset, so both are
     scanned)
+* suboptimal AND immediate
   - `25 FF000000` (AND EAX, 0xFF) -- use MOVZBL
 * suboptimal AND zero
   - `83E0 00` (AND EAX, 0) -- use XOR EAX, EAX (same flags, fewer bytes)

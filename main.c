@@ -90,6 +90,46 @@ int main(int argc, char **argv)
         goto out;
     }
 
+    // Section headers are read below at a stride of sizeof(Elf64_Shdr), so a
+    // file declaring any other e_shentsize would be misparsed: reject it.
+    // e_shnum is 16 bits; a file with SHN_LORESERVE (0xff00) or more sections
+    // -- e.g. a large -ffunction-sections build -- stores 0 there and the real
+    // count in section header 0's sh_size (extended section numbering).
+    // Without reading that, such a file would scan zero sections and pass as a
+    // clean run. e_shoff == 0 means no section header table at all. The whole
+    // table must fit in the file; checked in two steps to avoid wraparound on
+    // a forged count (cf. the per-section check below), which also bounds the
+    // offset arithmetic in the scan loop.
+    uint64_t shnum = 0;
+    if (ehdr.e_shoff != 0) {
+        if (ehdr.e_shentsize != sizeof(Elf64_Shdr)) {
+            fprintf(stderr, "%s: unexpected section header entry size %u\n",
+                path, ehdr.e_shentsize);
+            goto out;
+        }
+        if (ehdr.e_shoff > file_size) {
+            fprintf(stderr,
+                "%s: section header table offset %lu beyond file size %lu\n",
+                path, (unsigned long) ehdr.e_shoff, (unsigned long) file_size);
+            goto out;
+        }
+        shnum = ehdr.e_shnum;
+        if (shnum == 0) {
+            Elf64_Shdr shdr0;
+            if (!read_at(f, (long) ehdr.e_shoff, &shdr0, sizeof(shdr0))) {
+                fprintf(stderr, "%s: failed to read section header 0\n", path);
+                goto out;
+            }
+            shnum = shdr0.sh_size;
+        }
+        if (shnum > (file_size - ehdr.e_shoff) / sizeof(Elf64_Shdr)) {
+            fprintf(stderr,
+                "%s: section header count %lu overruns the file\n",
+                path, (unsigned long) shnum);
+            goto out;
+        }
+    }
+
     xed_tables_init();
     xed_set_verbosity(0);
 
@@ -98,10 +138,11 @@ int main(int argc, char **argv)
     summary = x86lint_summary_create();
 
     int errors = 0;
-    for (uint16_t i = 0; i < ehdr.e_shnum; ++i) {
+    for (uint64_t i = 0; i < shnum; ++i) {
         Elf64_Shdr shdr;
-        if (!read_at(f, ehdr.e_shoff + (long) i * sizeof(shdr), &shdr, sizeof(shdr))) {
-            fprintf(stderr, "%s: failed to read section header %u\n", path, i);
+        if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)), &shdr, sizeof(shdr))) {
+            fprintf(stderr, "%s: failed to read section header %lu\n", path,
+                (unsigned long) i);
             goto out;
         }
 
@@ -114,8 +155,8 @@ int main(int argc, char **argv)
         if (shdr.sh_offset > file_size ||
             shdr.sh_size > file_size - shdr.sh_offset) {
             fprintf(stderr,
-                "%s: section %u out of bounds (offset %lu size %lu, file %lu)\n",
-                path, i, (unsigned long) shdr.sh_offset,
+                "%s: section %lu out of bounds (offset %lu size %lu, file %lu)\n",
+                path, (unsigned long) i, (unsigned long) shdr.sh_offset,
                 (unsigned long) shdr.sh_size, (unsigned long) file_size);
             goto out;
         }
@@ -127,7 +168,8 @@ int main(int argc, char **argv)
             goto out;
         }
         if (!read_at(f, shdr.sh_offset, buf, shdr.sh_size)) {
-            fprintf(stderr, "%s: failed to read section %u\n", path, i);
+            fprintf(stderr, "%s: failed to read section %lu\n", path,
+                (unsigned long) i);
             goto out;
         }
 

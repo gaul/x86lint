@@ -405,11 +405,12 @@ broken run.
 
 ## References
 
-* [Agner Fog optimization guide](https://www.agner.org/optimize/optimizing_assembly.pdf)
+* [Agner Fog optimization guide](https://www.agner.org/optimize/)
 * [Intel instruction set reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-instruction-set-reference-manual-325383.pdf)
 * [Intel optimization manual](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf)
+* [uops.info](https://uops.info/) — machine-measured latency/throughput/port data per instruction and microarchitecture
 * [Intel x86 encoder decoder](https://github.com/intelxed/xed) - library to parse instructions
-* [armlint](https://github.com/gaul/armlint) - AArch64 equivalent of armlint
+* [armlint](https://github.com/gaul/armlint) - AArch64 equivalent of x86lint
 
 ## License
 

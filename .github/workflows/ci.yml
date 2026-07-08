@@ -8,8 +8,18 @@ on:
 
 jobs:
   build:
+    # GitHub hosts no Fedora runners, so run the job inside a Fedora 44
+    # container on the Ubuntu host.
     runs-on: ubuntu-latest
+    container: fedora:44
+
     steps:
+      # The Fedora base image ships neither a toolchain nor git nor python3
+      # (dnf5 is C++). Install before checkout so actions/checkout finds git
+      # and does a real clone instead of the REST-API tarball fallback.
+      - name: Install build dependencies
+        run: dnf install -y gcc gcc-c++ make git python3
+
       - uses: actions/checkout@v4
 
       - name: Clone XED and mbuild

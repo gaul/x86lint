@@ -20,7 +20,7 @@ jobs:
       - name: Install build dependencies
         run: dnf install -y gcc gcc-c++ make git python3
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Clone XED and mbuild
         run: |

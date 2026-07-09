@@ -263,6 +263,15 @@ and only for flags -- the ABI guarantees they do not survive it.
 * suboptimal OR/AND reg, reg
   - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write;
     the 32-bit form's zero-extension is gated by register liveness)
+* suboptimal SETcc zero-extension
+  - `0F94C0 0FB6C0` (SETZ AL; MOVZX EAX, AL) -- Intel's preferred form zeroes
+    the register ahead of the flag-setting compare (XOR EAX, EAX; CMP ...;
+    SETZ AL), dropping the MOVZX and the partial-register merge it exists to
+    hide. Advisory: the XOR belongs upstream of the flag-setter, whose
+    surroundings a peephole cannot prove safe, so the rewrite is suggested,
+    not verified. Same-register, low-byte, 32/64-bit forms only; rejected
+    when a direct branch targets the MOVZX -- that path's byte was set by
+    something else
 * suboptimal SHL one
   - `D1E0` (SHL EAX, 1) -- ADD EAX, EAX computes the same value with identical
     flags (CF gets the shifted-out bit either way, and OF matches too) in the

@@ -3269,6 +3269,83 @@ static void check_setcc_branch_test(void)
     ASSERT_FINDINGS(widened_test, "redundant TEST after SETcc", 0);
 }
 
+// Advisory window: setcc r8 followed by a movzx of that byte into its own
+// 32/64-bit parent -- Intel's preferred form zeroes the register upstream of
+// the compare instead, dropping the movzx. Matched only in the tight
+// same-register, low-byte, 32/64-bit shape.
+static void check_setcc_movzx_test(void)
+{
+    // setz al ; movzx eax, al -- the canonical widening idiom.
+    static const uint8_t widen[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+    };
+    ASSERT_FINDINGS(widen, "suboptimal SETcc zero-extension", 1);
+
+    // setz cl ; movzx rcx, cl -- the 64-bit destination is the same idiom,
+    // but its REX.W is itself droppable (movzx r32 zero-extends), so the
+    // unneeded-REX check co-fires: assert both categories directly.
+    static const uint8_t widen64[] = {
+        0x0F, 0x94, 0xC1,        // setz cl
+        0x48, 0x0F, 0xB6, 0xC9,  // movzx rcx, cl
+    };
+    int total;
+    assert(count_findings(widen64, sizeof(widen64),
+                          "suboptimal SETcc zero-extension", &total) == 1);
+    assert(total == 2);
+    assert(count_findings(widen64, sizeof(widen64),
+                          "unneeded REX prefix", &total) == 1);
+
+    // movzx into a DIFFERENT register is a real move, not the widening
+    // idiom: the xor form could not replace it.
+    static const uint8_t cross_reg[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x0F, 0xB6, 0xC8,  // movzx ecx, al
+    };
+    ASSERT_FINDINGS(cross_reg, "suboptimal SETcc zero-extension", 0);
+
+    // A high-byte setcc destination puts the value at bits 8-15; the xor
+    // form's setcc writes the low byte: suppress.
+    static const uint8_t high_byte[] = {
+        0x0F, 0x94, 0xC4,  // setz ah
+        0x0F, 0xB6, 0xC4,  // movzx eax, ah
+    };
+    ASSERT_FINDINGS(high_byte, "suboptimal SETcc zero-extension", 0);
+
+    // A 16-bit movzx leaves bits 16-63 the xor form would zero: suppress.
+    static const uint8_t narrow[] = {
+        0x0F, 0x94, 0xC0,        // setz al
+        0x66, 0x0F, 0xB6, 0xC0,  // movzx ax, al
+    };
+    ASSERT_FINDINGS(narrow, "suboptimal SETcc zero-extension", 0);
+
+    // setcc to memory has no register to widen.
+    static const uint8_t mem_dest[] = {
+        0x0F, 0x94, 0x06,  // setz byte [rsi]
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+    };
+    ASSERT_FINDINGS(mem_dest, "suboptimal SETcc zero-extension", 0);
+
+    // An incoming direct edge onto the movzx reaches it without the setcc:
+    // that path's byte was set elsewhere, so zeroing upstream of this setcc
+    // proves nothing for it. Suppress.
+    static const uint8_t edge_on_movzx[] = {
+        0xEB, 0x03,        // 0: jmp 5
+        0x0F, 0x94, 0xC0,  // 2: setz al
+        0x0F, 0xB6, 0xC0,  // 5: movzx eax, al  <- branch target
+    };
+    ASSERT_FINDINGS(edge_on_movzx, "suboptimal SETcc zero-extension", 0);
+
+    // An edge onto the setcc (the window head) executes the whole pattern:
+    // fires.
+    static const uint8_t edge_on_head[] = {
+        0xEB, 0x00,        // 0: jmp 2
+        0x0F, 0x94, 0xC0,  // 2: setz al  <- branch target
+        0x0F, 0xB6, 0xC0,  // 5: movzx eax, al
+    };
+    ASSERT_FINDINGS(edge_on_head, "suboptimal SETcc zero-extension", 1);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -3349,6 +3426,7 @@ int main(int argc, char *argv[])
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();
     check_setcc_branch_test();
+    check_setcc_movzx_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

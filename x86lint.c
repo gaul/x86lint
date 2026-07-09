@@ -3735,6 +3735,93 @@ static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
     return !flags_live_after(inst, len, (size_t) target, FLAG_ARITH);
 }
 
+// Multi-instruction peephole (advisory). setcc into a byte register
+// immediately widened into its own 32/64-bit parent builds a boolean the
+// long way around:
+//
+//   setz al ; movzx eax, al
+//
+// Intel's preferred form zeroes the register ahead of the flag-setting
+// instruction -- xor eax, eax ; cmp ... ; setz al -- dropping the movzx and
+// the partial-register merge it exists to paper over: the setcc's byte write
+// merges into the stale parent, and the movzx spends a uop re-reading that
+// merge (Intel optimization manual, the SETcc dependency-breaking
+// recommendation).
+//
+// Advisory, unlike the window rewrites above: the xor belongs upstream of
+// the flag-setting instruction, outside this window, where a peephole can
+// prove neither the register free nor the xor's flag clobber dead. The
+// sequence is reported as suboptimal with no verified replacement --
+// missing LOCK's precedent -- so no liveness gate applies. Matched tightly
+// so each finding is the real idiom:
+//
+//   * low-byte setcc destination only: under the xor form the result lives
+//     in the low byte, so a high-byte destination (setz ah) is a different
+//     value position;
+//   * movzx destination of 32 or 64 bits, which zero to bit 63 alike (the
+//     32-bit write zero-extends) -- exactly the state the xor form
+//     establishes; a 16-bit movzx (movzx ax, al) leaves bits 16-63 the xor
+//     form would zero;
+//   * the same register only (movzx eax, al): extending into a different
+//     register is a real move, not a widening idiom;
+//   * no incoming direct edge onto the movzx: that path's byte was set by
+//     something other than this setcc, and zeroing upstream of the setcc
+//     proves nothing for it.
+//
+// `setcc` is the already-decoded instruction ending at `movzx_offset`; on a
+// match the movzx is decoded into *movzx_out and the caller reports at
+// movzx_offset, the instruction the preferred form removes.
+static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
+                                    const uint8_t *branch_targets,
+                                    size_t movzx_offset,
+                                    const xed_decoded_inst_t *setcc,
+                                    xed_decoded_inst_t *movzx_out)
+{
+    if (xed_decoded_inst_get_category(setcc) != XED_CATEGORY_SETCC) {
+        return false;
+    }
+    xed_reg_enum_t byte_reg = xed_decoded_inst_get_reg(setcc, XED_OPERAND_REG0);
+    if (xed_reg_class(byte_reg) != XED_REG_CLASS_GPR) {
+        return false;   // setcc to memory has no register destination
+    }
+    switch (byte_reg) {
+    case XED_REG_AH:
+    case XED_REG_CH:
+    case XED_REG_DH:
+    case XED_REG_BH:
+        return false;
+    default:
+        break;
+    }
+
+    // movzx (r32|r64), byte_reg into the same enclosing register.
+    if (movzx_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_zero(movzx_out);
+    xed_decoded_inst_set_mode(movzx_out, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(movzx_out, inst + movzx_offset, len - movzx_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(movzx_out) != XED_ICLASS_MOVZX ||
+        xed_decoded_inst_number_of_memory_operands(movzx_out) > 0 ||
+        xed_decoded_inst_get_reg(movzx_out, XED_OPERAND_REG1) != byte_reg) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(movzx_out);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(movzx_out, XED_OPERAND_REG0);
+    if (xed_get_largest_enclosing_register(dst) !=
+            xed_get_largest_enclosing_register(byte_reg)) {
+        return false;
+    }
+
+    return !branch_target_in(branch_targets, movzx_offset,
+        movzx_offset + xed_decoded_inst_get_length(movzx_out));
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -3926,6 +4013,21 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "redundant TEST after SETcc");
             report_finding("redundant TEST after SETcc", offset, verbose, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole (advisory): setcc X ; movzx of X into
+        // its own 32/64-bit parent. Intel's preferred form zeroes the parent
+        // ahead of the compare instead, dropping the movzx and its
+        // partial-register merge. Reported against the movzx (at `next`),
+        // the instruction the preferred form removes. See
+        // setcc_movzx_zero_extend.
+        xed_decoded_inst_t widen_movzx;
+        if (setcc_movzx_zero_extend(inst, len, branch_targets, next, &xedd,
+                                    &widen_movzx)) {
+            summary_add(summary, "suboptimal SETcc zero-extension");
+            report_finding("suboptimal SETcc zero-extension", next, verbose,
+                &widen_movzx, inst + next);
             ++errors;
         }
 

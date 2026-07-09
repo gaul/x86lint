@@ -3346,6 +3346,87 @@ static void check_setcc_movzx_test(void)
     ASSERT_FINDINGS(edge_on_head, "suboptimal SETcc zero-extension", 1);
 }
 
+// Advisory: POPCNT's destination is a phantom input on Intel through Cascade
+// Lake, so a count into a register the adjacent predecessor did not redefine
+// is flagged -- break the dependency with a zero idiom before the count.
+static void check_popcnt_false_dep_test(void)
+{
+    // Stale destination, register and 64-bit forms: flagged.
+    static const uint8_t pop32[] = {
+        0xF3, 0x0F, 0xB8, 0xC1,  // popcnt eax, ecx
+    };
+    ASSERT_FINDINGS(pop32, "missing POPCNT dependency break", 1);
+
+    static const uint8_t pop64[] = {
+        0xF3, 0x48, 0x0F, 0xB8, 0xC7,  // popcnt rax, rdi
+    };
+    ASSERT_FINDINGS(pop64, "missing POPCNT dependency break", 1);
+
+    // Same register: the dependency is real, and the xor would destroy the
+    // input.
+    static const uint8_t same_reg[] = {
+        0xF3, 0x0F, 0xB8, 0xC0,  // popcnt eax, eax
+    };
+    ASSERT_FINDINGS(same_reg, "missing POPCNT dependency break", 0);
+
+    // 16-bit form: no zero idiom writes only the low word.
+    static const uint8_t narrow[] = {
+        0x66, 0xF3, 0x0F, 0xB8, 0xCA,  // popcnt cx, dx
+    };
+    ASSERT_FINDINGS(narrow, "missing POPCNT dependency break", 0);
+
+    // A memory source addressed through the destination -- as base or index
+    // -- would have its address corrupted by the xor: suppress. Any other
+    // address is fair game.
+    static const uint8_t mem_base[] = {
+        0xF3, 0x0F, 0xB8, 0x00,  // popcnt eax, [rax]
+    };
+    ASSERT_FINDINGS(mem_base, "missing POPCNT dependency break", 0);
+
+    static const uint8_t mem_index[] = {
+        0xF3, 0x0F, 0xB8, 0x0C, 0x48,  // popcnt ecx, [rax+rcx*2]
+    };
+    ASSERT_FINDINGS(mem_index, "missing POPCNT dependency break", 0);
+
+    static const uint8_t mem_ok[] = {
+        0xF3, 0x0F, 0xB8, 0x01,  // popcnt eax, [rcx]
+    };
+    ASSERT_FINDINGS(mem_ok, "missing POPCNT dependency break", 1);
+
+    // xor eax, eax ; popcnt rax, rdi -- gcc's mitigation: the 32-bit zero
+    // idiom redefines the whole register, so the count no longer waits on a
+    // stale value. Suppress.
+    static const uint8_t mitigated[] = {
+        0x31, 0xC0,                    // xor eax, eax
+        0xF3, 0x48, 0x0F, 0xB8, 0xC7,  // popcnt rax, rdi
+    };
+    ASSERT_FINDINGS(mitigated, "missing POPCNT dependency break", 0);
+
+    // Zeroing a DIFFERENT register mitigates nothing.
+    static const uint8_t wrong_reg[] = {
+        0x31, 0xDB,              // xor ebx, ebx
+        0xF3, 0x0F, 0xB8, 0xC1,  // popcnt eax, ecx
+    };
+    ASSERT_FINDINGS(wrong_reg, "missing POPCNT dependency break", 1);
+
+    // A partial (8-bit) write leaves the rest of the register -- and the
+    // dependency -- in place.
+    static const uint8_t partial_write[] = {
+        0x88, 0xD8,              // mov al, bl
+        0xF3, 0x0F, 0xB8, 0xC1,  // popcnt eax, ecx
+    };
+    ASSERT_FINDINGS(partial_write, "missing POPCNT dependency break", 1);
+
+    // lzcnt/tzcnt encodings decode as bsr/bsf under a stray REP prefix
+    // without a target chip -- and bsf/bsr must never be flagged (their
+    // destination dependency is load-bearing: real silicon preserves the
+    // destination on a zero source). Pins the POPCNT-only match.
+    static const uint8_t lzcnt_as_bsr[] = {
+        0xF3, 0x0F, 0xBD, 0xCA,  // lzcnt ecx, edx == bsr under stray rep
+    };
+    ASSERT_FINDINGS(lzcnt_as_bsr, "missing POPCNT dependency break", 0);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -3427,6 +3508,7 @@ int main(int argc, char *argv[])
     check_cmp_one_branch_test();
     check_setcc_branch_test();
     check_setcc_movzx_test();
+    check_popcnt_false_dep_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

@@ -2142,6 +2142,35 @@ static bool reg_kill_iclass(xed_iclass_enum_t iclass)
     }
 }
 
+// True when `xedd` unconditionally redefines the 64-bit GPR reg64: it writes
+// the register's 32-bit form (zero-extending into bits 32-63) or its 64-bit
+// form, with a defined result. Restricted to the reg_kill_iclass whitelist
+// for that whitelist's reasons; omitting an instruction only forgoes the
+// conclusion. The kill step of reg_upper32_live_after, shared with the
+// POPCNT false-dependency suppression.
+static bool redefines_reg_ge32(const xed_decoded_inst_t *xedd,
+                               xed_reg_enum_t reg64)
+{
+    if (!reg_kill_iclass(xed_decoded_inst_get_iclass(xedd))) {
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+            continue;
+        }
+        xed_reg_enum_t wr = xed_decoded_inst_get_reg(xedd, name);
+        if (xed_get_largest_enclosing_register(wr) == reg64 &&
+            xed_get_register_width_bits64(wr) >= 32) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Walk forward from byte `offset` to decide whether bits 32-63 of the 64-bit
 // GPR `reg64` might be read by a downstream instruction before being redefined.
 // Returns true (LIVE) on yes or unknown; the dispatcher suppresses a finding
@@ -2217,19 +2246,8 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
 
         // An unconditional 32- or 64-bit write to the register redefines bits
         // 32-63 independent of their prior value: DEAD.
-        if (reg_kill_iclass(xed_decoded_inst_get_iclass(&xedd))) {
-            for (unsigned i = 0; i < nops; ++i) {
-                const xed_operand_t *op = xed_inst_operand(xi, i);
-                xed_operand_enum_t name = xed_operand_name(op);
-                if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
-                    continue;
-                }
-                xed_reg_enum_t wr = xed_decoded_inst_get_reg(&xedd, name);
-                if (xed_get_largest_enclosing_register(wr) == reg64 &&
-                    xed_get_register_width_bits64(wr) >= 32) {
-                    return false;
-                }
-            }
+        if (redefines_reg_ge32(&xedd, reg64)) {
+            return false;
         }
 
         offset += xed_decoded_inst_get_length(&xedd);
@@ -3822,6 +3840,81 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
         movzx_offset + xed_decoded_inst_get_length(movzx_out));
 }
 
+// Single-instruction advisory with a backward suppression. POPCNT treats
+// its destination as an input on Intel Sandy Bridge through Cascade Lake --
+// uops.info measures 3 cycles of latency from the destination operand,
+// though no core needs the value -- so a count into a stale register
+// serializes behind whatever wrote it last, however unrelated:
+//
+//   popcnt rax, rdi   -- waits for rax's previous producer
+//
+// The mitigation gcc and clang emit is a zero idiom just before:
+// xor eax, eax ; popcnt rax, rdi. That insertion is invisible in the
+// architectural state: the count fully overwrites the destination (dst !=
+// src in every flagged form, and a 32-bit write zero-extends), and POPCNT
+// unconditionally writes every tracked flag -- all zeroed but ZF -- so
+// nothing downstream can see the xor's flag clobber and nothing sits
+// between the two to see it either. Advisory nonetheless: adding an
+// instruction is a size-for-latency trade on the affected cores, not an
+// equivalence rewrite.
+//
+// LZCNT and TZCNT share the erratum (through Broadwell) but not the check:
+// without a target chip, XED decodes their F3 0F BD / F3 0F BC encodings as
+// BSR/BSF under a stray REP prefix, so their iclasses never reach here --
+// and BSF/BSR themselves must never be flagged, since their destination
+// dependency is load-bearing: with a zero source the SDM leaves the
+// destination undefined and real silicon preserves it, which an inserted
+// xor would change to zero.
+//
+// Not flagged:
+//   * same-register forms (popcnt eax, eax): the dependency is real, and
+//     the xor would destroy the input;
+//   * memory sources addressed through the destination (popcnt rax, [rax]):
+//     the xor would corrupt the address;
+//   * 16-bit forms: no zero idiom writes only the low word;
+//   * an RSP destination: between the inserted xor and the count the stack
+//     pointer would be null, exactly where an asynchronous signal delivers;
+//   * a previous instruction that already redefined the register at 32 bits
+//     or wider (`prev`, NULL at the buffer start and after a resync): the
+//     compilers' xor shape, or any adjacent producer -- the dependency is
+//     then at most one instruction stale, and re-flagging mitigated code
+//     would bury the real findings. A direct edge onto the count reaches it
+//     without that predecessor; the suppression forgoes that path's
+//     finding, erring toward false negatives as everywhere else.
+static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
+                             const xed_decoded_inst_t *prev)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_POPCNT) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    xed_reg_enum_t parent = xed_get_largest_enclosing_register(dst);
+    if (parent == XED_REG_RSP) {
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_base_reg(xedd, 0)) == parent ||
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_index_reg(xedd, 0)) == parent) {
+            return false;
+        }
+    } else {
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        if (xed_get_largest_enclosing_register(src) == parent) {
+            return false;
+        }
+    }
+    return prev == NULL || !redefines_reg_ge32(prev, parent);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
@@ -4043,6 +4136,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "redundant re-extension");
             report_finding("redundant re-extension", offset, verbose, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Single-instruction advisory with a backward suppression: a POPCNT
+        // whose destination the adjacent predecessor did not redefine
+        // carries a false output dependency on Intel cores through Cascade
+        // Lake; a zero idiom just before the count breaks it. See
+        // popcnt_false_dep.
+        if (popcnt_false_dep(&xedd, have_prev ? &prev : NULL)) {
+            summary_add(summary, "missing POPCNT dependency break");
+            report_finding("missing POPCNT dependency break", offset, verbose,
+                &xedd, inst + offset);
             ++errors;
         }
 

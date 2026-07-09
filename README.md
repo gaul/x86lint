@@ -116,6 +116,19 @@ and only for flags -- the ABI guarantees they do not survive it.
     [RSI]. Removes the load and its partial-register write; also MOVSX and the
     MOVSXD (32->64) form
 * missing LOCK prefix on CMPXCHG and XADD
+* missing POPCNT dependency break
+  - `F30FB8C1` (POPCNT EAX, ECX) -- on Sandy Bridge through Cascade Lake the
+    destination is a phantom input (uops.info measures 3 cycles of latency
+    from it), serializing independent counts behind the register's last
+    writer. Insert XOR dst, dst just before: the count overwrites the zero
+    and rewrites every arithmetic flag, so the insertion is value- and
+    flag-invisible. Not flagged when the source is the destination (a real
+    dependency the xor would destroy), when memory is addressed through the
+    destination, or when the preceding instruction already redefined the
+    register -- the mitigation gcc and clang emit. LZCNT/TZCNT share the
+    erratum but decode as BSR/BSF under a stray REP prefix without a target
+    chip -- and BSF/BSR must never be flagged: real silicon preserves their
+    destination on a zero source, which the xor would change
 * MOV constant foldable
   - `B905000000 01C8` (MOV ECX, 5; ADD EAX, ECX) -- the constant folds into the
     next instruction's immediate: ADD EAX, 5. Applies to ADD/SUB/ADC/SBB/AND/OR/

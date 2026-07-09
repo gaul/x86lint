@@ -724,6 +724,24 @@ static void check_superfluous_lock_prefix_test(void)
     ASSERT_FINDINGS(lock_xchg, "unneeded LOCK prefix", 1);
 }
 
+// rep ret (F3 C3), the obsolete AMD K8/K10 branch-predictor workaround: the
+// prefix is architecturally ignored, so dropping it is unconditional. Only
+// F3 matches; F2 C3 was MPX's bnd ret, with real semantics on MPX silicon.
+static void check_rep_ret_test(void)
+{
+    CHECK_BYTES_ASM(!check_rep_ret, "ret", 0xF3, 0xC3);          // rep ret
+    CHECK_BYTES_ASM(!check_rep_ret, "ret 0x4", 0xF3, 0xC2, 0x04, 0x00);
+    CHECK_BYTES_ASM( check_rep_ret, "ret", 0xC3);
+    CHECK_BYTES_ASM( check_rep_ret, "ret 0x4", 0xC2, 0x04, 0x00);
+    CHECK_BYTES_ASM( check_rep_ret, "bnd ret", 0xF2, 0xC3);
+
+    // Dispatcher wiring: unconditional finding, end-to-end.
+    static const uint8_t rep_ret[] = {
+        0xF3, 0xC3,  // rep ret
+    };
+    ASSERT_FINDINGS(rep_ret, "unneeded REP prefix on RET", 1);
+}
+
 static void check_xchg_accumulator_test(void)
 {
     // modrm xchg with an accumulator operand -- shrinks to the 1-byte 90+r.
@@ -3504,6 +3522,7 @@ int main(int argc, char *argv[])
     check_single_bit_immediate_test();
     check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
+    check_rep_ret_test();
     check_xchg_accumulator_test();
     check_oversized_branch_test();
     check_mov_self_test();

@@ -334,6 +334,11 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `66 0FBEC0` instead of `66 98` (MOVSX AX, AL -> CBW)
 * unneeded MOVSXD
   - `48 63 C0` instead of `48 98` (MOVSXD RAX, EAX -> CDQE)
+* unneeded REP prefix on RET
+  - `F3C3` instead of `C3` (REP RET, the AMD K8/K10 branch-predictor
+    workaround gcc emitted until GCC 8; every core ignores the prefix and the
+    predictor quirk is gone since Bulldozer and Zen, so dropping the byte is
+    unconditional)
 * unneeded REX prefix
   - XOR RAX, RAX `4831C0` instead of XOR EAX, EAX `31C0`
   - `40C9` instead of `C9` (LEAVE)

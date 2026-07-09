@@ -87,6 +87,12 @@ bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
 // return false if instruction should not have a LOCK prefix
 bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd);
 
+// return false if a near RET carries the ignored F3 (REP) prefix -- the
+// obsolete AMD K8/K10 branch-predictor workaround gcc emitted until GCC 8;
+// dropping it saves the byte unconditionally. F2 (MPX's bnd ret) is not
+// matched
+bool check_rep_ret(const xed_decoded_inst_t *xedd);
+
 // return false if xchg with an accumulator uses the modrm form (87 /r)
 // when the one-byte 90+r form would do
 bool check_xchg_accumulator(const xed_decoded_inst_t *xedd);

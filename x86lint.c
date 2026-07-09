@@ -937,6 +937,25 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
     }
 }
 
+// gcc through version 7 emitted rep ret (F3 C3) for generic tuning: AMD
+// K8/K10 branch predictors mispredicted a one-byte RET that was a branch
+// target or followed a Jcc, and the ignored F3 prefix was AMD's recommended
+// two-byte spelling (Agner Fog's microarchitecture guide). Every core
+// ignores the prefix -- the workaround depended on exactly that -- and the
+// predictor quirk is gone since Bulldozer and Zen, so the byte is pure
+// waste: dropping it is value- and flag-identical, unconditional. Only F3 is
+// matched; F2 C3 was MPX's bnd ret, which carried real bounds semantics on
+// MPX silicon. (A future re-definition of F3 C3, cf. F3 90 becoming PAUSE,
+// is the same accepted residual as the other prefix-dropping checks.)
+bool check_rep_ret(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_RET_NEAR) {
+        return true;
+    }
+    return !xed_operand_values_has_rep_prefix(
+        xed_decoded_inst_operands_const(xedd));
+}
+
 // xchg between a word/dword/qword accumulator (AX/EAX/RAX) and another
 // register has a one-byte 90+r form; the modrm form (87 /r) is one byte
 // longer:
@@ -2688,6 +2707,7 @@ static const struct check_entry checks[] = {
     {check_single_bit_immediate,       "suboptimal single-bit immediate", FLAG_ARITH},
     {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
+    {check_rep_ret,                    "unneeded REP prefix on RET",      0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern, true},

@@ -15,7 +15,10 @@ compiler writers generate better code and documents the complexity of x86.
 
 x86lint is a peephole analyzer. It walks the machine code in a single linear
 sweep -- decoding one instruction at a time in 64-bit long mode with Intel
-XED -- and matches each decoded instruction against a table of checks, every
+XED, with every instruction set XED knows enabled (XED_CHIP_ALL), so a
+chip-gated encoding like LZCNT decodes as itself rather than as its legacy
+alias (BSR under a stray REP prefix) -- and matches each decoded instruction
+against a table of checks, every
 one recognizing a single suboptimal encoding by its opcode, operands, and
 immediate. Matching works on XED's decoded form, so aliases and alternate
 encodings of the same operation are all caught. Most checks inspect a single
@@ -134,10 +137,10 @@ and only for flags -- the ABI guarantees they do not survive it.
     flag-invisible. Not flagged when the source is the destination (a real
     dependency the xor would destroy), when memory is addressed through the
     destination, or when the preceding instruction already redefined the
-    register -- the mitigation gcc and clang emit. LZCNT/TZCNT share the
-    erratum but decode as BSR/BSF under a stray REP prefix without a target
-    chip -- and BSF/BSR must never be flagged: real silicon preserves their
-    destination on a zero source, which the xor would change
+    register -- the mitigation gcc and clang emit. LZCNT and TZCNT (affected
+    through Broadwell) are flagged the same way; their legacy aliases
+    BSF/BSR are never flagged -- real silicon preserves their destination on
+    a zero source, which the xor would change
 * MOV constant foldable
   - `B905000000 01C8` (MOV ECX, 5; ADD EAX, ECX) -- the constant folds into the
     next instruction's immediate: ADD EAX, 5. Applies to ADD/SUB/ADC/SBB/AND/OR/

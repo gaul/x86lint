@@ -134,6 +134,10 @@ static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, si
 
     xed_decoded_inst_zero(xedd);
     xed_decoded_inst_set_mode(xedd, mmode, stack_addr_width);
+    // Match the library's decode_init: fixtures must decode exactly as the
+    // sweep decodes them (XED_CHIP_ALL turns F3 0F BD into LZCNT, not BSR
+    // under a stray REP prefix).
+    xed_decoded_inst_set_input_chip(xedd, XED_CHIP_ALL);
     xed_error_enum_t err = xed_decode(xedd, inst, len);
     assert(err == XED_ERROR_NONE);
 }
@@ -3399,9 +3403,10 @@ static void check_setcc_movzx_test(void)
     ASSERT_FINDINGS(edge_on_head, "suboptimal SETcc zero-extension", 1);
 }
 
-// Advisory: POPCNT's destination is a phantom input on Intel through Cascade
-// Lake, so a count into a register the adjacent predecessor did not redefine
-// is flagged -- break the dependency with a zero idiom before the count.
+// Advisory: POPCNT/LZCNT/TZCNT's destination is a phantom input on affected
+// Intel cores (POPCNT through Cascade Lake, LZCNT/TZCNT through Broadwell),
+// so a count into a register the adjacent predecessor did not redefine is
+// flagged -- break the dependency with a zero idiom before the count.
 static void check_popcnt_false_dep_test(void)
 {
     // Stale destination, register and 64-bit forms: flagged.
@@ -3470,14 +3475,31 @@ static void check_popcnt_false_dep_test(void)
     };
     ASSERT_FINDINGS(partial_write, "missing POPCNT dependency break", 1);
 
-    // lzcnt/tzcnt encodings decode as bsr/bsf under a stray REP prefix
-    // without a target chip -- and bsf/bsr must never be flagged (their
-    // destination dependency is load-bearing: real silicon preserves the
-    // destination on a zero source). Pins the POPCNT-only match.
-    static const uint8_t lzcnt_as_bsr[] = {
-        0xF3, 0x0F, 0xBD, 0xCA,  // lzcnt ecx, edx == bsr under stray rep
+    // lzcnt/tzcnt share the erratum (through Broadwell) and are flagged the
+    // same way -- their encodings decode as themselves now that every
+    // decode sets XED_CHIP_ALL.
+    static const uint8_t lz[] = {
+        0xF3, 0x0F, 0xBD, 0xCA,  // lzcnt ecx, edx
     };
-    ASSERT_FINDINGS(lzcnt_as_bsr, "missing POPCNT dependency break", 0);
+    ASSERT_FINDINGS(lz, "missing POPCNT dependency break", 1);
+
+    static const uint8_t tz[] = {
+        0xF3, 0x0F, 0xBC, 0xCA,  // tzcnt ecx, edx
+    };
+    ASSERT_FINDINGS(tz, "missing POPCNT dependency break", 1);
+
+    // Their legacy aliases BSR/BSF are never flagged: the destination
+    // dependency is load-bearing (with a zero source real silicon preserves
+    // the destination, which the advised xor would change).
+    static const uint8_t bsr[] = {
+        0x0F, 0xBD, 0xCA,  // bsr ecx, edx
+    };
+    ASSERT_FINDINGS(bsr, "missing POPCNT dependency break", 0);
+
+    static const uint8_t bsf[] = {
+        0x0F, 0xBC, 0xCA,  // bsf ecx, edx
+    };
+    ASSERT_FINDINGS(bsf, "missing POPCNT dependency break", 0);
 }
 
 // An undecodable byte (executable sections routinely embed data) must not

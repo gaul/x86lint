@@ -23,6 +23,21 @@
 #include "xed/xed-interface.h"
 #include "x86lint.h"
 
+// Every decode in this file must agree on machine mode AND input chip: the
+// branch-target prepass and the scan proper rely on seeing identical
+// instruction boundaries, and the liveness walks must read the same stream
+// the sweep decoded. XED_CHIP_ALL decodes every instruction XED knows; the
+// chip-less default instead maps chip-gated encodings onto their legacy
+// aliases -- F3 0F BD read as BSR under a stray REP prefix rather than
+// LZCNT -- misattributing iclass, category, and flag behavior.
+static void decode_init(xed_decoded_inst_t *xedd)
+{
+    xed_decoded_inst_zero(xedd);
+    xed_decoded_inst_set_mode(xedd, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    xed_decoded_inst_set_input_chip(xedd, XED_CHIP_ALL);
+}
+
 // TODO: handle 10-15 byte NOPs
 bool check_suboptimal_nops(const uint8_t *inst, size_t len)
 {
@@ -30,13 +45,7 @@ bool check_suboptimal_nops(const uint8_t *inst, size_t len)
 
     for (size_t i = 0; i < len; ) {
         xed_decoded_inst_t xedd;
-
-        // TODO: make these configurable
-        xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
-        xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
-
-        xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        decode_init(&xedd);
         xed_error_enum_t err = xed_decode(&xedd, inst + i, len - i);
         if (err != XED_ERROR_NONE) {
             // An undecodable byte ends the NOP run; it is not itself a
@@ -2129,13 +2138,9 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
     const int MAX_LOOKAHEAD = 16;
     uint32_t live = concerns;
 
-    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
-    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
-
     for (int step = 0; step < MAX_LOOKAHEAD && offset < len && live != 0; ++step) {
         xed_decoded_inst_t xedd;
-        xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        decode_init(&xedd);
         if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
             return true;
         }
@@ -2270,13 +2275,9 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
 {
     const int MAX_LOOKAHEAD = 16;
 
-    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
-    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
-
     for (int step = 0; step < MAX_LOOKAHEAD && offset < len; ++step) {
         xed_decoded_inst_t xedd;
-        xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        decode_init(&xedd);
         if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
             return true;
         }
@@ -2798,13 +2799,9 @@ static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len)
         return NULL;    // branch_target_in treats this as every-offset-hit
     }
 
-    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
-    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
-
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
-        xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        decode_init(&xedd);
         if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
             offset += 1;    // resync exactly as the scan proper does
             continue;
@@ -2889,9 +2886,7 @@ static bool flags_test_redundant(const uint8_t *inst, size_t len,
     if (test_offset >= len) {
         return false;
     }
-    xed_decoded_inst_zero(test_out);
-    xed_decoded_inst_set_mode(test_out, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(test_out);
     if (xed_decode(test_out, inst + test_offset, len - test_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -2941,13 +2936,9 @@ static bool reg_live_after(const uint8_t *inst, size_t len, size_t offset,
 {
     const int MAX_LOOKAHEAD = 16;
 
-    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
-    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
-
     for (int step = 0; step < MAX_LOOKAHEAD && offset < len; ++step) {
         xed_decoded_inst_t xedd;
-        xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        decode_init(&xedd);
         if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
             return true;
         }
@@ -3080,9 +3071,7 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t consumer;
-    xed_decoded_inst_zero(&consumer);
-    xed_decoded_inst_set_mode(&consumer, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&consumer);
     if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3207,9 +3196,7 @@ static bool mov_const_foldable(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t consumer;
-    xed_decoded_inst_zero(&consumer);
-    xed_decoded_inst_set_mode(&consumer, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&consumer);
     if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3353,9 +3340,7 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t ext;
-    xed_decoded_inst_zero(&ext);
-    xed_decoded_inst_set_mode(&ext, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&ext);
     if (xed_decode(&ext, inst + ext_offset, len - ext_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3452,9 +3437,7 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t add;
-    xed_decoded_inst_zero(&add);
-    xed_decoded_inst_set_mode(&add, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&add);
     if (xed_decode(&add, inst + add_offset, len - add_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3600,9 +3583,7 @@ static bool shift_pair_foldable_to_extend(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t sar;
-    xed_decoded_inst_zero(&sar);
-    xed_decoded_inst_set_mode(&sar, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&sar);
     if (xed_decode(&sar, inst + sar_offset, len - sar_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3692,9 +3673,7 @@ static bool cmp_one_branch_foldable(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t jcc;
-    xed_decoded_inst_zero(&jcc);
-    xed_decoded_inst_set_mode(&jcc, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&jcc);
     if (xed_decode(&jcc, inst + jcc_offset, len - jcc_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3775,9 +3754,7 @@ static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t test;
-    xed_decoded_inst_zero(&test);
-    xed_decoded_inst_set_mode(&test, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&test);
     if (xed_decode(&test, inst + test_offset, len - test_offset) !=
             XED_ERROR_NONE ||
         xed_decoded_inst_get_iclass(&test) != XED_ICLASS_TEST ||
@@ -3793,9 +3770,7 @@ static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
         return false;
     }
     xed_decoded_inst_t jcc;
-    xed_decoded_inst_zero(&jcc);
-    xed_decoded_inst_set_mode(&jcc, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(&jcc);
     if (xed_decode(&jcc, inst + jcc_offset, len - jcc_offset) !=
             XED_ERROR_NONE) {
         return false;
@@ -3890,9 +3865,7 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
     if (movzx_offset >= len) {
         return false;
     }
-    xed_decoded_inst_zero(movzx_out);
-    xed_decoded_inst_set_mode(movzx_out, XED_MACHINE_MODE_LONG_64,
-                              XED_ADDRESS_WIDTH_64b);
+    decode_init(movzx_out);
     if (xed_decode(movzx_out, inst + movzx_offset, len - movzx_offset) !=
             XED_ERROR_NONE ||
         xed_decoded_inst_get_iclass(movzx_out) != XED_ICLASS_MOVZX ||
@@ -3914,10 +3887,11 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
         movzx_offset + xed_decoded_inst_get_length(movzx_out));
 }
 
-// Single-instruction advisory with a backward suppression. POPCNT treats
-// its destination as an input on Intel Sandy Bridge through Cascade Lake --
+// Single-instruction advisory with a backward suppression. POPCNT, LZCNT,
+// and TZCNT treat their destination as an input on affected Intel cores --
 // uops.info measures 3 cycles of latency from the destination operand,
-// though no core needs the value -- so a count into a stale register
+// though no core needs the value: POPCNT on Sandy Bridge through Cascade
+// Lake, LZCNT/TZCNT through Broadwell -- so a count into a stale register
 // serializes behind whatever wrote it last, however unrelated:
 //
 //   popcnt rax, rdi   -- waits for rax's previous producer
@@ -3925,20 +3899,19 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
 // The mitigation gcc and clang emit is a zero idiom just before:
 // xor eax, eax ; popcnt rax, rdi. That insertion is invisible in the
 // architectural state: the count fully overwrites the destination (dst !=
-// src in every flagged form, and a 32-bit write zero-extends), and POPCNT
-// unconditionally writes every tracked flag -- all zeroed but ZF -- so
-// nothing downstream can see the xor's flag clobber and nothing sits
-// between the two to see it either. Advisory nonetheless: adding an
-// instruction is a size-for-latency trade on the affected cores, not an
-// equivalence rewrite.
+// src in every flagged form, and a 32-bit write zero-extends), and all
+// three unconditionally write or undefine every tracked flag -- POPCNT
+// zeroes them all but ZF; LZCNT/TZCNT write CF/ZF and undefine the rest,
+// which counts as destroyed here (cf. flags_live_after) -- so nothing
+// downstream can see the xor's flag clobber and nothing sits between the
+// two to see it either. Advisory nonetheless: adding an instruction is a
+// size-for-latency trade on the affected cores, not an equivalence rewrite.
 //
-// LZCNT and TZCNT share the erratum (through Broadwell) but not the check:
-// without a target chip, XED decodes their F3 0F BD / F3 0F BC encodings as
-// BSR/BSF under a stray REP prefix, so their iclasses never reach here --
-// and BSF/BSR themselves must never be flagged, since their destination
-// dependency is load-bearing: with a zero source the SDM leaves the
-// destination undefined and real silicon preserves it, which an inserted
-// xor would change to zero.
+// BSF and BSR -- the legacy encodings whose F3 forms LZCNT/TZCNT occupy,
+// and what those bytes decode to without decode_init's chip -- are NOT
+// flagged, and must never be: their destination dependency is load-bearing.
+// With a zero source the SDM leaves the destination undefined and real
+// silicon preserves it, which an inserted xor would change to zero.
 //
 // Not flagged:
 //   * same-register forms (popcnt eax, eax): the dependency is real, and
@@ -3958,7 +3931,12 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
 static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
                              const xed_decoded_inst_t *prev)
 {
-    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_POPCNT) {
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_POPCNT:
+    case XED_ICLASS_LZCNT:
+    case XED_ICLASS_TZCNT:
+        break;
+    default:
         return false;
     }
     unsigned width = xed_decoded_inst_get_operand_width(xedd);
@@ -3993,8 +3971,6 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary)
 {
     int errors = 0;
-    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
-    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
 
     // The immediately preceding decoded instruction, for the one backward-
     // looking gate (check_mov_self's already-zero-extended case). have_prev is
@@ -4012,8 +3988,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
 
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
-        xed_decoded_inst_zero(&xedd);
-        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        decode_init(&xedd);
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
@@ -4047,8 +4022,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             dump_machine_code(&xedd, inst + offset);
 
             xed_decoded_inst_t xedd2;
-            xed_decoded_inst_zero(&xedd2);
-            xed_decoded_inst_set_mode(&xedd2, mmode, stack_addr_width);
+            decode_init(&xedd2);
             size_t cur_len = xed_decoded_inst_get_length(&xedd);
             xed_decode(&xedd2, inst + offset + cur_len, len - offset - cur_len);
             dump_instruction(&xedd2);
@@ -4213,10 +4187,10 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             ++errors;
         }
 
-        // Single-instruction advisory with a backward suppression: a POPCNT
-        // whose destination the adjacent predecessor did not redefine
-        // carries a false output dependency on Intel cores through Cascade
-        // Lake; a zero idiom just before the count breaks it. See
+        // Single-instruction advisory with a backward suppression: a POPCNT/
+        // LZCNT/TZCNT whose destination the adjacent predecessor did not
+        // redefine carries a false output dependency on affected Intel
+        // cores; a zero idiom just before the count breaks it. See
         // popcnt_false_dep.
         if (popcnt_false_dep(&xedd, have_prev ? &prev : NULL)) {
             summary_add(summary, "missing POPCNT dependency break");

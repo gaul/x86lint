@@ -355,6 +355,41 @@ static void check_oversized_add_sub_128_test(void)
     CHECK_BYTES( check_oversized_add_sub_128, 0x81, 0xE0, 0x80, 0x00, 0x00, 0x00);  // and eax, 128
 }
 
+// Advisory: a 66 prefix that narrows the immediate to 16 bits is a
+// length-changing prefix, stalling Intel's pre-decoder. Matched only for the
+// whitelisted iclasses whose imm16 exists solely under the prefix.
+static void check_lcp_imm16_test(void)
+{
+    // imm16 under a 66 prefix: the length-changing shape, register and
+    // memory destinations alike.
+    CHECK_BYTES_ASM(!check_lcp_imm16, "add cx, 0x1234", 0x66, 0x81, 0xC1, 0x34, 0x12);
+    CHECK_BYTES_ASM(!check_lcp_imm16, "mov cx, 0x1234", 0x66, 0xB9, 0x34, 0x12);
+    CHECK_BYTES_ASM(!check_lcp_imm16, "test ax, 0x1234", 0x66, 0xA9, 0x34, 0x12);
+    CHECK_BYTES_ASM(!check_lcp_imm16, "imul cx, ax, 0x1234", 0x66, 0x69, 0xC8, 0x34, 0x12);
+    CHECK_BYTES_ASM(!check_lcp_imm16, "push 0x1234", 0x66, 0x68, 0x34, 0x12);
+    CHECK_BYTES_ASM(!check_lcp_imm16, "or word ptr [rbx], 0x1234", 0x66, 0x81, 0x0B, 0x34, 0x12);
+
+    // The sign-extended imm8 form is imm8 at any operand size: no length
+    // change (and the value-fits case is oversized-immediate's finding).
+    CHECK_BYTES_ASM(check_lcp_imm16, "add cx, 0x12", 0x66, 0x83, 0xC1, 0x12);
+    // 32-bit operands: no prefix, no stall.
+    CHECK_BYTES_ASM(check_lcp_imm16, "add ecx, 0x1234", 0x81, 0xC1, 0x34, 0x12, 0x00, 0x00);
+    // ret's imm16 is fixed -- no prefix modulates its length.
+    CHECK_BYTES_ASM(check_lcp_imm16, "ret 0x1234", 0xC2, 0x34, 0x12);
+    // enter's imm16 likewise (pins the whitelist).
+    CHECK_BYTES_ASM(check_lcp_imm16, "enter 0x1234, 0x0", 0xC8, 0x34, 0x12, 0x00);
+    // A mandatory-66 SSE opcode: XED reports no operand-size prefix, and no
+    // SSE immediate is 16 bits anyway.
+    CHECK_BYTES_ASM(check_lcp_imm16, "pshufd xmm1, xmm0, 0x1b", 0x66, 0x0F, 0x70, 0xC8, 0x1B);
+
+    // Dispatcher wiring; 0x1234 has no imm8 form, so nothing co-fires.
+    static const uint8_t lcp[] = {
+        0x66, 0x81, 0xC1, 0x34, 0x12,  // add cx, 0x1234
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(lcp, "length-changing prefix stall", 1);
+}
+
 static void check_unneeded_rex_test(void)
 {
     CHECK_BYTES(!check_unneeded_rex, 0x48, 0x31, 0xC0);  // xor rax, rax (could be 31 C0)
@@ -3457,6 +3492,7 @@ int main(int argc, char *argv[])
     check_oversized_test_immediate_test();
     check_test_minus_one_test();
     check_oversized_add_sub_128_test();
+    check_lcp_imm16_test();
     check_unneeded_rex_test();
     check_cmp_zero_test();
     check_mov_zero_test();

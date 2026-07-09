@@ -292,6 +292,59 @@ bool check_oversized_add_sub_128(const xed_decoded_inst_t *xedd)
     return true;
 }
 
+// A 66 operand-size prefix on an instruction whose immediate it narrows to
+// 16 bits changes the instruction's length relative to the same opcode
+// without the prefix -- a "length-changing prefix". Intel's pre-decoder
+// speculates instruction lengths without consulting prefixes and re-walks
+// the bytes when the guess proves wrong, costing ~3 cycles per visit on big
+// cores through the Skylake era (Intel optimization manual, "Length-Changing
+// Prefixes"; mov dx, 0x1234 is the manual's own example):
+//
+//   add cx, 0x1234   66 81 c1 34 12
+//
+// Advisory, like missing LOCK: the clean fix -- a 32-bit operation -- writes
+// bits 16-31 of the destination, and nothing here tracks upper-16 liveness,
+// so no rewrite is claimed. Register and memory forms alike stall (the cost
+// is in pre-decode, before operands matter).
+//
+// The match is an iclass whitelist of exactly the ALU/MOV/PUSH/TEST forms
+// whose imm16 exists only under the prefix, so an instruction with a FIXED
+// 16-bit immediate that no prefix modulates -- ret 0x1234, enter -- cannot
+// match. Mandatory-66 SSE never carries an imm16 (every SSE immediate is a
+// byte), closing that side twice over. The sign-extended imm8 forms are imm8
+// at any operand size -- no length change, not matched -- and a 66-prefixed
+// imm16 whose value would fit that imm8 form is already the oversized-
+// immediate finding, whose narrowing removes the LCP by itself; assemblers
+// emit the imm8 form to begin with, so the overlap is hand-encoded-only and
+// either finding's fix resolves both.
+bool check_lcp_imm16(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_AND:
+    case XED_ICLASS_CMP:
+    case XED_ICLASS_IMUL:
+    case XED_ICLASS_MOV:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_PUSH:
+    case XED_ICLASS_SBB:
+    case XED_ICLASS_SUB:
+    case XED_ICLASS_TEST:
+    case XED_ICLASS_XOR:
+        break;
+    default:
+        return true;
+    }
+    if (xed_decoded_inst_get_immediate_width_bits(xedd) != 16) {
+        return true;
+    }
+    // The whitelisted iclasses reach an imm16 only through the prefix, but
+    // keep the direct test so a decode surprise fails toward no finding.
+    return !xed_operand_values_has_operand_size_prefix(
+        xed_decoded_inst_operands_const(xedd));
+}
+
 // True if this register requires a REX prefix when used as a memory base
 // or index. In 64-bit mode all 64-bit GPRs are valid base/index registers
 // without any REX prefix; only R8-R15 require REX.B/X to encode.
@@ -2622,6 +2675,7 @@ static const struct check_entry checks[] = {
     {check_oversized_test_immediate,   "oversized TEST immediate",        0},
     {check_test_minus_one,             "redundant TEST immediate",        0},
     {check_oversized_add_sub_128,      "oversized ADD/SUB 128",           FLAG_CF},
+    {check_lcp_imm16,                  "length-changing prefix stall",    0},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},
     {check_mov_zero,                   "suboptimal MOV zero",             FLAG_ARITH},

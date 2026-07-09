@@ -40,6 +40,13 @@ bool check_test_minus_one(const xed_decoded_inst_t *xedd);
 // instead of the negated SUB REG, -128 / ADD REG, -128 (3 bytes)
 bool check_oversized_add_sub_128(const xed_decoded_inst_t *xedd);
 
+// return false if a 66 operand-size prefix narrows the instruction's
+// immediate to 16 bits (add cx, 0x1234) -- a length-changing prefix, which
+// stalls Intel's pre-decoder ~3 cycles per visit through the Skylake era.
+// Advisory: the clean fix (32-bit operands) writes bits 16-31, which no
+// liveness here tracks
+bool check_lcp_imm16(const xed_decoded_inst_t *xedd);
+
 // return false if instruction has an unneeded rex prefix
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd);
 

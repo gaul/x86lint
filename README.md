@@ -110,6 +110,15 @@ and only for flags -- the ABI guarantees they do not survive it.
     disappears: MOV RAX, [RDI+RSI*4]. Fires when the LEA's register is dead
     after the fold (overwritten or unused) and the combined address still fits
     one index and a 32-bit displacement (gated by register liveness)
+* length-changing prefix stall
+  - `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
+    immediate's length (imm32 -> imm16) defeats the pre-decoder's length
+    speculation on Intel big cores through the Skylake era, costing ~3 cycles
+    per visit (Intel optimization manual, "Length-Changing Prefixes").
+    Advisory: the clean fix -- 32-bit operands -- needs upper-16 liveness
+    this tool does not track. A 66-prefixed imm16 whose value fits imm8 is
+    already the oversized-immediate finding, whose narrowing removes the LCP
+    by itself
 * load foldable into extend
   - `8A06 0FB6C0` (MOV AL, [RSI]; MOVZX EAX, AL) -- a narrow load then an
     in-place sign/zero-extension is a single extending load: MOVZX EAX, byte

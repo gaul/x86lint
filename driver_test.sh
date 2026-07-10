@@ -111,10 +111,15 @@ if [ "$rc" -gt 1 ]; then
     fail "self-lint of $X86LINT exited $rc"
 fi
 
-# Tool-failure paths: usage, unknown flag, unreadable file, non-ELF input.
+# Tool-failure paths: usage, unknown flag, dangling or unknown -m value,
+# unreadable file, non-ELF input.
 run 2
 expect 'usage:'
 run 2 -x "$dir/finding"
+expect 'usage:'
+run 2 -m
+expect 'usage:'
+run 2 -m sse9 "$dir/finding"
 expect 'usage:'
 run 2 "$dir/does-not-exist"
 run 2 "$dir/finding.s"

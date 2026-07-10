@@ -122,21 +122,35 @@ int main(int argc, char **argv)
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
     bool verbose = false;
     bool scan_all = false;
+    uint32_t extensions = 0;
     const char *path = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "-a") == 0) {
             scan_all = true;
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            ++i;
+            if (strcmp(argv[i], "bmi1") == 0) {
+                extensions |= X86LINT_EXT_BMI1;
+            } else if (strcmp(argv[i], "bmi2") == 0) {
+                extensions |= X86LINT_EXT_BMI2;
+            } else {
+                fprintf(stderr, "usage: %s [-v] [-a] [-m bmi1|bmi2] <ELF_FILE>\n",
+                    argv[0]);
+                return 2;
+            }
         } else if (path == NULL && argv[i][0] != '-') {
             path = argv[i];
         } else {
-            fprintf(stderr, "usage: %s [-v] [-a] <ELF_FILE>\n", argv[0]);
+            fprintf(stderr, "usage: %s [-v] [-a] [-m bmi1|bmi2] <ELF_FILE>\n",
+                argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
-        fprintf(stderr, "usage: %s [-v] [-a] <ELF_FILE>\n", argv[0]);
+        fprintf(stderr, "usage: %s [-v] [-a] [-m bmi1|bmi2] <ELF_FILE>\n",
+            argv[0]);
         return 2;
     }
 
@@ -340,7 +354,8 @@ int main(int argc, char **argv)
                 funcs, nfuncs);
         }
 
-        int n = check_instructions(buf, shdr.sh_size, verbose, summary);
+        int n = check_instructions(buf, shdr.sh_size, verbose, summary,
+            extensions);
         if (n < 0) {
             goto out;
         }

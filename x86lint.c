@@ -2686,6 +2686,12 @@ struct check_entry {
     // there the predecessor's zeros are overwritten either way and prove
     // nothing.
     bool reg_zx_escape;
+    // Instruction-set extensions (enum x86lint_extensions bits) the suggested
+    // replacement requires. The dispatcher skips the row unless the caller
+    // enabled every one of them: on a target not known to support the
+    // extension the finding would not be actionable. 0 (the default) for the
+    // baseline checks, whose replacements any x86-64 CPU executes.
+    uint32_t ext_required;
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
@@ -3968,7 +3974,7 @@ static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
 }
 
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
-                       x86lint_summary *summary)
+                       x86lint_summary *summary, uint32_t extensions)
 {
     int errors = 0;
 
@@ -4034,6 +4040,9 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
 
         size_t next = offset + xed_decoded_inst_get_length(&xedd);
         for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+            if ((checks[i].ext_required & ~extensions) != 0) {
+                continue;
+            }
             if (checks[i].fn(&xedd)) {
                 continue;
             }

@@ -390,7 +390,8 @@ found, which a test can assert is zero:
 int lint(const uint8_t *inst, size_t len)
 {
     xed_tables_init();
-    return check_instructions(inst, len, /*verbose=*/false, /*summary=*/NULL);
+    return check_instructions(inst, len, /*verbose=*/false, /*summary=*/NULL,
+                              /*extensions=*/0);
 }
 ```
 
@@ -399,6 +400,11 @@ The optional `summary` accumulates a by-type tally across one or more runs
 and `verbose` controls whether each opportunity is printed as it is found.
 `x86lint_summary_skipped` reports how many undecodable bytes were skipped, so
 incomplete coverage of a data-laden section is not mistaken for a clean scan.
+`extensions` is a bitwise OR of `enum x86lint_extensions` values
+(`X86LINT_EXT_BMI1`, `X86LINT_EXT_BMI2`) declaring which instruction-set
+extensions the code's target supports; checks that suggest an instruction
+from one of those sets run only when its bit is enabled, and 0 keeps the scan
+to baseline x86-64.
 
 x86lint can also read arbitrary 64-bit ELF executables directly. When the
 binary kept its symbol table (`.symtab`), the scan is restricted to the byte
@@ -436,6 +442,16 @@ oversized immediate at offset: 0x14: push 0x0
   68 00 00 00 00
 ...
 ```
+
+Pass `-m bmi1` and/or `-m bmi2` to declare that the binary's target supports
+those instruction-set extensions, enabling the checks that suggest replacing a
+baseline sequence with a BMI instruction. These are opt-in because the finding
+is only actionable when the target guarantees the extension: a distro binary
+built for x86-64-v2 could not have used ANDN however clear the opportunity,
+and inferring availability from the surrounding bytes is unsound for binaries
+like glibc that keep baseline code and CPU-dispatched BMI-rich variants in the
+same section. The flags are independent, matching their CPUID feature bits:
+`-m bmi2` does not imply `-m bmi1`.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --

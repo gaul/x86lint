@@ -77,7 +77,8 @@ do { \
 // check_instructions's return value -- the total finding count -- into
 // *total_out.
 static int count_findings(const uint8_t *inst, size_t len,
-                          const char *name, int *total_out)
+                          const char *name, int *total_out,
+                          uint32_t extensions)
 {
     char *buf = NULL;
     size_t bufsz = 0;
@@ -89,7 +90,7 @@ static int count_findings(const uint8_t *inst, size_t len,
     stdout = mem;
     // verbose=true so each finding prints its "<name> at offset:" line into
     // the captured buffer for the per-category count below.
-    int total = check_instructions(inst, len, true, NULL);
+    int total = check_instructions(inst, len, true, NULL, extensions);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -114,9 +115,15 @@ static int count_findings(const uint8_t *inst, size_t len,
 // AND no other findings. The second clause catches the common regression
 // pattern where a new check starts firing on the same bytes and silently
 // keeps a total-count assertion happy.
-#define ASSERT_FINDINGS(bytes_arr, category, expected) do { \
+#define ASSERT_FINDINGS(bytes_arr, category, expected) \
+    ASSERT_FINDINGS_EXT(bytes_arr, category, expected, 0)
+
+// ASSERT_FINDINGS with an enabled-extensions mask (enum x86lint_extensions
+// bits), for the checks the dispatcher runs only under -m.
+#define ASSERT_FINDINGS_EXT(bytes_arr, category, expected, ext) do { \
     int _total; \
-    int _cat = count_findings(bytes_arr, sizeof(bytes_arr), category, &_total); \
+    int _cat = count_findings(bytes_arr, sizeof(bytes_arr), category, &_total, \
+                              (ext)); \
     if (_cat != (expected) || _total != (expected)) { \
         fprintf(stderr, \
                 "%s:%d: expected %d \"%s\" finding(s) and no others; " \
@@ -3348,10 +3355,10 @@ static void check_setcc_movzx_test(void)
     };
     int total;
     assert(count_findings(widen64, sizeof(widen64),
-                          "suboptimal SETcc zero-extension", &total) == 1);
+                          "suboptimal SETcc zero-extension", &total, 0) == 1);
     assert(total == 2);
     assert(count_findings(widen64, sizeof(widen64),
-                          "unneeded REX prefix", &total) == 1);
+                          "unneeded REX prefix", &total, 0) == 1);
 
     // movzx into a DIFFERENT register is a real move, not the widening
     // idiom: the xor form could not replace it.
@@ -3515,7 +3522,7 @@ static void check_decode_resync_test(void)
 
     x86lint_summary *summary = x86lint_summary_create();
     assert(summary != NULL);
-    int findings = check_instructions(inst, sizeof(inst), false, summary);
+    int findings = check_instructions(inst, sizeof(inst), false, summary, 0);
     assert(findings == 1);                              // not -1; scan continued
     assert(x86lint_summary_skipped(summary) == 1);      // the one bad byte
     assert(x86lint_summary_instructions(summary) == 2); // nop + push, not the byte
@@ -3637,7 +3644,7 @@ int main(int argc, char *argv[])
     int total = 0;
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
         int count = count_findings(inst, sizeof(inst), expected[i].name,
-                                   &total);
+                                   &total, 0);
         if (count != expected[i].count) {
             printf("Expected %d \"%s\" finding(s), actual: %d\n",
                    expected[i].count, expected[i].name, count);

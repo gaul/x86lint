@@ -239,6 +239,19 @@ size_t x86lint_summary_instructions(const x86lint_summary *summary);
 // and jump tables), so coverage was incomplete. Returns 0 for a NULL summary.
 size_t x86lint_summary_skipped(const x86lint_summary *summary);
 
+// Instruction-set extensions the scanned code's target is known to support.
+// Checks whose suggested replacement is an instruction from one of these sets
+// run only when the caller enables that set: on a target without it the
+// "missed opportunity" is not actionable (the compiler was not allowed to use
+// the instruction), and code built for mixed dispatch -- glibc keeps baseline
+// and BMI-rich ifunc variants in one .text -- makes inferring availability
+// from the surrounding bytes unsound. The bits are independent, matching
+// their CPUID feature flags: bmi2 does not imply bmi1.
+enum x86lint_extensions {
+    X86LINT_EXT_BMI1 = 1u << 0,  // ANDN, BLSI, BLSMSK, BLSR, TZCNT, ...
+    X86LINT_EXT_BMI2 = 1u << 1,  // BZHI, MULX, PDEP, PEXT, RORX, SHLX, ...
+};
+
 // return number of failed checks. An undecodable byte is not fatal: linear
 // sweep skips it and resyncs (executable sections routinely embed data).
 // Skipped bytes are only tallied into the summary, never printed -- a stripped
@@ -247,8 +260,10 @@ size_t x86lint_summary_skipped(const x86lint_summary *summary);
 // followed by its offending encoding; otherwise nothing is printed per finding
 // (the caller's summary is the whole report). If summary is non-NULL, every
 // finding is tallied into it by type and the decoded-instruction and
-// skipped-byte counts are accumulated.
+// skipped-byte counts are accumulated. extensions is a bitwise OR of
+// enum x86lint_extensions values; 0 restricts the scan to baseline x86-64
+// checks.
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
-                       x86lint_summary *summary);
+                       x86lint_summary *summary, uint32_t extensions);
 
 #endif

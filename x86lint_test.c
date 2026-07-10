@@ -3509,6 +3509,120 @@ static void check_popcnt_false_dep_test(void)
     ASSERT_FINDINGS(bsf, "missing POPCNT dependency break", 0);
 }
 
+// not rX ; and rX, rY folds to andn rX, rX, rY -- but only when the caller
+// declared BMI1 available (-m bmi1), and only when PF, which AND defines and
+// ANDN leaves undefined, is dead. See not_and_foldable_to_andn.
+static void check_missing_andn_test(void)
+{
+    // Canonical fold, 32- and 64-bit. Flags die at the RET.
+    static const uint8_t fold32[] = {
+        0xF7, 0xD0,        // not eax
+        0x21, 0xC8,        // and eax, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold32, "missing ANDN", 1, X86LINT_EXT_BMI1);
+    // Without the opt-in the check must not run; nor under bmi2 alone (the
+    // bits are independent, matching their CPUID feature flags).
+    ASSERT_FINDINGS(fold32, "missing ANDN", 0);
+    ASSERT_FINDINGS_EXT(fold32, "missing ANDN", 0, X86LINT_EXT_BMI2);
+
+    static const uint8_t fold64[] = {
+        0x48, 0xF7, 0xD0,  // not rax
+        0x48, 0x21, 0xC8,  // and rax, rcx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold64, "missing ANDN", 1, X86LINT_EXT_BMI1);
+
+    // Same-register source: andn eax, eax, eax computes ~x & x = 0 where the
+    // pair computes ~x. The bytes still total one finding under bmi1 --
+    // check_or_and_self flags the and eax, eax (its upper-32 suppression is
+    // overridden by the zx-escape: prev `not eax` is a 32-bit kill) -- so
+    // assert the two categories directly instead of via ASSERT_FINDINGS_EXT.
+    static const uint8_t same_src[] = {
+        0xF7, 0xD0,        // not eax
+        0x21, 0xC0,        // and eax, eax
+        0xC3,              // ret
+    };
+    int total;
+    assert(count_findings(same_src, sizeof(same_src), "missing ANDN", &total,
+                          X86LINT_EXT_BMI1) == 0);
+    assert(total == 1);
+    assert(count_findings(same_src, sizeof(same_src),
+                          "suboptimal OR/AND reg, reg", &total,
+                          X86LINT_EXT_BMI1) == 1);
+
+    // Immediate mask: ANDN has no immediate form. 0x0f is inert for the
+    // immediate-family checks (not -1/0/0xff, not a single high bit, imm8
+    // already).
+    static const uint8_t imm_mask[] = {
+        0xF7, 0xD0,        // not eax
+        0x83, 0xE0, 0x0F,  // and eax, 0xf
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(imm_mask, "missing ANDN", 0, X86LINT_EXT_BMI1);
+
+    // AND into a different destination: the original leaves ~ecx behind,
+    // which the fold would not compute.
+    static const uint8_t cross_dest[] = {
+        0xF7, 0xD1,        // not ecx
+        0x21, 0xCB,        // and ebx, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(cross_dest, "missing ANDN", 0, X86LINT_EXT_BMI1);
+
+    // Width mismatch: the exact-register match rejects EAX vs RAX.
+    static const uint8_t width_mix[] = {
+        0xF7, 0xD0,        // not eax
+        0x48, 0x21, 0xC8,  // and rax, rcx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(width_mix, "missing ANDN", 0, X86LINT_EXT_BMI1);
+
+    // 16-bit pair: ANDN is 32/64-bit only.
+    static const uint8_t pair16[] = {
+        0x66, 0xF7, 0xD0,  // not ax
+        0x66, 0x21, 0xC8,  // and ax, cx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(pair16, "missing ANDN", 0, X86LINT_EXT_BMI1);
+
+    // Memory operands on either side. The tail case keeps the register match
+    // (XED reports the reg source of `and [mem], reg` in the REG0 slot) so
+    // the memory-operand rejection itself is what stops it.
+    static const uint8_t mem_head[] = {
+        0xF7, 0x16,        // not dword ptr [rsi]
+        0x21, 0xC8,        // and eax, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_head, "missing ANDN", 0, X86LINT_EXT_BMI1);
+    static const uint8_t mem_tail[] = {
+        0xF7, 0xD1,        // not ecx
+        0x21, 0x08,        // and dword ptr [rax], ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_tail, "missing ANDN", 0, X86LINT_EXT_BMI1);
+
+    // PF read downstream: AND defines it, ANDN would not. (The liveness walk
+    // stops at any conditional branch, so the jp suppresses as a branch, not
+    // by matching its PF read -- either way, conservative.)
+    static const uint8_t pf_live[] = {
+        0xF7, 0xD0,        // not eax
+        0x21, 0xC8,        // and eax, ecx
+        0x7A, 0x00,        // jp +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(pf_live, "missing ANDN", 0, X86LINT_EXT_BMI1);
+
+    // A direct branch onto the AND reaches it without the NOT.
+    static const uint8_t edge_on_and[] = {
+        0xEB, 0x02,        // jmp +2 (to the and)
+        0xF7, 0xD0,        // not eax
+        0x21, 0xC8,        // and eax, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_and, "missing ANDN", 0, X86LINT_EXT_BMI1);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -3593,6 +3707,7 @@ int main(int argc, char *argv[])
     check_setcc_branch_test();
     check_setcc_movzx_test();
     check_popcnt_false_dep_test();
+    check_missing_andn_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

@@ -3893,6 +3893,77 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
         movzx_offset + xed_decoded_inst_get_length(movzx_out));
 }
 
+// Multi-instruction peephole (BMI1): NOT feeding a register AND of the same
+// destination,
+//
+//   not eax ; and eax, ecx   ->   andn eax, eax, ecx
+//
+// ANDN computes ~src1 & src2 in one instruction, reading src1's original
+// value, so the pair collapses exactly: both forms write only the
+// destination, and a 32-bit write zero-extends either way. The flag delta is
+// PF alone -- both clear CF/OF and set SF/ZF from the same result, but AND
+// defines PF where ANDN leaves it undefined -- so the fold is suppressed
+// while PF may be read downstream (AF is untracked, and both leave it
+// undefined anyway).
+//
+// Not matched:
+//   * immediate masks (and eax, 0xf): ANDN has no immediate form, so the
+//     mask would need its own register and instruction -- no fold;
+//   * a different AND destination (not ecx ; and ebx, ecx): the original
+//     leaves ~ecx behind, which the fold would not compute, and proving that
+//     value dead needs register liveness this tool does not track;
+//   * a same-register source (not eax ; and eax, eax): andn eax, eax, eax
+//     computes ~x & x = 0 where the pair computes ~x;
+//   * memory operands on either side, and 8/16-bit widths (ANDN is 32/64
+//     only). The exact REG0 match also forces equal operand widths.
+//
+// `not_insn` is the already-decoded instruction ending at `and_offset`; the
+// caller reports at the NOT, where the pair collapses to the single ANDN. A
+// direct branch onto the AND reaches it without the NOT, so the fold is
+// suppressed then, as in every window peephole here.
+static bool not_and_foldable_to_andn(const uint8_t *inst, size_t len,
+                                     const uint8_t *branch_targets,
+                                     size_t and_offset,
+                                     const xed_decoded_inst_t *not_insn)
+{
+    if (xed_decoded_inst_get_iclass(not_insn) != XED_ICLASS_NOT ||
+        xed_decoded_inst_number_of_memory_operands(not_insn) > 0) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(not_insn);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(not_insn, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+
+    if (and_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t and_insn;
+    decode_init(&and_insn);
+    if (xed_decode(&and_insn, inst + and_offset, len - and_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&and_insn) != XED_ICLASS_AND ||
+        xed_decoded_inst_number_of_memory_operands(&and_insn) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(&and_insn) != 0 ||
+        xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG1);
+    if (xed_reg_class(src) != XED_REG_CLASS_GPR || src == dst) {
+        return false;
+    }
+
+    size_t after_and = and_offset + xed_decoded_inst_get_length(&and_insn);
+    if (flags_live_after(inst, len, after_and, FLAG_PF)) {
+        return false;
+    }
+    return !branch_target_in(branch_targets, and_offset, after_and);
+}
+
 // Single-instruction advisory with a backward suppression. POPCNT, LZCNT,
 // and TZCNT treat their destination as an input on affected Intel cores --
 // uops.info measures 3 cycles of latency from the destination operand,
@@ -4178,6 +4249,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "suboptimal SETcc zero-extension");
             report_finding("suboptimal SETcc zero-extension", next, verbose,
                 &widen_movzx, inst + next);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, only when the caller enabled BMI1:
+        // not rX ; and rX, rY collapses to one andn rX, rX, rY. Reported
+        // against the NOT (at `offset`), where the replacement lands. See
+        // not_and_foldable_to_andn.
+        if ((extensions & X86LINT_EXT_BMI1) != 0 &&
+            not_and_foldable_to_andn(inst, len, branch_targets, next, &xedd)) {
+            summary_add(summary, "missing ANDN");
+            report_finding("missing ANDN", offset, verbose, &xedd,
+                inst + offset);
             ++errors;
         }
 

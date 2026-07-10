@@ -73,7 +73,21 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean; do
+# A NOT/AND pair that folds to ANDN: a finding only under -m bmi1 (the ret
+# kills the flags the fold's PF gate watches).
+cat >"$dir/bmi.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xf7, 0xd0                    # not eax
+    .byte 0x21, 0xc8                    # and eax, ecx
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+for f in finding clean bmi; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -103,6 +117,13 @@ expect '^oversized XCHG encoding at offset: 0x5' "-v finding line at 0x5"
 run 0 "$dir/clean"
 expect '^0 optimization opportunities in 3 instructions$'
 reject '^Optimization opportunities by type:$' "by-type table on a clean scan"
+
+# Extension-gated checks: the NOT/AND pair is clean at baseline and a missing
+# ANDN under -m bmi1.
+run 0 "$dir/bmi"
+reject 'missing ANDN' "BMI finding without -m"
+run 1 -m bmi1 "$dir/bmi"
+expect '^ +1 +missing ANDN$' "count of 1 for missing ANDN under -m bmi1"
 
 # A real binary must never be a tool failure (0 or 1 both fine).
 "$X86LINT" "$X86LINT" >/dev/null 2>&1

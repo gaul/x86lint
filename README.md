@@ -127,6 +127,14 @@ and only for flags -- the ABI guarantees they do not survive it.
     in-place sign/zero-extension is a single extending load: MOVZX EAX, byte
     [RSI]. Removes the load and its partial-register write; also MOVSX and the
     MOVSXD (32->64) form
+* missing ANDN (only with `-m bmi1`)
+  - `F7D0 21C8` (NOT EAX; AND EAX, ECX) -- one ANDN EAX, EAX, ECX (BMI1)
+    computes ~x & y directly. An exact fold: both forms write only the
+    destination, SF/ZF come from the same result, and CF/OF are cleared by
+    both; flagged only while PF -- which AND defines and ANDN leaves
+    undefined -- is dead. Immediate masks are not flagged (ANDN has no
+    immediate form), nor is an AND into a different register (the NOT's
+    result would stay live)
 * missing LOCK prefix on CMPXCHG and XADD
 * missing POPCNT dependency break
   - `F30FB8C1` (POPCNT EAX, ECX) -- on Sandy Bridge through Cascade Lake the

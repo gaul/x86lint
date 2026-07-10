@@ -3770,6 +3770,103 @@ static void check_missing_shlx_test(void)
     ASSERT_FINDINGS_EXT(cf_live, "missing SHLX/SHRX/SARX", 0, X86LINT_EXT_BMI2);
 }
 
+// mov rX, [mem] ; bswap rX folds to movbe rX, [mem] -- but only when the
+// caller declared MOVBE available (-m movbe). No liveness gates: none of the
+// three instructions writes a flag, and only the destination register is
+// written, with the identical byte-reversed value. See
+// mov_bswap_foldable_to_movbe.
+static void check_missing_movbe_test(void)
+{
+    // Canonical fold, 32- and 64-bit.
+    static const uint8_t fold32[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x0F, 0xC8,        // bswap eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold32, "missing MOVBE", 1, X86LINT_EXT_MOVBE);
+    // Without the opt-in the check must not run; nor under bmi1 alone (the
+    // bits are independent, matching their CPUID feature flags).
+    ASSERT_FINDINGS(fold32, "missing MOVBE", 0);
+    ASSERT_FINDINGS_EXT(fold32, "missing MOVBE", 0, X86LINT_EXT_BMI1);
+
+    static const uint8_t fold64[] = {
+        0x48, 0x8B, 0x06,  // mov rax, [rsi]
+        0x48, 0x0F, 0xC8,  // bswap rax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold64, "missing MOVBE", 1, X86LINT_EXT_MOVBE);
+
+    // An address using the destination reads the pre-load value in both
+    // forms, so the fold stands.
+    static const uint8_t base_is_dest[] = {
+        0x48, 0x8B, 0x00,  // mov rax, [rax]
+        0x48, 0x0F, 0xC8,  // bswap rax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(base_is_dest, "missing MOVBE", 1, X86LINT_EXT_MOVBE);
+
+    // The swap must hit the loaded register.
+    static const uint8_t wrong_reg[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x0F, 0xC9,        // bswap ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(wrong_reg, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+
+    // Width mismatch: the exact-register match rejects EAX vs RAX.
+    static const uint8_t width_mix[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x48, 0x0F, 0xC8,  // bswap rax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(width_mix, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+
+    // The store direction is never flagged: movbe [rsi], eax would leave
+    // EAX un-swapped where the original leaves it swapped.
+    static const uint8_t store_dir[] = {
+        0x89, 0x06,        // mov [rsi], eax
+        0x0F, 0xC8,        // bswap eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(store_dir, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+
+    // A register-to-register mov has no memory operand to fold.
+    static const uint8_t reg_reg[] = {
+        0x89, 0xC8,        // mov eax, ecx
+        0x0F, 0xC8,        // bswap eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(reg_reg, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+
+    // 16-bit pair: MOVBE r16 exists but BSWAP of a 16-bit register is
+    // SDM-undefined, so the narrow pair is never matched (width gate).
+    static const uint8_t pair16[] = {
+        0x66, 0x8B, 0x06,  // mov ax, [rsi]
+        0x66, 0x0F, 0xC8,  // bswap ax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(pair16, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+
+    // The A1 moffs form loads through a 64-bit absolute address, which
+    // MOVBE (modrm-only) cannot encode.
+    static const uint8_t moffs[] = {
+        0xA1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                           // mov eax, [0x8877665544332211]
+        0x0F, 0xC8,        // bswap eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(moffs, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+
+    // A direct branch onto the BSWAP reaches it without the load.
+    static const uint8_t edge_on_bswap[] = {
+        0xEB, 0x02,        // jmp +2 (to the bswap)
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x0F, 0xC8,        // bswap eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_bswap, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -3857,6 +3954,7 @@ int main(int argc, char *argv[])
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_shlx_test();
+    check_missing_movbe_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

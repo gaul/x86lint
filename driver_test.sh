@@ -73,8 +73,10 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-# A NOT/AND pair that folds to ANDN: a finding only under -m bmi1 (the ret
-# kills the flags the fold's PF gate watches).
+# Two extension-gated patterns in one fixture: a NOT/AND pair that folds to
+# ANDN (a finding only under -m bmi1; the ret kills the flags the fold's PF
+# gate watches) and a load/BSWAP pair that folds to MOVBE (only under
+# -m movbe). Each -m run must see exactly its own finding.
 cat >"$dir/bmi.s" <<'EOF'
     .text
     .globl _start
@@ -82,6 +84,8 @@ cat >"$dir/bmi.s" <<'EOF'
 _start:
     .byte 0xf7, 0xd0                    # not eax
     .byte 0x21, 0xc8                    # and eax, ecx
+    .byte 0x8b, 0x06                    # mov eax, [rsi]
+    .byte 0x0f, 0xc8                    # bswap eax
     .byte 0xc3                          # ret
     .size _start, . - _start
     .section .note.GNU-stack, "", @progbits
@@ -118,12 +122,16 @@ run 0 "$dir/clean"
 expect '^0 optimization opportunities in 3 instructions$'
 reject '^Optimization opportunities by type:$' "by-type table on a clean scan"
 
-# Extension-gated checks: the NOT/AND pair is clean at baseline and a missing
-# ANDN under -m bmi1.
+# Extension-gated checks: the fixture is clean at baseline; each -m enables
+# exactly its own finding (the bits are independent).
 run 0 "$dir/bmi"
-reject 'missing ANDN' "BMI finding without -m"
+reject 'missing' "extension-gated finding without -m"
 run 1 -m bmi1 "$dir/bmi"
 expect '^ +1 +missing ANDN$' "count of 1 for missing ANDN under -m bmi1"
+reject 'missing MOVBE' "MOVBE finding under -m bmi1"
+run 1 -m movbe "$dir/bmi"
+expect '^ +1 +missing MOVBE$' "count of 1 for missing MOVBE under -m movbe"
+reject 'missing ANDN' "ANDN finding under -m movbe"
 
 # A real binary must never be a tool failure (0 or 1 both fine).
 "$X86LINT" "$X86LINT" >/dev/null 2>&1

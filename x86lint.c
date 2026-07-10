@@ -4092,6 +4092,75 @@ static bool lea_and_foldable_to_blsr(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, and_offset, after_and);
 }
 
+// Multi-instruction peephole (MOVBE): a load immediately byte-swapped in
+// place,
+//
+//   mov eax, [rsi] ; bswap eax   ->   movbe eax, [rsi]
+//
+// MOVBE performs the byte-swapping load in one instruction. The fold needs
+// no gate at all: none of the three instructions writes any flag, only the
+// destination register is written -- with the identical byte-reversed value
+// -- and the memory operand is untouched. An address that uses the
+// destination (mov rax, [rax]) reads the pre-load value in both forms, and
+// a 32-bit write zero-extends in both.
+//
+// Not matched:
+//   * the store direction (bswap rX ; mov [mem], rX): movbe [mem], rX would
+//     leave rX un-swapped where the original leaves it swapped, and proving
+//     the swapped value dead needs register liveness this tool does not
+//     track;
+//   * the moffs absolute forms (A1: mov eax, [abs64]), rejected by the
+//     modrm requirement -- MOVBE is modrm-only (0F 38 F0), so a 64-bit
+//     absolute address has no MOVBE encoding (and the 67-prefixed moffs
+//     variant, though encodable via SIB, is the one shape where the fold
+//     would grow the code);
+//   * 8- and 16-bit widths: MOVBE has no 8-bit form and BSWAP of a 16-bit
+//     register is SDM-undefined, so neither side of a narrow pair arises.
+// Every modrm addressing mode the load can carry -- RIP-relative, SIB,
+// disp32-absolute, segment overrides, r8-r15 -- MOVBE encodes identically.
+//
+// `mov` is the already-decoded instruction ending at `bswap_offset`; the
+// caller reports at the MOV, where the pair collapses to the single MOVBE.
+// A direct branch onto the BSWAP reaches it without the load, so the fold
+// is suppressed then, as in every window peephole here.
+static bool mov_bswap_foldable_to_movbe(const uint8_t *inst, size_t len,
+                                        const uint8_t *branch_targets,
+                                        size_t bswap_offset,
+                                        const xed_decoded_inst_t *mov)
+{
+    if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov) != 1 ||
+        !xed_decoded_inst_mem_read(mov, 0) ||
+        xed_decoded_inst_mem_written(mov, 0) ||
+        !xed_operand_values_has_modrm_byte(
+            xed_decoded_inst_operands_const(mov))) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(mov);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+
+    if (bswap_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t bswap;
+    decode_init(&bswap);
+    if (xed_decode(&bswap, inst + bswap_offset, len - bswap_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&bswap) != XED_ICLASS_BSWAP ||
+        xed_decoded_inst_get_reg(&bswap, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+
+    return !branch_target_in(branch_targets, bswap_offset,
+        bswap_offset + xed_decoded_inst_get_length(&bswap));
+}
+
 // Single-instruction advisory with a backward suppression. POPCNT, LZCNT,
 // and TZCNT treat their destination as an input on affected Intel cores --
 // uops.info measures 3 cycles of latency from the destination operand,
@@ -4400,6 +4469,19 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             lea_and_foldable_to_blsr(inst, len, branch_targets, next, &xedd)) {
             summary_add(summary, "missing BLSR");
             report_finding("missing BLSR", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, only when the caller enabled MOVBE:
+        // mov rX, [mem] ; bswap rX collapses to one movbe rX, [mem].
+        // Reported against the MOV (at `offset`), where the replacement
+        // lands. See mov_bswap_foldable_to_movbe.
+        if ((extensions & X86LINT_EXT_MOVBE) != 0 &&
+            mov_bswap_foldable_to_movbe(inst, len, branch_targets, next,
+                                        &xedd)) {
+            summary_add(summary, "missing MOVBE");
+            report_finding("missing MOVBE", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

@@ -135,21 +135,26 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_BMI1;
             } else if (strcmp(argv[i], "bmi2") == 0) {
                 extensions |= X86LINT_EXT_BMI2;
+            } else if (strcmp(argv[i], "movbe") == 0) {
+                extensions |= X86LINT_EXT_MOVBE;
             } else {
-                fprintf(stderr, "usage: %s [-v] [-a] [-m bmi1|bmi2] <ELF_FILE>\n",
+                fprintf(stderr,
+                    "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
         } else if (path == NULL && argv[i][0] != '-') {
             path = argv[i];
         } else {
-            fprintf(stderr, "usage: %s [-v] [-a] [-m bmi1|bmi2] <ELF_FILE>\n",
+            fprintf(stderr,
+                "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
-        fprintf(stderr, "usage: %s [-v] [-a] [-m bmi1|bmi2] <ELF_FILE>\n",
+        fprintf(stderr,
+            "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }

@@ -143,6 +143,16 @@ and only for flags -- the ABI guarantees they do not survive it.
     the AND's destination is the decremented register itself (the original
     keeps source-1 live there)
 * missing LOCK prefix on CMPXCHG and XADD
+* missing MOVBE (only with `-m movbe`)
+  - `8B06 0FC8` (MOV EAX, [RSI]; BSWAP EAX) -- one MOVBE EAX, [RSI] performs
+    the byte-swapping load: one instruction instead of two, never larger.
+    None of the three instructions touches a flag and only the destination
+    register is written, so the fold is exact with no liveness gate at all
+    (uops.info: fused-uop-neutral on Intel big cores, half the ops on Zen).
+    The store direction is never flagged -- MOVBE [RSI], EAX would leave the
+    register un-swapped where the original leaves it swapped -- and neither
+    is the moffs absolute form, whose 64-bit address the modrm-only MOVBE
+    cannot encode
 * missing POPCNT dependency break
   - `F30FB8C1` (POPCNT EAX, ECX) -- on Sandy Bridge through Cascade Lake the
     destination is a phantom input (uops.info measures 3 cycles of latency
@@ -466,16 +476,17 @@ oversized immediate at offset: 0x14: push 0x0
 ...
 ```
 
-Pass `-m bmi1` and/or `-m bmi2` to declare that the binary's target supports
-those instruction-set extensions, enabling the checks that suggest replacing a
-baseline sequence with a BMI instruction (missing ANDN, missing BLSR, missing
-SHLX/SHRX/SARX). These are opt-in because the finding is only actionable when
-the target guarantees the extension: a distro binary built for x86-64-v2 could
-not have used ANDN however clear the opportunity, and inferring availability
-from the surrounding bytes is unsound for binaries like glibc that keep
-baseline code and CPU-dispatched BMI-rich variants in the same section. The
-flags are independent, matching their CPUID feature bits: `-m bmi2` does not
-imply `-m bmi1`.
+Pass `-m bmi1`, `-m bmi2`, and/or `-m movbe` to declare that the binary's
+target supports those instruction-set extensions, enabling the checks that
+suggest replacing a baseline sequence with an instruction from that set
+(missing ANDN, missing BLSR, missing SHLX/SHRX/SARX, missing MOVBE). These
+are opt-in because the finding is only actionable when the target guarantees
+the extension: a distro binary built for x86-64-v2 could not have used ANDN
+however clear the opportunity, and inferring availability from the
+surrounding bytes is unsound for binaries like glibc that keep baseline code
+and CPU-dispatched BMI-rich variants in the same section. The flags are
+independent, matching their CPUID feature bits: `-m bmi2` does not imply
+`-m bmi1`.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --

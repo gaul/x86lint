@@ -260,6 +260,7 @@ size_t x86lint_summary_skipped(const x86lint_summary *summary);
 enum x86lint_extensions {
     X86LINT_EXT_BMI1 = 1u << 0,  // ANDN, BLSI, BLSMSK, BLSR, TZCNT, ...
     X86LINT_EXT_BMI2 = 1u << 1,  // BZHI, MULX, PDEP, PEXT, RORX, SHLX, ...
+    X86LINT_EXT_MOVBE = 1u << 2, // MOVBE (byte-swapping load/store)
 };
 
 // return number of failed checks. An undecodable byte is not fatal: linear

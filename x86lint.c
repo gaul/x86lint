@@ -3964,6 +3964,90 @@ static bool not_and_foldable_to_andn(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, and_offset, after_and);
 }
 
+// Multi-instruction peephole (BMI1): the clear-lowest-set-bit idiom spelled
+// out as a decrement-and-mask,
+//
+//   lea edx, [rax-1] ; and edx, eax   ->   blsr edx, eax
+//
+// BLSR computes src & (src-1) in one instruction. The fold is exact for
+// value: both forms write only the destination, and the 32-bit-destination /
+// 64-bit-base mix is safe because the truncated decrement equals the 32-bit
+// decrement (trunc32(rax-1) == (eax-1) mod 2^32). The flag deltas are CF --
+// AND clears it, BLSR sets it to (source == 0) -- and PF, which AND defines
+// and BLSR leaves undefined; SF/ZF come from the same result value in both,
+// and OF is cleared by both. So the fold is suppressed while CF or PF may be
+// read downstream.
+//
+// Not matched:
+//   * any other displacement, or an index register: the address is not
+//     src-1;
+//   * a non-64-bit base: RIP-relative is not a register decrement, and a
+//     67-prefixed 32-bit base under a 64-bit destination would zero-extend
+//     where BLSR's 64-bit decrement does not;
+//   * an AND whose destination is the LEA's base (lea rax's decrement
+//     already destroyed the source) or whose destination is not the LEA's
+//     (the original leaves rX-1 behind, which the fold would not compute);
+//   * memory or immediate AND forms, and 8/16-bit widths (BLSR is 32/64
+//     only; the exact REG0 match pins the AND to the LEA's width).
+//
+// `lea` is the already-decoded instruction ending at `and_offset`; the
+// caller reports at the LEA, where the pair collapses to the single BLSR. A
+// direct branch onto the AND suppresses, as in every window peephole here.
+static bool lea_and_foldable_to_blsr(const uint8_t *inst, size_t len,
+                                     const uint8_t *branch_targets,
+                                     size_t and_offset,
+                                     const xed_decoded_inst_t *lea)
+{
+    if (xed_decoded_inst_get_iclass(lea) != XED_ICLASS_LEA) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(lea);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(lea, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    // The decremented register: a 64-bit GPR base (rejects RIP-relative and
+    // 67-prefixed 32-bit bases), no index, displacement exactly -1.
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(lea, 0);
+    if (xed_reg_class(base) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(base) != 64 ||
+        xed_decoded_inst_get_index_reg(lea, 0) != XED_REG_INVALID ||
+        xed_decoded_inst_get_memory_displacement(lea, 0) != -1) {
+        return false;
+    }
+    if (xed_get_largest_enclosing_register(dst) == base) {
+        return false;   // the LEA already destroyed the AND's source
+    }
+
+    if (and_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t and_insn;
+    decode_init(&and_insn);
+    if (xed_decode(&and_insn, inst + and_offset, len - and_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&and_insn) != XED_ICLASS_AND ||
+        xed_decoded_inst_number_of_memory_operands(&and_insn) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(&and_insn) != 0 ||
+        xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG1);
+    if (xed_reg_class(src) != XED_REG_CLASS_GPR ||
+        xed_get_largest_enclosing_register(src) != base) {
+        return false;
+    }
+
+    size_t after_and = and_offset + xed_decoded_inst_get_length(&and_insn);
+    if (flags_live_after(inst, len, after_and, FLAG_CF | FLAG_PF)) {
+        return false;
+    }
+    return !branch_target_in(branch_targets, and_offset, after_and);
+}
+
 // Single-instruction advisory with a backward suppression. POPCNT, LZCNT,
 // and TZCNT treat their destination as an input on affected Intel cores --
 // uops.info measures 3 cycles of latency from the destination operand,
@@ -4260,6 +4344,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             not_and_foldable_to_andn(inst, len, branch_targets, next, &xedd)) {
             summary_add(summary, "missing ANDN");
             report_finding("missing ANDN", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, only when the caller enabled BMI1:
+        // lea rY, [rX-1] ; and rY, rX collapses to one blsr rY, rX. Reported
+        // against the LEA (at `offset`), where the replacement lands. See
+        // lea_and_foldable_to_blsr.
+        if ((extensions & X86LINT_EXT_BMI1) != 0 &&
+            lea_and_foldable_to_blsr(inst, len, branch_targets, next, &xedd)) {
+            summary_add(summary, "missing BLSR");
+            report_finding("missing BLSR", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

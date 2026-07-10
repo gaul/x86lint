@@ -135,6 +135,13 @@ and only for flags -- the ABI guarantees they do not survive it.
     undefined -- is dead. Immediate masks are not flagged (ANDN has no
     immediate form), nor is an AND into a different register (the NOT's
     result would stay live)
+* missing BLSR (only with `-m bmi1`)
+  - `8D50FF 21C2` (LEA EDX, [RAX-1]; AND EDX, EAX) -- one BLSR EDX, EAX
+    (BMI1) clears the lowest set bit. Flagged only while CF -- which AND
+    clears but BLSR sets to (source == 0) -- and PF -- defined vs undefined
+    -- are dead; SF/ZF come from the same result either way. Not flagged when
+    the AND's destination is the decremented register itself (the original
+    keeps source-1 live there)
 * missing LOCK prefix on CMPXCHG and XADD
 * missing POPCNT dependency break
   - `F30FB8C1` (POPCNT EAX, ECX) -- on Sandy Bridge through Cascade Lake the

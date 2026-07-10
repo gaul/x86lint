@@ -3623,6 +3623,92 @@ static void check_missing_andn_test(void)
     ASSERT_FINDINGS_EXT(edge_on_and, "missing ANDN", 0, X86LINT_EXT_BMI1);
 }
 
+// lea rY, [rX-1] ; and rY, rX folds to blsr rY, rX (clear lowest set bit) --
+// but only when the caller declared BMI1 available (-m bmi1), and only when
+// CF (AND clears it, BLSR sets it to source==0) and PF (defined vs
+// undefined) are dead. See lea_and_foldable_to_blsr.
+static void check_missing_blsr_test(void)
+{
+    // Canonical fold, 32- and 64-bit. Flags die at the RET.
+    static const uint8_t fold32[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x21, 0xC2,              // and edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(fold32, "missing BLSR", 1, X86LINT_EXT_BMI1);
+    ASSERT_FINDINGS(fold32, "missing BLSR", 0);
+
+    // The 64-bit LEA's REX.W is load-bearing here in two ways: the fold is
+    // 64-bit, and check_oversized_lea_width's predicate does match this LEA
+    // -- the dispatcher suppresses that finding only because the AND reads
+    // RDX, keeping the upper-32 bits live.
+    static const uint8_t fold64[] = {
+        0x48, 0x8D, 0x50, 0xFF,  // lea rdx, [rax-1]
+        0x48, 0x21, 0xC2,        // and rdx, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(fold64, "missing BLSR", 1, X86LINT_EXT_BMI1);
+
+    // Any other displacement is not a decrement.
+    static const uint8_t disp2[] = {
+        0x8D, 0x50, 0xFE,        // lea edx, [rax-2]
+        0x21, 0xC2,              // and edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(disp2, "missing BLSR", 0, X86LINT_EXT_BMI1);
+
+    // An index register makes the address more than src-1.
+    static const uint8_t indexed[] = {
+        0x8D, 0x54, 0x08, 0xFF,  // lea edx, [rax+rcx*1-1]
+        0x21, 0xC2,              // and edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(indexed, "missing BLSR", 0, X86LINT_EXT_BMI1);
+
+    // The AND must mask with the decremented register.
+    static const uint8_t wrong_src[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x21, 0xCA,              // and edx, ecx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(wrong_src, "missing BLSR", 0, X86LINT_EXT_BMI1);
+
+    // Swapped AND: and eax, edx computes the same value into eax, but the
+    // original also leaves rax-1 in edx, which blsr eax, eax would not.
+    static const uint8_t swapped[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x21, 0xD0,              // and eax, edx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(swapped, "missing BLSR", 0, X86LINT_EXT_BMI1);
+
+    // CF read downstream: AND clears it, BLSR sets it to (source == 0).
+    static const uint8_t cf_live[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x21, 0xC2,              // and edx, eax
+        0x72, 0x00,              // jb +0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(cf_live, "missing BLSR", 0, X86LINT_EXT_BMI1);
+
+    // RIP-relative is not a register decrement.
+    static const uint8_t rip_base[] = {
+        0x8D, 0x15, 0xFF, 0xFF, 0xFF, 0xFF,  // lea edx, [rip-1]
+        0x21, 0xC2,                          // and edx, eax
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS_EXT(rip_base, "missing BLSR", 0, X86LINT_EXT_BMI1);
+
+    // A 67-prefixed 32-bit base is rejected outright: under a 64-bit
+    // destination its zero-extended decrement diverges from BLSR's.
+    static const uint8_t base32[] = {
+        0x67, 0x8D, 0x50, 0xFF,  // lea edx, [eax-1]
+        0x21, 0xC2,              // and edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(base32, "missing BLSR", 0, X86LINT_EXT_BMI1);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -3708,6 +3794,7 @@ int main(int argc, char *argv[])
     check_setcc_movzx_test();
     check_popcnt_false_dep_test();
     check_missing_andn_test();
+    check_missing_blsr_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

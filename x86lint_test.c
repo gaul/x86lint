@@ -3709,6 +3709,67 @@ static void check_missing_blsr_test(void)
     ASSERT_FINDINGS_EXT(base32, "missing BLSR", 0, X86LINT_EXT_BMI1);
 }
 
+// shl/shr/sar reg, cl could be the flagless BMI2 shlx/shrx/sarx -- but only
+// when the caller declared BMI2 available (-m bmi2), only when every
+// arithmetic flag is dead, and (32-bit forms) only when the destination's
+// upper 32 bits are dead. See check_missing_shlx.
+static void check_missing_shlx_test(void)
+{
+    // The predicate itself is extension-agnostic; the dispatcher applies the
+    // -m gate and the liveness gates.
+    CHECK_BYTES_ASM(!check_missing_shlx, "shl eax, cl", 0xD3, 0xE0);
+    CHECK_BYTES_ASM(!check_missing_shlx, "shr eax, cl", 0xD3, 0xE8);
+    CHECK_BYTES_ASM(!check_missing_shlx, "sar rax, cl", 0x48, 0xD3, 0xF8);
+    // Immediate and by-1 counts are fixed at encode time; no BMI2 form is
+    // needed or clearer. (shl reg, 1 is check_shl_one's finding, so only the
+    // predicate is exercised here.)
+    CHECK_BYTES_ASM(check_missing_shlx, "shl eax, 0x5", 0xC1, 0xE0, 0x05);
+    CHECK_BYTES_ASM(check_missing_shlx, "shl eax, 0x1", 0xD1, 0xE0);
+    // No 8/16-bit BMI2 shifts exist, and none takes a memory destination.
+    CHECK_BYTES_ASM(check_missing_shlx, "shl al, cl", 0xD2, 0xE0);
+    CHECK_BYTES_ASM(check_missing_shlx, "shl ax, cl", 0x66, 0xD3, 0xE0);
+    CHECK_BYTES_ASM(check_missing_shlx, "shl dword ptr [rsi], cl", 0xD3, 0x26);
+
+    // Dispatcher wiring. The 32-bit positive needs its upper-32 bits killed
+    // downstream (mov eax, ecx) -- at a RET they are conservatively live.
+    static const uint8_t shift32[] = {
+        0xD3, 0xE0,        // shl eax, cl
+        0x89, 0xC8,        // mov eax, ecx (kills EAX: upper-32 dead)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(shift32, "missing SHLX/SHRX/SARX", 1, X86LINT_EXT_BMI2);
+    // Without the opt-in the check must not run; nor under bmi1 alone.
+    ASSERT_FINDINGS(shift32, "missing SHLX/SHRX/SARX", 0);
+    ASSERT_FINDINGS_EXT(shift32, "missing SHLX/SHRX/SARX", 0, X86LINT_EXT_BMI1);
+
+    // 64-bit forms carry no upper-32 concern: at count 0 the rewrite writes
+    // back the same value, which nothing can observe.
+    static const uint8_t shift64[] = {
+        0x48, 0xD3, 0xF8,  // sar rax, cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(shift64, "missing SHLX/SHRX/SARX", 1, X86LINT_EXT_BMI2);
+
+    // The upper-32 gate alone: per the SDM a count-0 shift may leave EAX's
+    // upper bits unwritten where shlx zero-extends, and at a RET they are
+    // conservatively live.
+    static const uint8_t upper_live[] = {
+        0xD3, 0xE0,        // shl eax, cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(upper_live, "missing SHLX/SHRX/SARX", 0,
+                        X86LINT_EXT_BMI2);
+
+    // The flag gate alone (64-bit, so no upper-32 gate): the legacy shift
+    // writes CF for a nonzero count, shlx never would.
+    static const uint8_t cf_live[] = {
+        0x48, 0xD3, 0xE0,  // shl rax, cl
+        0x72, 0x00,        // jb +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(cf_live, "missing SHLX/SHRX/SARX", 0, X86LINT_EXT_BMI2);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -3795,6 +3856,7 @@ int main(int argc, char *argv[])
     check_popcnt_false_dep_test();
     check_missing_andn_test();
     check_missing_blsr_test();
+    check_missing_shlx_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

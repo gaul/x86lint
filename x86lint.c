@@ -1246,6 +1246,49 @@ bool check_shl_one(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// SHL/SHR/SAR with a CL count on a 32/64-bit register have flagless BMI2
+// equivalents: shlx/shrx/sarx take the count in any register and write no
+// flags at all, where the legacy CL forms update CF/OF/SF/ZF/PF (for a
+// nonzero count) and cost flag-merge uops on Intel cores. The dispatcher
+// runs this check only when the caller enabled BMI2 (-m bmi2) and applies
+// two gates:
+//   * every arithmetic flag must be dead -- the legacy form writes them all
+//     for a nonzero count and preserves them at count 0, the BMI2 form never
+//     writes them, so equal flag state needs them unread either way;
+//   * for 32-bit forms, the destination's upper 32 bits must be dead
+//     (reg0_upper32_concern): the SDM's count-0 pseudocode skips the
+//     destination write, so the legacy shift may preserve those bits where
+//     shlx always zero-extends -- the same weaker-guarantee reading as
+//     check_shift_zero, whose comment records that measured hardware
+//     zero-extends anyway.
+// Memory destinations are excluded (the BMI2 forms have none), as are 8- and
+// 16-bit widths (no BMI2 form exists).
+bool check_missing_shlx(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_SHL:
+    case XED_ICLASS_SHR:
+    case XED_ICLASS_SAR:
+        break;
+    default:
+        return true;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(xedd);
+    if (width != 32 && width != 64) {
+        return true;
+    }
+    if (xed_reg_class(xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0)) !=
+            XED_REG_CLASS_GPR) {
+        return true;
+    }
+    // The CL-count forms carry the count register as REG1 (cf.
+    // check_shl_one); the by-1 and imm8 forms do not.
+    return xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1) != XED_REG_CL;
+}
+
 // Shift and rotate instructions with an immediate count of 0 are value- and
 // flag-preserving: the destination keeps its value and per the Intel SDM the
 // flags are explicitly "not affected" when the count is 0. Removal is still
@@ -2735,6 +2778,7 @@ static const struct check_entry checks[] = {
     {check_oversized_lea_width,        "oversized LEA width",             0, lea_width_upper_concern},
     {check_shift_zero,                 "redundant shift/rotate by zero",  0, reg0_upper32_concern, true},
     {check_shl_one,                    "suboptimal SHL one",              0},
+    {check_missing_shlx,               "missing SHLX/SHRX/SARX",          FLAG_ARITH, reg0_upper32_concern, false, X86LINT_EXT_BMI2},
     {check_sse_mov_opcode,             "suboptimal SSE MOV opcode",       0},
     {check_sse_zero_idiom,             "suboptimal SSE zero idiom",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},

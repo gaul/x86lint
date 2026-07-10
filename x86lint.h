@@ -198,6 +198,16 @@ bool check_shift_zero(const xed_decoded_inst_t *xedd);
 // execution ports; unconditional
 bool check_shl_one(const xed_decoded_inst_t *xedd);
 
+// return false if a variable shift (shl/shr/sar reg, cl) could be the
+// flagless BMI2 form (shlx/shrx/sarx), which takes its count in any register
+// and drops the flag-merge cost of CL shifts on Intel cores. The dispatcher
+// runs this only when the caller enabled BMI2 and gates it on the arithmetic
+// flags being dead (the CL form writes them all for a nonzero count; the
+// BMI2 forms write none) and, for 32-bit forms, on upper-32 register
+// liveness (per the SDM a count-0 shift may leave the destination unwritten,
+// where shlx always zero-extends; cf. check_shift_zero)
+bool check_missing_shlx(const xed_decoded_inst_t *xedd);
+
 // return false if a legacy-encoded movapd/movdqa/movupd/movdqu could be
 // movaps/movups, the identical copy without the one-byte 66/F3 prefix
 bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);

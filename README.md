@@ -156,6 +156,14 @@ and only for flags -- the ABI guarantees they do not survive it.
     through Broadwell) are flagged the same way; their legacy aliases
     BSF/BSR are never flagged -- real silicon preserves their destination on
     a zero source, which the xor would change
+* missing SHLX/SHRX/SARX (only with `-m bmi2`)
+  - `D3E0` (SHL EAX, CL) -- SHLX EAX, EAX, ECX (BMI2) shifts without touching
+    any flag, dropping the flag-merge uops CL-count shifts cost on Intel
+    cores, and takes its count from any register. Flagged only while every
+    arithmetic flag is dead (the CL form writes them all for a nonzero count;
+    the BMI2 forms write none) and, for 32-bit forms, while the destination's
+    upper half is dead -- the SDM leaves a count-0 shift writing nothing,
+    where SHLX always zero-extends
 * MOV constant foldable
   - `B905000000 01C8` (MOV ECX, 5; ADD EAX, ECX) -- the constant folds into the
     next instruction's immediate: ADD EAX, 5. Applies to ADD/SUB/ADC/SBB/AND/OR/
@@ -460,13 +468,14 @@ oversized immediate at offset: 0x14: push 0x0
 
 Pass `-m bmi1` and/or `-m bmi2` to declare that the binary's target supports
 those instruction-set extensions, enabling the checks that suggest replacing a
-baseline sequence with a BMI instruction. These are opt-in because the finding
-is only actionable when the target guarantees the extension: a distro binary
-built for x86-64-v2 could not have used ANDN however clear the opportunity,
-and inferring availability from the surrounding bytes is unsound for binaries
-like glibc that keep baseline code and CPU-dispatched BMI-rich variants in the
-same section. The flags are independent, matching their CPUID feature bits:
-`-m bmi2` does not imply `-m bmi1`.
+baseline sequence with a BMI instruction (missing ANDN, missing BLSR, missing
+SHLX/SHRX/SARX). These are opt-in because the finding is only actionable when
+the target guarantees the extension: a distro binary built for x86-64-v2 could
+not have used ANDN however clear the opportunity, and inferring availability
+from the surrounding bytes is unsound for binaries like glibc that keep
+baseline code and CPU-dispatched BMI-rich variants in the same section. The
+flags are independent, matching their CPUID feature bits: `-m bmi2` does not
+imply `-m bmi1`.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --

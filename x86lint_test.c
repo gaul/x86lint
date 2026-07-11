@@ -3709,6 +3709,93 @@ static void check_missing_blsr_test(void)
     ASSERT_FINDINGS_EXT(base32, "missing BLSR", 0, X86LINT_EXT_BMI1);
 }
 
+// lea rY, [rX-1] ; xor rY, rX folds to blsmsk rY, rX (mask through the
+// lowest set bit) -- BLSR's idiom with the AND swapped for an XOR, under
+// the same gates: -m bmi1, and CF (XOR clears it, BLSMSK sets it to
+// source==0) and PF (defined vs undefined) dead. ZF needs no gate: XOR
+// computes it from the result and BLSMSK hardwires 0, but src ^ (src-1) is
+// never zero. See lea_xor_foldable_to_blsmsk.
+static void check_missing_blsmsk_test(void)
+{
+    // Canonical fold, 32- and 64-bit. Flags die at the RET.
+    static const uint8_t fold32[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x31, 0xC2,              // xor edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(fold32, "missing BLSMSK", 1, X86LINT_EXT_BMI1);
+    ASSERT_FINDINGS(fold32, "missing BLSMSK", 0);
+
+    // As in the BLSR fold64: the LEA's REX.W is load-bearing, and
+    // check_oversized_lea_width stays silent only because the XOR reads RDX,
+    // keeping the upper-32 bits live.
+    static const uint8_t fold64[] = {
+        0x48, 0x8D, 0x50, 0xFF,  // lea rdx, [rax-1]
+        0x48, 0x31, 0xC2,        // xor rdx, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(fold64, "missing BLSMSK", 1, X86LINT_EXT_BMI1);
+
+    // Any other displacement is not a decrement.
+    static const uint8_t disp2[] = {
+        0x8D, 0x50, 0xFE,        // lea edx, [rax-2]
+        0x31, 0xC2,              // xor edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(disp2, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+
+    // An index register makes the address more than src-1.
+    static const uint8_t indexed[] = {
+        0x8D, 0x54, 0x08, 0xFF,  // lea edx, [rax+rcx*1-1]
+        0x31, 0xC2,              // xor edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(indexed, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+
+    // The XOR must difference against the decremented register.
+    static const uint8_t wrong_src[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x31, 0xCA,              // xor edx, ecx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(wrong_src, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+
+    // Swapped XOR: xor eax, edx computes the same value into eax, but the
+    // original also leaves rax-1 in edx, which blsmsk eax, eax would not.
+    static const uint8_t swapped[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x31, 0xD0,              // xor eax, edx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(swapped, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+
+    // CF read downstream: XOR clears it, BLSMSK sets it to (source == 0).
+    static const uint8_t cf_live[] = {
+        0x8D, 0x50, 0xFF,        // lea edx, [rax-1]
+        0x31, 0xC2,              // xor edx, eax
+        0x72, 0x00,              // jb +0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(cf_live, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+
+    // RIP-relative is not a register decrement.
+    static const uint8_t rip_base[] = {
+        0x8D, 0x15, 0xFF, 0xFF, 0xFF, 0xFF,  // lea edx, [rip-1]
+        0x31, 0xC2,                          // xor edx, eax
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS_EXT(rip_base, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+
+    // A 67-prefixed 32-bit base is rejected outright: under a 64-bit
+    // destination its zero-extended decrement diverges from BLSMSK's.
+    static const uint8_t base32[] = {
+        0x67, 0x8D, 0x50, 0xFF,  // lea edx, [eax-1]
+        0x31, 0xC2,              // xor edx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(base32, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+}
+
 // shl/shr/sar reg, cl could be the flagless BMI2 shlx/shrx/sarx -- but only
 // when the caller declared BMI2 available (-m bmi2), only when every
 // arithmetic flag is dead, and (32-bit forms) only when the destination's
@@ -3953,6 +4040,7 @@ int main(int argc, char *argv[])
     check_popcnt_false_dep_test();
     check_missing_andn_test();
     check_missing_blsr_test();
+    check_missing_blsmsk_test();
     check_missing_shlx_test();
     check_missing_movbe_test();
     check_decode_resync_test();

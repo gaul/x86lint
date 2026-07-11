@@ -4092,6 +4092,83 @@ static bool lea_and_foldable_to_blsr(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, and_offset, after_and);
 }
 
+// Multi-instruction peephole (BMI1): the mask-through-lowest-set-bit idiom
+// spelled out as a decrement-and-difference,
+//
+//   lea edx, [rax-1] ; xor edx, eax   ->   blsmsk edx, eax
+//
+// BLSMSK computes src ^ (src-1) in one instruction: BLSR's idiom with the
+// AND swapped for an XOR, so the head-side rules are lea_and_foldable_to_
+// blsr's verbatim (displacement exactly -1, no index, 64-bit non-RIP base,
+// destination distinct from the base -- the truncated-decrement argument
+// for the 32-bit-destination / 64-bit-base mix carries over unchanged). The
+// flag deltas are also BLSR's: CF -- XOR clears it, BLSMSK sets it to
+// (source == 0) -- and PF, which XOR defines and BLSMSK leaves undefined.
+// SF comes from the same result in both, OF is cleared by both, and ZF
+// agrees for free: XOR computes it from the result and BLSMSK hardwires it
+// to 0, but src ^ (src-1) is never zero (a zero source yields all-ones, any
+// other contains its lowest set bit). So the fold is suppressed while CF or
+// PF may be read downstream.
+//
+// `lea` is the already-decoded instruction ending at `xor_offset`; the
+// caller reports at the LEA, where the pair collapses to the single BLSMSK.
+// A direct branch onto the XOR suppresses, as in every window peephole
+// here.
+static bool lea_xor_foldable_to_blsmsk(const uint8_t *inst, size_t len,
+                                       const uint8_t *branch_targets,
+                                       size_t xor_offset,
+                                       const xed_decoded_inst_t *lea)
+{
+    if (xed_decoded_inst_get_iclass(lea) != XED_ICLASS_LEA) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(lea);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(lea, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    // The decremented register: a 64-bit GPR base (rejects RIP-relative and
+    // 67-prefixed 32-bit bases), no index, displacement exactly -1.
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(lea, 0);
+    if (xed_reg_class(base) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(base) != 64 ||
+        xed_decoded_inst_get_index_reg(lea, 0) != XED_REG_INVALID ||
+        xed_decoded_inst_get_memory_displacement(lea, 0) != -1) {
+        return false;
+    }
+    if (xed_get_largest_enclosing_register(dst) == base) {
+        return false;   // the LEA already destroyed the XOR's source
+    }
+
+    if (xor_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t xor_insn;
+    decode_init(&xor_insn);
+    if (xed_decode(&xor_insn, inst + xor_offset, len - xor_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&xor_insn) != XED_ICLASS_XOR ||
+        xed_decoded_inst_number_of_memory_operands(&xor_insn) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(&xor_insn) != 0 ||
+        xed_decoded_inst_get_reg(&xor_insn, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(&xor_insn, XED_OPERAND_REG1);
+    if (xed_reg_class(src) != XED_REG_CLASS_GPR ||
+        xed_get_largest_enclosing_register(src) != base) {
+        return false;
+    }
+
+    size_t after_xor = xor_offset + xed_decoded_inst_get_length(&xor_insn);
+    if (flags_live_after(inst, len, after_xor, FLAG_CF | FLAG_PF)) {
+        return false;
+    }
+    return !branch_target_in(branch_targets, xor_offset, after_xor);
+}
+
 // Multi-instruction peephole (MOVBE): a load immediately byte-swapped in
 // place,
 //
@@ -4469,6 +4546,19 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             lea_and_foldable_to_blsr(inst, len, branch_targets, next, &xedd)) {
             summary_add(summary, "missing BLSR");
             report_finding("missing BLSR", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, only when the caller enabled BMI1:
+        // lea rY, [rX-1] ; xor rY, rX collapses to one blsmsk rY, rX.
+        // Reported against the LEA (at `offset`), where the replacement
+        // lands. See lea_xor_foldable_to_blsmsk.
+        if ((extensions & X86LINT_EXT_BMI1) != 0 &&
+            lea_xor_foldable_to_blsmsk(inst, len, branch_targets, next,
+                                       &xedd)) {
+            summary_add(summary, "missing BLSMSK");
+            report_finding("missing BLSMSK", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

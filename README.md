@@ -135,6 +135,13 @@ and only for flags -- the ABI guarantees they do not survive it.
     undefined -- is dead. Immediate masks are not flagged (ANDN has no
     immediate form), nor is an AND into a different register (the NOT's
     result would stay live)
+* missing BLSMSK (only with `-m bmi1`)
+  - `8D50FF 31C2` (LEA EDX, [RAX-1]; XOR EDX, EAX) -- one BLSMSK EDX, EAX
+    (BMI1) builds the mask through the lowest set bit: the BLSR idiom with
+    the AND swapped for an XOR, gated the same way (CF and PF dead). ZF
+    needs no gate -- BLSMSK hardwires it to 0 where XOR computes it, but
+    x ^ (x-1) is never zero. Not flagged when the XOR's destination is the
+    decremented register itself (the original keeps source-1 live there)
 * missing BLSR (only with `-m bmi1`)
   - `8D50FF 21C2` (LEA EDX, [RAX-1]; AND EDX, EAX) -- one BLSR EDX, EAX
     (BMI1) clears the lowest set bit. Flagged only while CF -- which AND
@@ -479,7 +486,8 @@ oversized immediate at offset: 0x14: push 0x0
 Pass `-m bmi1`, `-m bmi2`, and/or `-m movbe` to declare that the binary's
 target supports those instruction-set extensions, enabling the checks that
 suggest replacing a baseline sequence with an instruction from that set
-(missing ANDN, missing BLSR, missing SHLX/SHRX/SARX, missing MOVBE). These
+(missing ANDN, missing BLSMSK, missing BLSR, missing SHLX/SHRX/SARX,
+missing MOVBE). These
 are opt-in because the finding is only actionable when the target guarantees
 the extension: a distro binary built for x86-64-v2 could not have used ANDN
 however clear the opportunity, and inferring availability from the

@@ -4169,6 +4169,98 @@ static bool lea_xor_foldable_to_blsmsk(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, xor_offset, after_xor);
 }
 
+// Multi-instruction peephole (BMI1, three instructions): the
+// isolate-lowest-set-bit idiom, which needs a copy in baseline code because
+// x and -x must coexist,
+//
+//   mov ecx, edi ; neg ecx ; and ecx, edi   ->   blsi ecx, edi
+//
+// BLSI computes src & -src in one instruction, so the whole triple -- copy
+// included -- collapses. The fold is exact for value: both forms write only
+// the destination, with the identical result, the source register is
+// preserved by both, and a 32-bit write zero-extends in all four
+// instructions. The NEG's intermediate flags are unobservable: nothing sits
+// between it and the AND, which rewrites every tracked flag (AF is
+// untracked; NEG defines it where AND leaves it undefined). The final flag
+// deltas are the family's usual pair: CF -- AND clears it, BLSI sets it to
+// (source != 0) -- and PF, which AND defines and BLSI leaves undefined;
+// SF/ZF come from the same result in both, and OF is cleared by both. So
+// the fold is suppressed while CF or PF may be read downstream.
+//
+// Not matched:
+//   * a copy aliasing its source (mov ecx, ecx): the NEG then destroys the
+//     original, and the AND computes -x & -x = -x, not x & -x;
+//   * an AND whose destination is the source register (and edi, ecx): the
+//     original leaves -x behind in the copy, which the fold would not
+//     compute, and proving that value dead needs register liveness this
+//     tool does not track;
+//   * memory or immediate forms in any slot, and 8/16-bit widths (BLSI is
+//     32/64 only). The exact REG0/REG1 matches pin all three instructions
+//     to one width and one register pair.
+//
+// `mov` is the already-decoded instruction ending at `neg_offset`; the
+// caller reports at the MOV, where the triple collapses to the single
+// BLSI. A direct branch onto the NEG or the AND reaches a partial idiom,
+// so the fold is suppressed then, as in every window peephole here.
+static bool mov_neg_and_foldable_to_blsi(const uint8_t *inst, size_t len,
+                                         const uint8_t *branch_targets,
+                                         size_t neg_offset,
+                                         const xed_decoded_inst_t *mov)
+{
+    if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(mov) != 0) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(mov);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG1);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR ||
+        xed_reg_class(src) != XED_REG_CLASS_GPR || src == dst) {
+        return false;
+    }
+
+    // neg of the copy.
+    if (neg_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t neg;
+    decode_init(&neg);
+    if (xed_decode(&neg, inst + neg_offset, len - neg_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&neg) != XED_ICLASS_NEG ||
+        xed_decoded_inst_number_of_memory_operands(&neg) > 0 ||
+        xed_decoded_inst_get_reg(&neg, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+
+    // and of the negated copy with the preserved source.
+    size_t and_offset = neg_offset + xed_decoded_inst_get_length(&neg);
+    if (and_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t and_insn;
+    decode_init(&and_insn);
+    if (xed_decode(&and_insn, inst + and_offset, len - and_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&and_insn) != XED_ICLASS_AND ||
+        xed_decoded_inst_number_of_memory_operands(&and_insn) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(&and_insn) != 0 ||
+        xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG0) != dst ||
+        xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG1) != src) {
+        return false;
+    }
+
+    size_t after_and = and_offset + xed_decoded_inst_get_length(&and_insn);
+    if (flags_live_after(inst, len, after_and, FLAG_CF | FLAG_PF)) {
+        return false;
+    }
+    return !branch_target_in(branch_targets, neg_offset, after_and);
+}
+
 // Multi-instruction peephole (MOVBE): a load immediately byte-swapped in
 // place,
 //
@@ -4559,6 +4651,19 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                                        &xedd)) {
             summary_add(summary, "missing BLSMSK");
             report_finding("missing BLSMSK", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, only when the caller enabled BMI1:
+        // mov rY, rX ; neg rY ; and rY, rX collapses to one blsi rY, rX.
+        // Reported against the MOV (at `offset`), where the replacement
+        // lands. See mov_neg_and_foldable_to_blsi.
+        if ((extensions & X86LINT_EXT_BMI1) != 0 &&
+            mov_neg_and_foldable_to_blsi(inst, len, branch_targets, next,
+                                         &xedd)) {
+            summary_add(summary, "missing BLSI");
+            report_finding("missing BLSI", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

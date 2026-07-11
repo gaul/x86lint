@@ -3796,6 +3796,153 @@ static void check_missing_blsmsk_test(void)
     ASSERT_FINDINGS_EXT(base32, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
 }
 
+// mov rY, rX ; neg rY ; and rY, rX folds to blsi rY, rX (isolate the lowest
+// set bit), collapsing the whole triple, copy included -- but only when the
+// caller declared BMI1 available (-m bmi1), and only when CF (AND clears
+// it, BLSI sets it to source != 0) and PF (defined vs undefined) are dead.
+// See mov_neg_and_foldable_to_blsi.
+static void check_missing_blsi_test(void)
+{
+    // Canonical fold, 32- and 64-bit. Flags die at the RET.
+    static const uint8_t fold32[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xF9,        // and ecx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold32, "missing BLSI", 1, X86LINT_EXT_BMI1);
+    // Without the opt-in the check must not run; nor under bmi2 alone (the
+    // bits are independent, matching their CPUID feature flags).
+    ASSERT_FINDINGS(fold32, "missing BLSI", 0);
+    ASSERT_FINDINGS_EXT(fold32, "missing BLSI", 0, X86LINT_EXT_BMI2);
+
+    static const uint8_t fold64[] = {
+        0x48, 0x89, 0xF8,  // mov rax, rdi
+        0x48, 0xF7, 0xD8,  // neg rax
+        0x48, 0x21, 0xF8,  // and rax, rdi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold64, "missing BLSI", 1, X86LINT_EXT_BMI1);
+
+    // A copy aliasing its source: the NEG destroys the original, so the AND
+    // computes -x & -x = -x, not x & -x. The bytes still total two findings
+    // under bmi1 -- check_mov_self flags the mov ecx, ecx and
+    // check_or_and_self the and ecx, ecx (each upper-32 suppression is
+    // overridden by the zx-escape: the neighboring 32-bit write is a kill)
+    // -- so assert the categories directly instead of via
+    // ASSERT_FINDINGS_EXT.
+    static const uint8_t aliased[] = {
+        0x89, 0xC9,        // mov ecx, ecx
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xC9,        // and ecx, ecx
+        0xC3,              // ret
+    };
+    int total;
+    assert(count_findings(aliased, sizeof(aliased), "missing BLSI", &total,
+                          X86LINT_EXT_BMI1) == 0);
+    assert(total == 2);
+    assert(count_findings(aliased, sizeof(aliased),
+                          "redundant MOV reg, reg", &total,
+                          X86LINT_EXT_BMI1) == 1);
+    assert(count_findings(aliased, sizeof(aliased),
+                          "suboptimal OR/AND reg, reg", &total,
+                          X86LINT_EXT_BMI1) == 1);
+
+    // The NEG must negate the copy.
+    static const uint8_t wrong_neg[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xDA,        // neg edx
+        0x21, 0xF9,        // and ecx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(wrong_neg, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // Width mismatch: the exact-register match rejects ECX vs RCX.
+    static const uint8_t width_mix[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0x48, 0xF7, 0xD9,  // neg rcx
+        0x21, 0xF9,        // and ecx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(width_mix, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // AND into the source register: the original leaves -x behind in the
+    // copy, which the fold would not compute.
+    static const uint8_t and_into_src[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xCF,        // and edi, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(and_into_src, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // The AND must mask with the preserved source.
+    static const uint8_t wrong_and_src[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xD9,        // and ecx, ebx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(wrong_and_src, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // Immediate mask: not the idiom. 0x0f is inert for the immediate-family
+    // checks (not -1/0/0xff, not a single high bit, imm8 already).
+    static const uint8_t imm_and[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x83, 0xE1, 0x0F,  // and ecx, 0xf
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(imm_and, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // Memory operands. The tail case keeps the register match (XED reports
+    // the reg source of `and [mem], reg` in the REG0 slot) so the
+    // memory-operand rejection itself is what stops it.
+    static const uint8_t mem_head[] = {
+        0x8B, 0x0F,        // mov ecx, [rdi]
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xF9,        // and ecx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_head, "missing BLSI", 0, X86LINT_EXT_BMI1);
+    static const uint8_t mem_tail[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0x08,        // and dword ptr [rax], ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_tail, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // 16-bit triple: BLSI is 32/64-bit only.
+    static const uint8_t triple16[] = {
+        0x66, 0x89, 0xF9,  // mov cx, di
+        0x66, 0xF7, 0xD9,  // neg cx
+        0x66, 0x21, 0xF9,  // and cx, di
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(triple16, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // CF read downstream: AND clears it, BLSI sets it to (source != 0).
+    static const uint8_t cf_live[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xF9,        // and ecx, edi
+        0x72, 0x00,        // jb +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(cf_live, "missing BLSI", 0, X86LINT_EXT_BMI1);
+
+    // A direct branch onto the NEG reaches a partial idiom.
+    static const uint8_t edge_on_neg[] = {
+        0xEB, 0x02,        // jmp +2 (to the neg)
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xF9,        // and ecx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_neg, "missing BLSI", 0, X86LINT_EXT_BMI1);
+}
+
 // shl/shr/sar reg, cl could be the flagless BMI2 shlx/shrx/sarx -- but only
 // when the caller declared BMI2 available (-m bmi2), only when every
 // arithmetic flag is dead, and (32-bit forms) only when the destination's
@@ -4041,6 +4188,7 @@ int main(int argc, char *argv[])
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_blsmsk_test();
+    check_missing_blsi_test();
     check_missing_shlx_test();
     check_missing_movbe_test();
     check_decode_resync_test();

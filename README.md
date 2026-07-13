@@ -352,13 +352,6 @@ and only for flags -- the ABI guarantees they do not survive it.
     same two bytes but on roughly twice the execution ports; the C1 imm8 form
     of a 1-count shift is a byte longer besides. Value- and flag-exact at
     every width, so unconditional
-* suboptimal single-bit immediate
-  - `0D 00010000` (OR EAX, 0x100) -- use BTS EAX, 8 (4 bytes vs 5-7 for every
-    register and width); AND with a single-bit-clear mask -> BTR, XOR -> BTC.
-    Bits 0-6 stay with the shorter sign-extended imm8 ALU form. The bt family
-    sets CF to the bit's old value and leaves SF/ZF/PF alone or undefined, so
-    the finding fires only when the arithmetic flags are dead (gated by flag
-    liveness)
 * suboptimal SSE MOV opcode
   - `660F6FCA` instead of `0F28CA` (MOVDQA XMM1, XMM2 -> MOVAPS; the legacy
     66/F3-prefixed copies movapd/movdqa/movupd/movdqu waste a byte over

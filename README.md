@@ -148,8 +148,18 @@ and only for flags -- the ABI guarantees they do not survive it.
     or memory-load source; NEG and NOT; and immediate shifts and rotates
     with a nonzero masked count (the SDM leaves a count-0 shift writing
     nothing, so the copy's value would survive in the original where the
-    NDD form's write behavior is unverified). The consumer need not be
-    adjacent: the fold looks through up to `APX_NDD_WINDOW - 2` intervening
+    NDD form's write behavior is unverified). The copy may equally be a
+    plain modrm load -- `8B06 29F8` (MOV EAX, [RSI]; SUB EAX, EDI) is SUB
+    EAX, [RSI], EDI, the promoted forms taking one memory source -- which
+    is where the population lives: a loaded value on the left of a
+    non-commutative op has no legacy single-instruction form. Behind a
+    load head ADD, SUB, INC, and DEC belong here too (the LEA fold's head
+    is register-to-register), the op itself must not touch memory (no NDD
+    form carries two memory operands), the moffs absolute loads are never
+    matched (no EVEX re-encoding), and the pair must be adjacent -- across
+    a gap the fold would reorder the access and its fault against the
+    gap's effects. A register-headed consumer need not be adjacent: the
+    fold looks through up to `APX_NDD_WINDOW - 2` intervening
     instructions (one at the default of 3; a build-time constant sized for
     experimentation) that prove themselves independent -- straight-line
     code that never touches the copy's register at any width and never

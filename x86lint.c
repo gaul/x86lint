@@ -4265,15 +4265,22 @@ static bool apx_ndd_gap_independent(const xed_decoded_inst_t *gap,
 
 // The consumer side of the APX NDD fold: does `op` destructively consume
 // the copy sitting in `dst` (family `dst_enc`; the mov's width `width`)
-// in a shape whose EVEX NDD promotion is exact? The matched-op inventory
-// and every rejection are mov_op_foldable_to_apx_ndd's story below;
-// factored out so the window scan can try each slot in turn.
+// in a shape whose EVEX NDD promotion is exact? `load_head` selects the
+// mov rY, [mem] variant, whose division of labor differs: ADD, SUB, INC,
+// and DEC belong here (the LEA fold's head is register-to-register), and
+// the op itself may not touch memory -- the head's load is the one
+// memory operand an NDD form encodes. The matched-op inventory and every
+// rejection are mov_op_foldable_to_apx_ndd's story below; factored out
+// so the window scan can try each slot in turn.
 static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
                                      xed_reg_enum_t dst,
                                      xed_reg_enum_t dst_enc,
-                                     unsigned width)
+                                     unsigned width, bool load_head)
 {
     if (xed_decoded_inst_get_reg(op, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+    if (load_head && xed_decoded_inst_number_of_memory_operands(op) > 0) {
         return false;
     }
 
@@ -4283,17 +4290,28 @@ static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
     case XED_ICLASS_ADD:
         // Register and immediate adds are lea dest, [srcA + addend]:
         // mov_add_foldable_to_lea's finding, needing no extension. Only
-        // the memory source, which lea cannot load, is this fold's.
-        if (xed_decoded_inst_number_of_memory_operands(op) == 0) {
+        // the memory source, which lea cannot load, is this fold's --
+        // except behind a load head, which the LEA fold cannot see.
+        if (!load_head &&
+            xed_decoded_inst_number_of_memory_operands(op) == 0) {
             return false;
         }
         break;
     case XED_ICLASS_SUB:
         // sub dest, imm is likewise lea dest, [srcA - imm].
-        if (xed_decoded_inst_get_immediate_width_bits(op) != 0 &&
+        if (!load_head &&
+            xed_decoded_inst_get_immediate_width_bits(op) != 0 &&
             xed_decoded_inst_number_of_memory_operands(op) == 0) {
             return false;
         }
+        break;
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+        // The LEA fold's implied +/-1 forms, behind a register head.
+        if (!load_head) {
+            return false;
+        }
+        unary = true;
         break;
     case XED_ICLASS_AND:
     case XED_ICLASS_OR:
@@ -4375,12 +4393,18 @@ static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
 // Multi-instruction peephole (APX): a destructive ALU op consuming a fresh
 // copy,
 //
-//   mov ecx, edi ; sub ecx, esi   ->   sub ecx, edi, esi (EVEX NDD)
+//   mov ecx, edi ; sub ecx, esi     ->   sub ecx, edi, esi (EVEX NDD)
+//   mov rax, [rbx] ; sub rax, rdi   ->   sub rax, [rbx], rdi
 //
 // APX promotes the legacy ALU group to EVEX forms with a new data
 // destination: the op reads its sources and writes the copy's register
 // directly, so the mov -- which exists only because the legacy form
-// destroys its first source -- disappears. The fold is exact with no
+// destroys its first source -- disappears. The copy may equally be a
+// plain load: the promoted forms take one memory source in either
+// operand order, so the load folds into the op the same way. That shape
+// is where the population lives -- a loaded value on the left of a
+// non-commutative op (rY = [mem] - rZ) has no legacy single-instruction
+// form, which is why compilers emit the pair. The fold is exact with no
 // liveness gate at all: each matched op's NDD form sets every flag exactly
 // as its legacy twin does on the same source values (XED's APX tables
 // carry identical flag records, form for form), and only the destination
@@ -4401,7 +4425,15 @@ static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
 // Not matched:
 //   * pairs LEA already expresses -- register and immediate ADD, and
 //     immediate SUB: mov_add_foldable_to_lea's finding, which needs no
-//     extension (memory-source ADD, which LEA cannot load, stays here);
+//     extension (memory-source ADD, which LEA cannot load, stays here --
+//     and so do ALL the ops behind a load head, ADD, SUB, INC, and DEC
+//     included, since the LEA fold's head is register-to-register);
+//   * a load head that is not a pure modrm load: the moffs absolute
+//     forms have no EVEX re-encoding, and a store or read-modify-write
+//     mov is not a copy. Its address may use the destination itself --
+//     mov rax, [rax] reads the pre-load value in both shapes -- and an
+//     op behind a load head may not carry a second memory operand,
+//     which no NDD form encodes;
 //   * CL-count shifts: under -m bmi2 they are the missing SHLX finding,
 //     whose flagless forms are the stronger rewrite, and a runtime count
 //     of 0 reaches the SDM carve-out above, where the NDD form's write
@@ -4417,14 +4449,19 @@ static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
 //     (67-prefixed, kept out conservatively as in the BLSR family), and
 //     8/16-bit widths, as everywhere in this family.
 //
-// The consumer need not be adjacent: the search looks through up to
-// APX_NDD_WINDOW - 2 intervening instructions (one at the default), each
-// of which must prove itself independent of the fold -- see
-// apx_ndd_gap_independent. The first instruction that fails independence
-// must be the consumer or there is no fold, which preserves every
-// rejection above at a distance: a consumer shape that fails its own
-// guards (shl rY, 0, a CL-count shift, sub rY, rY) reads or writes the
-// copy and so stops the scan.
+// A register-headed consumer need not be adjacent: the search looks
+// through up to APX_NDD_WINDOW - 2 intervening instructions (one at the
+// default), each of which must prove itself independent of the fold --
+// see apx_ndd_gap_independent. The first instruction that fails
+// independence must be the consumer or there is no fold, which preserves
+// every rejection above at a distance: a consumer shape that fails its
+// own guards (shl rY, 0, a CL-count shift, sub rY, rY) reads or writes
+// the copy and so stops the scan. Load-headed pairs are the exception:
+// they must be adjacent. The fold moves the load -- and any fault it
+// takes -- to the op's position, which with nothing between changes no
+// value and no ordering, but across a gap would reorder the access and
+// its fault against the gap's effects, where deleting a register copy
+// moves nothing observable.
 //
 // `mov` is the already-decoded instruction ending at `op_offset`; the
 // caller reports at the MOV, whose removal the finding suggests. A direct
@@ -4437,7 +4474,6 @@ static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
                                        const xed_decoded_inst_t *mov)
 {
     if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
-        xed_decoded_inst_number_of_memory_operands(mov) > 0 ||
         xed_decoded_inst_get_immediate_width_bits(mov) != 0) {
         return false;
     }
@@ -4446,21 +4482,55 @@ static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
         return false;
     }
     xed_reg_enum_t dst = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
-    xed_reg_enum_t src = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG1);
-    if (xed_reg_class(dst) != XED_REG_CLASS_GPR ||
-        xed_reg_class(src) != XED_REG_CLASS_GPR || src == dst) {
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
         return false;
     }
     xed_reg_enum_t dst_enc = xed_get_largest_enclosing_register(dst);
-    xed_reg_enum_t src_enc = xed_get_largest_enclosing_register(src);
+    xed_reg_enum_t src_enc = XED_REG_INVALID;
+    bool load_head = xed_decoded_inst_number_of_memory_operands(mov) > 0;
+    if (load_head) {
+        // A pure modrm load (cf. mov_bswap_foldable_to_movbe): the moffs
+        // absolute forms have no EVEX re-encoding, and a store or
+        // read-modify-write head is not a copy. The address may use the
+        // destination itself -- both shapes compute it before any write
+        // -- but 32-bit (67-prefixed) address registers are kept out
+        // conservatively, as on the consumer side.
+        if (xed_decoded_inst_number_of_memory_operands(mov) != 1 ||
+            !xed_decoded_inst_mem_read(mov, 0) ||
+            xed_decoded_inst_mem_written(mov, 0) ||
+            !xed_operand_values_has_modrm_byte(
+                xed_decoded_inst_operands_const(mov))) {
+            return false;
+        }
+        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(mov, 0);
+        if (base != XED_REG_INVALID && base != XED_REG_RIP &&
+            (xed_reg_class(base) != XED_REG_CLASS_GPR ||
+             xed_get_register_width_bits64(base) != 64)) {
+            return false;
+        }
+        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(mov, 0);
+        if (index != XED_REG_INVALID &&
+            (xed_reg_class(index) != XED_REG_CLASS_GPR ||
+             xed_get_register_width_bits64(index) != 64)) {
+            return false;
+        }
+    } else {
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG1);
+        if (xed_reg_class(src) != XED_REG_CLASS_GPR || src == dst) {
+            return false;
+        }
+        src_enc = xed_get_largest_enclosing_register(src);
+    }
 
     // Scan forward: each slot is either the consumer or a provably
-    // independent instruction to look through, up to the window bound.
-    // The consumer test's exact REG0 match pins the op's width to the
-    // mov's and rejects the memory-destination and shift/unary memory
-    // forms, whose REG0 is not the destination register.
+    // independent instruction to look through, up to the window bound --
+    // one slot only for a load head, whose access must not move across a
+    // gap. The consumer test's exact REG0 match pins the op's width to
+    // the mov's and rejects the memory-destination and shift/unary
+    // memory forms, whose REG0 is not the destination register.
+    int slots = load_head ? 1 : APX_NDD_WINDOW - 1;
     size_t cur = op_offset;
-    for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
+    for (int slot = 0; slot < slots; ++slot) {
         if (cur >= len) {
             return false;
         }
@@ -4470,7 +4540,7 @@ static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
             return false;
         }
         size_t after = cur + xed_decoded_inst_get_length(&op);
-        if (apx_ndd_op_consumes_copy(&op, dst, dst_enc, width)) {
+        if (apx_ndd_op_consumes_copy(&op, dst, dst_enc, width, load_head)) {
             return !branch_target_in(branch_targets, op_offset, after);
         }
         if (!apx_ndd_gap_independent(&op, dst_enc, src_enc)) {
@@ -4889,8 +4959,9 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         }
         // Multi-instruction peephole, only when the caller enabled APX:
         // mov rY, rX ; op rY, src -- a destructive op consuming the fresh
-        // copy -- collapses to one EVEX new-data-destination op rY, rX,
-        // src. The `else` keeps it off a site the BLSI collapse above
+        // copy (or a fresh load: mov rY, [mem]) -- collapses to one EVEX
+        // new-data-destination op rY, rX, src (op rY, [mem], src). The
+        // `else` keeps it off a site the BLSI collapse above
         // claimed: that triple begins with the same mov/neg pair, and the
         // 3 -> 1 advice supersedes this 2 -> 1 fold (a merely gate-
         // suppressed BLSI still falls through to here). Reported against

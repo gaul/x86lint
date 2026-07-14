@@ -4490,6 +4490,151 @@ static void check_missing_apx_ndd_test(void)
     };
     ASSERT_FINDINGS_EXT(two_gaps, "missing APX NDD", two_gap,
                         X86LINT_EXT_APX);
+
+    // ---- Load heads: mov rY, [mem] ; op rY, src folds to the NDD form
+    // with the load as its memory source, op rY, [mem], src.
+
+    // The dominant shape: a loaded value on the left of a non-commutative
+    // op has no legacy single-instruction form. 32- and 64-bit.
+    static const uint8_t load_sub32[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x29, 0xF8,        // sub eax, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_sub32, "missing APX NDD", 1, X86LINT_EXT_APX);
+    ASSERT_FINDINGS(load_sub32, "missing APX NDD", 0);
+    static const uint8_t load_sub64[] = {
+        0x48, 0x8B, 0x03,  // mov rax, [rbx]
+        0x48, 0x29, 0xF8,  // sub rax, rdi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_sub64, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // Load-then-mask, the other common idiom (and [mem], imm writes
+    // memory, so getting the masked value into a register forces the
+    // pair).
+    static const uint8_t load_and_imm[] = {
+        0x48, 0x8B, 0x07,        // mov rax, [rdi]
+        0x48, 0x83, 0xE0, 0xF0,  // and rax, -16
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(load_and_imm, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+    // Load-then-shift (bitfield extraction).
+    static const uint8_t load_shr[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0xC1, 0xE8, 0x05,  // shr eax, 5
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_shr, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // Behind a load head, ADD and INC belong to this fold -- the LEA
+    // fold's head is register-to-register, so there is no division of
+    // labor to respect.
+    static const uint8_t load_add_reg[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x01, 0xF8,        // add eax, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_add_reg, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+    static const uint8_t load_inc[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0xFF, 0xC0,        // inc eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_inc, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // NEG of a loaded value, and the two-operand IMUL (commutative, so
+    // the memory source rides in the NDD form's second slot).
+    static const uint8_t load_neg[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0xF7, 0xD8,        // neg eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_neg, "missing APX NDD", 1, X86LINT_EXT_APX);
+    static const uint8_t load_imul[] = {
+        0x48, 0x8B, 0x03,        // mov rax, [rbx]
+        0x48, 0x0F, 0xAF, 0xC1,  // imul rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(load_imul, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // An address through the destination reads the pre-load value in
+    // both shapes (cf. the MOVBE fold's base==dest case).
+    static const uint8_t load_base_dst[] = {
+        0x48, 0x8B, 0x00,  // mov rax, [rax]
+        0x48, 0x29, 0xF8,  // sub rax, rdi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_base_dst, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+
+    // No NDD form carries two memory operands.
+    static const uint8_t load_op_mem[] = {
+        0x48, 0x8B, 0x03,  // mov rax, [rbx]
+        0x48, 0x2B, 0x07,  // sub rax, [rdi]
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_op_mem, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
+    // Load-headed pairs must be adjacent: across a gap the fold would
+    // reorder the access and its fault against the gap's effects.
+    static const uint8_t load_gap[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x31, 0xC9,        // xor ecx, ecx
+        0x29, 0xF8,        // sub eax, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_gap, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // The A1 moffs form loads through a 64-bit absolute address, which
+    // no EVEX form re-encodes (cf. the MOVBE fold).
+    static const uint8_t load_moffs[] = {
+        0xA1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                           // mov eax, [0x8877665544332211]
+        0x29, 0xF8,        // sub eax, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_moffs, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // A store head is not a copy.
+    static const uint8_t store_head[] = {
+        0x89, 0x06,        // mov [rsi], eax
+        0x29, 0xF8,        // sub eax, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(store_head, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // 16-bit pair: kept out as everywhere in this family.
+    static const uint8_t load_pair16[] = {
+        0x66, 0x8B, 0x06,  // mov ax, [rsi]
+        0x66, 0x29, 0xF8,  // sub ax, di
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(load_pair16, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
+    // The op's register source must not alias the destination, load
+    // heads included (sub eax, eax after the load is not [mem] - [mem]).
+    static const uint8_t load_src_alias[] = {
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x29, 0xC0,        // sub eax, eax
+        0xC3,              // ret
+    };
+    assert(count_findings(load_src_alias, sizeof(load_src_alias),
+                          "missing APX NDD", &total, X86LINT_EXT_APX) == 0);
+
+    // A direct branch onto the op reaches it without the load.
+    static const uint8_t edge_on_load_op[] = {
+        0xEB, 0x02,        // jmp +2 (to the sub)
+        0x8B, 0x06,        // mov eax, [rsi]
+        0x29, 0xF8,        // sub eax, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_load_op, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
 }
 
 // An undecodable byte (executable sections routinely embed data) must not

@@ -258,7 +258,12 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `89F2 83C205` (MOV EDX, ESI; ADD EDX, 5) -- an immediate addend folds the
     same way, as LEA EDX, [RSI+5]; SUB negates the displacement and INC/DEC
     are the implied +/-1 forms, which -- like LEA -- leave CF untouched, so
-    only the flags they do write gate them
+    only the flags they do write gate them. The pair need not be adjacent:
+    the fold shares the missing-APX-NDD check's window and independence
+    proof (`APX_NDD_WINDOW`), looking through instructions that neither
+    touch the destination nor write the source, which keeps the division
+    of labor with that check -- these pairs fold to LEA while the flags
+    die, to an NDD op while they live -- exact at every distance
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)

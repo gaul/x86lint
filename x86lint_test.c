@@ -2945,6 +2945,74 @@ static void check_mov_add_lea_test(void)
         0xC3,              // ret
     };
     ASSERT_FINDINGS(sub_consumer, "MOV+ADD foldable to LEA", 0);
+
+    // ---- The window, shared with the APX NDD fold (APX_NDD_WINDOW, and
+    // the same independence proof): the consumer may sit past independent
+    // instructions. These expectations track the build's window.
+    const int one_gap = APX_NDD_WINDOW >= 3 ? 1 : 0;
+
+    // A flag-writing zero idiom between the pair: flags matter only after
+    // the add (lea writes none), and ECX is neither dest nor srcA.
+    static const uint8_t gap_fold[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x01, 0xFA,        // add edx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(gap_fold, "MOV+ADD foldable to LEA", one_gap);
+    static const uint8_t gap_fold_imm[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x83, 0xC2, 0x05,  // add edx, 5
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(gap_fold_imm, "MOV+ADD foldable to LEA", one_gap);
+
+    // Reading the copy stops the scan; so does writing srcA, whose value
+    // the lea reads later than the mov captured it.
+    static const uint8_t gap_reads_dest[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x85, 0xD2,        // test edx, edx
+        0x01, 0xFA,        // add edx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(gap_reads_dest, "MOV+ADD foldable to LEA", 0);
+    static const uint8_t gap_writes_src[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x89, 0xFE,        // mov esi, edi
+        0x01, 0xFA,        // add edx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(gap_writes_src, "MOV+ADD foldable to LEA", 0);
+
+    // A direct branch onto the looked-through instruction: the widened
+    // suppression span covers every slot.
+    static const uint8_t edge_on_gap[] = {
+        0xEB, 0x02,        // jmp +2 (to the xor)
+        0x89, 0xF2,        // mov edx, esi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x01, 0xFA,        // add edx, edi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(edge_on_gap, "MOV+ADD foldable to LEA", 0);
+
+    // The gapped division of labor: while the add's flags live this pair
+    // is missing APX NDD's (under -m apx) and never this finding's.
+    static const uint8_t gap_flags_live[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x01, 0xFA,        // add edx, edi
+        0x70, 0x00,        // jo +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(gap_flags_live, "MOV+ADD foldable to LEA", 0);
+    int total;
+    assert(count_findings(gap_flags_live, sizeof(gap_flags_live),
+                          "missing APX NDD", &total,
+                          X86LINT_EXT_APX) == one_gap);
+    assert(count_findings(gap_flags_live, sizeof(gap_flags_live),
+                          "MOV+ADD foldable to LEA", &total,
+                          X86LINT_EXT_APX) == 0);
 }
 
 // Multi-instruction peephole: shl reg, k ; sar reg, k sign-extends the low

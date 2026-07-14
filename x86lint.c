@@ -3358,6 +3358,70 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
            xed_get_largest_enclosing_register(dest);
 }
 
+// Window support for the copy folds below -- mov_add_foldable_to_lea and
+// the APX NDD fold share this proof and the APX_NDD_WINDOW bound: may the
+// scan look through `gap` -- is it provably independent of deleting the
+// copy? Deleting the
+// mov changes exactly two things: the copy's register no longer holds the
+// source's value while `gap` runs, and the op reads the source at its own
+// position rather than the mov's. So `gap` must not touch the copy's
+// register in any width or role (a read would see the stale value; a
+// write means the op consumes gap's result, not the copy -- and a partial
+// write like shr cl, 5 under mov ecx, eax is a write), must not write the
+// source, and must not transfer control (a call conservatively does all
+// of the above, and any branch changes which code runs between the two).
+// Everything else is independent: flag reads and writes (the mov is
+// flag-transparent, so deleting it moves nothing relative to any flag
+// producer or consumer), loads, and stores -- even to memory the op then
+// loads, which both shapes read at the op's own position. Register
+// operands are walked through XED's full template, implicit and
+// suppressed ones included (cdqe writes rax without naming it), plus the
+// memory base and index registers, which are reads; every comparison is
+// by largest enclosing register, so aliases at any width count.
+// Pseudo-registers (RFLAGS, RIP, STACKPUSH) never equal a GPR family and
+// pass through.
+static bool apx_ndd_gap_independent(const xed_decoded_inst_t *gap,
+                                    xed_reg_enum_t dst_enc,
+                                    xed_reg_enum_t src_enc)
+{
+    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
+    if (category == XED_CATEGORY_CALL ||
+        category == XED_CATEGORY_RET ||
+        category == XED_CATEGORY_UNCOND_BR ||
+        category == XED_CATEGORY_COND_BR ||
+        category == XED_CATEGORY_SYSCALL ||
+        category == XED_CATEGORY_SYSRET ||
+        category == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *operand = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(operand);
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        xed_reg_enum_t enc = xed_get_largest_enclosing_register(
+            xed_decoded_inst_get_reg(gap, name));
+        if (enc == dst_enc ||
+            (enc == src_enc && xed_operand_written(operand))) {
+            return false;
+        }
+    }
+    int nmem = xed_decoded_inst_number_of_memory_operands(gap);
+    for (int m = 0; m < nmem; ++m) {
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_base_reg(gap, m)) == dst_enc ||
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_index_reg(gap, m)) == dst_enc) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Multi-instruction peephole. mov dest, srcA followed by an add into dest
 // computes srcA + addend into dest; lea does the same in one instruction --
 // the non-destructive three-operand add -- saving the mov. The addend may be a
@@ -3371,6 +3435,17 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
 // `mov_rr` is the already-decoded producer ending at `add_offset`; on a match
 // the function returns true and the caller reports against the mov, the start of
 // the pair.
+//
+// The consumer need not be adjacent: the search shares the APX NDD fold's
+// window (APX_NDD_WINDOW, x86lint.h) and its independence proof -- each
+// instruction looked through must neither touch dest in any width or role,
+// nor write srcA, whose value the lea reads later than the mov captured
+// it, nor transfer control (see apx_ndd_gap_independent above). A direct
+// branch onto any looked-through instruction or onto the consumer reaches
+// code that expects the copy done, so the widened span suppresses it.
+// Sharing the window keeps the division of labor with the APX NDD fold
+// exact at every distance: that check claims these pairs while the flags
+// live, this one while they die.
 //
 // Soundness. lea reproduces the sum but writes no flags, so the finding is
 // suppressed while any flag the consumer writes may be read: every arithmetic
@@ -3422,93 +3497,111 @@ static bool mov_add_foldable_to_lea(const uint8_t *inst, size_t len,
     }
 
     // Consumer: an add into the same dest -- add dest, srcB, add/sub dest,
-    // imm, or inc/dec dest (add/sub by an implied 1).
-    if (add_offset >= len) {
-        return false;
-    }
-    xed_decoded_inst_t add;
-    decode_init(&add);
-    if (xed_decode(&add, inst + add_offset, len - add_offset) !=
-            XED_ERROR_NONE) {
-        return false;
-    }
-    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&add);
-    uint32_t divergent;
-    switch (cic) {
-    case XED_ICLASS_ADD:
-    case XED_ICLASS_SUB:
-        divergent = FLAG_ARITH;
-        break;
-    case XED_ICLASS_INC:
-    case XED_ICLASS_DEC:
-        // inc/dec leave CF untouched exactly as lea does, so only the flags
-        // they do write can diverge.
-        divergent = FLAG_ARITH & ~FLAG_CF;
-        break;
-    default:
-        return false;
-    }
-    if (xed_decoded_inst_number_of_memory_operands(&add) != 0 ||
-        xed_decoded_inst_get_reg(&add, XED_OPERAND_REG0) != dest) {
-        return false;
-    }
-
-    // An incoming direct edge onto the consumer reaches it without the mov --
-    // the canonical scan loop enters at its increment (mov rbx, rax ; L: add
-    // rbx, 1 ; ... ; je L), where the fold would turn the increment into a
-    // per-iteration reset. Suppress.
-    if (branch_target_in(branch_targets, add_offset,
-            add_offset + xed_decoded_inst_get_length(&add))) {
-        return false;
-    }
-
-    if (cic == XED_ICLASS_ADD &&
-        !xed_operand_values_has_immediate(
-            xed_decoded_inst_operands_const(&add))) {
-        // Register addend: add dest, srcB -> lea dest, [srcA + srcB].
-        xed_reg_enum_t src_b = xed_decoded_inst_get_reg(&add, XED_OPERAND_REG1);
-        if (xed_reg_class(src_b) != XED_REG_CLASS_GPR ||
-            xed_get_largest_enclosing_register(src_b) == dest_enc) {
+    // imm, or inc/dec dest (add/sub by an implied 1) -- found within the
+    // shared window.
+    xed_reg_enum_t src_a_enc = xed_get_largest_enclosing_register(src_a);
+    size_t cur = add_offset;
+    for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
+        if (cur >= len) {
             return false;
         }
-        // [rsp + rsp] cannot be encoded: RSP is not a legal SIB index.
-        if (xed_get_largest_enclosing_register(src_a) == XED_REG_RSP &&
-            xed_get_largest_enclosing_register(src_b) == XED_REG_RSP) {
+        xed_decoded_inst_t add;
+        decode_init(&add);
+        if (xed_decode(&add, inst + cur, len - cur) != XED_ERROR_NONE) {
             return false;
         }
-    } else {
-        // Immediate addend: add/sub dest, imm or inc/dec dest ->
-        // lea dest, [srcA + disp], the displacement negated for sub/dec.
-        int64_t disp;
-        if (cic == XED_ICLASS_INC) {
-            disp = 1;
-        } else if (cic == XED_ICLASS_DEC) {
-            disp = -1;
+        size_t after = cur + xed_decoded_inst_get_length(&add);
+
+        xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&add);
+        uint32_t divergent;
+        switch (cic) {
+        case XED_ICLASS_ADD:
+        case XED_ICLASS_SUB:
+            divergent = FLAG_ARITH;
+            break;
+        case XED_ICLASS_INC:
+        case XED_ICLASS_DEC:
+            // inc/dec leave CF untouched exactly as lea does, so only the
+            // flags they do write can diverge.
+            divergent = FLAG_ARITH & ~FLAG_CF;
+            break;
+        default:
+            divergent = 0;
+            break;
+        }
+        if (divergent == 0 ||
+            xed_decoded_inst_number_of_memory_operands(&add) != 0 ||
+            xed_decoded_inst_get_reg(&add, XED_OPERAND_REG0) != dest) {
+            // Not the consumer: an instruction the fold may look through if
+            // it proves independence; otherwise -- it touches dest, writes
+            // srcA, or transfers control -- there is no fold.
+            if (!apx_ndd_gap_independent(&add, dest_enc, src_a_enc)) {
+                return false;
+            }
+            cur = after;
+            continue;
+        }
+
+        // An incoming direct edge onto any looked-through instruction or
+        // onto the consumer reaches it without the mov -- the canonical
+        // scan loop enters at its increment (mov rbx, rax ; L: add rbx, 1 ;
+        // ... ; je L), where the fold would turn the increment into a
+        // per-iteration reset. Suppress.
+        if (branch_target_in(branch_targets, add_offset, after)) {
+            return false;
+        }
+
+        if (cic == XED_ICLASS_ADD &&
+            !xed_operand_values_has_immediate(
+                xed_decoded_inst_operands_const(&add))) {
+            // Register addend: add dest, srcB -> lea dest, [srcA + srcB].
+            xed_reg_enum_t src_b = xed_decoded_inst_get_reg(&add,
+                XED_OPERAND_REG1);
+            if (xed_reg_class(src_b) != XED_REG_CLASS_GPR ||
+                xed_get_largest_enclosing_register(src_b) == dest_enc) {
+                return false;
+            }
+            // [rsp + rsp] cannot be encoded: RSP is not a legal SIB index.
+            if (src_a_enc == XED_REG_RSP &&
+                xed_get_largest_enclosing_register(src_b) == XED_REG_RSP) {
+                return false;
+            }
         } else {
-            if (!xed_operand_values_has_immediate(
-                    xed_decoded_inst_operands_const(&add))) {
-                return false;   // sub dest, srcB: lea cannot subtract a register
+            // Immediate addend: add/sub dest, imm or inc/dec dest ->
+            // lea dest, [srcA + disp], the displacement negated for
+            // sub/dec.
+            int64_t disp;
+            if (cic == XED_ICLASS_INC) {
+                disp = 1;
+            } else if (cic == XED_ICLASS_DEC) {
+                disp = -1;
+            } else {
+                if (!xed_operand_values_has_immediate(
+                        xed_decoded_inst_operands_const(&add))) {
+                    // sub dest, srcB: lea cannot subtract a register.
+                    return false;
+                }
+                int64_t imm = xed_decoded_inst_get_signed_immediate(&add);
+                if (imm == 0) {
+                    return false;   // the add/sub is check_add_sub_zero's
+                }
+                disp = (cic == XED_ICLASS_SUB) ? -imm : imm;
             }
-            int64_t imm = xed_decoded_inst_get_signed_immediate(&add);
-            if (imm == 0) {
-                return false;   // the add/sub is check_add_sub_zero's finding
+            // A 16/32-bit lea truncates the address to the destination
+            // width, so any immediate folds mod 2^w; a 64-bit pair uses the
+            // displacement at full value, which must fit disp32 --
+            // everything but the negation of sub rdx, INT32_MIN.
+            if (xed_get_register_width_bits64(dest) == 64 &&
+                (disp < INT32_MIN || disp > INT32_MAX)) {
+                return false;
             }
-            disp = (cic == XED_ICLASS_SUB) ? -imm : imm;
         }
-        // A 16/32-bit lea truncates the address to the destination width, so
-        // any immediate folds mod 2^w; a 64-bit pair uses the displacement at
-        // full value, which must fit disp32 -- everything but the negation of
-        // sub rdx, INT32_MIN.
-        if (xed_get_register_width_bits64(dest) == 64 &&
-            (disp < INT32_MIN || disp > INT32_MAX)) {
-            return false;
-        }
-    }
 
-    // lea writes no flags; suppress while any flag the consumer sets
-    // diverges -- i.e. may be read before being overwritten.
-    size_t after = add_offset + xed_decoded_inst_get_length(&add);
-    return !flags_live_after(inst, len, after, divergent);
+        // lea writes no flags; suppress while any flag the consumer sets
+        // diverges -- i.e. may be read before being overwritten.
+        return !flags_live_after(inst, len, after, divergent);
+    }
+    return false;
 }
 
 // Multi-instruction peephole. shl reg, k followed by sar reg, k on the same
@@ -4203,68 +4296,6 @@ static bool mov_neg_and_foldable_to_blsi(const uint8_t *inst, size_t len,
         return false;
     }
     return !branch_target_in(branch_targets, neg_offset, after_and);
-}
-
-// Window support for the APX NDD fold below: may the scan look through
-// `gap` -- is it provably independent of deleting the copy? Deleting the
-// mov changes exactly two things: the copy's register no longer holds the
-// source's value while `gap` runs, and the op reads the source at its own
-// position rather than the mov's. So `gap` must not touch the copy's
-// register in any width or role (a read would see the stale value; a
-// write means the op consumes gap's result, not the copy -- and a partial
-// write like shr cl, 5 under mov ecx, eax is a write), must not write the
-// source, and must not transfer control (a call conservatively does all
-// of the above, and any branch changes which code runs between the two).
-// Everything else is independent: flag reads and writes (the mov is
-// flag-transparent, so deleting it moves nothing relative to any flag
-// producer or consumer), loads, and stores -- even to memory the op then
-// loads, which both shapes read at the op's own position. Register
-// operands are walked through XED's full template, implicit and
-// suppressed ones included (cdqe writes rax without naming it), plus the
-// memory base and index registers, which are reads; every comparison is
-// by largest enclosing register, so aliases at any width count.
-// Pseudo-registers (RFLAGS, RIP, STACKPUSH) never equal a GPR family and
-// pass through.
-static bool apx_ndd_gap_independent(const xed_decoded_inst_t *gap,
-                                    xed_reg_enum_t dst_enc,
-                                    xed_reg_enum_t src_enc)
-{
-    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
-    if (category == XED_CATEGORY_CALL ||
-        category == XED_CATEGORY_RET ||
-        category == XED_CATEGORY_UNCOND_BR ||
-        category == XED_CATEGORY_COND_BR ||
-        category == XED_CATEGORY_SYSCALL ||
-        category == XED_CATEGORY_SYSRET ||
-        category == XED_CATEGORY_INTERRUPT) {
-        return false;
-    }
-
-    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
-    unsigned nops = xed_inst_noperands(xi);
-    for (unsigned i = 0; i < nops; ++i) {
-        const xed_operand_t *operand = xed_inst_operand(xi, i);
-        xed_operand_enum_t name = xed_operand_name(operand);
-        if (!xed_operand_is_register(name)) {
-            continue;
-        }
-        xed_reg_enum_t enc = xed_get_largest_enclosing_register(
-            xed_decoded_inst_get_reg(gap, name));
-        if (enc == dst_enc ||
-            (enc == src_enc && xed_operand_written(operand))) {
-            return false;
-        }
-    }
-    int nmem = xed_decoded_inst_number_of_memory_operands(gap);
-    for (int m = 0; m < nmem; ++m) {
-        if (xed_get_largest_enclosing_register(
-                xed_decoded_inst_get_base_reg(gap, m)) == dst_enc ||
-            xed_get_largest_enclosing_register(
-                xed_decoded_inst_get_index_reg(gap, m)) == dst_enc) {
-            return false;
-        }
-    }
-    return true;
 }
 
 // The ADD/SUB/INC/DEC division of labor with mov_add_foldable_to_lea,

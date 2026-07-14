@@ -4267,16 +4267,39 @@ static bool apx_ndd_gap_independent(const xed_decoded_inst_t *gap,
     return true;
 }
 
-// The consumer side of the APX NDD fold: does `op` destructively consume
-// the copy sitting in `dst` (family `dst_enc`; the mov's width `width`)
-// in a shape whose EVEX NDD promotion is exact? `load_head` selects the
-// mov rY, [mem] variant, whose division of labor differs: ADD, SUB, INC,
-// and DEC belong here (the LEA fold's head is register-to-register), and
-// the op itself may not touch memory -- the head's load is the one
-// memory operand an NDD form encodes. The matched-op inventory and every
+// The ADD/SUB/INC/DEC division of labor with mov_add_foldable_to_lea,
+// seen from that fold's side: it claims a register-headed pair only
+// while every flag the op writes is dead after it (lea writes none), so
+// this fold takes the exact complement -- the same walk saying LIVE,
+// where the NDD form, flag-identical to the legacy op, is the only
+// rewrite -- and exactly one of the two claims any pair. A zero
+// immediate degenerates the pair (redundant ADD/SUB zero's finding);
+// neither fold claims it, matching the LEA fold's own rejection.
+static bool apx_ndd_lea_complement(const uint8_t *inst, size_t len,
+                                   size_t after,
+                                   const xed_decoded_inst_t *op,
+                                   uint32_t divergent)
+{
+    if (xed_decoded_inst_get_immediate_width_bits(op) != 0 &&
+        xed_decoded_inst_get_signed_immediate(op) == 0) {
+        return false;
+    }
+    return flags_live_after(inst, len, after, divergent);
+}
+
+// The consumer side of the APX NDD fold: does the op at [`after` -
+// its length, `after`) destructively consume the copy sitting in `dst`
+// (family `dst_enc`; the mov's width `width`) in a shape whose EVEX NDD
+// promotion is exact? `load_head` selects the mov rY, [mem] variant,
+// whose division of labor differs: ADD, SUB, INC, and DEC belong here
+// unconditionally (the LEA fold's head is register-to-register), and the
+// op itself may not touch memory -- the head's load is the one memory
+// operand an NDD form encodes. The matched-op inventory and every
 // rejection are mov_op_foldable_to_apx_ndd's story below; factored out
 // so the window scan can try each slot in turn.
-static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
+static bool apx_ndd_op_consumes_copy(const uint8_t *inst, size_t len,
+                                     size_t after,
+                                     const xed_decoded_inst_t *op,
                                      xed_reg_enum_t dst,
                                      xed_reg_enum_t dst_enc,
                                      unsigned width, bool load_head)
@@ -4293,26 +4316,34 @@ static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
     switch (xed_decoded_inst_get_iclass(op)) {
     case XED_ICLASS_ADD:
         // Register and immediate adds are lea dest, [srcA + addend]:
-        // mov_add_foldable_to_lea's finding, needing no extension. Only
-        // the memory source, which lea cannot load, is this fold's --
-        // except behind a load head, which the LEA fold cannot see.
+        // mov_add_foldable_to_lea's finding, needing no extension --
+        // while the arithmetic flags die. While they live that fold is
+        // suppressed and this one takes the complement. Memory sources,
+        // which lea cannot load, and load heads, which its head cannot
+        // see, are this fold's at any liveness.
         if (!load_head &&
-            xed_decoded_inst_number_of_memory_operands(op) == 0) {
+            xed_decoded_inst_number_of_memory_operands(op) == 0 &&
+            !apx_ndd_lea_complement(inst, len, after, op, FLAG_ARITH)) {
             return false;
         }
         break;
     case XED_ICLASS_SUB:
-        // sub dest, imm is likewise lea dest, [srcA - imm].
+        // sub dest, imm is likewise lea dest, [srcA - imm], under the
+        // same complement.
         if (!load_head &&
             xed_decoded_inst_get_immediate_width_bits(op) != 0 &&
-            xed_decoded_inst_number_of_memory_operands(op) == 0) {
+            xed_decoded_inst_number_of_memory_operands(op) == 0 &&
+            !apx_ndd_lea_complement(inst, len, after, op, FLAG_ARITH)) {
             return false;
         }
         break;
     case XED_ICLASS_INC:
     case XED_ICLASS_DEC:
-        // The LEA fold's implied +/-1 forms, behind a register head.
-        if (!load_head) {
+        // The LEA fold's implied +/-1 forms, which -- like lea -- leave
+        // CF untouched, so only the flags they do write divide the labor.
+        if (!load_head &&
+            !apx_ndd_lea_complement(inst, len, after, op,
+                                    FLAG_ARITH & ~FLAG_CF)) {
             return false;
         }
         unary = true;
@@ -4427,11 +4458,16 @@ static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
 // qualify; a zero immediate is check_shift_rotate_zero's finding anyway).
 //
 // Not matched:
-//   * pairs LEA already expresses -- register and immediate ADD, and
-//     immediate SUB: mov_add_foldable_to_lea's finding, which needs no
-//     extension (memory-source ADD, which LEA cannot load, stays here --
-//     and so do ALL the ops behind a load head, ADD, SUB, INC, and DEC
-//     included, since the LEA fold's head is register-to-register);
+//   * pairs LEA claims -- register and immediate ADD, immediate SUB, and
+//     INC/DEC behind a register head, while every flag the op writes is
+//     dead after it: mov_add_foldable_to_lea's finding, which needs no
+//     extension. While those flags live, lea (which writes none) cannot
+//     fold and the NDD form -- flag-identical to the legacy op -- is the
+//     only rewrite, so this fold takes the exact complement of that
+//     check's gate: exactly one of the two claims any pair (see
+//     apx_ndd_lea_complement). Memory-source ADD, which lea cannot load,
+//     and every op behind a load head (the LEA fold's head is
+//     register-to-register) are this fold's at any liveness;
 //   * a load head that is not a pure modrm load: the moffs absolute
 //     forms have no EVEX re-encoding, and a store or read-modify-write
 //     mov is not a copy. Its address may use the destination itself --
@@ -4544,7 +4580,8 @@ static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
             return false;
         }
         size_t after = cur + xed_decoded_inst_get_length(&op);
-        if (apx_ndd_op_consumes_copy(&op, dst, dst_enc, width, load_head)) {
+        if (apx_ndd_op_consumes_copy(inst, len, after, &op, dst, dst_enc,
+                                     width, load_head)) {
             return !branch_target_in(branch_targets, op_offset, after);
         }
         if (!apx_ndd_gap_independent(&op, dst_enc, src_enc)) {

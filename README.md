@@ -165,8 +165,12 @@ and only for flags -- the ABI guarantees they do not survive it.
     code that never touches the copy's register at any width and never
     writes the mov's source -- so a scheduling gap like a flag-zeroing
     XOR, a load, or a store does not hide the pair. Division of labor:
-    register and immediate ADD and immediate SUB stay with the
-    MOV+ADD-foldable-to-LEA finding, which needs no extension; CL-count
+    register and immediate ADD, immediate SUB, and INC/DEC belong to the
+    MOV+ADD-foldable-to-LEA finding, which needs no extension, while the
+    flags they write die -- lea writes none. While those flags live that
+    fold is suppressed and this one takes the exact complement of its
+    gate, so exactly one of the two claims any pair (behind a load head
+    there is no split: lea cannot see those at all). CL-count
     shifts stay with missing SHLX; and under both extensions the BLSI
     triple's mov/neg prefix defers to the 3 -> 1 BLSI collapse. One
     instruction and one uop fewer and a shorter dependency chain, though

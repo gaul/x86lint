@@ -4359,6 +4359,49 @@ static void check_missing_apx_ndd_test(void)
                           X86LINT_EXT_APX) == 1);
     assert(total == 1);
 
+    // ...but only while the flags the op writes die (lea writes none).
+    // While they live the LEA fold is suppressed and this fold takes the
+    // exact complement: the jo reads OF, so these previously unflagged
+    // pairs are the NDD fold's -- and stay unflagged at baseline.
+    static const uint8_t live_add_reg[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x01, 0xFA,        // add edx, edi
+        0x70, 0x00,        // jo +0
+        0xC3,              // ret
+    };
+    assert(count_findings(live_add_reg, sizeof(live_add_reg),
+                          "missing APX NDD", &total, X86LINT_EXT_APX) == 1);
+    assert(count_findings(live_add_reg, sizeof(live_add_reg),
+                          "MOV+ADD foldable to LEA", &total,
+                          X86LINT_EXT_APX) == 0);
+    assert(total == 1);
+    ASSERT_FINDINGS(live_add_reg, "missing APX NDD", 0);
+    static const uint8_t live_add_imm[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x83, 0xC2, 0x05,  // add edx, 5
+        0x70, 0x00,        // jo +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(live_add_imm, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+    static const uint8_t live_sub_imm[] = {
+        0x89, 0xC8,        // mov eax, ecx
+        0x83, 0xE8, 0x03,  // sub eax, 3
+        0x70, 0x00,        // jo +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(live_sub_imm, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+    // INC divides by the flags it writes -- CF, which it and lea alike
+    // leave untouched, plays no part.
+    static const uint8_t live_inc[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0xFF, 0xC2,        // inc edx
+        0x70, 0x00,        // jo +0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(live_inc, "missing APX NDD", 1, X86LINT_EXT_APX);
+
     // A direct branch onto the op reaches it without the copy.
     static const uint8_t edge_on_op[] = {
         0xEB, 0x02,        // jmp +2 (to the neg)

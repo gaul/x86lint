@@ -148,7 +148,11 @@ and only for flags -- the ABI guarantees they do not survive it.
     or memory-load source; NEG and NOT; and immediate shifts and rotates
     with a nonzero masked count (the SDM leaves a count-0 shift writing
     nothing, so the copy's value would survive in the original where the
-    NDD form's write behavior is unverified). The copy may equally be a
+    NDD form's write behavior is unverified); CMOVcc folds as a true
+    select -- the copy is the untaken value, the moved one the taken, the
+    32-bit forms zero-extend on a false condition in both shapes, and
+    behind a load head the inverse condition code puts the loaded default
+    in the selectable slot. The copy may equally be a
     plain modrm load -- `8B06 29F8` (MOV EAX, [RSI]; SUB EAX, EDI) is SUB
     EAX, [RSI], EDI, the promoted forms taking one memory source -- which
     is where the population lives: a loaded value on the left of a

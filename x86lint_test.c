@@ -4534,6 +4534,68 @@ static void check_missing_apx_ndd_test(void)
     ASSERT_FINDINGS_EXT(two_gaps, "missing APX NDD", two_gap,
                         X86LINT_EXT_APX);
 
+    // ---- CMOVcc consumers: the pair is a select, rY = cc ? rZ : rX,
+    // and the NDD promotion selects the same way -- exactly, since the
+    // 32-bit forms zero-extend on a false condition in both shapes and
+    // both read the same flags.
+    static const uint8_t cmov_reg32[] = {
+        0x89, 0xF8,        // mov eax, edi
+        0x0F, 0x44, 0xC2,  // cmovz eax, edx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_reg32, "missing APX NDD", 1, X86LINT_EXT_APX);
+    ASSERT_FINDINGS(cmov_reg32, "missing APX NDD", 0);
+    static const uint8_t cmov_reg64[] = {
+        0x48, 0x89, 0xF8,        // mov rax, rdi
+        0x48, 0x0F, 0x45, 0xC1,  // cmovnz rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_reg64, "missing APX NDD", 1, X86LINT_EXT_APX);
+    // A memory taken-value loads unconditionally in both shapes.
+    static const uint8_t cmov_mem_src[] = {
+        0x48, 0x89, 0xF8,        // mov rax, rdi
+        0x48, 0x0F, 0x44, 0x03,  // cmovz rax, [rbx]
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_mem_src, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+    // Behind a load head the inverse condition code puts the loaded
+    // default in the selectable slot: cc ? rcx : [rdi] is the inverted
+    // cmov of ([rdi], rcx).
+    static const uint8_t cmov_load_head[] = {
+        0x48, 0x8B, 0x07,        // mov rax, [rdi]
+        0x48, 0x0F, 0x44, 0xC1,  // cmovz rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_load_head, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+    // A flag-writing gap changes what the cmov reads in both shapes
+    // alike; the fold still stands.
+    static const uint8_t cmov_gap[] = {
+        0x89, 0xF8,        // mov eax, edi
+        0x31, 0xD2,        // xor edx, edx
+        0x0F, 0x44, 0xC1,  // cmovz eax, ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_gap, "missing APX NDD", one_gap,
+                        X86LINT_EXT_APX);
+    // The usual rejections carry over: a source aliasing the destination,
+    // and an address through it.
+    static const uint8_t cmov_src_alias[] = {
+        0x89, 0xF8,        // mov eax, edi
+        0x0F, 0x44, 0xC0,  // cmovz eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_src_alias, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+    static const uint8_t cmov_addr_dst[] = {
+        0x48, 0x89, 0xF1,        // mov rcx, rsi
+        0x48, 0x0F, 0x44, 0x09,  // cmovz rcx, [rcx]
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(cmov_addr_dst, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
     // ---- Load heads: mov rY, [mem] ; op rY, src folds to the NDD form
     // with the load as its memory source, op rY, [mem], src.
 

@@ -4354,6 +4354,38 @@ static bool apx_ndd_op_consumes_copy(const uint8_t *inst, size_t len,
     case XED_ICLASS_ADC:
     case XED_ICLASS_SBB:
         break;
+    // CMOVcc after the copy is a select -- rY = cc ? rZ : rX -- and the
+    // NDD promotion is exactly a select: the reg-field operand carries
+    // the untaken value, the rm or memory operand the taken one, and the
+    // destination is written either way (the 32-bit forms zero-extend on
+    // a false condition in both shapes, per the SDM). The condition
+    // flags are read, never written, and the mov is flag-transparent, so
+    // both shapes read the same flags -- even across a flag-writing
+    // window gap, which both shapes read identically. Behind a load head
+    // the loaded value is the untaken default, which the memory operand's
+    // rm slot cannot carry -- but the inverse condition code swaps the
+    // roles, and every cc has one, so the fold stands there too. A
+    // memory-source cmov loads unconditionally in the legacy and the
+    // promoted form alike (conditional faulting is CFCMOV, a different
+    // instruction), so the access moves exactly as any other memory
+    // source here.
+    case XED_ICLASS_CMOVB:
+    case XED_ICLASS_CMOVBE:
+    case XED_ICLASS_CMOVL:
+    case XED_ICLASS_CMOVLE:
+    case XED_ICLASS_CMOVNB:
+    case XED_ICLASS_CMOVNBE:
+    case XED_ICLASS_CMOVNL:
+    case XED_ICLASS_CMOVNLE:
+    case XED_ICLASS_CMOVNO:
+    case XED_ICLASS_CMOVNP:
+    case XED_ICLASS_CMOVNS:
+    case XED_ICLASS_CMOVNZ:
+    case XED_ICLASS_CMOVO:
+    case XED_ICLASS_CMOVP:
+    case XED_ICLASS_CMOVS:
+    case XED_ICLASS_CMOVZ:
+        break;
     case XED_ICLASS_IMUL:
         if (xed_decoded_inst_get_iform_enum(op) != XED_IFORM_IMUL_GPRv_GPRv &&
             xed_decoded_inst_get_iform_enum(op) != XED_IFORM_IMUL_GPRv_MEMv) {
@@ -4450,7 +4482,9 @@ static bool apx_ndd_op_consumes_copy(const uint8_t *inst, size_t len,
 // above already accepts the same drop.
 //
 // Matched: SUB, AND, OR, XOR, ADC, SBB, and two-operand IMUL with a
-// register, immediate, or memory-load source; NEG and NOT; and
+// register, immediate, or memory-load source; CMOVcc, whose promotion is
+// a true select of the copy against the moved value (see the switch
+// below); NEG and NOT; and
 // SHL/SHR/SAR/ROL/ROR by an immediate whose masked count is nonzero --
 // the SDM leaves a count-0 shift writing nothing, where the copy's value
 // would survive in the original, so only a provably nonzero count keeps

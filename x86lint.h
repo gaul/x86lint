@@ -259,16 +259,19 @@ enum x86lint_extensions {
 };
 
 // How many instructions the missing-APX-NDD fold may examine, counting the
-// copy and its consumer: 2 matches only adjacent pairs, 3 (the default) sees
-// through one independent instruction between them, and so on. Overridable
-// at build time (-DAPX_NDD_WINDOW=16) to measure wider windows; soundness
-// never depends on the value -- every instruction looked through must prove
-// independence (see apx_ndd_gap_independent in x86lint.c) -- but the
-// population decays quickly with distance, so wide windows mostly buy decode
-// time. Lives here rather than in x86lint.c so the tests can size their
-// window fixtures' expectations to the build's value.
+// copy and its consumer: 2 matches only adjacent pairs, 3 sees through one
+// independent instruction between them, and so on. Overridable at build
+// time (-DAPX_NDD_WINDOW=16) to measure other widths; soundness never
+// depends on the value -- every instruction looked through must prove
+// independence (see apx_ndd_gap_independent in x86lint.c) -- and neither,
+// measurably, does scan time. The default of 8 is the measured knee: one
+// gap captures about half of the non-adjacent population, window 8 nearly
+// all of it (96-99% of the window-16 ceiling on bash/git/glibc/libcrypto),
+// and consumers further out essentially do not occur. Lives here rather
+// than in x86lint.c so the tests can size their window fixtures'
+// expectations to the build's value.
 #ifndef APX_NDD_WINDOW
-#define APX_NDD_WINDOW 3
+#define APX_NDD_WINDOW 8
 #endif
 
 // return number of failed checks. An undecodable byte is not fatal: linear

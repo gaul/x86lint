@@ -164,8 +164,9 @@ and only for flags -- the ABI guarantees they do not survive it.
     a gap the fold would reorder the access and its fault against the
     gap's effects. A register-headed consumer need not be adjacent: the
     fold looks through up to `APX_NDD_WINDOW - 2` intervening
-    instructions (one at the default of 3; a build-time constant sized for
-    experimentation) that prove themselves independent -- straight-line
+    instructions (six at the default of 8, the measured knee of the yield
+    curve; a build-time constant sized for experimentation) that prove
+    themselves independent -- straight-line
     code that never touches the copy's register at any width and never
     writes the mov's source -- so a scheduling gap like a flag-zeroing
     XOR, a load, or a store does not hide the pair. Division of labor:

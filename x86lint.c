@@ -4524,7 +4524,7 @@ static bool apx_ndd_op_consumes_copy(const uint8_t *inst, size_t len,
 //     8/16-bit widths, as everywhere in this family.
 //
 // A register-headed consumer need not be adjacent: the search looks
-// through up to APX_NDD_WINDOW - 2 intervening instructions (one at the
+// through up to APX_NDD_WINDOW - 2 intervening instructions (six at the
 // default), each of which must prove itself independent of the fold --
 // see apx_ndd_gap_independent. The first instruction that fails
 // independence must be the consumer or there is no fold, which preserves

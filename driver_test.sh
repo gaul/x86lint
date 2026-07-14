@@ -73,10 +73,11 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-# Two extension-gated patterns in one fixture: a NOT/AND pair that folds to
-# ANDN (a finding only under -m bmi1; the ret kills the flags the fold's PF
-# gate watches) and a load/BSWAP pair that folds to MOVBE (only under
-# -m movbe). Each -m run must see exactly its own finding.
+# Three extension-gated patterns in one fixture: a NOT/AND pair that folds
+# to ANDN (a finding only under -m bmi1; the trailing sub kills the flags
+# the fold's PF gate watches), a load/BSWAP pair that folds to MOVBE (only
+# under -m movbe), and a MOV/SUB pair that folds to an NDD sub (only under
+# -m apx). Each -m run must see exactly its own finding.
 cat >"$dir/bmi.s" <<'EOF'
     .text
     .globl _start
@@ -86,6 +87,8 @@ _start:
     .byte 0x21, 0xc8                    # and eax, ecx
     .byte 0x8b, 0x06                    # mov eax, [rsi]
     .byte 0x0f, 0xc8                    # bswap eax
+    .byte 0x89, 0xf8                    # mov eax, edi
+    .byte 0x29, 0xf0                    # sub eax, esi
     .byte 0xc3                          # ret
     .size _start, . - _start
     .section .note.GNU-stack, "", @progbits
@@ -132,6 +135,9 @@ reject 'missing MOVBE' "MOVBE finding under -m bmi1"
 run 1 -m movbe "$dir/bmi"
 expect '^ +1 +missing MOVBE$' "count of 1 for missing MOVBE under -m movbe"
 reject 'missing ANDN' "ANDN finding under -m movbe"
+run 1 -m apx "$dir/bmi"
+expect '^ +1 +missing APX NDD$' "count of 1 for missing APX NDD under -m apx"
+reject 'missing MOVBE' "MOVBE finding under -m apx"
 
 # A real binary must never be a tool failure (0 or 1 both fine).
 "$X86LINT" "$X86LINT" >/dev/null 2>&1

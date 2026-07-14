@@ -137,9 +137,11 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_BMI2;
             } else if (strcmp(argv[i], "movbe") == 0) {
                 extensions |= X86LINT_EXT_MOVBE;
+            } else if (strcmp(argv[i], "apx") == 0) {
+                extensions |= X86LINT_EXT_APX;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe] <ELF_FILE>\n",
+                    "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -147,14 +149,14 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe] <ELF_FILE>\n",
+                "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe] <ELF_FILE>\n",
+            "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }

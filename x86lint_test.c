@@ -4040,6 +4040,335 @@ static void check_missing_movbe_test(void)
     ASSERT_FINDINGS_EXT(edge_on_bswap, "missing MOVBE", 0, X86LINT_EXT_MOVBE);
 }
 
+// mov rY, rX ; <destructive ALU op> rY, src folds to one EVEX
+// new-data-destination op rY, rX, src -- but only when the caller declared
+// APX available (-m apx). No liveness gates: each matched op's NDD form
+// sets every flag exactly as its legacy twin, and only the destination is
+// written, with the identical value. See mov_op_foldable_to_apx_ndd.
+static void check_missing_apx_ndd_test(void)
+{
+    // Canonical fold, 32- and 64-bit, register source.
+    static const uint8_t fold32[] = {
+        0x89, 0xF8,        // mov eax, edi
+        0x29, 0xF0,        // sub eax, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold32, "missing APX NDD", 1, X86LINT_EXT_APX);
+    // Without the opt-in the check must not run; nor under the other
+    // extension bits (independent, matching their CPUID feature flags).
+    ASSERT_FINDINGS(fold32, "missing APX NDD", 0);
+    ASSERT_FINDINGS_EXT(fold32, "missing APX NDD", 0,
+                        X86LINT_EXT_BMI1 | X86LINT_EXT_BMI2 |
+                            X86LINT_EXT_MOVBE);
+
+    static const uint8_t fold64[] = {
+        0x4C, 0x89, 0xF8,  // mov rax, r15
+        0x4C, 0x29, 0xF0,  // sub rax, r14
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(fold64, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // The plain-binary path with a register source (SUB above takes its
+    // own case): and ecx, ebx reads neither the copy nor its source.
+    static const uint8_t and_reg[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0x21, 0xD9,        // and ecx, ebx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(and_reg, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // Immediate sources ride the NDD forms unchanged. and rdi, -0x1000 is
+    // glibc's page-mask idiom.
+    static const uint8_t and_imm[] = {
+        0x48, 0x89, 0xC7,                          // mov rdi, rax
+        0x48, 0x81, 0xE7, 0x00, 0xF0, 0xFF, 0xFF,  // and rdi, -0x1000
+        0xC3,                                      // ret
+    };
+    ASSERT_FINDINGS_EXT(and_imm, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // The accumulator short forms (or eax, imm32: 0D) are the same iclass.
+    static const uint8_t or_accum[] = {
+        0x89, 0xF0,                    // mov eax, esi
+        0x0D, 0x00, 0x00, 0x20, 0x00,  // or eax, 0x200000
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_EXT(or_accum, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // ADC reads CF, but the mov between the flag producer and the adc
+    // writes no flag, so the NDD form reads the same CF.
+    static const uint8_t adc_imm[] = {
+        0x4D, 0x89, 0xC8,        // mov r8, r9
+        0x49, 0x83, 0xD0, 0x05,  // adc r8, 5
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(adc_imm, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // Two-operand IMUL (0F AF) is a plain destructive consumer.
+    static const uint8_t imul_two[] = {
+        0x48, 0x89, 0xD8,        // mov rax, rbx
+        0x48, 0x0F, 0xAF, 0xC1,  // imul rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(imul_two, "missing APX NDD", 1, X86LINT_EXT_APX);
+    // The one-operand widening IMUL also parks its operand in the REG0
+    // slot, but consumes rax, not the copy: the iform check stops it.
+    static const uint8_t imul_one[] = {
+        0x48, 0x89, 0xF3,  // mov rbx, rsi
+        0x48, 0xF7, 0xEB,  // imul rbx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(imul_one, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // Immediate shifts and rotates with a nonzero masked count.
+    static const uint8_t shl_imm[] = {
+        0x48, 0x89, 0xC1,        // mov rcx, rax
+        0x48, 0xC1, 0xE1, 0x04,  // shl rcx, 4
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(shl_imm, "missing APX NDD", 1, X86LINT_EXT_APX);
+    static const uint8_t ror_imm[] = {
+        0x4D, 0x89, 0xF2,        // mov r10, r14
+        0x49, 0xC1, 0xCA, 0x11,  // ror r10, 17
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(ror_imm, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // The D1 by-one form decodes as an immediate count of 1 and qualifies.
+    // The shift itself is also check_shl_one's finding (add rdx, rdx), so
+    // the pair totals two -- assert both categories directly.
+    static const uint8_t shl_one[] = {
+        0x48, 0x89, 0xCA,  // mov rdx, rcx
+        0x48, 0xD1, 0xE2,  // shl rdx (by one)
+        0xC3,              // ret
+    };
+    int total;
+    assert(count_findings(shl_one, sizeof(shl_one), "missing APX NDD",
+                          &total, X86LINT_EXT_APX) == 1);
+    assert(total == 2);
+    assert(count_findings(shl_one, sizeof(shl_one), "suboptimal SHL one",
+                          &total, X86LINT_EXT_APX) == 1);
+
+    // Zero counts leave the legacy destination -- the copy -- unwritten
+    // (the SDM's count-0 carve-out), so the pair is not equal to the NDD
+    // form. Raw zero (the shift itself stays check_shift_zero's finding),
+    // and 0x20 masked to zero at 32-bit width.
+    static const uint8_t shl_zero[] = {
+        0x48, 0x89, 0xC8,        // mov rax, rcx
+        0x48, 0xC1, 0xE0, 0x00,  // shl rax, 0
+        0xC3,                    // ret
+    };
+    assert(count_findings(shl_zero, sizeof(shl_zero), "missing APX NDD",
+                          &total, X86LINT_EXT_APX) == 0);
+    assert(count_findings(shl_zero, sizeof(shl_zero),
+                          "redundant shift/rotate by zero", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    static const uint8_t shl_masked[] = {
+        0x89, 0xC8,        // mov eax, ecx
+        0xC1, 0xE0, 0x20,  // shl eax, 0x20 (masked count: 0x20 & 31 == 0)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(shl_masked, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // CL counts are missing SHLX territory: under bmi2 the flagless form
+    // is the stronger rewrite, and this check never claims the pair.
+    static const uint8_t shl_cl[] = {
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x48, 0xD3, 0xE0,  // shl rax, cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(shl_cl, "missing APX NDD", 0, X86LINT_EXT_APX);
+    assert(count_findings(shl_cl, sizeof(shl_cl), "missing APX NDD", &total,
+                          X86LINT_EXT_APX | X86LINT_EXT_BMI2) == 0);
+    ASSERT_FINDINGS_EXT(shl_cl, "missing SHLX/SHRX/SARX", 1,
+                        X86LINT_EXT_APX | X86LINT_EXT_BMI2);
+
+    // Unary forms.
+    static const uint8_t neg32[] = {
+        0x89, 0xDA,        // mov edx, ebx
+        0xF7, 0xDA,        // neg edx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(neg32, "missing APX NDD", 1, X86LINT_EXT_APX);
+    static const uint8_t not32[] = {
+        0x89, 0xD0,        // mov eax, edx
+        0xF7, 0xD0,        // not eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(not32, "missing APX NDD", 1, X86LINT_EXT_APX);
+
+    // The BLSI interplay. Under bmi1+apx the full triple is one BLSI
+    // finding -- the dispatcher's else arm defers this fold to the 3 -> 1
+    // collapse; under apx alone the mov/neg prefix is this finding.
+    static const uint8_t blsi_triple[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xF9,        // and ecx, edi
+        0xC3,              // ret
+    };
+    assert(count_findings(blsi_triple, sizeof(blsi_triple), "missing BLSI",
+                          &total, X86LINT_EXT_BMI1 | X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    assert(count_findings(blsi_triple, sizeof(blsi_triple),
+                          "missing APX NDD", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    // A merely gate-suppressed BLSI does not claim the site: with CF read
+    // downstream the triple is no BLSI, but the mov/neg pair still folds
+    // (the NDD neg writes CF exactly as neg does).
+    static const uint8_t blsi_gated[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0x21, 0xF9,        // and ecx, edi
+        0x72, 0x00,        // jb +0
+        0xC3,              // ret
+    };
+    assert(count_findings(blsi_gated, sizeof(blsi_gated), "missing BLSI",
+                          &total, X86LINT_EXT_BMI1 | X86LINT_EXT_APX) == 0);
+    assert(count_findings(blsi_gated, sizeof(blsi_gated), "missing APX NDD",
+                          &total, X86LINT_EXT_BMI1 | X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+
+    // Memory sources are pure loads the NDD forms take directly.
+    static const uint8_t mem_sub[] = {
+        0x48, 0x89, 0xC2,  // mov rdx, rax
+        0x48, 0x2B, 0x13,  // sub rdx, [rbx]
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_sub, "missing APX NDD", 1, X86LINT_EXT_APX);
+    // A memory-source ADD is this fold's, not the LEA fold's: lea cannot
+    // load.
+    static const uint8_t mem_add[] = {
+        0x48, 0x89, 0xC8,  // mov rax, rcx
+        0x48, 0x03, 0x07,  // add rax, [rdi]
+        0xC3,              // ret
+    };
+    assert(count_findings(mem_add, sizeof(mem_add), "missing APX NDD",
+                          &total, X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    // RIP-relative sources pass the address guard.
+    static const uint8_t mem_rip[] = {
+        0x48, 0x89, 0xD8,                          // mov rax, rbx
+        0x48, 0x23, 0x05, 0xF6, 0xFF, 0xFF, 0xFF,  // and rax, [rip-0xa]
+        0xC3,                                      // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_rip, "missing APX NDD", 1, X86LINT_EXT_APX);
+    // An address through the mov's source reads the same value in both
+    // shapes...
+    static const uint8_t addr_src[] = {
+        0x48, 0x89, 0xF1,  // mov rcx, rsi
+        0x48, 0x2B, 0x0E,  // sub rcx, [rsi]
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(addr_src, "missing APX NDD", 1, X86LINT_EXT_APX);
+    // ...but an address through the destination would read the stale
+    // pre-copy value in the folded shape.
+    static const uint8_t addr_dst[] = {
+        0x48, 0x89, 0xF1,  // mov rcx, rsi
+        0x48, 0x2B, 0x09,  // sub rcx, [rcx]
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(addr_dst, "missing APX NDD", 0, X86LINT_EXT_APX);
+    // Memory destinations: XED reports the register source of
+    // and [rax], rcx in the REG0 slot, so the write-back rejection is
+    // what stops it.
+    static const uint8_t mem_dst[] = {
+        0x48, 0x89, 0xF1,  // mov rcx, rsi
+        0x48, 0x21, 0x08,  // and [rax], rcx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(mem_dst, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // A register source aliasing the destination: the folded op would
+    // read the stale pre-copy value. (The sub rax, rax itself stays
+    // check_sub_self's finding.)
+    static const uint8_t src_alias[] = {
+        0x48, 0x89, 0xF0,  // mov rax, rsi
+        0x48, 0x29, 0xC0,  // sub rax, rax
+        0xC3,              // ret
+    };
+    assert(count_findings(src_alias, sizeof(src_alias), "missing APX NDD",
+                          &total, X86LINT_EXT_APX) == 0);
+    assert(count_findings(src_alias, sizeof(src_alias),
+                          "suboptimal SUB reg, reg", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    // A copy aliasing its own source is no copy (and check_mov_self's
+    // finding: the following 32-bit write kills the upper-32 concern).
+    static const uint8_t head_alias[] = {
+        0x89, 0xC0,        // mov eax, eax
+        0x29, 0xF0,        // sub eax, esi
+        0xC3,              // ret
+    };
+    assert(count_findings(head_alias, sizeof(head_alias), "missing APX NDD",
+                          &total, X86LINT_EXT_APX) == 0);
+    assert(count_findings(head_alias, sizeof(head_alias),
+                          "redundant MOV reg, reg", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+
+    // Width mismatch: the exact-register match rejects EAX vs RAX.
+    static const uint8_t width_mix[] = {
+        0x48, 0x89, 0xF0,  // mov rax, rsi
+        0x29, 0xF0,        // sub eax, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(width_mix, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // 16-bit pair: kept out as everywhere in this family.
+    static const uint8_t pair16[] = {
+        0x66, 0x89, 0xD1,  // mov cx, dx
+        0x66, 0x29, 0xD1,  // sub cx, dx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(pair16, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // Pairs LEA expresses stay mov_add_foldable_to_lea's finding, which
+    // needs no extension: register add, immediate add, immediate sub.
+    static const uint8_t lea_add_reg[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x01, 0xFA,        // add edx, edi
+        0xC3,              // ret
+    };
+    assert(count_findings(lea_add_reg, sizeof(lea_add_reg),
+                          "missing APX NDD", &total, X86LINT_EXT_APX) == 0);
+    assert(count_findings(lea_add_reg, sizeof(lea_add_reg),
+                          "MOV+ADD foldable to LEA", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    static const uint8_t lea_add_imm[] = {
+        0x89, 0xF2,        // mov edx, esi
+        0x83, 0xC2, 0x05,  // add edx, 5
+        0xC3,              // ret
+    };
+    assert(count_findings(lea_add_imm, sizeof(lea_add_imm),
+                          "missing APX NDD", &total, X86LINT_EXT_APX) == 0);
+    assert(count_findings(lea_add_imm, sizeof(lea_add_imm),
+                          "MOV+ADD foldable to LEA", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+    static const uint8_t lea_sub_imm[] = {
+        0x89, 0xC8,        // mov eax, ecx
+        0x83, 0xE8, 0x03,  // sub eax, 3
+        0xC3,              // ret
+    };
+    assert(count_findings(lea_sub_imm, sizeof(lea_sub_imm),
+                          "missing APX NDD", &total, X86LINT_EXT_APX) == 0);
+    assert(count_findings(lea_sub_imm, sizeof(lea_sub_imm),
+                          "MOV+ADD foldable to LEA", &total,
+                          X86LINT_EXT_APX) == 1);
+    assert(total == 1);
+
+    // A direct branch onto the op reaches it without the copy.
+    static const uint8_t edge_on_op[] = {
+        0xEB, 0x02,        // jmp +2 (to the neg)
+        0x89, 0xF9,        // mov ecx, edi
+        0xF7, 0xD9,        // neg ecx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_op, "missing APX NDD", 0, X86LINT_EXT_APX);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -4129,6 +4458,7 @@ int main(int argc, char *argv[])
     check_missing_blsi_test();
     check_missing_shlx_test();
     check_missing_movbe_test();
+    check_missing_apx_ndd_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

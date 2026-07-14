@@ -4201,6 +4201,187 @@ static bool mov_neg_and_foldable_to_blsi(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, neg_offset, after_and);
 }
 
+// Multi-instruction peephole (APX): a destructive ALU op consuming a fresh
+// copy,
+//
+//   mov ecx, edi ; sub ecx, esi   ->   sub ecx, edi, esi (EVEX NDD)
+//
+// APX promotes the legacy ALU group to EVEX forms with a new data
+// destination: the op reads its sources and writes the copy's register
+// directly, so the mov -- which exists only because the legacy form
+// destroys its first source -- disappears. The fold is exact with no
+// liveness gate at all: each matched op's NDD form sets every flag exactly
+// as its legacy twin does on the same source values (XED's APX tables
+// carry identical flag records, form for form), and only the destination
+// is written, with the identical result -- a 32-bit write zero-extends in
+// both shapes. The one flag delta in the family is SBB's AF, which the
+// legacy form defines and the NDD record leaves undefined: this tool does
+// not track AF (64-bit user code cannot branch on it), and the LEA fold
+// above already accepts the same drop.
+//
+// Matched: SUB, AND, OR, XOR, ADC, SBB, and two-operand IMUL with a
+// register, immediate, or memory-load source; NEG and NOT; and
+// SHL/SHR/SAR/ROL/ROR by an immediate whose masked count is nonzero --
+// the SDM leaves a count-0 shift writing nothing, where the copy's value
+// would survive in the original, so only a provably nonzero count keeps
+// the two shapes equal (the D1 by-one forms decode as an immediate 1 and
+// qualify; a zero immediate is check_shift_rotate_zero's finding anyway).
+//
+// Not matched:
+//   * pairs LEA already expresses -- register and immediate ADD, and
+//     immediate SUB: mov_add_foldable_to_lea's finding, which needs no
+//     extension (memory-source ADD, which LEA cannot load, stays here);
+//   * CL-count shifts: under -m bmi2 they are the missing SHLX finding,
+//     whose flagless forms are the stronger rewrite, and a runtime count
+//     of 0 reaches the SDM carve-out above, where the NDD form's write
+//     behavior is not something this tool has verified;
+//   * an op source aliasing the destination (sub ecx, ecx after the
+//     copy), or a memory source addressed through it (sub rcx, [rcx]):
+//     the folded op would read the stale pre-copy value;
+//   * memory destinations (and [rax], rcx -- whose register source XED
+//     reports in the REG0 slot, so the write-back rejection is what stops
+//     it), the one-operand widening IMUL (imul rbx fills rdx:rax and also
+//     parks its operand in REG0, but consumes rax, not the copy -- the
+//     iform check is what stops it), non-64-bit address registers
+//     (67-prefixed, kept out conservatively as in the BLSR family), and
+//     8/16-bit widths, as everywhere in this family.
+//
+// `mov` is the already-decoded instruction ending at `op_offset`; the
+// caller reports at the MOV, where the pair collapses to the single NDD
+// op. A direct branch onto the op reaches it without the copy, so the
+// fold is suppressed then, as in every window peephole here.
+static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
+                                       const uint8_t *branch_targets,
+                                       size_t op_offset,
+                                       const xed_decoded_inst_t *mov)
+{
+    if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(mov) != 0) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(mov);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG1);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR ||
+        xed_reg_class(src) != XED_REG_CLASS_GPR || src == dst) {
+        return false;
+    }
+    xed_reg_enum_t dst_enc = xed_get_largest_enclosing_register(dst);
+
+    // The consuming op. The exact REG0 match pins its width to the mov's
+    // and rejects the memory-destination and shift/unary memory forms,
+    // whose REG0 is not the destination register.
+    if (op_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t op;
+    decode_init(&op);
+    if (xed_decode(&op, inst + op_offset, len - op_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_reg(&op, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+
+    bool unary = false;
+    bool shift = false;
+    switch (xed_decoded_inst_get_iclass(&op)) {
+    case XED_ICLASS_ADD:
+        // Register and immediate adds are lea dest, [srcA + addend]:
+        // mov_add_foldable_to_lea's finding, needing no extension. Only
+        // the memory source, which lea cannot load, is this fold's.
+        if (xed_decoded_inst_number_of_memory_operands(&op) == 0) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_SUB:
+        // sub dest, imm is likewise lea dest, [srcA - imm].
+        if (xed_decoded_inst_get_immediate_width_bits(&op) != 0 &&
+            xed_decoded_inst_number_of_memory_operands(&op) == 0) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_SBB:
+        break;
+    case XED_ICLASS_IMUL:
+        if (xed_decoded_inst_get_iform_enum(&op) != XED_IFORM_IMUL_GPRv_GPRv &&
+            xed_decoded_inst_get_iform_enum(&op) != XED_IFORM_IMUL_GPRv_MEMv) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_NEG:
+    case XED_ICLASS_NOT:
+        unary = true;
+        break;
+    case XED_ICLASS_SHL:
+    case XED_ICLASS_SHR:
+    case XED_ICLASS_SAR:
+    case XED_ICLASS_ROL:
+    case XED_ICLASS_ROR:
+        shift = true;
+        break;
+    default:
+        return false;
+    }
+
+    if (shift) {
+        if (xed_decoded_inst_get_reg(&op, XED_OPERAND_REG1) == XED_REG_CL ||
+            xed_decoded_inst_get_immediate_width_bits(&op) == 0) {
+            return false;
+        }
+        uint64_t count = xed_decoded_inst_get_unsigned_immediate(&op);
+        if ((count & (width == 64 ? 63 : 31)) == 0) {
+            return false;
+        }
+    } else if (!unary) {
+        // A register source must not alias the destination: the folded op
+        // would read its stale pre-copy value. (The immediate and memory
+        // forms carry RFLAGS in REG1.) The mov's own source may recur --
+        // it holds the same value in both shapes.
+        xed_reg_enum_t op_src = xed_decoded_inst_get_reg(&op,
+            XED_OPERAND_REG1);
+        if (xed_reg_class(op_src) == XED_REG_CLASS_GPR &&
+            xed_get_largest_enclosing_register(op_src) == dst_enc) {
+            return false;
+        }
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(&op) > 0) {
+        // A pure load: the write-back forms put their register source in
+        // the REG0 slot, so this is what rejects them.
+        if (!xed_decoded_inst_mem_read(&op, 0) ||
+            xed_decoded_inst_mem_written(&op, 0)) {
+            return false;
+        }
+        // The address is computed after the mov in the original but with
+        // no copy in the folded form, so it must not read the destination.
+        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&op, 0);
+        if (base != XED_REG_INVALID && base != XED_REG_RIP &&
+            (xed_reg_class(base) != XED_REG_CLASS_GPR ||
+             xed_get_register_width_bits64(base) != 64 ||
+             xed_get_largest_enclosing_register(base) == dst_enc)) {
+            return false;
+        }
+        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(&op, 0);
+        if (index != XED_REG_INVALID &&
+            (xed_reg_class(index) != XED_REG_CLASS_GPR ||
+             xed_get_register_width_bits64(index) != 64 ||
+             xed_get_largest_enclosing_register(index) == dst_enc)) {
+            return false;
+        }
+    }
+
+    return !branch_target_in(branch_targets, op_offset,
+        op_offset + xed_decoded_inst_get_length(&op));
+}
+
 // Multi-instruction peephole (MOVBE): a load immediately byte-swapped in
 // place,
 //
@@ -4604,6 +4785,23 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                                          &xedd)) {
             summary_add(summary, "missing BLSI");
             report_finding("missing BLSI", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+        // Multi-instruction peephole, only when the caller enabled APX:
+        // mov rY, rX ; op rY, src -- a destructive op consuming the fresh
+        // copy -- collapses to one EVEX new-data-destination op rY, rX,
+        // src. The `else` keeps it off a site the BLSI collapse above
+        // claimed: that triple begins with the same mov/neg pair, and the
+        // 3 -> 1 advice supersedes this 2 -> 1 fold (a merely gate-
+        // suppressed BLSI still falls through to here). Reported against
+        // the MOV (at `offset`), where the replacement lands. See
+        // mov_op_foldable_to_apx_ndd.
+        else if ((extensions & X86LINT_EXT_APX) != 0 &&
+            mov_op_foldable_to_apx_ndd(inst, len, branch_targets, next,
+                                       &xedd)) {
+            summary_add(summary, "missing APX NDD");
+            report_finding("missing APX NDD", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

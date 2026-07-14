@@ -135,6 +135,26 @@ and only for flags -- the ABI guarantees they do not survive it.
     undefined -- is dead. Immediate masks are not flagged (ANDN has no
     immediate form), nor is an AND into a different register (the NOT's
     result would stay live)
+* missing APX NDD (only with `-m apx`)
+  - `89F8 29F0` (MOV EAX, EDI; SUB EAX, ESI) -- one EVEX new-data-destination
+    SUB EAX, EDI, ESI (APX) computes the difference straight into the copy's
+    register: the mov exists only because the legacy op destroys its first
+    source. An exact fold with no liveness gate at all: each promoted form
+    sets every flag exactly as its legacy twin (the one delta in the family
+    is SBB's AF, defined -> undefined, which 64-bit user code cannot read
+    and this tool does not track -- the LEA fold accepts the same drop), and
+    only the destination is written, with the identical value. Matches SUB,
+    AND, OR, XOR, ADC, SBB, and two-operand IMUL with a register, immediate,
+    or memory-load source; NEG and NOT; and immediate shifts and rotates
+    with a nonzero masked count (the SDM leaves a count-0 shift writing
+    nothing, so the copy's value would survive in the original where the
+    NDD form's write behavior is unverified). Division of labor: register
+    and immediate ADD and immediate SUB stay with the MOV+ADD-foldable-to-
+    LEA finding, which needs no extension; CL-count shifts stay with
+    missing SHLX; and under both extensions the BLSI triple's mov/neg
+    prefix defers to the 3 -> 1 BLSI collapse. One instruction and one uop
+    fewer and a shorter dependency chain, though the 4-byte EVEX prefix can
+    cost two bytes of size on a 32-bit pair
 * missing BLSI (only with `-m bmi1`)
   - `89F9 F7D9 21F9` (MOV ECX, EDI; NEG ECX; AND ECX, EDI) -- one BLSI ECX,
     EDI (BMI1) isolates the lowest set bit, collapsing the whole triple: the
@@ -485,11 +505,11 @@ oversized immediate at offset: 0x14: push 0x0
 ...
 ```
 
-Pass `-m bmi1`, `-m bmi2`, and/or `-m movbe` to declare that the binary's
-target supports those instruction-set extensions, enabling the checks that
-suggest replacing a baseline sequence with an instruction from that set
-(missing ANDN, missing BLSI, missing BLSMSK, missing BLSR, missing
-SHLX/SHRX/SARX, missing MOVBE). These
+Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` to declare that the
+binary's target supports those instruction-set extensions, enabling the
+checks that suggest replacing a baseline sequence with an instruction from
+that set (missing ANDN, missing BLSI, missing BLSMSK, missing BLSR, missing
+SHLX/SHRX/SARX, missing MOVBE, missing APX NDD). These
 are opt-in because the finding is only actionable when the target guarantees
 the extension: a distro binary built for x86-64-v2 could not have used ANDN
 however clear the opportunity, and inferring availability from the

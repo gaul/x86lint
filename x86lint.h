@@ -258,6 +258,19 @@ enum x86lint_extensions {
     X86LINT_EXT_APX = 1u << 3,   // EVEX-promoted NDD three-operand forms, ...
 };
 
+// How many instructions the missing-APX-NDD fold may examine, counting the
+// copy and its consumer: 2 matches only adjacent pairs, 3 (the default) sees
+// through one independent instruction between them, and so on. Overridable
+// at build time (-DAPX_NDD_WINDOW=16) to measure wider windows; soundness
+// never depends on the value -- every instruction looked through must prove
+// independence (see apx_ndd_gap_independent in x86lint.c) -- but the
+// population decays quickly with distance, so wide windows mostly buy decode
+// time. Lives here rather than in x86lint.c so the tests can size their
+// window fixtures' expectations to the build's value.
+#ifndef APX_NDD_WINDOW
+#define APX_NDD_WINDOW 3
+#endif
+
 // return number of failed checks. An undecodable byte is not fatal: linear
 // sweep skips it and resyncs (executable sections routinely embed data).
 // Skipped bytes are only tallied into the summary, never printed -- a stripped

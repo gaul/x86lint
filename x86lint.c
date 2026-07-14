@@ -4201,6 +4201,177 @@ static bool mov_neg_and_foldable_to_blsi(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, neg_offset, after_and);
 }
 
+// Window support for the APX NDD fold below: may the scan look through
+// `gap` -- is it provably independent of deleting the copy? Deleting the
+// mov changes exactly two things: the copy's register no longer holds the
+// source's value while `gap` runs, and the op reads the source at its own
+// position rather than the mov's. So `gap` must not touch the copy's
+// register in any width or role (a read would see the stale value; a
+// write means the op consumes gap's result, not the copy -- and a partial
+// write like shr cl, 5 under mov ecx, eax is a write), must not write the
+// source, and must not transfer control (a call conservatively does all
+// of the above, and any branch changes which code runs between the two).
+// Everything else is independent: flag reads and writes (the mov is
+// flag-transparent, so deleting it moves nothing relative to any flag
+// producer or consumer), loads, and stores -- even to memory the op then
+// loads, which both shapes read at the op's own position. Register
+// operands are walked through XED's full template, implicit and
+// suppressed ones included (cdqe writes rax without naming it), plus the
+// memory base and index registers, which are reads; every comparison is
+// by largest enclosing register, so aliases at any width count.
+// Pseudo-registers (RFLAGS, RIP, STACKPUSH) never equal a GPR family and
+// pass through.
+static bool apx_ndd_gap_independent(const xed_decoded_inst_t *gap,
+                                    xed_reg_enum_t dst_enc,
+                                    xed_reg_enum_t src_enc)
+{
+    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
+    if (category == XED_CATEGORY_CALL ||
+        category == XED_CATEGORY_RET ||
+        category == XED_CATEGORY_UNCOND_BR ||
+        category == XED_CATEGORY_COND_BR ||
+        category == XED_CATEGORY_SYSCALL ||
+        category == XED_CATEGORY_SYSRET ||
+        category == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *operand = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(operand);
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        xed_reg_enum_t enc = xed_get_largest_enclosing_register(
+            xed_decoded_inst_get_reg(gap, name));
+        if (enc == dst_enc ||
+            (enc == src_enc && xed_operand_written(operand))) {
+            return false;
+        }
+    }
+    int nmem = xed_decoded_inst_number_of_memory_operands(gap);
+    for (int m = 0; m < nmem; ++m) {
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_base_reg(gap, m)) == dst_enc ||
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_index_reg(gap, m)) == dst_enc) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The consumer side of the APX NDD fold: does `op` destructively consume
+// the copy sitting in `dst` (family `dst_enc`; the mov's width `width`)
+// in a shape whose EVEX NDD promotion is exact? The matched-op inventory
+// and every rejection are mov_op_foldable_to_apx_ndd's story below;
+// factored out so the window scan can try each slot in turn.
+static bool apx_ndd_op_consumes_copy(const xed_decoded_inst_t *op,
+                                     xed_reg_enum_t dst,
+                                     xed_reg_enum_t dst_enc,
+                                     unsigned width)
+{
+    if (xed_decoded_inst_get_reg(op, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+
+    bool unary = false;
+    bool shift = false;
+    switch (xed_decoded_inst_get_iclass(op)) {
+    case XED_ICLASS_ADD:
+        // Register and immediate adds are lea dest, [srcA + addend]:
+        // mov_add_foldable_to_lea's finding, needing no extension. Only
+        // the memory source, which lea cannot load, is this fold's.
+        if (xed_decoded_inst_number_of_memory_operands(op) == 0) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_SUB:
+        // sub dest, imm is likewise lea dest, [srcA - imm].
+        if (xed_decoded_inst_get_immediate_width_bits(op) != 0 &&
+            xed_decoded_inst_number_of_memory_operands(op) == 0) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_SBB:
+        break;
+    case XED_ICLASS_IMUL:
+        if (xed_decoded_inst_get_iform_enum(op) != XED_IFORM_IMUL_GPRv_GPRv &&
+            xed_decoded_inst_get_iform_enum(op) != XED_IFORM_IMUL_GPRv_MEMv) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_NEG:
+    case XED_ICLASS_NOT:
+        unary = true;
+        break;
+    case XED_ICLASS_SHL:
+    case XED_ICLASS_SHR:
+    case XED_ICLASS_SAR:
+    case XED_ICLASS_ROL:
+    case XED_ICLASS_ROR:
+        shift = true;
+        break;
+    default:
+        return false;
+    }
+
+    if (shift) {
+        if (xed_decoded_inst_get_reg(op, XED_OPERAND_REG1) == XED_REG_CL ||
+            xed_decoded_inst_get_immediate_width_bits(op) == 0) {
+            return false;
+        }
+        uint64_t count = xed_decoded_inst_get_unsigned_immediate(op);
+        if ((count & (width == 64 ? 63 : 31)) == 0) {
+            return false;
+        }
+    } else if (!unary) {
+        // A register source must not alias the destination: the folded op
+        // would read its stale pre-copy value. (The immediate and memory
+        // forms carry RFLAGS in REG1.) The mov's own source may recur --
+        // it holds the same value in both shapes.
+        xed_reg_enum_t op_src = xed_decoded_inst_get_reg(op,
+            XED_OPERAND_REG1);
+        if (xed_reg_class(op_src) == XED_REG_CLASS_GPR &&
+            xed_get_largest_enclosing_register(op_src) == dst_enc) {
+            return false;
+        }
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(op) > 0) {
+        // A pure load: the write-back forms put their register source in
+        // the REG0 slot, so this is what rejects them.
+        if (!xed_decoded_inst_mem_read(op, 0) ||
+            xed_decoded_inst_mem_written(op, 0)) {
+            return false;
+        }
+        // The address is computed after the mov in the original but with
+        // no copy in the folded form, so it must not read the destination.
+        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(op, 0);
+        if (base != XED_REG_INVALID && base != XED_REG_RIP &&
+            (xed_reg_class(base) != XED_REG_CLASS_GPR ||
+             xed_get_register_width_bits64(base) != 64 ||
+             xed_get_largest_enclosing_register(base) == dst_enc)) {
+            return false;
+        }
+        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(op, 0);
+        if (index != XED_REG_INVALID &&
+            (xed_reg_class(index) != XED_REG_CLASS_GPR ||
+             xed_get_register_width_bits64(index) != 64 ||
+             xed_get_largest_enclosing_register(index) == dst_enc)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // Multi-instruction peephole (APX): a destructive ALU op consuming a fresh
 // copy,
 //
@@ -4246,10 +4417,20 @@ static bool mov_neg_and_foldable_to_blsi(const uint8_t *inst, size_t len,
 //     (67-prefixed, kept out conservatively as in the BLSR family), and
 //     8/16-bit widths, as everywhere in this family.
 //
+// The consumer need not be adjacent: the search looks through up to
+// APX_NDD_WINDOW - 2 intervening instructions (one at the default), each
+// of which must prove itself independent of the fold -- see
+// apx_ndd_gap_independent. The first instruction that fails independence
+// must be the consumer or there is no fold, which preserves every
+// rejection above at a distance: a consumer shape that fails its own
+// guards (shl rY, 0, a CL-count shift, sub rY, rY) reads or writes the
+// copy and so stops the scan.
+//
 // `mov` is the already-decoded instruction ending at `op_offset`; the
-// caller reports at the MOV, where the pair collapses to the single NDD
-// op. A direct branch onto the op reaches it without the copy, so the
-// fold is suppressed then, as in every window peephole here.
+// caller reports at the MOV, whose removal the finding suggests. A direct
+// branch onto any looked-through instruction or onto the op reaches code
+// that expects the copy done, so the fold is suppressed then, as in every
+// window peephole here.
 static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
                                        const uint8_t *branch_targets,
                                        size_t op_offset,
@@ -4271,115 +4452,33 @@ static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
         return false;
     }
     xed_reg_enum_t dst_enc = xed_get_largest_enclosing_register(dst);
+    xed_reg_enum_t src_enc = xed_get_largest_enclosing_register(src);
 
-    // The consuming op. The exact REG0 match pins its width to the mov's
-    // and rejects the memory-destination and shift/unary memory forms,
-    // whose REG0 is not the destination register.
-    if (op_offset >= len) {
-        return false;
+    // Scan forward: each slot is either the consumer or a provably
+    // independent instruction to look through, up to the window bound.
+    // The consumer test's exact REG0 match pins the op's width to the
+    // mov's and rejects the memory-destination and shift/unary memory
+    // forms, whose REG0 is not the destination register.
+    size_t cur = op_offset;
+    for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
+        if (cur >= len) {
+            return false;
+        }
+        xed_decoded_inst_t op;
+        decode_init(&op);
+        if (xed_decode(&op, inst + cur, len - cur) != XED_ERROR_NONE) {
+            return false;
+        }
+        size_t after = cur + xed_decoded_inst_get_length(&op);
+        if (apx_ndd_op_consumes_copy(&op, dst, dst_enc, width)) {
+            return !branch_target_in(branch_targets, op_offset, after);
+        }
+        if (!apx_ndd_gap_independent(&op, dst_enc, src_enc)) {
+            return false;
+        }
+        cur = after;
     }
-    xed_decoded_inst_t op;
-    decode_init(&op);
-    if (xed_decode(&op, inst + op_offset, len - op_offset) !=
-            XED_ERROR_NONE ||
-        xed_decoded_inst_get_reg(&op, XED_OPERAND_REG0) != dst) {
-        return false;
-    }
-
-    bool unary = false;
-    bool shift = false;
-    switch (xed_decoded_inst_get_iclass(&op)) {
-    case XED_ICLASS_ADD:
-        // Register and immediate adds are lea dest, [srcA + addend]:
-        // mov_add_foldable_to_lea's finding, needing no extension. Only
-        // the memory source, which lea cannot load, is this fold's.
-        if (xed_decoded_inst_number_of_memory_operands(&op) == 0) {
-            return false;
-        }
-        break;
-    case XED_ICLASS_SUB:
-        // sub dest, imm is likewise lea dest, [srcA - imm].
-        if (xed_decoded_inst_get_immediate_width_bits(&op) != 0 &&
-            xed_decoded_inst_number_of_memory_operands(&op) == 0) {
-            return false;
-        }
-        break;
-    case XED_ICLASS_AND:
-    case XED_ICLASS_OR:
-    case XED_ICLASS_XOR:
-    case XED_ICLASS_ADC:
-    case XED_ICLASS_SBB:
-        break;
-    case XED_ICLASS_IMUL:
-        if (xed_decoded_inst_get_iform_enum(&op) != XED_IFORM_IMUL_GPRv_GPRv &&
-            xed_decoded_inst_get_iform_enum(&op) != XED_IFORM_IMUL_GPRv_MEMv) {
-            return false;
-        }
-        break;
-    case XED_ICLASS_NEG:
-    case XED_ICLASS_NOT:
-        unary = true;
-        break;
-    case XED_ICLASS_SHL:
-    case XED_ICLASS_SHR:
-    case XED_ICLASS_SAR:
-    case XED_ICLASS_ROL:
-    case XED_ICLASS_ROR:
-        shift = true;
-        break;
-    default:
-        return false;
-    }
-
-    if (shift) {
-        if (xed_decoded_inst_get_reg(&op, XED_OPERAND_REG1) == XED_REG_CL ||
-            xed_decoded_inst_get_immediate_width_bits(&op) == 0) {
-            return false;
-        }
-        uint64_t count = xed_decoded_inst_get_unsigned_immediate(&op);
-        if ((count & (width == 64 ? 63 : 31)) == 0) {
-            return false;
-        }
-    } else if (!unary) {
-        // A register source must not alias the destination: the folded op
-        // would read its stale pre-copy value. (The immediate and memory
-        // forms carry RFLAGS in REG1.) The mov's own source may recur --
-        // it holds the same value in both shapes.
-        xed_reg_enum_t op_src = xed_decoded_inst_get_reg(&op,
-            XED_OPERAND_REG1);
-        if (xed_reg_class(op_src) == XED_REG_CLASS_GPR &&
-            xed_get_largest_enclosing_register(op_src) == dst_enc) {
-            return false;
-        }
-    }
-
-    if (xed_decoded_inst_number_of_memory_operands(&op) > 0) {
-        // A pure load: the write-back forms put their register source in
-        // the REG0 slot, so this is what rejects them.
-        if (!xed_decoded_inst_mem_read(&op, 0) ||
-            xed_decoded_inst_mem_written(&op, 0)) {
-            return false;
-        }
-        // The address is computed after the mov in the original but with
-        // no copy in the folded form, so it must not read the destination.
-        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&op, 0);
-        if (base != XED_REG_INVALID && base != XED_REG_RIP &&
-            (xed_reg_class(base) != XED_REG_CLASS_GPR ||
-             xed_get_register_width_bits64(base) != 64 ||
-             xed_get_largest_enclosing_register(base) == dst_enc)) {
-            return false;
-        }
-        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(&op, 0);
-        if (index != XED_REG_INVALID &&
-            (xed_reg_class(index) != XED_REG_CLASS_GPR ||
-             xed_get_register_width_bits64(index) != 64 ||
-             xed_get_largest_enclosing_register(index) == dst_enc)) {
-            return false;
-        }
-    }
-
-    return !branch_target_in(branch_targets, op_offset,
-        op_offset + xed_decoded_inst_get_length(&op));
+    return false;
 }
 
 // Multi-instruction peephole (MOVBE): a load immediately byte-swapped in

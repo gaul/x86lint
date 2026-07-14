@@ -148,13 +148,19 @@ and only for flags -- the ABI guarantees they do not survive it.
     or memory-load source; NEG and NOT; and immediate shifts and rotates
     with a nonzero masked count (the SDM leaves a count-0 shift writing
     nothing, so the copy's value would survive in the original where the
-    NDD form's write behavior is unverified). Division of labor: register
-    and immediate ADD and immediate SUB stay with the MOV+ADD-foldable-to-
-    LEA finding, which needs no extension; CL-count shifts stay with
-    missing SHLX; and under both extensions the BLSI triple's mov/neg
-    prefix defers to the 3 -> 1 BLSI collapse. One instruction and one uop
-    fewer and a shorter dependency chain, though the 4-byte EVEX prefix can
-    cost two bytes of size on a 32-bit pair
+    NDD form's write behavior is unverified). The consumer need not be
+    adjacent: the fold looks through up to `APX_NDD_WINDOW - 2` intervening
+    instructions (one at the default of 3; a build-time constant sized for
+    experimentation) that prove themselves independent -- straight-line
+    code that never touches the copy's register at any width and never
+    writes the mov's source -- so a scheduling gap like a flag-zeroing
+    XOR, a load, or a store does not hide the pair. Division of labor:
+    register and immediate ADD and immediate SUB stay with the
+    MOV+ADD-foldable-to-LEA finding, which needs no extension; CL-count
+    shifts stay with missing SHLX; and under both extensions the BLSI
+    triple's mov/neg prefix defers to the 3 -> 1 BLSI collapse. One
+    instruction and one uop fewer and a shorter dependency chain, though
+    the 4-byte EVEX prefix can cost two bytes of size on a 32-bit pair
 * missing BLSI (only with `-m bmi1`)
   - `89F9 F7D9 21F9` (MOV ECX, EDI; NEG ECX; AND ECX, EDI) -- one BLSI ECX,
     EDI (BMI1) isolates the lowest set bit, collapsing the whole triple: the

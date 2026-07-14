@@ -4367,6 +4367,129 @@ static void check_missing_apx_ndd_test(void)
         0xC3,              // ret
     };
     ASSERT_FINDINGS_EXT(edge_on_op, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // ---- The window. Up to APX_NDD_WINDOW - 2 instructions may sit
+    // between the copy and its consumer when each proves independence
+    // (see apx_ndd_gap_independent); these expectations track the build's
+    // window so -DAPX_NDD_WINDOW experiments stay green. The negatives
+    // below hold at every window: reads, writes, aliases, and control
+    // flow stop the scan regardless of how far it may look.
+    const int one_gap = APX_NDD_WINDOW >= 3 ? 1 : 0;
+    const int two_gap = APX_NDD_WINDOW >= 4 ? 1 : 0;
+
+    // A flag-writing zero idiom between the pair: flags are free (the
+    // mov is flag-transparent), and ECX is neither the copy nor the
+    // source.
+    static const uint8_t gap_flags[] = {
+        0x89, 0xF8,        // mov eax, edi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x29, 0xF0,        // sub eax, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_flags, "missing APX NDD", one_gap,
+                        X86LINT_EXT_APX);
+
+    // A load between: memory is unconstrained, and the loaded ECX could
+    // even feed the op -- it holds the same value in both shapes.
+    static const uint8_t gap_load[] = {
+        0x48, 0x89, 0xC2,  // mov rdx, rax
+        0x8B, 0x0B,        // mov ecx, [rbx]
+        0x48, 0x29, 0xF2,  // sub rdx, rsi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_load, "missing APX NDD", one_gap,
+                        X86LINT_EXT_APX);
+
+    // A store between: both shapes store the same value at the same
+    // point.
+    static const uint8_t gap_store[] = {
+        0x4D, 0x89, 0xF4,        // mov r12, r14
+        0x48, 0x89, 0x55, 0xF8,  // mov [rbp-0x8], rdx
+        0x49, 0x83, 0xE4, 0x80,  // and r12, -0x80
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_store, "missing APX NDD", one_gap,
+                        X86LINT_EXT_APX);
+
+    // Reading the copy stops the scan: it is genuinely used, and the
+    // folded shape would hand the TEST a stale value.
+    static const uint8_t gap_reads_copy[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0x85, 0xC9,        // test ecx, ecx
+        0x29, 0xF1,        // sub ecx, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_reads_copy, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
+    // Writing the copy stops the scan for the first mov, whose copy dies
+    // unread -- and the second mov IS the pair: exactly one finding at
+    // any window.
+    static const uint8_t gap_writes_copy[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0x89, 0xD9,        // mov ecx, ebx
+        0x29, 0xF1,        // sub ecx, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_writes_copy, "missing APX NDD", 1,
+                        X86LINT_EXT_APX);
+
+    // Writing the source stops it: the folded op would read the source
+    // after the overwrite, where the original captured it at the mov.
+    static const uint8_t gap_writes_src[] = {
+        0x89, 0xF9,        // mov ecx, edi
+        0x89, 0xD7,        // mov edi, edx
+        0x29, 0xF1,        // sub ecx, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_writes_src, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
+    // A partial-register alias is still the copy: SHR CL, 5 writes CL
+    // inside ECX. (0x7 is inert for the immediate-family checks.)
+    static const uint8_t gap_partial_alias[] = {
+        0x89, 0xC1,        // mov ecx, eax
+        0xC0, 0xE9, 0x05,  // shr cl, 5
+        0x83, 0xE1, 0x07,  // and ecx, 7
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_partial_alias, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
+    // Control flow stops the scan: a call conservatively reads and
+    // writes everything.
+    static const uint8_t gap_call[] = {
+        0x89, 0xF8,                    // mov eax, edi
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call +0
+        0x29, 0xF0,                    // sub eax, esi
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_EXT(gap_call, "missing APX NDD", 0, X86LINT_EXT_APX);
+
+    // A direct branch onto the looked-through instruction reaches code
+    // that expects the copy done: the widened suppression span covers
+    // every slot, not just the op.
+    static const uint8_t edge_on_gap[] = {
+        0xEB, 0x02,        // jmp +2 (to the xor)
+        0x89, 0xF8,        // mov eax, edi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x29, 0xF0,        // sub eax, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_gap, "missing APX NDD", 0,
+                        X86LINT_EXT_APX);
+
+    // The window is bounded by the constant: two independent
+    // instructions between the pair need APX_NDD_WINDOW >= 4.
+    static const uint8_t two_gaps[] = {
+        0x89, 0xF8,        // mov eax, edi
+        0x31, 0xC9,        // xor ecx, ecx
+        0x31, 0xD2,        // xor edx, edx
+        0x29, 0xF0,        // sub eax, esi
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(two_gaps, "missing APX NDD", two_gap,
+                        X86LINT_EXT_APX);
 }
 
 // An undecodable byte (executable sections routinely embed data) must not

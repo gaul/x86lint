@@ -4637,6 +4637,73 @@ static void check_missing_apx_ndd_test(void)
                         X86LINT_EXT_APX);
 }
 
+// setcc X ; movzx of X into its own 32/64-bit parent: under -m apx the
+// pair is one zero-upper setcc (setzu.cc, EVEX ND=1), which writes the 0/1
+// result zero-extended to 64 bits itself -- an exact fold where the
+// baseline finding is advisory. One matcher serves both: the dispatcher
+// reports missing APX SETZU with the extension and the suboptimal SETcc
+// zero-extension advisory without it, never both. See
+// setcc_movzx_zero_extend.
+static void check_missing_apx_setzu_test(void)
+{
+    // The canonical pair. Under -m apx: the exact fold and only it; the
+    // total of 1 pins that the advisory does not co-fire. Without the
+    // extension, and under the unrelated extension bits, the advisory.
+    static const uint8_t pair32[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(pair32, "missing APX SETZU", 1, X86LINT_EXT_APX);
+    ASSERT_FINDINGS(pair32, "suboptimal SETcc zero-extension", 1);
+    ASSERT_FINDINGS_EXT(pair32, "suboptimal SETcc zero-extension", 1,
+                        X86LINT_EXT_BMI1 | X86LINT_EXT_BMI2 |
+                            X86LINT_EXT_MOVBE);
+
+    // The 64-bit widening form folds the same way (SETZU zero-extends to
+    // 64 bits regardless); the movzx's REX.W is separately the unneeded-
+    // REX finding, which keeps firing -- it concerns the pair's encoding,
+    // not its replacement.
+    static const uint8_t pair64[] = {
+        0x0F, 0x94, 0xC0,        // setz al
+        0x48, 0x0F, 0xB6, 0xC0,  // movzx rax, al
+        0xC3,                    // ret
+    };
+    int total;
+    assert(count_findings(pair64, sizeof(pair64), "missing APX SETZU",
+                          &total, X86LINT_EXT_APX) == 1);
+    assert(count_findings(pair64, sizeof(pair64), "unneeded REX prefix",
+                          &total, X86LINT_EXT_APX) == 1);
+    assert(total == 2);
+
+    // Condition- and register-generic: every cc has a zero-upper form.
+    static const uint8_t pair_ne[] = {
+        0x0F, 0x95, 0xC1,  // setnz cl
+        0x0F, 0xB6, 0xC9,  // movzx ecx, cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(pair_ne, "missing APX SETZU", 1, X86LINT_EXT_APX);
+
+    // Widening into a different register is a real move, not the idiom
+    // (the byte result stays live): no finding in either mode.
+    static const uint8_t wrong_reg[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x0F, 0xB6, 0xC8,  // movzx ecx, al
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(wrong_reg, "missing APX SETZU", 0, X86LINT_EXT_APX);
+
+    // A direct branch onto the movzx reaches it without the setcc.
+    static const uint8_t edge_on_movzx[] = {
+        0xEB, 0x03,        // jmp +3 (to the movzx)
+        0x0F, 0x94, 0xC0,  // setz al
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS_EXT(edge_on_movzx, "missing APX SETZU", 0,
+                        X86LINT_EXT_APX);
+}
+
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
@@ -4727,6 +4794,7 @@ int main(int argc, char *argv[])
     check_missing_shlx_test();
     check_missing_movbe_test();
     check_missing_apx_ndd_test();
+    check_missing_apx_setzu_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

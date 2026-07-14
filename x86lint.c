@@ -3809,8 +3809,12 @@ static bool redundant_test_after_setcc(const uint8_t *inst, size_t len,
 // the flag-setting instruction, outside this window, where a peephole can
 // prove neither the register free nor the xor's flag clobber dead. The
 // sequence is reported as suboptimal with no verified replacement --
-// missing LOCK's precedent -- so no liveness gate applies. Matched tightly
-// so each finding is the real idiom:
+// missing LOCK's precedent -- so no liveness gate applies. Under -m apx
+// the same match stops being advisory: the zero-upper setcc (EVEX ND=1)
+// writes the 0/1 result zero-extended to 64 bits itself, reading the same
+// condition flags, so the dispatcher reports the pair as the exact
+// missing-SETZU fold instead. Matched tightly so each finding is the real
+// idiom:
 //
 //   * low-byte setcc destination only: under the xor form the result lives
 //     in the low byte, so a high-byte destination (setz ah) is a different
@@ -4893,18 +4897,32 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             ++errors;
         }
 
-        // Multi-instruction peephole (advisory): setcc X ; movzx of X into
-        // its own 32/64-bit parent. Intel's preferred form zeroes the parent
-        // ahead of the compare instead, dropping the movzx and its
-        // partial-register merge. Reported against the movzx (at `next`),
-        // the instruction the preferred form removes. See
+        // Multi-instruction peephole: setcc X ; movzx of X into its own
+        // 32/64-bit parent. Under -m apx the pair is one zero-upper setcc
+        // -- setzu.cc r32 writes the 0/1 result zero-extended to 64 bits
+        // (the EVEX ND=1 form; XED's record models the byte register, the
+        // APX spec defines the upper bits zeroed), reads the same
+        // condition flags, and nothing sits between the pair to see the
+        // dropped intermediate state -- an exact fold, reported against
+        // the SETcc (at `offset`), where the replacement lands. Without
+        // the extension the finding stays the advisory: Intel's preferred
+        // form zeroes the parent ahead of the compare instead, dropping
+        // the movzx and its partial-register merge, reported against the
+        // movzx (at `next`), the instruction the preferred form removes.
+        // One matcher, one site, one finding either way. See
         // setcc_movzx_zero_extend.
         xed_decoded_inst_t widen_movzx;
         if (setcc_movzx_zero_extend(inst, len, branch_targets, next, &xedd,
                                     &widen_movzx)) {
-            summary_add(summary, "suboptimal SETcc zero-extension");
-            report_finding("suboptimal SETcc zero-extension", next, verbose,
-                &widen_movzx, inst + next);
+            if ((extensions & X86LINT_EXT_APX) != 0) {
+                summary_add(summary, "missing APX SETZU");
+                report_finding("missing APX SETZU", offset, verbose, &xedd,
+                    inst + offset);
+            } else {
+                summary_add(summary, "suboptimal SETcc zero-extension");
+                report_finding("suboptimal SETcc zero-extension", next,
+                    verbose, &widen_movzx, inst + next);
+            }
             ++errors;
         }
 

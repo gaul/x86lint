@@ -171,6 +171,17 @@ and only for flags -- the ABI guarantees they do not survive it.
     triple's mov/neg prefix defers to the 3 -> 1 BLSI collapse. One
     instruction and one uop fewer and a shorter dependency chain, though
     the 4-byte EVEX prefix can cost two bytes of size on a 32-bit pair
+* missing APX SETZU (only with `-m apx`)
+  - `0F94C0 0FB6C0` (SETZ AL; MOVZX EAX, AL) -- one zero-upper SETZ (APX,
+    EVEX ND=1: XED's record models the byte register, the spec zeroes bits
+    63:8) writes the 0/1 result zero-extended to 64 bits itself, reading
+    the same condition flags, so the widening pair collapses exactly.
+    This is the suboptimal-SETcc-zero-extension idiom made foldable: the
+    baseline finding is advisory because its fix lives upstream of the
+    flag-setter, where a peephole proves nothing, but the zero-upper form
+    replaces the pair in place. One matcher serves both, and the
+    dispatcher reports exactly one of the two -- this finding with the
+    extension, the advisory without it
 * missing BLSI (only with `-m bmi1`)
   - `89F9 F7D9 21F9` (MOV ECX, EDI; NEG ECX; AND ECX, EDI) -- one BLSI ECX,
     EDI (BMI1) isolates the lowest set bit, collapsing the whole triple: the
@@ -381,7 +392,9 @@ and only for flags -- the ABI guarantees they do not survive it.
     surroundings a peephole cannot prove safe, so the rewrite is suggested,
     not verified. Same-register, low-byte, 32/64-bit forms only; rejected
     when a direct branch targets the MOVZX -- that path's byte was set by
-    something else
+    something else. Under `-m apx` the same pair reports as missing APX
+    SETZU instead: the zero-upper form is the exact in-place fold the
+    baseline lacks
 * suboptimal SHL one
   - `D1E0` (SHL EAX, 1) -- ADD EAX, EAX computes the same value with identical
     flags (CF gets the shifted-out bit either way, and OF matches too) in the
@@ -525,7 +538,8 @@ Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` to declare that the
 binary's target supports those instruction-set extensions, enabling the
 checks that suggest replacing a baseline sequence with an instruction from
 that set (missing ANDN, missing BLSI, missing BLSMSK, missing BLSR, missing
-SHLX/SHRX/SARX, missing MOVBE, missing APX NDD). These
+SHLX/SHRX/SARX, missing MOVBE, missing APX NDD, missing APX
+SETZU). These
 are opt-in because the finding is only actionable when the target guarantees
 the extension: a distro binary built for x86-64-v2 could not have used ANDN
 however clear the opportunity, and inferring availability from the

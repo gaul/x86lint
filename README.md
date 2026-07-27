@@ -368,7 +368,15 @@ and only for flags -- the ABI guarantees they do not survive it.
   - `21D8 85C0` (AND EAX, EBX; TEST EAX, EAX) -- the AND already set SF/ZF/PF,
     so the TEST is dead. AND/OR/XOR match TEST's flags exactly (CF/OF cleared)
     and fire unconditionally; ADD/SUB/INC/DEC and friends diverge only on CF/OF
-    and are flagged only when those are dead downstream (gated by flag liveness)
+    and are flagged only when those are dead downstream (gated by flag liveness).
+    The TEST need not be adjacent: it is searched for through `APX_NDD_WINDOW`,
+    past instructions writing neither the flags nor the tested register. Reads
+    of either are looked through -- both see the same value with the TEST gone
+    -- which an alignment NOP or a spill store between the pair depends on;
+    Go's assembler pads before an aligned branch target, hiding these behind a
+    NOP. The register must match the producer's exactly, since `AND EAX, EBX`
+    clears bits 63:32 and `TEST RAX, RAX` would read a sign bit the narrow
+    form never sees
 * redundant TEST after SETcc
   - `0F94C0 84C0 74xx` (SETZ AL; TEST AL, AL; JE) -- SETcc preserves the
     compare's flags, so the TEST only recomputes a condition they still hold;

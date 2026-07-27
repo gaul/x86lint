@@ -2828,11 +2828,72 @@ static bool branch_target_in(const uint8_t *targets, size_t lo, size_t hi)
     return false;
 }
 
+// An instruction the redundant-TEST fold may look through on its way to the
+// test. Both halves of the pattern have to survive it: the flags the producer
+// left, and the value the test would read.
+//
+// So it must write no flag -- a write, "undefined" per the SDM, or a
+// conditional one (a shift by CL writes none for a masked count of zero, but
+// may), all replace what the producer set, leaving the test no longer a
+// duplicate of it -- and must not write the tested register at any width. It
+// must not transfer control either, since the fold reasons about one
+// straight-line path.
+//
+// Reading either is fine, and is where this parts company with
+// apx_ndd_gap_independent, which rejects any mention of its destination: an
+// instruction that reads the flags reads the producer's both before and after
+// the test is dropped, and one that reads the register (a store spilling it,
+// say) leaves the value the test would have seen. Neither can tell the
+// difference, and both are common enough between a compare and its branch to
+// be worth looking through -- a store sits in one of the go sites this
+// window was measured on.
+static bool flags_gap_transparent(const xed_decoded_inst_t *gap,
+                                  xed_reg_enum_t dest_enc)
+{
+    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
+    if (category == XED_CATEGORY_CALL ||
+        category == XED_CATEGORY_RET ||
+        category == XED_CATEGORY_UNCOND_BR ||
+        category == XED_CATEGORY_COND_BR ||
+        category == XED_CATEGORY_SYSCALL ||
+        category == XED_CATEGORY_SYSRET ||
+        category == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+
+    const xed_simple_flag_t *fi = xed_decoded_inst_get_rflags_info(gap);
+    if (fi != NULL &&
+        (flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
+         flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi))) != 0) {
+        return false;
+    }
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *operand = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(operand);
+        // The memory-addressing names carry the stack-pointer updates, which
+        // XED reports nowhere else: push writes RSP through BASE0.
+        if ((!xed_operand_is_register(name) &&
+             !xed_operand_is_memory_addressing_register(name)) ||
+            !xed_operand_written(operand)) {
+            continue;
+        }
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(gap, name)) == dest_enc) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool flags_test_redundant(const uint8_t *inst, size_t len,
                                  const uint8_t *branch_targets,
-                                 size_t test_offset,
+                                 size_t after_producer,
                                  const xed_decoded_inst_t *producer,
-                                 xed_decoded_inst_t *test_out)
+                                 xed_decoded_inst_t *test_out,
+                                 size_t *test_offset_out)
 {
     uint32_t divergent;
     switch (xed_decoded_inst_get_iclass(producer)) {
@@ -2856,7 +2917,9 @@ static bool flags_test_redundant(const uint8_t *inst, size_t len,
 
     // The ALU's destination must be a register (skip add [mem], reg and the
     // like): the written register operand, which for these iclasses is the
-    // first operand when it is not memory.
+    // first operand when it is not memory. A memory-destination form has no
+    // written GPR at all and would otherwise leave the suppressed RFLAGS
+    // operand in `dest`, so the class test is what rejects it.
     xed_reg_enum_t dest = XED_REG_INVALID;
     const xed_inst_t *xi = xed_decoded_inst_inst(producer);
     unsigned nops = xed_inst_noperands(xi);
@@ -2868,42 +2931,54 @@ static bool flags_test_redundant(const uint8_t *inst, size_t len,
             break;
         }
     }
-    if (dest == XED_REG_INVALID) {
+    if (dest == XED_REG_INVALID || xed_reg_class(dest) != XED_REG_CLASS_GPR) {
         return false;
     }
+    xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(dest);
 
-    // The following instruction must be test dest, dest.
-    if (test_offset >= len) {
-        return false;
-    }
-    decode_init(test_out);
-    if (xed_decode(test_out, inst + test_offset, len - test_offset) !=
-            XED_ERROR_NONE) {
-        return false;
-    }
-    if (xed_decoded_inst_get_iclass(test_out) != XED_ICLASS_TEST ||
-        xed_decoded_inst_number_of_memory_operands(test_out) > 0 ||
-        xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG0) != dest ||
-        xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) != dest) {
-        return false;
-    }
-
-    // An incoming direct edge onto the test reaches it without the producer;
-    // dropping the test would break that path.
-    if (branch_target_in(branch_targets, test_offset,
-            test_offset + xed_decoded_inst_get_length(test_out))) {
-        return false;
-    }
-
-    // Arithmetic producers diverge from the test on CF/OF; suppress while
-    // either might still be read past the test.
-    if (divergent != 0) {
-        size_t after = test_offset + xed_decoded_inst_get_length(test_out);
-        if (flags_live_after(inst, len, after, divergent)) {
+    // test dest, dest, found within the shared window. The register must match
+    // the producer's exactly, not merely enclose it: and eax, ebx clears bits
+    // 63:32, so test rax, rax reads a sign bit the narrower test never sees.
+    size_t cur = after_producer;
+    for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
+        if (cur >= len) {
             return false;
         }
+        decode_init(test_out);
+        if (xed_decode(test_out, inst + cur, len - cur) != XED_ERROR_NONE) {
+            return false;
+        }
+        size_t after = cur + xed_decoded_inst_get_length(test_out);
+
+        if (xed_decoded_inst_get_iclass(test_out) != XED_ICLASS_TEST ||
+            xed_decoded_inst_number_of_memory_operands(test_out) > 0 ||
+            xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG0) != dest ||
+            xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) != dest) {
+            // Not the test: an instruction the fold may look through if it
+            // leaves the flags and the tested value alone.
+            if (!flags_gap_transparent(test_out, dest_enc)) {
+                return false;
+            }
+            cur = after;
+            continue;
+        }
+
+        // An incoming direct edge onto any looked-through instruction or onto
+        // the test reaches it without the producer, whose flags the rewrite
+        // relies on; dropping the test would break that path.
+        if (branch_target_in(branch_targets, after_producer, after)) {
+            return false;
+        }
+
+        // Arithmetic producers diverge from the test on CF/OF; suppress while
+        // either might still be read past the test.
+        if (divergent != 0 && flags_live_after(inst, len, after, divergent)) {
+            return false;
+        }
+        *test_offset_out = cur;
+        return true;
     }
-    return true;
+    return false;
 }
 
 // The full-register analogue of reg_upper32_live_after: walk forward from
@@ -5069,16 +5144,20 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             ++errors;
         }
 
-        // Multi-instruction peephole: a flag-setting ALU write immediately
-        // followed by test reg, reg on the same register makes the test
-        // redundant. Reported against the test (at `next`), the removable
-        // instruction. See flags_test_redundant.
+        // Multi-instruction peephole: a flag-setting ALU write followed by
+        // test reg, reg on the same register makes the test redundant. The
+        // test need not be adjacent -- it is searched for through the shared
+        // APX_NDD_WINDOW, past instructions that write neither the flags nor
+        // the tested register (see flags_gap_transparent) -- so the finding is
+        // reported at the test's own offset, the removable instruction. See
+        // flags_test_redundant.
         xed_decoded_inst_t redundant_test;
+        size_t redundant_test_offset;
         if (flags_test_redundant(inst, len, branch_targets, next, &xedd,
-                                 &redundant_test)) {
+                                 &redundant_test, &redundant_test_offset)) {
             summary_add(summary, "redundant TEST after flags");
-            report_finding("redundant TEST after flags", next, verbose,
-                &redundant_test, inst + next);
+            report_finding("redundant TEST after flags", redundant_test_offset,
+                verbose, &redundant_test, inst + redundant_test_offset);
             ++errors;
         }
 

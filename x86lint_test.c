@@ -2440,6 +2440,114 @@ static void check_redundant_flags_test(void)
         0x85, 0xC0,        // test eax, eax
     };
     ASSERT_FINDINGS(shl_test, "redundant TEST after flags", 0);
+
+    // ---- The window, shared with the APX NDD fold (APX_NDD_WINDOW): the test
+    // may sit past instructions that leave the producer's flags and the tested
+    // register alone (flags_gap_transparent). These expectations track the
+    // build's window; the negatives hold at every width.
+    const int one_gap = APX_NDD_WINDOW >= 3 ? 1 : 0;
+    const int two_gap = APX_NDD_WINDOW >= 4 ? 1 : 0;
+
+    // An alignment NOP between the pair -- the shape that hid these findings
+    // in Go binaries, where the assembler pads to align the branch target.
+    static const uint8_t gap_nop[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x90,              // nop
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_nop, "redundant TEST after flags", one_gap);
+
+    static const uint8_t gap_two_nops[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x90,              // nop
+        0x90,              // nop
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_two_nops, "redundant TEST after flags", two_gap);
+
+    // A gap that reads the tested register still leaves the value the test
+    // would see, so the fold looks through it. This is where the rule parts
+    // company with apx_ndd_gap_independent, which rejects any mention of its
+    // destination.
+    static const uint8_t gap_reads_dest[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x89, 0x06,        // mov [rsi], eax
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_reads_dest, "redundant TEST after flags", one_gap);
+
+    // A gap that reads the flags reads the producer's either way, before and
+    // after the test is dropped: transparent.
+    static const uint8_t gap_reads_flags[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x0F, 0x94, 0xC1,  // sete cl
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_reads_flags, "redundant TEST after flags", one_gap);
+
+    // A gap that writes the flags replaces what the producer set, so the test
+    // is no longer a duplicate of it.
+    static const uint8_t gap_writes_flags[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x31, 0xC9,        // xor ecx, ecx
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_writes_flags, "redundant TEST after flags", 0);
+
+    // A gap that writes the tested register makes the test read a different
+    // value than the producer computed -- at any width, so a byte write to
+    // the same enclosing register stops the scan too.
+    static const uint8_t gap_writes_dest[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0xB0, 0x05,        // mov al, 5
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_writes_dest, "redundant TEST after flags", 0);
+
+    // Control flow ends the straight-line path the fold reasons about.
+    static const uint8_t gap_branches[] = {
+        0x21, 0xD8,        // and eax, ebx
+        0x74, 0x00,        // jz +0
+        0x85, 0xC0,        // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_branches, "redundant TEST after flags", 0);
+
+    // An incoming edge onto a looked-through instruction reaches the test
+    // without the producer, exactly as an edge onto the test itself does.
+    static const uint8_t gap_edge_on_gap[] = {
+        0x21, 0xD8,        // 0: and eax, ebx
+        0x90,              // 2: nop            <- branch target
+        0x85, 0xC0,        // 3: test eax, eax
+        0xEB, 0xFB,        // 5: jmp 2
+    };
+    ASSERT_FINDINGS(gap_edge_on_gap, "redundant TEST after flags", 0);
+
+    // An edge onto the producer executes the whole pattern: fires.
+    static const uint8_t gap_edge_on_head[] = {
+        0x21, 0xD8,        // 0: and eax, ebx   <- branch target
+        0x90,              // 2: nop
+        0x85, 0xC0,        // 3: test eax, eax
+        0xEB, 0xF9,        // 5: jmp 0
+    };
+    ASSERT_FINDINGS(gap_edge_on_head, "redundant TEST after flags", one_gap);
+
+    // The divergence gate evaluates at the test wherever the window found it:
+    // an arithmetic producer fires through a gap when CF/OF die at the RET,
+    // and stays suppressed when a later reader keeps them live.
+    static const uint8_t gap_add_ret[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x90,              // nop
+        0x85, 0xC0,        // test eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(gap_add_ret, "redundant TEST after flags", one_gap);
+    static const uint8_t gap_add_jb[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x90,              // nop
+        0x85, 0xC0,        // test eax, eax
+        0x72, 0x00,        // jb +0
+    };
+    ASSERT_FINDINGS(gap_add_jb, "redundant TEST after flags", 0);
 }
 
 // Multi-instruction peephole: lea reg, [addr] whose address the next

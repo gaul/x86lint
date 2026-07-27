@@ -238,6 +238,29 @@ and only for flags -- the ABI guarantees they do not survive it.
     through Broadwell) are flagged the same way; their legacy aliases
     BSF/BSR are never flagged -- real silicon preserves their destination on
     a zero source, which the xor would change
+* missing SSE dependency break
+  - `F30F5AC1` (CVTSS2SD XMM0, XMM1) -- the legacy scalar SSE instructions
+    write only their destination's low element and leave the rest of the
+    register standing ("DEST[127:64] (unmodified)" in the SDM), so the
+    destination is an input to that merge on every core. Code that keeps
+    scalars in vector registers never wants those bits, so the dependency is
+    pure latency: the instruction serializes behind whatever wrote the
+    register last, however unrelated. Insert XORPS dst, dst just before --
+    the low element is overwritten, the upper bits were dead, and vector XOR
+    writes no flags, so the insertion is invisible. gcc and clang both emit
+    it; llvm carries a pass for it (X86's BreakFalseDeps). Flagged for
+    CVTSI2SD/SS, CVTSS2SD, CVTSD2SS, SQRTSD/SS, ROUNDSD/SS, RCPSS and
+    RSQRTSS. Not flagged when the source is the destination (a real
+    dependency the xor would destroy), for the VEX and EVEX forms (whose
+    third operand names the merge source outright -- the fix there is to
+    choose that operand, a different rewrite), or when the preceding
+    instruction already rewrote the whole register, whether by a
+    same-register vector XOR or by any full producer. ADDSD and the other
+    scalar arithmetic merge identically and are never flagged: their
+    destination is a genuine source operand, the same real-versus-phantom
+    input distinction that keeps BSF/BSR out of the POPCNT check. A memory
+    source needs no exception, unlike POPCNT's -- the address is built from
+    general-purpose registers a vector zero idiom cannot disturb
 * missing SHLX/SHRX/SARX (only with `-m bmi2`)
   - `D3E0` (SHL EAX, CL) -- SHLX EAX, EAX, ECX (BMI2) shifts without touching
     any flag, dropping the flag-merge uops CL-count shifts cost on Intel

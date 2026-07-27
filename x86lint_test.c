@@ -3516,6 +3516,151 @@ static void check_popcnt_false_dep_test(void)
     ASSERT_FINDINGS(bsf, "missing POPCNT dependency break", 0);
 }
 
+// Advisory: the legacy scalar SSE instructions write only their
+// destination's low element and leave the upper lanes standing, so a
+// destination the adjacent predecessor did not rewrite is a phantom input --
+// break it with a vector zero idiom before the instruction.
+static void check_sse_merge_false_dep_test(void)
+{
+    // Stale destination: flagged across the whole family.
+    static const uint8_t cvtss2sd[] = {
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(cvtss2sd, "missing SSE dependency break", 1);
+
+    static const uint8_t cvtsd2ss[] = {
+        0xF2, 0x0F, 0x5A, 0xC1,  // cvtsd2ss xmm0, xmm1
+    };
+    ASSERT_FINDINGS(cvtsd2ss, "missing SSE dependency break", 1);
+
+    static const uint8_t sqrtsd[] = {
+        0xF2, 0x0F, 0x51, 0xC1,  // sqrtsd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(sqrtsd, "missing SSE dependency break", 1);
+
+    static const uint8_t roundsd[] = {
+        0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x03,  // roundsd xmm0, xmm1, 0x3
+    };
+    ASSERT_FINDINGS(roundsd, "missing SSE dependency break", 1);
+
+    static const uint8_t rsqrtss[] = {
+        0xF3, 0x0F, 0x52, 0xC1,  // rsqrtss xmm0, xmm1
+    };
+    ASSERT_FINDINGS(rsqrtss, "missing SSE dependency break", 1);
+
+    // An integer source lives in a GPR, so the destination can never be the
+    // source: the form is always flagged, memory operand or not. The address
+    // is built from general-purpose registers a vector zero idiom cannot
+    // disturb, unlike POPCNT's.
+    static const uint8_t cvtsi2sd[] = {
+        0xF2, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, eax
+    };
+    ASSERT_FINDINGS(cvtsi2sd, "missing SSE dependency break", 1);
+
+    static const uint8_t mem_src[] = {
+        0xF3, 0x0F, 0x5A, 0x00,  // cvtss2sd xmm0, dword ptr [rax]
+    };
+    ASSERT_FINDINGS(mem_src, "missing SSE dependency break", 1);
+
+    // Same register: the destination is the source, so the dependency is
+    // real and the xor would destroy the input.
+    static const uint8_t same_reg[] = {
+        0xF3, 0x0F, 0x5A, 0xC0,  // cvtss2sd xmm0, xmm0
+    };
+    ASSERT_FINDINGS(same_reg, "missing SSE dependency break", 0);
+
+    // The scalar arithmetic that merges the same way is never flagged: its
+    // destination is a genuine source operand.
+    static const uint8_t addsd[] = {
+        0xF2, 0x0F, 0x58, 0xC1,  // addsd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(addsd, "missing SSE dependency break", 0);
+
+    // VEX names the merge source outright, so the fix is to choose that
+    // operand, not to insert a zero idiom: a different rewrite, not flagged.
+    static const uint8_t vex[] = {
+        0xC5, 0xF2, 0x5A, 0xC2,  // vcvtss2sd xmm0, xmm1, xmm2
+    };
+    ASSERT_FINDINGS(vex, "missing SSE dependency break", 0);
+
+    // xorps xmm0, xmm0 ; cvtss2sd xmm0, xmm1 -- the mitigation gcc, clang
+    // and Go all emit. XED models the xor's destination as read-and-written,
+    // so recognizing it takes the explicit zero-idiom match. Suppress.
+    static const uint8_t mitigated[] = {
+        0x0F, 0x57, 0xC0,        // xorps xmm0, xmm0
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(mitigated, "missing SSE dependency break", 0);
+
+    // The integer-domain zero idiom breaks the dependency just as well. Its
+    // legacy form is spelled vpxor here only so the fixture stands alone:
+    // pxor xmm0, xmm0 is suppressed identically, but carries a suboptimal
+    // SSE zero idiom finding of its own that this assertion would count.
+    static const uint8_t mitigated_vpxor[] = {
+        0xC5, 0xF9, 0xEF, 0xC0,  // vpxor xmm0, xmm0, xmm0
+        0xF2, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, eax
+    };
+    ASSERT_FINDINGS(mitigated_vpxor, "missing SSE dependency break", 0);
+
+    static const uint8_t mitigated_vex_xor[] = {
+        0xC5, 0xF8, 0x57, 0xC0,  // vxorps xmm0, xmm0, xmm0
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(mitigated_vex_xor, "missing SSE dependency break", 0);
+
+    // Zeroing a DIFFERENT register mitigates nothing.
+    static const uint8_t wrong_reg[] = {
+        0x0F, 0x57, 0xDB,        // xorps xmm3, xmm3
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(wrong_reg, "missing SSE dependency break", 1);
+
+    // Nor does a vector XOR against another register: xorps xmm0, xmm1
+    // zeroes nothing and leaves the dependency in place.
+    static const uint8_t xor_other[] = {
+        0x0F, 0x57, 0xC1,        // xorps xmm0, xmm1
+        0xF3, 0x0F, 0x5A, 0xC2,  // cvtss2sd xmm0, xmm2
+    };
+    ASSERT_FINDINGS(xor_other, "missing SSE dependency break", 1);
+
+    // Any adjacent producer that rewrites the whole register leaves the
+    // dependency one instruction stale, which is what the advice would buy.
+    static const uint8_t full_write[] = {
+        0x0F, 0x28, 0xC3,        // movaps xmm0, xmm3
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(full_write, "missing SSE dependency break", 0);
+
+    static const uint8_t movd[] = {
+        0x66, 0x0F, 0x6E, 0xC0,  // movd xmm0, eax
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(movd, "missing SSE dependency break", 0);
+
+    // A partial write leaves the upper lanes -- and the dependency -- in
+    // place. XED reports MOVSS's destination written-only in both forms, so
+    // telling the merging register form from the zeroing memory form is the
+    // suppression's other correction.
+    static const uint8_t movss_reg[] = {
+        0xF3, 0x0F, 0x10, 0xC3,  // movss xmm0, xmm3
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(movss_reg, "missing SSE dependency break", 1);
+
+    static const uint8_t movss_mem[] = {
+        0xF3, 0x0F, 0x10, 0x00,  // movss xmm0, dword ptr [rax]
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(movss_mem, "missing SSE dependency break", 0);
+
+    // A lane insert writes half the register and merges the other half.
+    static const uint8_t movhps[] = {
+        0x0F, 0x16, 0x00,        // movhps xmm0, qword ptr [rax]
+        0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
+    };
+    ASSERT_FINDINGS(movhps, "missing SSE dependency break", 1);
+}
+
 // not rX ; and rX, rY folds to andn rX, rX, rY -- but only when the caller
 // declared BMI1 available (-m bmi1), and only when PF, which AND defines and
 // ANDN leaves undefined, is dead. See not_and_foldable_to_andn.
@@ -4960,6 +5105,7 @@ int main(int argc, char *argv[])
     check_setcc_branch_test();
     check_setcc_movzx_test();
     check_popcnt_false_dep_test();
+    check_sse_merge_false_dep_test();
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_blsmsk_test();

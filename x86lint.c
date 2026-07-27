@@ -4806,6 +4806,167 @@ static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
     return prev == NULL || !redefines_reg_ge32(prev, parent);
 }
 
+// True when `xedd` unconditionally rewrites every bit of the vector register
+// enclosed by `vec_parent`, leaving nothing of its previous value for a
+// later merge to depend on. The suppression step of sse_merge_false_dep, and
+// the vector analogue of redefines_reg_ge32.
+//
+// XED marks a destination it models as fully overwritten written-only, and a
+// destination whose old bits survive read-and-written, which decides almost
+// every case on its own: movaps, movd/movq from a GPR, cvtps2pd and movddup
+// come back written-only, while the lane inserts (movlps, movhps, movlhps,
+// pinsr, insertps) and every scalar op come back read-and-written. Two
+// corrections are needed at the edges:
+//
+//   * a same-register vector XOR -- the mitigation this check asks for --
+//     reads its destination as an ALU operand, so XED reports it
+//     read-and-written even though the result is a constant zero. Matched
+//     ahead of the scan, and only when every register operand is the same
+//     register: xorps xmm0, xmm1 zeroes nothing. SUBPS and friends are
+//     deliberately not matched -- self-subtraction is not a zero idiom the
+//     renamer recognizes, so the dependency it carries is real.
+//   * MOVSS and MOVSD come back written-only in both forms, but only the
+//     memory form zeroes the upper lanes; the register form merges into them
+//     exactly like the instructions this file flags. Excluded by form.
+//
+// Omitting a full writer costs a suppression, so the correction list errs
+// toward reporting; a wrong entry would instead hide a real finding.
+static bool redefines_xmm_full(const xed_decoded_inst_t *xedd,
+                               xed_reg_enum_t vec_parent)
+{
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+
+    switch (iclass) {
+    case XED_ICLASS_XORPS:
+    case XED_ICLASS_XORPD:
+    case XED_ICLASS_PXOR:
+    case XED_ICLASS_VXORPS:
+    case XED_ICLASS_VXORPD:
+    case XED_ICLASS_VPXOR: {
+        bool all_same = false;
+        for (unsigned i = 0; i < nops; ++i) {
+            xed_operand_enum_t name =
+                xed_operand_name(xed_inst_operand(xi, i));
+            if (!xed_operand_is_register(name)) {
+                continue;
+            }
+            if (xed_get_largest_enclosing_register(
+                    xed_decoded_inst_get_reg(xedd, name)) != vec_parent) {
+                return false;
+            }
+            all_same = true;
+        }
+        if (all_same) {
+            return true;
+        }
+        break;
+    }
+    case XED_ICLASS_MOVSS:
+    case XED_ICLASS_MOVSD_XMM:
+    case XED_ICLASS_VMOVSS:
+    case XED_ICLASS_VMOVSD:
+        if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+            return false;
+        }
+        break;
+    default:
+        break;
+    }
+
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || !xed_operand_written_only(op)) {
+            continue;
+        }
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(xedd, name)) == vec_parent) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Single-instruction advisory with a backward suppression, the vector
+// counterpart of popcnt_false_dep. The legacy scalar SSE instructions below
+// write only the low element of their destination and leave the rest of the
+// register untouched -- the SDM spells every one of them "DEST[127:64]
+// (unmodified)" -- so the destination is an input to the merge whatever the
+// program means by it:
+//
+//   cvtss2sd xmm0, xmm1   -- waits for xmm0's previous producer
+//
+// A compiler that keeps scalars in vector registers never wants those upper
+// bits, so the dependency is pure latency: the conversion serializes behind
+// whatever last wrote the register, however unrelated. The mitigation gcc and
+// clang emit -- llvm carries a whole pass for it, X86's BreakFalseDeps -- is a
+// zero idiom just before: xorps xmm0, xmm0 ; cvtss2sd xmm0, xmm1. That
+// insertion is invisible in the architectural state, since the low element is
+// overwritten and the upper bits were dead, and vector XOR writes no flags, so
+// nothing downstream can see it and nothing sits between the two either.
+// Advisory nonetheless: adding an instruction is a size-for-latency trade, not
+// an equivalence rewrite.
+//
+// The addend and multiplicand scalars -- ADDSD, MULSS, MINSD and the rest --
+// merge the same way and are never flagged: their destination is a genuine
+// source operand, so the dependency is architectural and a zero idiom would
+// destroy the input. That distinction, real input versus phantom input, is the
+// same one that keeps BSF and BSR out of popcnt_false_dep.
+//
+// Not flagged:
+//   * same-register forms (cvtss2sd xmm0, xmm0): the destination is the
+//     source, so the dependency is real and the xor would destroy it;
+//   * the VEX and EVEX forms (vcvtss2sd xmm0, xmm1, xmm2): the merge source
+//     is a third operand the encoding names outright, so the fix is to give
+//     that operand a register already known dead rather than to insert
+//     anything -- a different rewrite, and one this check would misreport;
+//   * a previous instruction that already rewrote the whole register
+//     (`prev`, NULL at the buffer start and after a resync): the compilers'
+//     xor shape, or any adjacent full producer -- re-flagging mitigated code
+//     would bury the real findings. A direct edge onto the instruction
+//     reaches it without that predecessor; the suppression forgoes that
+//     path's finding, erring toward false negatives as everywhere else.
+//
+// A memory source needs no special handling, unlike POPCNT's: the address is
+// built from general-purpose registers, which a vector zero idiom cannot
+// disturb, so cvtss2sd xmm0, [rax] is flagged like any other form.
+static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
+                                const xed_decoded_inst_t *prev)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_CVTSI2SD:
+    case XED_ICLASS_CVTSI2SS:
+    case XED_ICLASS_CVTSS2SD:
+    case XED_ICLASS_CVTSD2SS:
+    case XED_ICLASS_SQRTSD:
+    case XED_ICLASS_SQRTSS:
+    case XED_ICLASS_ROUNDSD:
+    case XED_ICLASS_ROUNDSS:
+    case XED_ICLASS_RCPSS:
+    case XED_ICLASS_RSQRTSS:
+        break;
+    default:
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_XMM) {
+        return false;
+    }
+    xed_reg_enum_t parent = xed_get_largest_enclosing_register(dst);
+    if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+        // CVTSI2SD's source is a GPR, whose enclosing register can never be
+        // the vector destination's -- the comparison simply never fires
+        // there, which is the right answer.
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        if (xed_get_largest_enclosing_register(src) == parent) {
+            return false;
+        }
+    }
+    return prev == NULL || !redefines_xmm_full(prev, parent);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                        x86lint_summary *summary, uint32_t extensions)
 {
@@ -5132,6 +5293,18 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if (popcnt_false_dep(&xedd, have_prev ? &prev : NULL)) {
             summary_add(summary, "missing POPCNT dependency break");
             report_finding("missing POPCNT dependency break", offset, verbose,
+                &xedd, inst + offset);
+            ++errors;
+        }
+
+        // Single-instruction advisory with a backward suppression: a legacy
+        // scalar SSE instruction writes only its destination's low element
+        // and merges into the rest, so a destination the adjacent
+        // predecessor did not rewrite carries a false dependency; a vector
+        // zero idiom just before breaks it. See sse_merge_false_dep.
+        if (sse_merge_false_dep(&xedd, have_prev ? &prev : NULL)) {
+            summary_add(summary, "missing SSE dependency break");
+            report_finding("missing SSE dependency break", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }

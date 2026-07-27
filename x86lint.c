@@ -3433,6 +3433,199 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
            xed_get_largest_enclosing_register(dest);
 }
 
+// One frame slot's addressing, enough to decide that two loads name the same
+// bytes. Filled only for a load off RSP or RBP; `base` is INVALID otherwise.
+struct frame_slot {
+    xed_reg_enum_t base;        // enclosing RSP or RBP
+    xed_reg_enum_t index;       // enclosing, or INVALID
+    unsigned scale;
+    int64_t disp;
+    unsigned width;             // bytes accessed
+};
+
+// Describe `xedd` if it is a plain register load from the stack frame:
+// mov reg, [rsp/rbp + ...], no segment override, reading memory rather than
+// writing it. Returns the loaded register, or XED_REG_INVALID when the shape
+// does not match.
+//
+// Restricting the reload check to the frame is what makes it safe to delete a
+// memory access at all. A frame slot is private to one thread and is never
+// device memory, so the reads this drops cannot be an MMIO side effect, cannot
+// race another thread, and cannot be a relaxed atomic load that Go or Rust
+// compiles to a plain mov. The same cannot be said of a global or a
+// pointer dereference, where a second load of one address usually means the
+// compiler was forbidden to reuse the first -- CSE is otherwise universal, and
+// gcc -O2 already rewrites two reads of a plain global into one read and a
+// register copy, exactly this check's suggestion. What survives there is
+// enriched for volatile, so those forms are left alone.
+static xed_reg_enum_t frame_load_slot(const xed_decoded_inst_t *xedd,
+                                      struct frame_slot *slot)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(xedd) != 1 ||
+        !xed_decoded_inst_mem_read(xedd, 0) ||
+        xed_decoded_inst_mem_written(xedd, 0)) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(xedd, 0);
+    if (seg == XED_REG_FS || seg == XED_REG_GS) {
+        return XED_REG_INVALID;     // thread-local, not the frame
+    }
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, 0);
+    if (xed_reg_class(base) != XED_REG_CLASS_GPR) {
+        return XED_REG_INVALID;
+    }
+    base = xed_get_largest_enclosing_register(base);
+    if (base != XED_REG_RSP && base != XED_REG_RBP) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t index = xed_decoded_inst_get_index_reg(xedd, 0);
+    slot->base = base;
+    slot->index = xed_reg_class(index) == XED_REG_CLASS_GPR
+        ? xed_get_largest_enclosing_register(index) : XED_REG_INVALID;
+    slot->scale = xed_decoded_inst_get_scale(xedd, 0);
+    slot->disp = xed_decoded_inst_get_memory_displacement(xedd, 0);
+    slot->width = xed_decoded_inst_get_memory_operand_length(xedd, 0);
+    return dest;
+}
+
+// An instruction the reload check may look through. The address, the memory
+// it names, and the register holding the loaded value all have to survive it,
+// so it must not write the base or index (the address would move), must not
+// write the loaded register (the value would be gone), and must not write
+// memory at all -- a store anywhere could be the slot, and proving otherwise
+// is alias analysis this tool does not do. A LOCK prefix is a store by
+// another name. Control transfers end the straight-line path, and a call in
+// particular could write the frame through a pointer to it.
+//
+// Reads are all fine: memory reads change nothing, and reading the loaded
+// register is the point of loading it.
+static bool reload_gap_transparent(const xed_decoded_inst_t *gap,
+                                   const struct frame_slot *slot,
+                                   xed_reg_enum_t held)
+{
+    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
+    if (category == XED_CATEGORY_CALL ||
+        category == XED_CATEGORY_RET ||
+        category == XED_CATEGORY_UNCOND_BR ||
+        category == XED_CATEGORY_COND_BR ||
+        category == XED_CATEGORY_SYSCALL ||
+        category == XED_CATEGORY_SYSRET ||
+        category == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+    if (xed_operand_values_has_lock_prefix(
+            xed_decoded_inst_operands_const(gap))) {
+        return false;
+    }
+    unsigned nmem = xed_decoded_inst_number_of_memory_operands(gap);
+    for (unsigned m = 0; m < nmem; ++m) {
+        if (xed_decoded_inst_mem_written(gap, m)) {
+            return false;
+        }
+    }
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *operand = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(operand);
+        // The memory-addressing names carry the stack-pointer updates: push
+        // writes RSP through BASE0 and would move every RSP-relative slot.
+        if ((!xed_operand_is_register(name) &&
+             !xed_operand_is_memory_addressing_register(name)) ||
+            !xed_operand_written(operand)) {
+            continue;
+        }
+        xed_reg_enum_t enc = xed_get_largest_enclosing_register(
+            xed_decoded_inst_get_reg(gap, name));
+        if (enc == slot->base || enc == slot->index || enc == held) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Multi-instruction peephole. A frame slot loaded once and loaded again with
+// the first value still in a register is a load that need not happen: delete
+// it when the two loads name the same register, or replace it with
+// mov reload_dest, held when they differ -- either way one fewer memory read,
+// and fewer bytes than the [rsp + disp] form.
+//
+// `first` is the already-decoded load ending at `after_first`; on a match the
+// reload's decoding and offset come back through the out-parameters and the
+// caller reports against the reload, the instruction that goes away. The
+// search runs to APX_NDD_WINDOW, the bound the other windowed folds share,
+// through instructions that leave the address, the memory, and the held value
+// alone (reload_gap_transparent).
+//
+// Soundness rests on the frame restriction argued at frame_load_slot, plus
+// the usual window discipline: an incoming direct edge anywhere from the first
+// load's successor through the reload reaches the reload without having
+// executed the load whose register the rewrite reads, so the whole span
+// suppresses. The first load's destination must not be the base or index
+// either, or the address the reload computes is not the one that was loaded.
+//
+// The residual risk is a volatile local -- the setjmp pattern, where a
+// variable modified between setjmp and longjmp must be volatile and so is
+// reloaded deliberately. Nothing in the encoding distinguishes it from a
+// register allocator that spilled and reloaded without noticing the value was
+// still live, which is what the corpus is mostly made of.
+static bool frame_reload_redundant(const uint8_t *inst, size_t len,
+                                   const uint8_t *branch_targets,
+                                   size_t after_first,
+                                   const xed_decoded_inst_t *first,
+                                   xed_decoded_inst_t *reload_out,
+                                   size_t *reload_offset_out)
+{
+    struct frame_slot slot;
+    xed_reg_enum_t loaded = frame_load_slot(first, &slot);
+    if (loaded == XED_REG_INVALID) {
+        return false;
+    }
+    xed_reg_enum_t held = xed_get_largest_enclosing_register(loaded);
+    if (held == slot.base || held == slot.index) {
+        return false;   // the load moved the address it was loaded from
+    }
+
+    size_t cur = after_first;
+    for (int step = 0; step < APX_NDD_WINDOW - 1; ++step) {
+        if (cur >= len) {
+            return false;
+        }
+        decode_init(reload_out);
+        if (xed_decode(reload_out, inst + cur, len - cur) != XED_ERROR_NONE) {
+            return false;
+        }
+        size_t after = cur + xed_decoded_inst_get_length(reload_out);
+
+        struct frame_slot again;
+        xed_reg_enum_t redest = frame_load_slot(reload_out, &again);
+        if (redest == XED_REG_INVALID || again.base != slot.base ||
+            again.index != slot.index || again.scale != slot.scale ||
+            again.disp != slot.disp || again.width != slot.width) {
+            // Not the reload: look through it if it changes nothing the
+            // rewrite depends on.
+            if (!reload_gap_transparent(reload_out, &slot, held)) {
+                return false;
+            }
+            cur = after;
+            continue;
+        }
+
+        if (branch_target_in(branch_targets, after_first, after)) {
+            return false;
+        }
+        *reload_offset_out = cur;
+        return true;
+    }
+    return false;
+}
+
 // Window support for the copy folds below -- mov_add_foldable_to_lea and
 // the APX NDD fold share this proof and the APX_NDD_WINDOW bound: may the
 // scan look through `gap` -- is it provably independent of deleting the
@@ -5179,6 +5372,21 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
             summary_add(summary, "MOV constant foldable");
             report_finding("MOV constant foldable", offset, verbose, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a frame slot loaded again while the
+        // first load's value is still in a register. Reported against the
+        // reload, the instruction that goes away -- delete it outright when
+        // both loads name the same register, or replace it with a register
+        // copy when they differ. See frame_reload_redundant.
+        xed_decoded_inst_t frame_reload;
+        size_t frame_reload_offset;
+        if (frame_reload_redundant(inst, len, branch_targets, next, &xedd,
+                                   &frame_reload, &frame_reload_offset)) {
+            summary_add(summary, "redundant frame reload");
+            report_finding("redundant frame reload", frame_reload_offset,
+                verbose, &frame_reload, inst + frame_reload_offset);
             ++errors;
         }
 

@@ -2850,6 +2850,140 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
 }
 
+// Multi-instruction peephole: a frame slot loaded twice while the first value
+// is still in a register. check_instructions reports it against the reload.
+// Deliberately restricted to RSP/RBP bases -- a thread-private, never-MMIO
+// slot -- since a second load of a global or a pointer target is usually one
+// the compiler was forbidden to fold.
+static void check_frame_reload_test(void)
+{
+    // mov rax, [rsp+8] ; mov rax, [rsp+8] -- the same slot into the same
+    // register with nothing in between: the second load is a pure duplicate.
+    static const uint8_t same_reg[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+    };
+    ASSERT_FINDINGS(same_reg, "redundant frame reload", 1);
+
+    // A different destination makes it a register copy rather than a deletion,
+    // which is still one fewer memory read.
+    static const uint8_t other_reg[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(other_reg, "redundant frame reload", 1);
+
+    // RBP-relative slots are the same frame.
+    static const uint8_t rbp_base[] = {
+        0x48, 0x8B, 0x45, 0xF8,        // mov rax, [rbp-8]
+        0x48, 0x8B, 0x5D, 0xF8,        // mov rbx, [rbp-8]
+    };
+    ASSERT_FINDINGS(rbp_base, "redundant frame reload", 1);
+
+    // A different displacement or a different access width is a different
+    // slot.
+    static const uint8_t other_disp[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x8B, 0x5C, 0x24, 0x10,  // mov rbx, [rsp+16]
+    };
+    ASSERT_FINDINGS(other_disp, "redundant frame reload", 0);
+    static const uint8_t other_width[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x8B, 0x5C, 0x24, 0x08,        // mov ebx, [rsp+8]
+    };
+    ASSERT_FINDINGS(other_width, "redundant frame reload", 0);
+
+    // A pointer dereference is not the frame: a compiler that left two loads
+    // of one address in place was usually not allowed to fold them, and
+    // nothing in the encoding says whether this is one of those.
+    static const uint8_t heap_base[] = {
+        0x48, 0x8B, 0x41, 0x08,        // mov rax, [rcx+8]
+        0x48, 0x8B, 0x59, 0x08,        // mov rbx, [rcx+8]
+    };
+    ASSERT_FINDINGS(heap_base, "redundant frame reload", 0);
+
+    // Nor is a global, even where both loads reach the same address: the two
+    // RIP displacements differ by the distance between the instructions.
+    static const uint8_t rip_base[] = {
+        0x48, 0x8B, 0x05, 0x07, 0x00, 0x00, 0x00,  // mov rax, [rip+7]
+        0x48, 0x8B, 0x1D, 0x00, 0x00, 0x00, 0x00,  // mov rbx, [rip+0]
+    };
+    ASSERT_FINDINGS(rip_base, "redundant frame reload", 0);
+
+    // The first load must not write the register the address is built from,
+    // or the reload names a different slot.
+    static const uint8_t load_moves_base[] = {
+        0x48, 0x8B, 0x64, 0x24, 0x08,  // mov rsp, [rsp+8]
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(load_moves_base, "redundant frame reload", 0);
+
+    // ---- The window, shared with the other multi-instruction folds.
+    const int one_gap = APX_NDD_WINDOW >= 3 ? 1 : 0;
+
+    static const uint8_t gap_fold[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0xD1,              // mov rcx, rdx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(gap_fold, "redundant frame reload", one_gap);
+
+    // A gap may read the held value -- that is what it was loaded for.
+    static const uint8_t gap_reads_held[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0xC1,              // mov rcx, rax
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(gap_reads_held, "redundant frame reload", one_gap);
+
+    // Writing the held register loses the value the rewrite would copy.
+    static const uint8_t gap_writes_held[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0xD0,              // mov rax, rdx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(gap_writes_held, "redundant frame reload", 0);
+
+    // Moving the stack pointer moves the slot.
+    static const uint8_t gap_writes_base[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x83, 0xEC, 0x10,        // sub rsp, 16
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(gap_writes_base, "redundant frame reload", 0);
+
+    // Any store could be the slot; proving otherwise is alias analysis.
+    static const uint8_t gap_stores[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0x11,              // mov [rcx], rdx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(gap_stores, "redundant frame reload", 0);
+
+    // A call can write the frame through a pointer to it.
+    static const uint8_t gap_calls[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call +0
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+    };
+    ASSERT_FINDINGS(gap_calls, "redundant frame reload", 0);
+
+    // An incoming edge onto the reload reaches it without the load whose
+    // register the rewrite reads; one onto the head executes both.
+    static const uint8_t edge_on_reload[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // 0: mov rax, [rsp+8]
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // 5: mov rbx, [rsp+8]  <- target
+        0xEB, 0xF9,                    // 10: jmp 5
+    };
+    ASSERT_FINDINGS(edge_on_reload, "redundant frame reload", 0);
+    static const uint8_t edge_on_head[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // 0: mov rax, [rsp+8]  <- target
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // 5: mov rbx, [rsp+8]
+        0xEB, 0xF4,                    // 10: jmp 0
+    };
+    ASSERT_FINDINGS(edge_on_head, "redundant frame reload", 1);
+}
+
 // Multi-instruction peephole: mov dest, srcA ; add dest, srcB is the
 // three-operand lea dest, [srcA + srcB]. check_instructions reports it against
 // the mov when the arithmetic flags the add would set are dead.
@@ -5207,6 +5341,7 @@ int main(int argc, char *argv[])
     check_lea_fold_test();
     check_mov_const_fold_test();
     check_load_extend_fold_test();
+    check_frame_reload_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();

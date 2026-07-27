@@ -127,6 +127,22 @@ and only for flags -- the ABI guarantees they do not survive it.
     in-place sign/zero-extension is a single extending load: MOVZX EAX, byte
     [RSI]. Removes the load and its partial-register write; also MOVSX and the
     MOVSXD (32->64) form
+* redundant frame reload
+  - `488B442408 4889D1 488B5C2408` (MOV RAX, [RSP+8]; MOV RCX, RDX;
+    MOV RBX, [RSP+8]) -- the slot is loaded again while the first load's value
+    is still in a register: delete the reload when both name the same register,
+    or replace it with MOV RBX, RAX when they differ. Searched through
+    `APX_NDD_WINDOW`, past instructions that write neither the address
+    registers, nor the register holding the value, nor memory at all (any store
+    could be the slot, and proving otherwise is alias analysis). Restricted to
+    RSP/RBP bases on purpose: deleting a load is only safe where the memory
+    cannot be device memory, cannot race another thread, and cannot be a
+    relaxed atomic load that Go or Rust compiles to a plain MOV -- all true of
+    a frame slot and none guaranteed of a global or a pointer target, where
+    `gcc -O2` already performs this exact rewrite whenever it is legal, so what
+    survives is enriched for `volatile`. The residual risk is a volatile local
+    (the setjmp pattern), which no encoding distinguishes from a spill the
+    register allocator reloaded without noticing the value was still live
 * missing ANDN (only with `-m bmi1`)
   - `F7D0 21C8` (NOT EAX; AND EAX, ECX) -- one ANDN EAX, EAX, ECX (BMI1)
     computes ~x & y directly. An exact fold: both forms write only the

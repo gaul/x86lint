@@ -1,4 +1,6 @@
 x86lint
 x86lint_test
 libx86lint.a
+tools/pairscan
+tools/defuse
 *.o

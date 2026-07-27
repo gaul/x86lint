@@ -25,6 +25,18 @@ test: x86lint.o x86lint_test.o
 
 all: lib x86lint test
 
+# Corpus-mining research utilities (see "Mining tools" in README.md); not part
+# of the default build or of check.
+tools: tools/pairscan tools/defuse
+
+tools/pairscan: tools/pairscan.c tools/corpus.c tools/corpus.h
+	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
+		tools/pairscan.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+
+tools/defuse: tools/defuse.c tools/corpus.c tools/corpus.h
+	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
+		tools/defuse.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+
 # Run the unit suite and the ELF-driver smoke test.
 check: all
 	./x86lint_test
@@ -35,4 +47,6 @@ clean:
 		x86lint \
 		x86lint_test \
 		libx86lint.a \
+		tools/pairscan \
+		tools/defuse \
 		*.o

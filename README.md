@@ -590,6 +590,43 @@ opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
 broken run.
 
+## Mining tools
+
+`tools/` holds the research utilities that feed x86lint's check backlog,
+built separately with `XED_PATH=/path/to/xed make tools`:
+
+* `tools/pairscan` counts adjacent-instruction pairs by normalized shape
+  across the executable sections of an ELF binary, surfacing frequent
+  patterns worth a new check. Registers collapse to a class and width
+  (with RAX, RCX, RDX, RSP, and RBP kept distinct), immediates to
+  `#0`/`#1`/`#-1`/`#i`, memory to `[base+index*scale+disp]:width`, and the
+  Jcc, SETcc, and CMOVcc families to one token each. Every pair is tagged
+  with how the two instructions couple: `dep` and `waw` on registers,
+  `fdep` and `fdead` on the flags -- the last being the gate that decides
+  whether a flag-disturbing rewrite is legal. `-e SUBSTR` prints example
+  sites for matching shapes.
+* `tools/defuse` profiles block-local def-to-use distances -- how far a
+  value's sole consumer sits from its producer, bucketed so a window can
+  be sized against it -- and the multi-instruction redundancies no pair
+  statistic can see: dead definitions, redundant reloads of one address,
+  re-materialized constants, and zero compares of a value whose producer
+  already set the flags.
+
+Both restrict the scan to the symbol table's function ranges exactly as
+the driver does, so no pair or distance spans two functions or is mined
+from the non-code that executable sections interleave; `-a` scans every
+byte. The workflow behind several current checks: run `pairscan` over a
+representative corpus, classify the top shapes as by-design or foldable,
+then use `defuse` to decide whether a candidate needs adjacency only or a
+liveness window -- the measurement `APX_NDD_WINDOW`'s default rests on.
+
+Both lean on XED's operand model, which is exact about the compare
+aliases where Capstone is not, but reports `CMOVcc` as a plain write to
+its destination. That is right about the encoding and wrong about the
+dataflow -- the prior value survives a not-taken move -- so the tools
+add a conditional writer's destination to its read set, the same
+correction `reg_kill_iclass` embodies in `x86lint.c`.
+
 ## References
 
 * [Agner Fog optimization guide](https://www.agner.org/optimize/)

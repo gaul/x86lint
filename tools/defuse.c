@@ -50,7 +50,12 @@
 //          dead and the candidate rewrite is a cmp/test rather than a
 //          deletion. Unprovable cases land here, never in dead
 //   reload the same address loaded again with no intervening store, call, or
-//          redefinition of its base or index
+//          redefinition of its base or index, split by what the earlier load
+//          left behind: same (its value still in the register this load
+//          targets, so this one is a duplicate), copy (still in another
+//          register, so this one is a mov), or clobbered (gone, so acting on
+//          it would take register allocation rather than a peephole). Only
+//          the first two are rewritable in place
 //   remat  mov r, imm of a constant still live in another register
 //   cmp0   cmp r, 0 or test r, r where r's producer already set the flags,
 //          with no flag writer in between. Split three ways. By consumer
@@ -342,6 +347,15 @@ typedef struct {
     char text[96];
 } defrec;
 
+// RIP-relative addressing names a fixed target, but the displacement is
+// measured from the end of each instruction, so two loads of one global carry
+// different displacements and never match on the raw value. Normalize those to
+// the absolute target and give them a base class of their own: reg_slot maps
+// RIP to -1, which is also what a load with no base register at all gets, so
+// otherwise the two match each other on a coincidental displacement.
+#define BASE_RIP (-2)
+#define BASE_ABS (-3)
+
 typedef struct {
     bool live;
     long idx;
@@ -351,6 +365,8 @@ typedef struct {
     int64_t disp;
     unsigned size;
     xed_reg_enum_t seg;
+    int dest;               // slot the value was loaded into
+    bool dest_live;         // and which still holds it
 } loadrec;
 
 typedef struct {
@@ -599,14 +615,16 @@ static bool flag_producer_iclass(xed_iclass_enum_t ic, bool *logic)
     }
 }
 
-static const char *base_kind(int base_slot, xed_reg_enum_t seg,
-                             xed_reg_enum_t base)
+static const char *base_kind(int base_slot, xed_reg_enum_t seg)
 {
     if (seg == XED_REG_FS || seg == XED_REG_GS) {
         return "tls";
     }
-    if (base == XED_REG_RIP || base == XED_REG_EIP) {
+    if (base_slot == BASE_RIP) {
         return "rip";
+    }
+    if (base_slot == BASE_ABS) {
+        return "abs";
     }
     if (base_slot == (int) (XED_REG_RSP - XED_REG_GPR64_FIRST) ||
         base_slot == (int) (XED_REG_RBP - XED_REG_GPR64_FIRST)) {
@@ -740,18 +758,29 @@ static void scan_range(const corpus_section *sec, uint64_t start, uint64_t end)
             nloads = 0;
         } else if (ic == XED_ICLASS_MOV && nmem == 1 &&
                    xed_decoded_inst_mem_read(&xedd, 0)) {
-            int bslot = reg_slot(xed_decoded_inst_get_base_reg(&xedd, 0));
             xed_reg_enum_t breg = xed_decoded_inst_get_base_reg(&xedd, 0);
             xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(&xedd, 0);
+            int bslot = reg_slot(breg);
+            int islot = reg_slot(xed_decoded_inst_get_index_reg(&xedd, 0));
+            int64_t disp = xed_decoded_inst_get_memory_displacement(&xedd, 0);
+            if (breg == XED_REG_RIP || breg == XED_REG_EIP) {
+                bslot = BASE_RIP;
+                disp += (int64_t) (sec->vaddr + next);
+            } else if (bslot < 0 && islot < 0) {
+                bslot = BASE_ABS;
+            }
+            int ldest = reg_slot(dest_reg(&xedd));
             loadrec cur = {
                 .live = true,
                 .idx = idx,
                 .base = bslot,
-                .index = reg_slot(xed_decoded_inst_get_index_reg(&xedd, 0)),
+                .index = islot,
                 .scale = xed_decoded_inst_get_scale(&xedd, 0),
-                .disp = xed_decoded_inst_get_memory_displacement(&xedd, 0),
+                .disp = disp,
                 .size = xed_decoded_inst_get_memory_operand_length(&xedd, 0),
                 .seg = seg,
+                .dest = ldest,
+                .dest_live = ldest >= 0,
             };
             bool matched = false;
             for (int k = 0; k < nloads; ++k) {
@@ -761,9 +790,19 @@ static void scan_range(const corpus_section *sec, uint64_t start, uint64_t end)
                     l->size != cur.size || l->seg != cur.seg) {
                     continue;
                 }
+                // What the earlier load left behind decides what a rewrite
+                // could be. Its value still in the register it landed in makes
+                // this load either a plain duplicate (same register: delete
+                // it) or a register copy (another: mov, no load port, fewer
+                // bytes). Overwritten, the address is still being loaded twice
+                // but nothing holds the value, so acting on it would mean
+                // finding a register to keep it in -- register allocation, not
+                // a peephole, and outside what a check here could suggest.
+                const char *rewrite = !l->dest_live ? "clobbered"
+                    : l->dest == cur.dest ? "same" : "copy";
                 char key[64];
-                snprintf(key, sizeof(key), "reload|%s|sz%u",
-                    base_kind(bslot, seg, breg), cur.size);
+                snprintf(key, sizeof(key), "reload|%s|sz%u|%s",
+                    base_kind(cur.base, seg), cur.size, rewrite);
                 bump(key, idx - l->idx);
                 if (example_cat != NULL && example_printed < example_max &&
                     strcmp(example_cat, "reload") == 0) {
@@ -772,11 +811,15 @@ static void scan_range(const corpus_section *sec, uint64_t start, uint64_t end)
                             sizeof(disasm), addr, NULL, NULL)) {
                         disasm[0] = '\0';
                     }
-                    printf("EX reload %s %#" PRIx64 ": d=%ld %s\n", sec->path,
-                        addr, idx - l->idx, disasm);
+                    printf("EX reload %s %#" PRIx64 ": d=%ld %s ;; %s\n",
+                        sec->path, addr, idx - l->idx, rewrite, disasm);
                     example_printed++;
                 }
-                l->idx = idx;       // re-arm from the later load
+                // Re-arm from the later load, which is now the one holding
+                // the value.
+                l->idx = idx;
+                l->dest = cur.dest;
+                l->dest_live = cur.dest_live;
                 matched = true;
                 break;              // records are unique per address
             }
@@ -801,7 +844,13 @@ static void scan_range(const corpus_section *sec, uint64_t start, uint64_t end)
             for (int k = 0; k < nloads; ++k) {
                 if (loads[k].live &&
                     (loads[k].base == slot || loads[k].index == slot)) {
-                    loads[k].live = false;
+                    loads[k].live = false;    // a different address now
+                }
+                // The value stops being available the moment anything writes
+                // the register holding it, at any width -- except the load's
+                // own write, which is what put it there.
+                if (loads[k].dest == slot && loads[k].idx != idx) {
+                    loads[k].dest_live = false;
                 }
             }
             for (int k = 0; k < nconsts; ++k) {

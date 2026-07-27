@@ -42,11 +42,13 @@
 // counts as addr rather than as a value use: the two admit different rewrites.
 //
 // Multi-instruction-only categories:
-//   dead   a pure definition overwritten with no use, its flag write unread
-//          too -- the whole instruction is removable
-//   deadv  the same, but a later instruction read the flags it set, so only
-//          the value is dead (the candidate rewrite is a cmp/test, not a
-//          deletion)
+//   dead   a pure definition overwritten with no use, and with the flags it
+//          set proven unread -- both before the overwrite and past it, since
+//          the flags outlive the register kill (flags_live_from) -- so the
+//          whole instruction is removable
+//   deadv  the same, but its flags may still be read, so only the value is
+//          dead and the candidate rewrite is a cmp/test rather than a
+//          deletion. Unprovable cases land here, never in dead
 //   reload the same address loaded again with no intervening store, call, or
 //          redefinition of its base or index
 //   remat  mov r, imm of a constant still live in another register
@@ -213,6 +215,61 @@ static void collect_flags(const xed_decoded_inst_t *xedd, uint32_t *read,
         *written = flag_mask(xed_simple_flag_get_written_flag_set(fi)) |
                    flag_mask(xed_simple_flag_get_undefined_flag_set(fi));
     }
+}
+
+// Walk forward from `offset` to decide whether any flag in `concerns` might be
+// read before it is overwritten. The register analogue is what the linear scan
+// already does; the flags need their own walk because they outlive the
+// register kill. A definition whose value dies stops being tracked the moment
+// something overwrites the register, but the flags it set are still standing,
+// and in the shape this exists for -- LLVM's chunked comparison,
+//
+//      xor rax, 0x2(r13) ; or rax, rsi ; mov rax, r13 ; je ...
+//
+// -- the branch reading them sits past that overwrite. Watching only the span
+// between definition and kill sees no reader there and calls the OR removable,
+// which it is not.
+//
+// Returns true (LIVE) on yes or unknown, so a definition is called wholly dead
+// only where that is proven. Conservative LIVE on decode error, any control
+// transfer other than a return, the end of the range, and the lookahead bound;
+// false (DEAD) at a RET, which no ABI crosses with flags intact. Mirrors
+// x86lint.c's flags_live_after, including its treatment of a conditional flag
+// writer as no writer at all (collect_flags drops those writes), since the
+// earlier value flows through it for a count of zero.
+static bool flags_live_from(const corpus_section *sec, uint64_t offset,
+                            uint64_t end, uint32_t concerns)
+{
+    const int MAX_LOOKAHEAD = 16;
+    uint32_t live = concerns;
+
+    for (int step = 0; step < MAX_LOOKAHEAD && offset < end && live != 0;
+         ++step) {
+        xed_decoded_inst_t xedd;
+        corpus_decode_init(&xedd);
+        if (xed_decode(&xedd, sec->code + offset, end - offset) !=
+                XED_ERROR_NONE) {
+            return true;
+        }
+        xed_category_enum_t cat = xed_decoded_inst_get_category(&xedd);
+        if (cat == XED_CATEGORY_RET) {
+            return false;
+        }
+        if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_UNCOND_BR ||
+            cat == XED_CATEGORY_COND_BR || cat == XED_CATEGORY_SYSCALL ||
+            cat == XED_CATEGORY_SYSRET || cat == XED_CATEGORY_INTERRUPT) {
+            return true;
+        }
+
+        uint32_t read, written;
+        collect_flags(&xedd, &read, &written);
+        if ((read & live) != 0) {
+            return true;
+        }
+        live &= ~written;
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+    return live != 0;
 }
 
 // ---- result table: key -> count plus a distance histogram ----
@@ -434,7 +491,8 @@ static bool kill_iclass(xed_iclass_enum_t ic)
 // between -- that it was dead. A narrow (8- or 16-bit) write, or a wide but
 // conditional one, only stops tracking: part or all of the value can survive,
 // so nothing about the definition is proven.
-static void finalize_def(int slot, bool redefined, const char *path,
+static void finalize_def(int slot, bool redefined, const corpus_section *sec,
+                         uint64_t range_end, uint64_t after_killer,
                          const char *killer)
 {
     defrec *d = &defs[slot];
@@ -443,7 +501,13 @@ static void finalize_def(int slot, bool redefined, const char *path,
     }
     char key[96];
     if (d->uses == 0 && d->pure && redefined) {
-        bool flags_dead = d->wflags == 0 || !d->flags_used;
+        // Removable outright only if its flags go unread too -- between here
+        // and the definition, which the scan saw, and past the killing
+        // instruction, which it has not reached yet. A definition writing no
+        // flags at all (mov, lea) skips the walk.
+        bool flags_dead = d->wflags == 0 ||
+            (!d->flags_used &&
+             !flags_live_from(sec, after_killer, range_end, d->wflags));
         snprintf(key, sizeof(key), "%s|%s|%s%s",
             flags_dead ? "dead" : "deadv", d->kind, d->detail,
             d->xbr ? "|xbr" : "");
@@ -451,7 +515,8 @@ static void finalize_def(int slot, bool redefined, const char *path,
         if (example_cat != NULL && example_printed < example_max &&
             strcmp(example_cat, flags_dead ? "dead" : "deadv") == 0) {
             printf("EX %s %s %#" PRIx64 ": %s ;; killed by %s\n",
-                flags_dead ? "dead" : "deadv", path, d->addr, d->text, killer);
+                flags_dead ? "dead" : "deadv", sec->path, d->addr, d->text,
+                killer);
             example_printed++;
         }
     } else if (d->uses == 1) {
@@ -732,7 +797,7 @@ static void scan_range(const corpus_section *sec, uint64_t start, uint64_t end)
         for (int i = 0; i < wide.n + narrow.n; ++i) {
             bool full = i < wide.n;
             int slot = full ? wide.s[i] : narrow.s[i - wide.n];
-            finalize_def(slot, full && unconditional, sec->path, killer);
+            finalize_def(slot, full && unconditional, sec, end, next, killer);
             for (int k = 0; k < nloads; ++k) {
                 if (loads[k].live &&
                     (loads[k].base == slot || loads[k].index == slot)) {

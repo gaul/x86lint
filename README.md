@@ -228,7 +228,6 @@ and only for flags -- the ABI guarantees they do not survive it.
     -- are dead; SF/ZF come from the same result either way. Not flagged when
     the AND's destination is the decremented register itself (the original
     keeps source-1 live there)
-* missing LOCK prefix on CMPXCHG and XADD
 * missing MOVBE (only with `-m movbe`)
   - `8B06 0FC8` (MOV EAX, [RSI]; BSWAP EAX) -- one MOVBE EAX, [RSI] performs
     the byte-swapping load: one instruction instead of two, never larger.

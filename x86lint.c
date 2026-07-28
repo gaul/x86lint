@@ -845,35 +845,6 @@ bool check_xor_to_not(const xed_decoded_inst_t *xedd)
     return eff != opmask;
 }
 
-bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd)
-{
-    bool has_lock = xed_operand_values_has_lock_prefix(xed_decoded_inst_operands_const(xedd));
-
-    switch (xed_decoded_inst_get_iclass(xedd)) {
-    case XED_ICLASS_CMPXCHG:
-    case XED_ICLASS_CMPXCHG16B:
-    case XED_ICLASS_CMPXCHG8B:
-    case XED_ICLASS_XADD:
-        // LOCK is only legal with a memory destination. The register-form
-        // encodings (ModRM.mod == 11, e.g. cmpxchg ebx, eax) cannot take a
-        // LOCK prefix at all -- it would #UD -- so a missing prefix there is
-        // not a fixable finding. (CMPXCHG8B/CMPXCHG16B are memory-only and
-        // always pass this guard.)
-        if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
-            return true;
-        }
-        if (!has_lock) {
-            return false;
-        }
-        return true;
-    case XED_ICLASS_CMPXCHG16B_LOCK:
-    case XED_ICLASS_CMPXCHG8B_LOCK:
-    case XED_ICLASS_CMPXCHG_LOCK:
-    case XED_ICLASS_XADD_LOCK:
-    default:
-        return true;
-    }
-}
 
 bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd)
 {
@@ -2724,7 +2695,6 @@ static const struct check_entry checks[] = {
     {check_and_minus_one,              "redundant AND immediate",         0, reg0_upper32_concern, true},
     {check_and_zero,                   "suboptimal AND zero",             0},
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
-    {check_missing_lock_prefix,        "missing LOCK prefix",             0},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_rep_ret,                    "unneeded REP prefix on RET",      0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},

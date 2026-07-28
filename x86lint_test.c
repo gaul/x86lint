@@ -639,26 +639,6 @@ static void check_xor_to_not_test(void)
     ASSERT_FINDINGS(xornot_jz, "suboptimal XOR immediate", 0);
 }
 
-static void check_missing_lock_prefix_test(void)
-{
-    CHECK_BYTES( check_missing_lock_prefix, 0x67, 0xf0, 0x0f, 0xc1, 0x18);  // lock xadd [eax], ebx
-    CHECK_BYTES(!check_missing_lock_prefix, 0x67, 0x0f, 0xc1, 0x18);  // xadd [eax], ebx
-    CHECK_BYTES( check_missing_lock_prefix, 0xf0, 0x0f, 0xb1, 0x18);  // lock cmpxchg [rax], ebx
-    CHECK_BYTES(!check_missing_lock_prefix, 0x0f, 0xb1, 0x18);  // cmpxchg [rax], ebx
-    CHECK_BYTES( check_missing_lock_prefix, 0xf0, 0x0f, 0xc7, 0x08);  // lock cmpxchg8b [rax]
-    CHECK_BYTES(!check_missing_lock_prefix, 0x0f, 0xc7, 0x08);  // cmpxchg8b [rax]
-    // Register-form cmpxchg/xadd cannot take a LOCK prefix (#UD), so a
-    // missing prefix is not a fixable finding -- do not flag.
-    CHECK_BYTES( check_missing_lock_prefix, 0x0f, 0xb1, 0xc3);  // cmpxchg ebx, eax (register dst)
-    CHECK_BYTES( check_missing_lock_prefix, 0x0f, 0xc1, 0xc3);  // xadd ebx, eax (register dst)
-
-    // Dispatcher wiring: unconditional finding, end-to-end.
-    static const uint8_t xadd_nolock[] = {
-        0x0F, 0xC1, 0x18,  // xadd [rax], ebx
-        0xC3,              // ret
-    };
-    ASSERT_FINDINGS(xadd_nolock, "missing LOCK prefix", 1);
-}
 
 static void check_superfluous_lock_prefix_test(void)
 {
@@ -5316,7 +5296,6 @@ int main(int argc, char *argv[])
     check_and_strength_reduce_test();
     check_and_minus_one_test();
     check_xor_to_not_test();
-    check_missing_lock_prefix_test();
     check_superfluous_lock_prefix_test();
     check_rep_ret_test();
     check_xchg_accumulator_test();
@@ -5388,7 +5367,6 @@ int main(int argc, char *argv[])
         0xc1, 0xd0, 0x01,  // rcl eax, 1 (C1 ib -> D1)
         0x83, 0xe0, 0xff,  // and eax, -1 (-> test eax, eax)
         0x89, 0xc8,  // mov eax, ecx (32-bit kill: keeps the gated and eax, -1 firing)
-        0x67, 0x0f, 0xc1, 0x18,  // xadd [eax], ebx (missing LOCK)
         0xf0, 0x87, 0x07,  // lock xchg [rdi], eax (LOCK is implicit in XCHG)
         0x48, 0x8d, 0x47, 0x08,  // lea rax, [rdi+8] (-> lea eax, [rdi+8])
         0x89, 0xc8,  // mov eax, ecx (kills rax's bits 32-63 for the lea)
@@ -5408,7 +5386,6 @@ int main(int argc, char *argv[])
         {"unneeded explicit register",  1},
         {"unneeded explicit immediate", 1},
         {"redundant AND immediate",     1},
-        {"missing LOCK prefix",         1},
         {"unneeded LOCK prefix",        1},
         {"oversized LEA width",         1},
         {"suboptimal SSE zero idiom",   1},

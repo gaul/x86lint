@@ -75,9 +75,6 @@ bool check_and_minus_one(const xed_decoded_inst_t *xedd);
 // when the arithmetic flags are dead, since NOT writes none)
 bool check_xor_to_not(const xed_decoded_inst_t *xedd);
 
-// return false if instruction should have a LOCK prefix
-bool check_missing_lock_prefix(const xed_decoded_inst_t *xedd);
-
 // return false if instruction should not have a LOCK prefix
 bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd);
 

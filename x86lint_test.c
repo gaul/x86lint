@@ -3678,6 +3678,31 @@ static void check_popcnt_false_dep_test(void)
     };
     ASSERT_FINDINGS(mitigated, "missing POPCNT dependency break", 0);
 
+    // The mitigation need not be adjacent: gcc emits the zero idiom and then
+    // an unrelated instruction before the count. Suppress at a distance too.
+    static const uint8_t mitigated_gap[] = {
+        0x31, 0xC0,                    // xor eax, eax
+        0x89, 0xD1,                    // mov ecx, edx      (independent)
+        0xF3, 0x48, 0x0F, 0xB8, 0xC7,  // popcnt rax, rdi
+    };
+    ASSERT_FINDINGS(mitigated_gap, "missing POPCNT dependency break",
+                    APX_NDD_WINDOW >= 3 ? 0 : 1);
+
+    // Only a deliberate mitigation reaches back. An ordinary producer
+    // suppresses when adjacent -- the dependency is then one instruction
+    // stale -- but not from further away, where it may still be in flight.
+    static const uint8_t producer_adjacent[] = {
+        0x89, 0xC8,              // mov eax, ecx
+        0xF3, 0x0F, 0xB8, 0xC3,  // popcnt eax, ebx
+    };
+    ASSERT_FINDINGS(producer_adjacent, "missing POPCNT dependency break", 0);
+    static const uint8_t producer_gap[] = {
+        0x89, 0xC8,              // mov eax, ecx
+        0x89, 0xD1,              // mov ecx, edx
+        0xF3, 0x0F, 0xB8, 0xC3,  // popcnt eax, ebx
+    };
+    ASSERT_FINDINGS(producer_gap, "missing POPCNT dependency break", 1);
+
     // Zeroing a DIFFERENT register mitigates nothing.
     static const uint8_t wrong_reg[] = {
         0x31, 0xDB,              // xor ebx, ebx
@@ -3736,6 +3761,32 @@ static void check_sse_merge_false_dep_test(void)
         0xF2, 0x0F, 0x5A, 0xC1,  // cvtsd2ss xmm0, xmm1
     };
     ASSERT_FINDINGS(cvtsd2ss, "missing SSE dependency break", 1);
+
+    // The zero idiom that breaks the merge dependency need not be adjacent:
+    // libcrypto emits it and then an unrelated instruction before the
+    // conversion, and the check used to re-flag its own mitigation.
+    static const uint8_t mitigated_gap[] = {
+        0x0F, 0x57, 0xC0,              // xorps xmm0, xmm0
+        0xF2, 0x48, 0x0F, 0x2C, 0xC1,  // cvttsd2si rax, xmm1  (independent)
+        0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
+    };
+    ASSERT_FINDINGS(mitigated_gap, "missing SSE dependency break",
+                    APX_NDD_WINDOW >= 3 ? 0 : 1);
+
+    // An ordinary full producer suppresses only from the adjacent slot, where
+    // the dependency is one instruction stale; from further back it may still
+    // be in flight and the finding stands.
+    static const uint8_t producer_adjacent[] = {
+        0x0F, 0x28, 0xC1,              // movaps xmm0, xmm1
+        0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
+    };
+    ASSERT_FINDINGS(producer_adjacent, "missing SSE dependency break", 0);
+    static const uint8_t producer_gap[] = {
+        0x0F, 0x28, 0xC1,              // movaps xmm0, xmm1
+        0x89, 0xD1,                    // mov ecx, edx
+        0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
+    };
+    ASSERT_FINDINGS(producer_gap, "missing SSE dependency break", 1);
 
     static const uint8_t sqrtsd[] = {
         0xF2, 0x0F, 0x51, 0xC1,  // sqrtsd xmm0, xmm1

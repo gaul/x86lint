@@ -4938,8 +4938,126 @@ static bool mov_bswap_foldable_to_movbe(const uint8_t *inst, size_t len,
 //     would bury the real findings. A direct edge onto the count reaches it
 //     without that predecessor; the suppression forgoes that path's
 //     finding, erring toward false negatives as everywhere else.
+// The recently decoded instructions, for the two backward-looking
+// dependency-break gates. Both ask whether something upstream already wrote
+// the register whole, which is what severs a false dependency; consulting
+// only the immediate predecessor answers that question too narrowly, because
+// a compiler that emits the break does not always place it adjacent to the
+// consumer. In libcrypto,
+//
+//     pxor  xmm0, xmm0
+//     cvttsd2si rax, xmm1
+//     cvtsi2sd xmm0, rax
+//
+// has the break two instructions up and was reported as missing one.
+//
+// Depth is the window bound the other multi-instruction checks share. The
+// ring resets at a resync, so it never spans undecodable bytes. It carries no
+// branch-target reasoning, matching the single-predecessor behavior it
+// replaces: the walk only ever suppresses a finding, so a direct edge landing
+// inside the window costs recall and nothing else.
+#define DEP_HISTORY (APX_NDD_WINDOW - 1)
+
+struct dep_history {
+    xed_decoded_inst_t insn[DEP_HISTORY];
+    int pos;                    // next slot to overwrite
+    int depth;                  // valid entries, at most DEP_HISTORY
+};
+
+static void dep_history_reset(struct dep_history *h)
+{
+    h->pos = 0;
+    h->depth = 0;
+}
+
+static void dep_history_push(struct dep_history *h,
+                             const xed_decoded_inst_t *xedd)
+{
+    h->insn[h->pos] = *xedd;
+    h->pos = (h->pos + 1) % DEP_HISTORY;
+    if (h->depth < DEP_HISTORY) {
+        ++h->depth;
+    }
+}
+
+// A self-XOR or self-SUB on `parent` at 32 bits or wider: the shape a
+// compiler emits deliberately to break a false dependency, as opposed to an
+// ordinary producer that happens to write the register.
+static bool gpr_dep_mitigation(const xed_decoded_inst_t *xedd,
+                               xed_reg_enum_t parent)
+{
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    if ((iclass != XED_ICLASS_XOR && iclass != XED_ICLASS_SUB) ||
+        xed_decoded_inst_number_of_memory_operands(xedd) != 0) {
+        return false;
+    }
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    return r0 == r1 && xed_reg_class(r0) == XED_REG_CLASS_GPR &&
+           xed_get_register_width_bits64(r0) >= 32 &&
+           xed_get_largest_enclosing_register(r0) == parent;
+}
+
+// The vector counterpart: a same-register XORPS/XORPD/PXOR on `parent`.
+static bool xmm_dep_mitigation(const xed_decoded_inst_t *xedd,
+                               xed_reg_enum_t parent)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_XORPS:
+    case XED_ICLASS_XORPD:
+    case XED_ICLASS_PXOR:
+    case XED_ICLASS_VXORPS:
+    case XED_ICLASS_VXORPD:
+    case XED_ICLASS_VPXOR:
+        break;
+    default:
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    bool any = false;
+    for (unsigned i = 0; i < nops; ++i) {
+        xed_operand_enum_t name = xed_operand_name(xed_inst_operand(xi, i));
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(xedd, name)) != parent) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
+// True when something upstream already severed the dependency. The two
+// distances answer different questions and so use different rules. The
+// immediate predecessor is judged by the caller's full-redefinition rule,
+// preserving the original gate: any producer there leaves the dependency at
+// most one instruction stale, which is too cheap to be worth flagging.
+// Further back only a deliberate mitigation counts -- the self-XOR a compiler
+// emits for exactly this purpose -- because an ordinary producer several
+// instructions up may still be in flight, and that is a real cost the finding
+// should report.
+static bool dep_broken_in_history(const struct dep_history *h,
+                                  xed_reg_enum_t parent,
+                                  bool (*redefines)(const xed_decoded_inst_t *,
+                                                    xed_reg_enum_t),
+                                  bool (*mitigation)(const xed_decoded_inst_t *,
+                                                     xed_reg_enum_t))
+{
+    for (int i = 0; i < h->depth; ++i) {
+        int idx = (h->pos - 1 - i + DEP_HISTORY) % DEP_HISTORY;
+        const xed_decoded_inst_t *p = &h->insn[idx];
+        if (i == 0 ? redefines(p, parent) : mitigation(p, parent)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
-                             const xed_decoded_inst_t *prev)
+                             const struct dep_history *history)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_POPCNT:
@@ -4974,7 +5092,8 @@ static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
             return false;
         }
     }
-    return prev == NULL || !redefines_reg_ge32(prev, parent);
+    return !dep_broken_in_history(history, parent, redefines_reg_ge32,
+                                  gpr_dep_mitigation);
 }
 
 // True when `xedd` unconditionally rewrites every bit of the vector register
@@ -5104,7 +5223,7 @@ static bool redefines_xmm_full(const xed_decoded_inst_t *xedd,
 // built from general-purpose registers, which a vector zero idiom cannot
 // disturb, so cvtss2sd xmm0, [rax] is flagged like any other form.
 static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
-                                const xed_decoded_inst_t *prev)
+                                const struct dep_history *history)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_CVTSI2SD:
@@ -5135,7 +5254,8 @@ static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
             return false;
         }
     }
-    return prev == NULL || !redefines_xmm_full(prev, parent);
+    return !dep_broken_in_history(history, parent, redefines_xmm_full,
+                                  xmm_dep_mitigation);
 }
 
 int check_instructions(const uint8_t *inst, size_t len, bool verbose,
@@ -5149,6 +5269,11 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
     // when it is adjacent to the current instruction.
     xed_decoded_inst_t prev;
     bool have_prev = false;
+
+    // Backward window for the dependency-break gates (see struct
+    // dep_history); wider than `prev`, which the adjacency-only gates keep.
+    struct dep_history dep_history;
+    dep_history_reset(&dep_history);
 
     // Direct branch targets for the multi-instruction windows (see
     // collect_branch_targets). NULL on allocation failure, which
@@ -5174,6 +5299,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                 summary->skipped++;
             }
             have_prev = false;
+            dep_history_reset(&dep_history);
             offset += 1;
             continue;
         }
@@ -5478,7 +5604,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // redefine carries a false output dependency on affected Intel
         // cores; a zero idiom just before the count breaks it. See
         // popcnt_false_dep.
-        if (popcnt_false_dep(&xedd, have_prev ? &prev : NULL)) {
+        if (popcnt_false_dep(&xedd, &dep_history)) {
             summary_add(summary, "missing POPCNT dependency break");
             report_finding("missing POPCNT dependency break", offset, verbose,
                 &xedd, inst + offset);
@@ -5490,7 +5616,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // and merges into the rest, so a destination the adjacent
         // predecessor did not rewrite carries a false dependency; a vector
         // zero idiom just before breaks it. See sse_merge_false_dep.
-        if (sse_merge_false_dep(&xedd, have_prev ? &prev : NULL)) {
+        if (sse_merge_false_dep(&xedd, &dep_history)) {
             summary_add(summary, "missing SSE dependency break");
             report_finding("missing SSE dependency break", offset, verbose,
                 &xedd, inst + offset);
@@ -5499,6 +5625,7 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
 
         prev = xedd;
         have_prev = true;
+        dep_history_push(&dep_history, &xedd);
         offset = next;
     }
 

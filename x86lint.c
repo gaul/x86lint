@@ -1484,7 +1484,36 @@ bool check_oversized_evex(const xed_decoded_inst_t *xedd)
     if (xed_encode(&req, out, sizeof(out), &olen) != XED_ERROR_NONE) {
         return true;
     }
-    return olen >= xed_decoded_inst_get_length(xedd);
+    if (olen >= xed_decoded_inst_get_length(xedd)) {
+        return true;
+    }
+
+    // A shorter encoding is only an opportunity if the target can run it, and
+    // for a few families the VEX form is not the older encoding of the same
+    // feature but a *later* extension carrying its own CPUID bit. EVEX
+    // VPMADD52LUQ is AVX512_IFMA, shipped from Cannon Lake; the VEX spelling
+    // XED encodes for it is AVX_IFMA, which arrived years later on parts that
+    // dropped AVX-512 -- so the rewrite would fault on precisely the CPUs the
+    // original code targets. AVX512_VNNI against AVX_VNNI and AVX512_BF16
+    // against AVX_NE_CONVERT divide the same way. Decode what was just
+    // encoded and let XED name the feature rather than inferring it from the
+    // iclass: an unrecognized encoding, like any other uncertainty here,
+    // suppresses the finding.
+    xed_decoded_inst_t reenc;
+    decode_init(&reenc);
+    if (xed_decode(&reenc, out, olen) != XED_ERROR_NONE) {
+        return true;
+    }
+    switch (xed_decoded_inst_get_isa_set(&reenc)) {
+    case XED_ISA_SET_AVX_IFMA:
+    case XED_ISA_SET_AVX_NE_CONVERT:
+    case XED_ISA_SET_AVX_VNNI:
+    case XED_ISA_SET_AVX_VNNI_INT8:
+    case XED_ISA_SET_AVX_VNNI_INT16:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // A VEX instruction has a compact two-byte prefix (C5) and a long three-byte

@@ -1511,6 +1511,18 @@ static void check_oversized_evex_test(void)
     CHECK_BYTES( check_oversized_evex, 0xc5, 0xfc, 0x58, 0xca);                          // vaddps ymm1, ymm0, ymm2 (VEX)
     CHECK_BYTES( check_oversized_evex, 0x0f, 0x58, 0xca);                                // addps xmm1, xmm2 (legacy)
     CHECK_BYTES( check_oversized_evex, 0x90);                                            // nop
+    // Families whose VEX spelling is a LATER extension with its own CPUID bit,
+    // not the older encoding of the same feature: demoting them would fault on
+    // the AVX-512 parts the EVEX form targets. Shorter, and still rejected.
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf2, 0xf5, 0x08, 0xb4, 0xc2);              // vpmadd52luq (AVX512_IFMA -> AVX_IFMA)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf2, 0xf5, 0x08, 0xb5, 0xc2);              // vpmadd52huq (AVX512_IFMA -> AVX_IFMA)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf2, 0xf5, 0x28, 0xb4, 0x1e);              // vpmadd52luq ymm3, ymm1, [rsi] (a libcrypto site)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf2, 0x75, 0x08, 0x50, 0xc2);              // vpdpbusd (AVX512_VNNI -> AVX_VNNI)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf2, 0x75, 0x08, 0x52, 0xc2);              // vpdpwssd (AVX512_VNNI -> AVX_VNNI)
+    CHECK_BYTES( check_oversized_evex, 0x62, 0xf2, 0x7e, 0x08, 0x72, 0xc1);              // vcvtneps2bf16 (AVX512_BF16 -> AVX_NE_CONVERT)
+    // VAES is the other direction -- its VEX form predates the EVEX one, so
+    // any part running the EVEX encoding runs the VEX one too: still flagged.
+    CHECK_BYTES(!check_oversized_evex, 0x62, 0xf2, 0x75, 0x08, 0xdc, 0xc2);              // vaesenc xmm0, xmm1, xmm2 (-> VEX vaesenc)
 
     // Dispatcher wiring: the VEX re-encoding is identical, unconditional.
     static const uint8_t evex_ymm[] = {

@@ -303,7 +303,16 @@ and only for flags -- the ABI guarantees they do not survive it.
 * oversized EVEX encoding
   - `62F1FD286FCA` instead of `C5FD6FCA` (VMOVDQA64 YMM1, YMM2 -> VMOVDQA;
     without an opmask, broadcast, rounding, 512-bit length, or xmm16-31,
-    the 4-byte EVEX prefix wastes 1-2 bytes over VEX)
+    the 4-byte EVEX prefix wastes 1-2 bytes over VEX). The demotion is proved
+    by re-encoding through XED and comparing lengths, so a form VEX cannot
+    express suppresses itself. A shorter encoding is not enough on its own,
+    though: for a few families the VEX spelling is a *later* extension with
+    its own CPUID bit rather than the older encoding of one feature --
+    AVX512\_IFMA against AVX\_IFMA (VPMADD52LUQ/HUQ), AVX512\_VNNI against
+    AVX\_VNNI (VPDP\*), AVX512\_BF16 against AVX\_NE\_CONVERT -- where the
+    rewrite would fault on the very parts the EVEX form targets. The
+    re-encoded instruction is decoded back and rejected on those ISA sets,
+    which lets XED name the feature instead of the check inferring it
 * oversized immediates
   - `81C0 01000000` instead of `83C0 01` (ADD EAX, 1)
   - `68 01000000` instead of `6A 01` (PUSH 1)

@@ -112,7 +112,10 @@ and only for flags -- the ABI guarantees they do not survive it.
     computation folds into the load's own base+index*scale+disp, so the LEA
     disappears: MOV RAX, [RDI+RSI*4]. Fires when the LEA's register is dead
     after the fold (overwritten or unused) and the combined address still fits
-    one index and a 32-bit displacement (gated by register liveness)
+    one index and a 32-bit displacement (gated by register liveness). The
+    consumer need not access memory: a second LEA folds the same way
+    (`LEA RAX, [RBX+RAX]; LEA RAX, [RAX+2]` -> `LEA RAX, [RBX+RAX+2]`), which
+    is the shape Go emits, where LLVM output is overwhelmingly the load above
 * length-changing prefix stall
   - `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
     immediate's length (imm32 -> imm16) defeats the pre-decoder's length
@@ -574,10 +577,17 @@ offending encoding -- ahead of the summary:
 
 ```console
 $ ./x86lint -v /bin/ls
+== section 5 .text: vaddr 0x2100, 1077514 bytes ==
 oversized immediate at offset: 0x14: push 0x0
   68 00 00 00 00
 ...
 ```
+
+Offsets are relative to the section being scanned, so the banner names each
+one and gives the address to add to place a finding in a disassembly. A
+binary can hold several executable sections -- a BOLT-processed library keeps
+the functions it did not move in `.bolt.org.text` beside those it moved into
+`.text` -- and without the banner their offsets are indistinguishable.
 
 Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` to declare that the
 binary's target supports those instruction-set extensions, enabling the

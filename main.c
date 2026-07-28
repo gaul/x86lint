@@ -173,6 +173,8 @@ int main(int argc, char **argv)
     x86lint_summary *summary = NULL;
     struct func_sym *funcs = NULL;
     size_t nfuncs = 0;
+    char *shstrtab = NULL;
+    uint64_t shstrtab_size = 0;
 
     if (fseek(f, 0, SEEK_END) != 0) {
         fprintf(stderr, "%s: failed to seek to end of file\n", path);
@@ -313,6 +315,43 @@ int main(int argc, char **argv)
         }
     }
 
+    // Section names, for the per-section banner -v prints. Findings carry an
+    // offset into the section being scanned, which on a binary with one
+    // executable section reads like a file offset but on several -- a
+    // BOLT-processed library keeps its unmoved functions in .bolt.org.text
+    // beside the ones it moved into .text -- is ambiguous without knowing
+    // which section it belongs to. Only -v needs this, so a failure to read
+    // the table costs the names and nothing else. e_shstrndx holds
+    // SHN_XINDEX when the real index does not fit, with the value in section
+    // header 0's sh_link (the same overflow convention as e_shnum).
+    if (verbose && shnum != 0) {
+        uint64_t strndx = ehdr.e_shstrndx;
+        if (strndx == SHN_XINDEX) {
+            Elf64_Shdr shdr0;
+            if (read_at(f, (long) ehdr.e_shoff, &shdr0, sizeof(shdr0))) {
+                strndx = shdr0.sh_link;
+            } else {
+                strndx = SHN_UNDEF;
+            }
+        }
+        Elf64_Shdr strhdr;
+        if (strndx != SHN_UNDEF && strndx < shnum &&
+            read_at(f, (long) (ehdr.e_shoff + strndx * sizeof(strhdr)),
+                    &strhdr, sizeof(strhdr)) &&
+            strhdr.sh_size != 0 && strhdr.sh_offset <= file_size &&
+            strhdr.sh_size <= file_size - strhdr.sh_offset) {
+            shstrtab = malloc(strhdr.sh_size);
+            if (shstrtab != NULL &&
+                read_at(f, (long) strhdr.sh_offset, shstrtab, strhdr.sh_size)) {
+                shstrtab_size = strhdr.sh_size;
+                shstrtab[strhdr.sh_size - 1] = '\0';    // bound every lookup
+            } else {
+                free(shstrtab);
+                shstrtab = NULL;
+            }
+        }
+    }
+
     xed_tables_init();
     xed_set_verbosity(0);
 
@@ -361,6 +400,17 @@ int main(int argc, char **argv)
                 funcs, nfuncs);
         }
 
+        // Name the section the following findings belong to, and give the
+        // address their offsets are relative to, so a site can be located in
+        // a disassembly.
+        if (verbose) {
+            const char *name = shstrtab != NULL && shdr.sh_name < shstrtab_size
+                ? shstrtab + shdr.sh_name : "";
+            printf("== section %lu%s%s: vaddr 0x%lx, %lu bytes ==\n",
+                (unsigned long) i, name[0] != '\0' ? " " : "", name,
+                (unsigned long) shdr.sh_addr, (unsigned long) shdr.sh_size);
+        }
+
         int n = check_instructions(buf, shdr.sh_size, verbose, summary,
             extensions);
         if (n < 0) {
@@ -383,6 +433,7 @@ int main(int argc, char **argv)
 
 out:
     x86lint_summary_destroy(summary);
+    free(shstrtab);
     free(funcs);
     free(buf);
     fclose(f);

@@ -130,12 +130,21 @@ and only for flags -- the ABI guarantees they do not survive it.
 * length-changing prefix stall
   - `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
     immediate's length (imm32 -> imm16) defeats the pre-decoder's length
-    speculation on Intel big cores through the Skylake era, costing ~3 cycles
-    per visit (Intel optimization manual, "Length-Changing Prefixes").
-    Advisory: the clean fix -- 32-bit operands -- needs upper-16 liveness
-    this tool does not track. A 66-prefixed imm16 whose value fits imm8 is
-    already the oversized-immediate finding, whose narrowing removes the LCP
-    by itself
+    speculation, costing 2-3 cycles per visit (Intel optimization manual,
+    "Length-Changing Prefixes"). Which instructions pay it has moved twice,
+    so how much a finding is worth depends on the target (Agner Fog,
+    *microarchitecture.pdf*). Arithmetic and logic forms pay on every Intel
+    big core from the Pentium 4 to the present. MOV pays on the Pentium 4
+    through Nehalem, then not on Sandy Bridge through Skylake -- where
+    "mov ax,1234 has no penalty", Haswell and Skylake both inheriting Sandy
+    Bridge's behavior -- and then again from Ice Lake onward. The Atom line
+    has never paid it at all. MOV is most of what this check fires on -- 92%
+    of the findings on librustc_driver -- so against a Sandy-Bridge-through-
+    Skylake target the bulk of them cost nothing, while the arithmetic and
+    logic subset is valid everywhere. Advisory either way: the clean fix,
+    32-bit operands, needs upper-16 liveness this tool does not track. A
+    66-prefixed imm16 whose value fits imm8 is already the
+    oversized-immediate finding, whose narrowing removes the LCP by itself
 * load foldable into extend
   - `8A06 0FB6C0` (MOV AL, [RSI]; MOVZX EAX, AL) -- a narrow load then an
     in-place sign/zero-extension is a single extending load: MOVZX EAX, byte

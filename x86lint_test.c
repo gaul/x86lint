@@ -3525,6 +3525,90 @@ static void check_setcc_movzx_test(void)
     ASSERT_FINDINGS(edge_on_head, "suboptimal SETcc zero-extension", 1);
 }
 
+// Multi-instruction peephole: setcc X ; xor X, 1 inverts the boolean the
+// complementary condition code produces outright, so the XOR disappears.
+// check_instructions reports it against the setcc, gated on the arithmetic
+// flags the XOR writes being dead afterward.
+static void check_setcc_invert_test(void)
+{
+    // setz al ; xor al, 1 -- the accumulator short form of the XOR. RET makes
+    // the flags dead, so it fires.
+    static const uint8_t acc_form[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x34, 0x01,        // xor al, 1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(acc_form, "suboptimal SETcc inversion", 1);
+
+    // The same through the modrm encoding, on a register with no short form.
+    static const uint8_t modrm_form[] = {
+        0x0F, 0x95, 0xC1,  // setnz cl
+        0x80, 0xF1, 0x01,  // xor cl, 1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(modrm_form, "suboptimal SETcc inversion", 1);
+
+    // A different register is not the same boolean.
+    static const uint8_t other_reg[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x80, 0xF1, 0x01,  // xor cl, 1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(other_reg, "suboptimal SETcc inversion", 0);
+
+    // Only 1 inverts a 0/1 boolean.
+    static const uint8_t other_imm[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x34, 0x02,        // xor al, 2
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(other_imm, "suboptimal SETcc inversion", 0);
+
+    // A wider XOR flips the same bit but writes the whole register,
+    // zero-extending where setnz al leaves bits 63:8 alone.
+    static const uint8_t wide_xor[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x83, 0xF0, 0x01,  // xor eax, 1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(wide_xor, "suboptimal SETcc inversion", 0);
+
+    // The XOR writes the arithmetic flags and setcc writes none, so a reader
+    // downstream keeps the pair.
+    static const uint8_t flags_live[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x34, 0x01,        // xor al, 1
+        0x74, 0x00,        // jz +0
+    };
+    ASSERT_FINDINGS(flags_live, "suboptimal SETcc inversion", 0);
+
+    // Memory destinations are out.
+    static const uint8_t mem_dest[] = {
+        0x0F, 0x94, 0x00,  // setz byte [rax]
+        0x80, 0x30, 0x01,  // xor byte [rax], 1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(mem_dest, "suboptimal SETcc inversion", 0);
+
+    // An incoming edge onto the XOR inverts whatever else arrived in the
+    // register; one onto the setcc executes the whole pattern.
+    static const uint8_t edge_on_xor[] = {
+        0x0F, 0x94, 0xC0,  // 0: setz al
+        0x34, 0x01,        // 3: xor al, 1   <- branch target
+        0xC3,              // 5: ret
+        0xEB, 0xFB,        // 6: jmp 3
+    };
+    ASSERT_FINDINGS(edge_on_xor, "suboptimal SETcc inversion", 0);
+    static const uint8_t edge_on_head[] = {
+        0x0F, 0x94, 0xC0,  // 0: setz al     <- branch target
+        0x34, 0x01,        // 3: xor al, 1
+        0xC3,              // 5: ret
+        0xEB, 0xF8,        // 6: jmp 0
+    };
+    ASSERT_FINDINGS(edge_on_head, "suboptimal SETcc inversion", 1);
+}
+
+
 // Advisory: POPCNT/LZCNT/TZCNT's destination is a phantom input on affected
 // Intel cores (POPCNT through Cascade Lake, LZCNT/TZCNT through Broadwell),
 // so a count into a register the adjacent predecessor did not redefine is
@@ -5212,6 +5296,7 @@ int main(int argc, char *argv[])
     check_cmp_one_branch_test();
     check_setcc_branch_test();
     check_setcc_movzx_test();
+    check_setcc_invert_test();
     check_popcnt_false_dep_test();
     check_sse_merge_false_dep_test();
     check_missing_andn_test();

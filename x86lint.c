@@ -4057,6 +4057,73 @@ static bool setcc_movzx_zero_extend(const uint8_t *inst, size_t len,
 // ANDN computes ~src1 & src2 in one instruction, reading src1's original
 // value, so the pair collapses exactly: both forms write only the
 // destination, and a 32-bit write zero-extends either way. The flag delta is
+// Multi-instruction peephole. SETcc writes 0 or 1, so exclusive-oring it with
+// 1 inverts a boolean the complementary condition code produces outright:
+//
+//   setz al ; xor al, 1  ->  setnz al
+//
+// The XOR disappears. Every condition code has a complement, so the rewrite
+// always exists and the check need not enumerate them; the finding is
+// reported at the SETcc, where the replacement lands.
+//
+// Soundness. SETcc writes no flags and the XOR writes all the arithmetic ones,
+// so dropping it leaves whatever the compare feeding the SETcc set, and the
+// finding is gated on those being dead past the pair. The destination must be
+// the same byte register in both, matched exactly: `setz al ; xor eax, 1`
+// inverts the same bit but writes eax, zero-extending into bits 63:8 where
+// setnz al leaves them alone, and proving those dead is a separate question
+// from the one this check answers. Memory destinations are excluded for the
+// same reason the pair is required to be adjacent -- see below.
+//
+// Adjacency. Unlike the other window peepholes here this one does not scan:
+// the pair is a single emitted idiom, and a gap could neither read the
+// destination (it would observe the value before inversion, which the rewrite
+// inverts earlier) nor write it, which leaves almost nothing a gap could be.
+// The measured population is adjacent.
+static bool setcc_xor_one_invertible(const uint8_t *inst, size_t len,
+                                     const uint8_t *branch_targets,
+                                     size_t xor_offset,
+                                     const xed_decoded_inst_t *setcc,
+                                     xed_decoded_inst_t *xor_out)
+{
+    if (xed_decoded_inst_get_category(setcc) != XED_CATEGORY_SETCC ||
+        xed_decoded_inst_number_of_memory_operands(setcc) != 0) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(setcc, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(dest) != 8) {
+        return false;
+    }
+
+    if (xor_offset >= len) {
+        return false;
+    }
+    decode_init(xor_out);
+    if (xed_decode(xor_out, inst + xor_offset, len - xor_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_get_iclass(xor_out) != XED_ICLASS_XOR ||
+        xed_decoded_inst_number_of_memory_operands(xor_out) != 0 ||
+        xed_decoded_inst_get_operand_width(xor_out) != 8 ||
+        xed_decoded_inst_get_reg(xor_out, XED_OPERAND_REG0) != dest) {
+        return false;
+    }
+    if (xed_decoded_inst_get_immediate_width_bits(xor_out) == 0 ||
+        xed_decoded_inst_get_unsigned_immediate(xor_out) != 1) {
+        return false;
+    }
+
+    // An incoming direct edge onto the XOR reaches it without the SETcc, so it
+    // would invert whatever else arrived in the register.
+    size_t after = xor_offset + xed_decoded_inst_get_length(xor_out);
+    if (branch_target_in(branch_targets, xor_offset, after)) {
+        return false;
+    }
+    return !flags_live_after(inst, len, after, FLAG_ARITH);
+}
+
 // PF alone -- both clear CF/OF and set SF/ZF from the same result, but AND
 // defines PF where ANDN leaves it undefined -- so the fold is suppressed
 // while PF may be read downstream (AF is untracked, and both leave it
@@ -5235,6 +5302,19 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                                        &xedd)) {
             summary_add(summary, "redundant TEST after SETcc");
             report_finding("redundant TEST after SETcc", offset, verbose, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: setcc X ; xor X, 1 inverts the boolean
+        // the complementary condition code produces outright. Reported against
+        // the SETcc (at `offset`), where the replacement lands and from which
+        // the XOR disappears. See setcc_xor_one_invertible.
+        xed_decoded_inst_t inverting_xor;
+        if (setcc_xor_one_invertible(inst, len, branch_targets, next, &xedd,
+                                     &inverting_xor)) {
+            summary_add(summary, "suboptimal SETcc inversion");
+            report_finding("suboptimal SETcc inversion", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }

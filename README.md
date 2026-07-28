@@ -432,6 +432,18 @@ and only for flags -- the ABI guarantees they do not survive it.
 * suboptimal OR/AND reg, reg
   - `09C0` (OR EAX, EAX) -- use TEST EAX, EAX (same flags, no register write;
     the 32-bit form's zero-extension is gated by register liveness)
+* suboptimal SETcc inversion
+  - `0F94C0 3401` (SETZ AL; XOR AL, 1) -- SETcc writes 0 or 1, so inverting it
+    with XOR reproduces what the complementary condition code sets directly:
+    SETNZ AL, and the XOR disappears. Every condition has a complement, so the
+    rewrite always exists. SETcc writes no flags where XOR writes all the
+    arithmetic ones, so the finding is gated on those being dead past the pair
+    (flag liveness). The register must match exactly and the XOR be 8-bit:
+    XOR EAX, 1 flips the same bit but writes the whole register, zero-extending
+    into bits 63:8 where SETNZ AL leaves them alone. Adjacent-only -- the pair
+    is one emitted idiom, and a gap could neither read the destination (it
+    would see the value before an inversion the rewrite moves earlier) nor
+    write it
 * suboptimal SETcc zero-extension
   - `0F94C0 0FB6C0` (SETZ AL; MOVZX EAX, AL) -- Intel's preferred form zeroes
     the register ahead of the flag-setting compare (XOR EAX, EAX; CMP ...;

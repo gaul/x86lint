@@ -483,11 +483,14 @@ and only for flags -- the ABI guarantees they do not survive it.
     SETZU instead: the zero-upper form is the exact in-place fold the
     baseline lacks
 * suboptimal SHL one
-  - `D1E0` (SHL EAX, 1) -- ADD EAX, EAX computes the same value with identical
-    flags (CF gets the shifted-out bit either way, and OF matches too) in the
-    same two bytes but on roughly twice the execution ports; the C1 imm8 form
-    of a 1-count shift is a byte longer besides. Value- and flag-exact at
-    every width, so unconditional
+  - `D1E0` (SHL EAX, 1) -- ADD EAX, EAX computes the same value with the same
+    flags in the same two bytes but on roughly twice the execution ports; the
+    C1 imm8 form of a 1-count shift is a byte longer besides. CF takes the
+    shifted-out bit either way, and OF agrees because a 1-bit shift defines it
+    as MSB(result) XOR CF, which is exactly the signed overflow of adding a
+    value to itself. The one divergence is AF, which SHL leaves undefined and
+    ADD defines; that runs in the safe direction -- no correct program reads
+    an undefined flag -- so the finding stays unconditional
 * suboptimal SSE MOV opcode
   - `660F6FCA` instead of `0F28CA` (MOVDQA XMM1, XMM2 -> MOVAPS; the legacy
     66/F3-prefixed copies movapd/movdqa/movupd/movdqu waste a byte over

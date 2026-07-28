@@ -515,7 +515,17 @@ and only for flags -- the ABI guarantees they do not survive it.
     the self form is flagged -- a data XOR really executes, where the domain
     can matter on older cores)
 * suboptimal SUB reg, reg
-  - `29C0` (SUB EAX, EAX) -- use XOR for dependency-breaking
+  - `29C0` (SUB EAX, EAX) -- XOR EAX, EAX zeroes the register in the same two
+    bytes, so this is not about size but about which self-operations a core
+    recognizes as independent of the register's prior value. Intel's big cores
+    and AMD list XOR and SUB together and the rewrite buys nothing there; the
+    low-power line does not, and on Silvermont "SUB, SBB and CMP instructions
+    are not recognized in this way" (Agner Fog, *microarchitecture.pdf*), so
+    the SUB carries a false dependency the XOR breaks. Measured on a desktop
+    part this check looks like noise, which is why the reason is written down.
+    One flag diverges, and unusually it runs the wrong way: SUB defines AF
+    where XOR leaves it undefined. Nothing here can gate on that -- FLAG_ARITH
+    omits AF -- and no 64-bit code observes it without LAHF or PUSHF
 * suboptimal XOR immediate
   - `83F0 FF` instead of `F7D0` (XOR EAX, -1 -> NOT EAX, when flags are unused)
 * unneeded explicit immediate

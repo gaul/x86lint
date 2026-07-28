@@ -296,6 +296,16 @@ and only for flags -- the ABI guarantees they do not survive it.
 * oversized ADD/SUB one
   - `83C0 01` instead of `FFC0` (ADD EAX, 1 -> INC EAX, when CF is unused)
   - `836B10 01` instead of `FF4B10` (SUB DWORD [RBX+0x10], 1 -> DEC DWORD [RBX+0x10])
+  - The long-standing advice runs the other way -- "always use ADD and SUB
+    instead of INC and DEC" (Agner Fog, *microarchitecture.pdf*) -- because
+    INC and DEC write every arithmetic flag but CF, so a later read of CF
+    together with them has to join two sources: a multi-cycle partial-flags
+    stall through Core 2, and from Sandy Bridge an extra µop, still present on
+    Haswell, whose example is exactly `inc eax ; jbe L1`. That cost lands only
+    when something downstream reads CF, which is the very condition the CF
+    gate above rules out: every finding emitted here has CF provably dead
+    before its next write, so no reader spans the two halves and no merge is
+    inserted. The gate that makes the rewrite correct is what makes it free
 * oversized branch displacement
   - `E9 00000000` instead of `EB 03` (JMP rel32 that fits in rel8)
 * oversized displacement

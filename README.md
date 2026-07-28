@@ -473,7 +473,17 @@ and only for flags -- the ABI guarantees they do not survive it.
 * suboptimal SSE MOV opcode
   - `660F6FCA` instead of `0F28CA` (MOVDQA XMM1, XMM2 -> MOVAPS; the legacy
     66/F3-prefixed copies movapd/movdqa/movupd/movdqu waste a byte over
-    movaps/movups)
+    movaps/movups). All four are bit copies, so the rewrite never changes a
+    value. The byte is free on the load and store forms -- no bypass delay
+    attaches to moving the "wrong" type to or from memory (Agner Fog,
+    *microarchitecture.pdf*) -- and those are the bulk of the findings here,
+    88-92% on the larger binaries in the measurement corpus. The
+    register-to-register forms carry a caveat on cores that separate the
+    integer and FP domains: from Nehalem, MOVAPS/MOVAPD issue on port 5 alone
+    where MOVDQA reaches the integer units, so the shorter encoding can cost
+    bypass latency in a dependency chain, and throughput besides -- one move
+    per clock against three. Move elimination on later cores erases the
+    distinction, so this is recorded as a caveat rather than a gate
 * suboptimal SSE zero idiom
   - `660FEFC0` instead of `0F57C0` (PXOR XMM0, XMM0 -> XORPS XMM0, XMM0; XOR
     is typeless, and the self forms write identical bits -- 128 zeros, upper

@@ -207,9 +207,20 @@ bool check_missing_shlx(const xed_decoded_inst_t *xedd);
 bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd);
 
 // return false if a legacy-encoded self-XOR zeroing idiom -- pxor xmm, xmm or
-// xorpd xmm, xmm -- could be xorps xmm, xmm, the identical zeroing without
-// the one-byte 66 prefix (XOR is typeless; all three are rename-time zeroing
-// idioms on every recent core, so no domain-bypass concern applies)
+// xorpd xmm, xmm -- could be xorps xmm, xmm, the identical zeroing without the
+// one-byte 66 prefix.
+//
+// What makes the swap free is that the three are interchangeable to the
+// hardware, not that they cost nothing: every microarchitecture that
+// recognizes a self-XOR as independent of the register's prior value lists
+// PXOR, XORPS and XORPD together, so the dependency break survives the
+// rewrite. Whether the idiom also skips an execution unit varies and is the
+// same for all three either way -- resolved at the register allocation stage
+// through Broadwell, executing on a vector port from Skylake (Agner Fog,
+// microarchitecture.pdf) -- so it does not distinguish them. The
+// integer-versus-FP domain question that qualifies the sibling SSE MOV check
+// is weaker here because the value produced is a constant zero rather than
+// forwarded data
 bool check_sse_zero_idiom(const xed_decoded_inst_t *xedd);
 
 // return false if an EVEX-encoded instruction uses no EVEX-only feature

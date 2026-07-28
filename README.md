@@ -289,7 +289,15 @@ and only for flags -- the ABI guarantees they do not survive it.
     proof (`APX_NDD_WINDOW`), looking through instructions that neither
     touch the destination nor write the source, which keeps the division
     of labor with that check -- these pairs fold to LEA while the flags
-    die, to an NDD op while they live -- exact at every distance
+    die, to an NDD op while they live -- exact at every distance. The
+    finding is reported at the MOV, the instruction that disappears, but
+    the LEA takes the ADD's place, and for a gapped pair that placement is
+    what makes it correct: only the source's read moves later, which the
+    window's independence proof covers, while the addend is still read
+    where the ADD read it. Writing the LEA at the MOV instead would hoist
+    the addend's read above anything between them -- in `MOV RCX, R12;
+    MOV RBX, [RSP+0x70]; ADD RCX, RBX` (a Go site) it would read RBX
+    before the load
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)

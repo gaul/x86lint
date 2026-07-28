@@ -70,6 +70,17 @@ instructions) starting at the successor.
   branch, call, or interrupt whose path the scan cannot follow ends it
   conservatively live.
 
+  The model covers CF, PF, ZF, SF and OF. AF is deliberately outside it, and
+  three rewrites do diverge there, each replacing an instruction that defines
+  AF with one that leaves it undefined: `CMP reg, 0` and `ADD reg, 0` to
+  `TEST reg, reg`, and `SUB reg, reg` to `XOR reg, reg`. Nothing gates them,
+  because `flag_concerns` has no bit for AF and adding one would suppress
+  findings on a flag that 64-bit code cannot read without `LAHF` or `PUSHF`
+  and that no compiler emits a dependence on. Recorded rather than assumed:
+  the divergence is real, it runs toward *undefined*, and it is accepted.
+  The reverse direction is harmless and appears once, in `SHL reg, 1` to
+  `ADD reg, reg`, which gives AF a definition the shift did not have.
+
 * **Register (upper-32) liveness.** Writing a 32-bit register zero-extends
   into the upper half of its 64-bit parent, so a 32-bit identity operation
   whose rewrite writes nothing -- `mov eax, eax` removed; `add eax, 0`,

@@ -94,6 +94,21 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# A 3E-prefixed indirect call is exempt from CET indirect-branch tracking
+# and is flagged; the same prefix on an indirect JMP is the compilers'
+# switch-table idiom and must stay clean.
+cat >"$dir/notrack.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x3e, 0xff, 0xd0              # notrack call rax (IBT bypass)
+    .byte 0x3e, 0xff, 0xe0              # notrack jmp rax (switch idiom)
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # CET fixtures for -e. The .note.gnu.property section is the same note gcc
 # emits under -fcf-protection (the linker merges it through to the output):
 # cetgood declares IBT and pads its entry point, cetbad declares IBT but
@@ -193,7 +208,7 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi; do
+for f in finding clean bmi notrack; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -257,6 +272,12 @@ reject 'missing ANDN' "ANDN finding under -m movbe"
 run 1 -m apx "$dir/bmi"
 expect '^ +1 +missing APX NDD$' "count of 1 for missing APX NDD under -m apx"
 reject 'missing MOVBE' "MOVBE finding under -m apx"
+
+# The NOTRACK call is flagged; the switch-table jmp idiom beside it is not
+# (the instruction count pins that the jmp decoded and produced nothing).
+run 1 "$dir/notrack"
+expect '^ +1 +IBT-bypassing NOTRACK call$' "count of 1 for NOTRACK call"
+expect '^1 optimization opportunities in 3 instructions$'
 
 # -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
 run 0 "$dir/cetbad"

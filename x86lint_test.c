@@ -672,6 +672,33 @@ static void check_rep_ret_test(void)
     ASSERT_FINDINGS(rep_ret, "unneeded REP prefix on RET", 1);
 }
 
+// notrack call (3E FF /2): a call site exempted from CET indirect-branch
+// tracking. Only CALLs match: notrack jmp is the compilers' read-only
+// switch-table idiom, and on direct calls, far calls, and non-branches the
+// 3E byte is an ignored segment override with no CET meaning (XED reports
+// cet_no_track only for near indirect call/jmp -- the CS-prefixed lookalike
+// 2E pins that it is specifically 3E).
+static void check_notrack_call_test(void)
+{
+    CHECK_BYTES_ASM(!check_notrack_call, "notrack call rax",
+                    0x3E, 0xFF, 0xD0);
+    CHECK_BYTES_ASM(!check_notrack_call, "notrack call qword ptr [rax]",
+                    0x3E, 0xFF, 0x10);
+    CHECK_BYTES_ASM( check_notrack_call, "call rax", 0xFF, 0xD0);
+    CHECK_BYTES_ASM( check_notrack_call, "call rax", 0x2E, 0xFF, 0xD0);
+    CHECK_BYTES_ASM( check_notrack_call, "notrack jmp rax",
+                    0x3E, 0xFF, 0xE0);
+    CHECK_BYTES_ASM( check_notrack_call, "call 0x6",
+                    0x3E, 0xE8, 0x00, 0x00, 0x00, 0x00);
+    CHECK_BYTES( check_notrack_call, 0x3E, 0xC3);  // ds-prefixed ret
+
+    // Dispatcher wiring: unconditional finding, end-to-end.
+    static const uint8_t notrack_call[] = {
+        0x3E, 0xFF, 0xD0,  // notrack call rax
+    };
+    ASSERT_FINDINGS(notrack_call, "IBT-bypassing NOTRACK call", 1);
+}
+
 static void check_xchg_accumulator_test(void)
 {
     // modrm xchg with an accumulator operand -- shrinks to the 1-byte 90+r.
@@ -5320,6 +5347,7 @@ int main(int argc, char *argv[])
     check_xor_to_not_test();
     check_superfluous_lock_prefix_test();
     check_rep_ret_test();
+    check_notrack_call_test();
     check_xchg_accumulator_test();
     check_oversized_branch_test();
     check_mov_self_test();

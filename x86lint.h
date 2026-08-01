@@ -84,6 +84,13 @@ bool check_superfluous_lock_prefix(const xed_decoded_inst_t *xedd);
 // matched
 bool check_rep_ret(const xed_decoded_inst_t *xedd);
 
+// return false for an indirect near CALL carrying the CET NOTRACK prefix
+// (3E): the call site is exempt from indirect-branch tracking, a deliberate
+// hole in IBT coverage. Indirect JMPs are not matched -- NOTRACK there is
+// the compilers' read-only switch-table idiom. A security review flag
+// rather than a rewrite suggestion
+bool check_notrack_call(const xed_decoded_inst_t *xedd);
+
 // return false if xchg with an accumulator uses the modrm form (87 /r)
 // when the one-byte 90+r form would do
 bool check_xchg_accumulator(const xed_decoded_inst_t *xedd);

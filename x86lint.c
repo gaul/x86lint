@@ -877,6 +877,31 @@ bool check_rep_ret(const xed_decoded_inst_t *xedd)
         xed_decoded_inst_operands_const(xedd));
 }
 
+// The NOTRACK prefix (3E) on an indirect near CALL or JMP exempts that one
+// transfer from CET indirect-branch tracking: the CPU will not require an
+// ENDBR64 landing pad at the target (Intel SDM vol. 1, Control-flow
+// Enforcement Technology chapter). Compilers emit it for exactly one shape
+// -- register-form JMPs through read-only switch tables, whose basic-block
+// targets legitimately lack pads (all 447 NOTRACK branches across bash,
+// libc, ld.so, and libcrypto on Fedora 44 are that shape) -- so indirect
+// JMPs are not matched. A NOTRACK call reaches compiler output only through
+// an explicit __attribute__((nocf_check)) function-pointer type, otherwise
+// hand-written assembly: a deliberately untracked forward edge in an
+// otherwise enforced binary, exactly where a CFI bypass hides. Unlike the
+// optimization checks this finding is a security review flag, not a rewrite
+// -- deleting the prefix makes the call tracked, which #CP-faults if the
+// target really lacks a pad. Direct and far calls need no gate here: XED's
+// cet_no_track is already false for them (their 3E is an ignored legacy
+// segment override with no CET meaning).
+bool check_notrack_call(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_CALL_NEAR) {
+        return true;
+    }
+    return !xed_operand_values_cet_no_track(
+        xed_decoded_inst_operands_const(xedd));
+}
+
 // xchg between a word/dword/qword accumulator (AX/EAX/RAX) and another
 // register has a one-byte 90+r form; the modrm form (87 /r) is one byte
 // longer:
@@ -2716,6 +2741,7 @@ static const struct check_entry checks[] = {
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_rep_ret,                    "unneeded REP prefix on RET",      0},
+    {check_notrack_call,               "IBT-bypassing NOTRACK call",      0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern, true},

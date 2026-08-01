@@ -118,6 +118,20 @@ and only for flags -- the ABI guarantees they do not survive it.
 
 ## Implemented analyses
 
+* IBT-bypassing NOTRACK call
+  - `3E FFD0` (NOTRACK CALL RAX) -- the 3E prefix exempts this one indirect
+    call from CET indirect-branch tracking: the CPU will not require an
+    ENDBR64 landing pad at its target. Compilers emit NOTRACK only for
+    register-form JMPs through read-only switch tables, whose basic-block
+    targets legitimately lack pads (all 447 NOTRACK branches across bash,
+    libc, ld.so, and libcrypto on Fedora 44 are that shape; indirect JMPs
+    are therefore not matched). A NOTRACK *call* reaches compiler output
+    only through an explicit `__attribute__((nocf_check))` function-pointer
+    type, otherwise hand-written assembly: a deliberately untracked forward
+    edge in an otherwise enforced binary, exactly where a CFI bypass hides.
+    Unlike the optimization checks this finding is a security review flag,
+    not a rewrite -- dropping the prefix without padding the target trades
+    the bypass for a #CP fault
 * LEA foldable into memory
   - `488D04B7 488B00` (LEA RAX, [RDI+RSI*4]; MOV RAX, [RAX]) -- the address
     computation folds into the load's own base+index*scale+disp, so the LEA

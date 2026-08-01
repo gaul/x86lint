@@ -261,18 +261,20 @@ static uint8_t *load_section(FILE *f, const Elf64_Shdr *shdr,
     return buf;
 }
 
-// Whether the GNU property note declares IBT support: an
-// NT_GNU_PROPERTY_TYPE_0 note named "GNU" holding a
-// GNU_PROPERTY_X86_FEATURE_1_AND property with the IBT bit set. The loader
-// enables enforcement from exactly this bit, so it is the binary's claim of
-// correctness. Property notes are 8-aligned in ELF64; other note sections
-// (build-id) use 4, hence the per-section alignment. Each property is
-// {u32 pr_type, u32 pr_datasz, data padded to 8}.
-static bool elf_declares_ibt(FILE *f, const Elf64_Shdr *sh, uint64_t shnum,
-                             uint64_t file_size)
+// The GNU property note's GNU_PROPERTY_X86_FEATURE_1_AND word: an
+// NT_GNU_PROPERTY_TYPE_0 note named "GNU" holding the CET feature bits,
+// IBT (bit 0) and SHSTK (bit 1). The loader enables enforcement from
+// exactly these bits, so the word is the binary's claim of correctness;
+// returns 0 when no note carries it. Property notes are 8-aligned in
+// ELF64; other note sections (build-id) use 4, hence the per-section
+// alignment. Each property is {u32 pr_type, u32 pr_datasz, data padded
+// to 8}.
+static uint32_t elf_feature_1_and(FILE *f, const Elf64_Shdr *sh,
+                                  uint64_t shnum, uint64_t file_size)
 {
-    bool ibt = false;
-    for (uint64_t i = 0; i < shnum && !ibt; ++i) {
+    uint32_t feat = 0;
+    bool found = false;
+    for (uint64_t i = 0; i < shnum && !found; ++i) {
         if (sh[i].sh_type != SHT_NOTE) {
             continue;
         }
@@ -308,13 +310,11 @@ static bool elf_declares_ibt(FILE *f, const Elf64_Shdr *sh, uint64_t shnum,
                     if (pr_datasz > dend - (p + 8)) {
                         break;
                     }
-                    if (pr_type == GNU_PROPERTY_X86_FEATURE_1_AND &&
+                    if (!found &&
+                        pr_type == GNU_PROPERTY_X86_FEATURE_1_AND &&
                         pr_datasz >= 4) {
-                        uint32_t feat;
                         memcpy(&feat, buf + p + 8, 4);
-                        if (feat & GNU_PROPERTY_X86_FEATURE_1_IBT) {
-                            ibt = true;
-                        }
+                        found = true;
                     }
                     p += 8 + (((uint64_t) pr_datasz + 7) & ~(uint64_t) 7);
                 }
@@ -323,7 +323,7 @@ static bool elf_declares_ibt(FILE *f, const Elf64_Shdr *sh, uint64_t shnum,
         }
         free(buf);
     }
-    return ibt;
+    return feat;
 }
 
 // Resolve one RELR-relocated slot: the packed format encodes only WHERE a
@@ -443,7 +443,9 @@ static int check_elf_endbr64(FILE *f, const char *path,
         goto out;
     }
 
-    bool ibt = elf_declares_ibt(f, sh, shnum, file_size);
+    uint32_t feat = elf_feature_1_and(f, sh, shnum, file_size);
+    bool ibt = (feat & GNU_PROPERTY_X86_FEATURE_1_IBT) != 0;
+    bool shstk = (feat & GNU_PROPERTY_X86_FEATURE_1_SHSTK) != 0;
 
     // The dynamic symbol table names relocation targets and lists the
     // exported functions, each an indirect target in its own right.
@@ -780,6 +782,35 @@ static int check_elf_endbr64(FILE *f, const char *path,
         printf("ENDBR64: no IBT in the property note and no ENDBR64 "
             "landing pads; not an IBT binary\n");
         rc = 0;
+    }
+
+    // The same FEATURE_1_AND word carries the shadow-stack bit, and
+    // -fcf-protection=full emits both, so an asymmetric declaration earns a
+    // line. Calibration across 3,203 /usr/lib64 library files: 3,120
+    // declare both, none declare IBT alone, 18 declare SHSTK alone -- all
+    // media/JIT libraries (the ffmpeg family, dav1d, x264, libass, LuaJIT)
+    // whose hand-written assembly emits an SHSTK-only note: its returns
+    // stay paired but its entries lack pads, and under the linker's AND an
+    // SHSTK-only output proves every object declared SHSTK while at least
+    // one withheld IBT. Each such library pairs this line with the
+    // annotation-lost verdict above. Informational only, never the exit
+    // status: SHSTK -- unlike IBT -- leaves nothing in the instruction
+    // stream to verify, and even a shadow-stack-incompatible idiom is not
+    // statically recognizable (glibc's setcontext ends in the classic
+    // push-and-ret yet takes an RSTORSSP path first when a shadow stack is
+    // live -- a runtime feature gate no instruction matcher can see). In
+    // the annotation-lost verdict the pads evidence branch protection only,
+    // so the SHSTK line states the bit's absence without claiming a loss.
+    if (ibt && shstk) {
+        printf("SHSTK: shadow stack declared alongside IBT\n");
+    } else if (ibt) {
+        printf("SHSTK: no shadow stack in the property note despite IBT "
+            "(branch-only -fcf-protection?)\n");
+    } else if (shstk) {
+        printf("SHSTK: shadow stack declared without IBT (SHSTK-only asm "
+            "in the link, or return-only -fcf-protection?)\n");
+    } else if (checked != 0 && misses < checked) {
+        printf("SHSTK: no shadow stack in the property note\n");
     }
 
 out:

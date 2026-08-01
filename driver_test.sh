@@ -111,10 +111,11 @@ EOF
 
 # CET fixtures for -e. The .note.gnu.property section is the same note gcc
 # emits under -fcf-protection (the linker merges it through to the output):
-# cetgood declares IBT and pads its entry point, cetbad declares IBT but
-# does not pad, cetlost pads without declaring (the linker ANDs the note
-# across inputs, so this is what a link poisoned by one non-CET object
-# leaves), and cetso is a shared object whose exported fn_bad lacks its pad.
+# cetgood declares IBT+SHSTK and pads its entry point, cetbad declares IBT
+# only and does not pad, cetlost pads without declaring (the linker ANDs
+# the note across inputs, so this is what a link poisoned by one non-CET
+# object leaves), cetret declares only SHSTK (-fcf-protection=return), and
+# cetso is a shared object whose exported fn_bad lacks its pad.
 cat >"$dir/cetgood.s" <<'EOF'
     .section .note.gnu.property,"a",@note
     .p2align 3
@@ -125,7 +126,7 @@ cat >"$dir/cetgood.s" <<'EOF'
 1:  .p2align 3
 2:  .long 0xc0000002                    # GNU_PROPERTY_X86_FEATURE_1_AND
     .long 4
-    .long 1                             # GNU_PROPERTY_X86_FEATURE_1_IBT
+    .long 3                             # FEATURE_1_IBT | FEATURE_1_SHSTK
     .long 0
 3:
     .text
@@ -177,6 +178,32 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# cetret: only the shadow-stack bit (-fcf-protection=return). No IBT claim
+# to hold the code to, but the asymmetric declaration is reported.
+cat >"$dir/cetret.s" <<'EOF'
+    .section .note.gnu.property,"a",@note
+    .p2align 3
+    .long 1f - 0f                       # n_namesz
+    .long 3f - 2f                       # n_descsz
+    .long 5                             # NT_GNU_PROPERTY_TYPE_0
+0:  .asciz "GNU"
+1:  .p2align 3
+2:  .long 0xc0000002                    # GNU_PROPERTY_X86_FEATURE_1_AND
+    .long 4
+    .long 2                             # GNU_PROPERTY_X86_FEATURE_1_SHSTK
+    .long 0
+3:
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xb8, 0x3c, 0x00, 0x00, 0x00  # mov eax, 60
+    .byte 0x31, 0xff                    # xor edi, edi
+    .byte 0x0f, 0x05                    # syscall
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 cat >"$dir/cetso.s" <<'EOF'
     .section .note.gnu.property,"a",@note
     .p2align 3
@@ -221,7 +248,7 @@ done
 # and plain `cc -nostdlib` with no shared dependencies emits no PT_INTERP
 # either. cleandyn is the clean fixture linked the same way, for the
 # not-an-IBT verdict.
-for f in cetgood cetbad cetlost; do
+for f in cetgood cetbad cetlost cetret; do
     if ! cc -nostdlib -pie -Wl,--build-id=none -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
         exit 2
@@ -282,24 +309,40 @@ expect '^1 optimization opportunities in 3 instructions$'
 # -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
 run 0 "$dir/cetbad"
 reject 'ENDBR64' "ENDBR64 output without -e"
+reject 'SHSTK' "SHSTK output without -e"
 
-# Note present, entry point padded: clean, exit 0.
+# Note present, entry point padded: clean, exit 0. cetgood declares both
+# CET bits, the -fcf-protection=full shape.
 run 0 -e "$dir/cetgood"
 expect '^ENDBR64: IBT property note present; all 1 indirect branch targets land on ENDBR64$'
+expect '^SHSTK: shadow stack declared alongside IBT$'
 
 # Note present, entry point bare: a would-be #CP fault, printed without -v.
+# cetbad declares IBT alone, so the SHSTK asymmetry is reported.
 run 1 -e "$dir/cetbad"
 expect '^indirect branch target missing ENDBR64: 0x[0-9a-f]+ \(entry point\)$'
 expect '1 of 1 indirect branch targets missing ENDBR64'
+expect '^SHSTK: no shadow stack in the property note despite IBT \(branch-only -fcf-protection\?\)$'
 
 # Pads without the note: the poisoned-link verdict, one finding, exit 1.
+# The SHSTK line states the bit's absence without claiming a loss (the
+# pads evidence branch protection only).
 run 1 -e "$dir/cetlost"
 expect 'IBT annotation lost at link\?'
 reject 'missing ENDBR64' "per-target miss on a fully padded binary"
+expect '^SHSTK: no shadow stack in the property note$'
 
-# No IBT declaration, no pads: not an IBT binary, no findings.
+# No IBT declaration, no pads: not an IBT binary, no findings, and no
+# SHSTK line either -- a binary with no CET story gets no CET output.
 run 0 -e "$dir/cleandyn"
 expect '^ENDBR64: no IBT in the property note and no ENDBR64 landing pads; not an IBT binary$'
+reject 'SHSTK' "SHSTK line on a note-less non-CET binary"
+
+# Return-only CET: shadow stack declared without IBT. Nothing to hold the
+# instruction stream to (exit 0), but the asymmetry is reported.
+run 0 -e "$dir/cetret"
+expect '^ENDBR64: no IBT in the property note and no ENDBR64 landing pads; not an IBT binary$'
+expect '^SHSTK: shadow stack declared without IBT \(SHSTK-only asm in the link, or return-only -fcf-protection\?\)$'
 
 # Shared object: fn_bad is reachable through any caller's PLT and unpadded;
 # the miss is named via the dynamic symbol table.

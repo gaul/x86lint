@@ -763,6 +763,31 @@ Four verdicts, reconciling the pads against the note:
 * no declaration, no pads -- not an IBT binary; nothing to hold it to, no
   findings.
 
+The same `FEATURE_1_AND` word carries the shadow-stack bit, so `-e` reports
+it in the same pass: `-fcf-protection=full` emits both, and an asymmetric
+declaration earns a line. The asymmetries are real and directional: of
+3,203 `/usr/lib64` library files, 3,120 declare both bits, none declare IBT
+alone, and 18 declare SHSTK alone -- all media/JIT libraries (the ffmpeg
+family, dav1d, x264, libass, LuaJIT) whose hand-written assembly emits an
+SHSTK-only property note, since its returns stay call-paired but its entry
+points carry no pads. Under the linker's AND an SHSTK-only *output* proves
+every input object declared SHSTK while at least one withheld IBT, so each
+of the 18 pairs this line with the annotation-lost verdict: the two
+together read "the C was compiled with full CET, the assembly could claim
+only the return half, and the AND kept exactly what everything agreed on."
+The SHSTK line is informational and never sets the exit status, because
+SHSTK, unlike IBT, leaves nothing in the instruction stream to hold the
+binary to; even a shadow-stack-*incompatible* idiom is not statically
+recognizable -- glibc's own `setcontext`/`swapcontext` end in the classic
+`push`-and-`ret`, legitimately, because a runtime branch takes an
+`RSTORSSP`-based path first whenever a shadow stack is live, a feature gate
+no instruction matcher can see. So the declared bit is reported and the
+instructions are not judged. In the annotation-lost verdict the pads
+evidence branch protection only -- a lost `FEATURE_1_AND` takes IBT and
+SHSTK down together, but whether return protection was ever compiled in is
+unknowable, so there the line states the bit's absence without claiming a
+loss.
+
 Verified against a Fedora system where CET is on by default: `bash` (1,767
 evidenced targets), `libc.so.6` (2,500), `libcrypto.so.3` (5,867, including
 OpenSSL's perlasm), `ld-linux-x86-64.so.2`, and `git` all reconcile

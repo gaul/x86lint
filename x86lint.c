@@ -2520,6 +2520,25 @@ static bool redundant_reextension(const xed_decoded_inst_t *prev,
     return c_wd == 16 ? p_wd >= 16 : p_wd == c_wd;
 }
 
+bool check_endbr64_target(const uint8_t *inst, size_t len, size_t offset)
+{
+    // The tracker matches the decoded instruction, not raw bytes, so decode
+    // rather than memcmp the canonical F3 0F 1E FA: a redundant-prefixed
+    // ENDBR64 still decodes (and lands) as ENDBR64. ENDBR32 does not
+    // terminate 64-bit tracking and correctly fails the iclass test, as does
+    // an offset where no instruction decodes at all -- a landing there
+    // faults either way.
+    if (offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t xedd;
+    decode_init(&xedd);
+    if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+        return false;
+    }
+    return xed_decoded_inst_get_iclass(&xedd) == XED_ICLASS_ENDBR64;
+}
+
 #define X86LINT_SUMMARY_MAX 64
 
 struct x86lint_summary {

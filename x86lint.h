@@ -230,6 +230,19 @@ bool check_oversized_evex(const xed_decoded_inst_t *xedd);
 // r8-r15 base/index/rm operand -- which wastes one byte
 bool check_oversized_vex(const xed_decoded_inst_t *xedd);
 
+// return false if the bytes at `offset` do not begin with an ENDBR64
+// instruction. For a caller with outside evidence that an indirect branch can
+// land at `offset` -- an ELF relocation, an init_array slot, an exported
+// function, the entry point -- a false return in a CET IBT-marked binary is a
+// runtime fault: with indirect branch tracking enforced, an indirect JMP or
+// CALL landing anywhere but an ENDBR64 raises #CP. The evidence is the
+// caller's job precisely because the instruction stream cannot supply it:
+// nothing in the bytes distinguishes an indirect target from fallthrough
+// code, so a streamwise "missing ENDBR64" check would be guessing (and its
+// inverse -- flagging a superfluous ENDBR64 -- would be unsound, since a
+// target materialized by LEA leaves no relocation behind)
+bool check_endbr64_target(const uint8_t *inst, size_t len, size_t offset);
+
 // A by-type tally of findings accumulated across one or more
 // check_instructions runs, so a driver can print a by-prevalence summary.
 // Opaque; created and destroyed by the caller. A NULL summary is accepted

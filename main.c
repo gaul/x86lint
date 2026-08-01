@@ -115,6 +115,688 @@ static void mask_non_function_bytes(uint8_t *buf, const Elf64_Shdr *shdr,
     free(r);
 }
 
+// ---- ENDBR64 (CET IBT) verification, -e ---------------------------------
+//
+// With indirect branch tracking enforced, an indirect JMP or CALL must land
+// on an ENDBR64 or the CPU raises #CP. Which addresses an indirect branch
+// can reach is not a property of the instruction stream -- nothing in the
+// bytes distinguishes a landing site from fallthrough code -- but the ELF
+// metadata of a linked binary evidences a checkable subset, collected below.
+// The subset under-approximates (a function pointer materialized by a
+// RIP-relative LEA leaves no relocation behind), so a target the metadata
+// does evidence really is reachable indirectly and a missing landing pad
+// there really faults; the converse check -- flagging a superfluous ENDBR64
+// -- would be guessing, and is not attempted.
+
+// Evidence sources, strongest first: when several name the same address (an
+// exported function also referenced by a GOT relocation), dedup keeps the
+// smallest kind. Every kind but the last proves the address is *branched*
+// to -- the loader or startup code calls it, or a PLT/GOT slot resolves to
+// it. An address relocation proves only that the address is *taken*: glibc
+// bakes pointers to bracket labels (__syscall_cancel_arch_start) that are
+// compared against interrupted PCs and never branched to, with landing pads
+// deliberately omitted. The verify loop therefore counts ENDBR_ADDR
+// evidence only when the target is a known function entry, and its
+// last-place rank keeps it from shadowing a stronger claim to the same
+// address.
+enum endbr_kind {
+    ENDBR_ENTRY,    // e_entry: the loader enters by indirect jump
+    ENDBR_INIT,     // .init/.fini: DT_INIT/DT_FINI, called through a pointer
+    ENDBR_ARRAY,    // .preinit_array/.init_array/.fini_array slot
+    ENDBR_PLT,      // R_X86_64_JUMP_SLOT resolving to a local definition
+    ENDBR_GOT,      // R_X86_64_GLOB_DAT resolving to a local definition
+    ENDBR_IFUNC,    // R_X86_64_IRELATIVE: the loader calls the resolver
+    ENDBR_EXPORT,   // defined dynsym function: reachable via any caller's PLT
+    ENDBR_ADDR,     // absolute-address relocation into an executable section
+};
+
+static const char *const endbr_kind_name[] = {
+    "entry point",
+    ".init/.fini entry",
+    "init/fini array entry",
+    "PLT relocation",
+    "GOT relocation",
+    "ifunc resolver",
+    "exported function",
+    "address relocation",
+};
+
+struct endbr_target {
+    uint64_t va;
+    uint32_t sym;       // index into .dynsym, or 0 (STN_UNDEF) for none
+    uint8_t kind;       // enum endbr_kind
+};
+
+struct endbr_targets {
+    struct endbr_target *v;
+    size_t n;
+    size_t cap;
+};
+
+static bool endbr_push(struct endbr_targets *t, uint64_t va, uint32_t sym,
+                       uint8_t kind)
+{
+    if (t->n == t->cap) {
+        size_t cap = t->cap == 0 ? 64 : t->cap * 2;
+        struct endbr_target *v = realloc(t->v, cap * sizeof(*v));
+        if (v == NULL) {
+            return false;
+        }
+        t->v = v;
+        t->cap = cap;
+    }
+    t->v[t->n].va = va;
+    t->v[t->n].sym = sym;
+    t->v[t->n].kind = kind;
+    ++t->n;
+    return true;
+}
+
+static int endbr_target_cmp(const void *a, const void *b)
+{
+    const struct endbr_target *ta = a, *tb = b;
+    if (ta->va != tb->va) {
+        return ta->va < tb->va ? -1 : 1;
+    }
+    if (ta->kind != tb->kind) {
+        return ta->kind < tb->kind ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool u64_push(uint64_t **v, size_t *n, size_t *cap, uint64_t x)
+{
+    if (*n == *cap) {
+        size_t ncap = *cap == 0 ? 64 : *cap * 2;
+        uint64_t *nv = realloc(*v, ncap * sizeof(*nv));
+        if (nv == NULL) {
+            return false;
+        }
+        *v = nv;
+        *cap = ncap;
+    }
+    (*v)[(*n)++] = x;
+    return true;
+}
+
+static int u64_cmp(const void *a, const void *b)
+{
+    uint64_t ua = *(const uint64_t *) a, ub = *(const uint64_t *) b;
+    return ua < ub ? -1 : ua > ub ? 1 : 0;
+}
+
+static bool u64_contains(const uint64_t *v, size_t n, uint64_t x)
+{
+    size_t lo = 0;
+    size_t hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (v[mid] < x) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo < n && v[lo] == x;
+}
+
+// Read a whole section's contents, bounds-checked against the file. NULL for
+// a section with no bytes in the file or on I/O or allocation failure; the
+// metadata callers treat all of these as absent evidence and move on (the
+// summary line still states how many targets were actually checked).
+static uint8_t *load_section(FILE *f, const Elf64_Shdr *shdr,
+                             uint64_t file_size)
+{
+    if (shdr->sh_type == SHT_NOBITS || shdr->sh_size == 0 ||
+        shdr->sh_offset > file_size ||
+        shdr->sh_size > file_size - shdr->sh_offset) {
+        return NULL;
+    }
+    uint8_t *buf = malloc(shdr->sh_size);
+    if (buf != NULL &&
+        !read_at(f, (long) shdr->sh_offset, buf, shdr->sh_size)) {
+        free(buf);
+        buf = NULL;
+    }
+    return buf;
+}
+
+// Whether the GNU property note declares IBT support: an
+// NT_GNU_PROPERTY_TYPE_0 note named "GNU" holding a
+// GNU_PROPERTY_X86_FEATURE_1_AND property with the IBT bit set. The loader
+// enables enforcement from exactly this bit, so it is the binary's claim of
+// correctness. Property notes are 8-aligned in ELF64; other note sections
+// (build-id) use 4, hence the per-section alignment. Each property is
+// {u32 pr_type, u32 pr_datasz, data padded to 8}.
+static bool elf_declares_ibt(FILE *f, const Elf64_Shdr *sh, uint64_t shnum,
+                             uint64_t file_size)
+{
+    bool ibt = false;
+    for (uint64_t i = 0; i < shnum && !ibt; ++i) {
+        if (sh[i].sh_type != SHT_NOTE) {
+            continue;
+        }
+        uint8_t *buf = load_section(f, &sh[i], file_size);
+        if (buf == NULL) {
+            continue;
+        }
+        uint64_t size = sh[i].sh_size;
+        uint64_t align = sh[i].sh_addralign == 8 ? 8 : 4;
+        uint64_t off = 0;
+        while (off + sizeof(Elf64_Nhdr) <= size) {
+            Elf64_Nhdr nh;
+            memcpy(&nh, buf + off, sizeof(nh));
+            uint64_t name_off = off + sizeof(nh);
+            // The padding rounds the cumulative offset to the alignment,
+            // not the field size alone: header (12) + "GNU\0" (4) is
+            // already 8-aligned, so the descriptor starts at +16.
+            uint64_t desc_off = (name_off + nh.n_namesz + align - 1) &
+                ~(align - 1);
+            if (desc_off > size || nh.n_descsz > size - desc_off ||
+                nh.n_namesz > size - name_off) {
+                break;      // malformed: stop parsing this section
+            }
+            if (nh.n_type == NT_GNU_PROPERTY_TYPE_0 && nh.n_namesz == 4 &&
+                memcmp(buf + name_off, "GNU", 4) == 0) {
+                uint64_t p = desc_off;
+                uint64_t dend = desc_off + nh.n_descsz;
+                while (p + 8 <= dend) {
+                    uint32_t pr_type;
+                    uint32_t pr_datasz;
+                    memcpy(&pr_type, buf + p, 4);
+                    memcpy(&pr_datasz, buf + p + 4, 4);
+                    if (pr_datasz > dend - (p + 8)) {
+                        break;
+                    }
+                    if (pr_type == GNU_PROPERTY_X86_FEATURE_1_AND &&
+                        pr_datasz >= 4) {
+                        uint32_t feat;
+                        memcpy(&feat, buf + p + 8, 4);
+                        if (feat & GNU_PROPERTY_X86_FEATURE_1_IBT) {
+                            ibt = true;
+                        }
+                    }
+                    p += 8 + (((uint64_t) pr_datasz + 7) & ~(uint64_t) 7);
+                }
+            }
+            off = (desc_off + nh.n_descsz + align - 1) & ~(align - 1);
+        }
+        free(buf);
+    }
+    return ibt;
+}
+
+// Resolve one RELR-relocated slot: the packed format encodes only WHERE a
+// relative relocation applies; its target is the slot's raw link-time value,
+// read here from whichever section holds the slot. Slots arrive sorted, so
+// the single-section cache almost always hits. Returns false only on
+// allocation failure; a slot outside any loadable section, an unreadable
+// section, and a 0/-1 sentinel value are skipped.
+static bool endbr_relr_slot(FILE *f, const Elf64_Shdr *sh, uint64_t shnum,
+                            uint64_t file_size, uint64_t where,
+                            uint64_t *cache_i, uint8_t **cache,
+                            struct endbr_targets *targets)
+{
+    if (*cache_i >= shnum || where < sh[*cache_i].sh_addr ||
+        where - sh[*cache_i].sh_addr > sh[*cache_i].sh_size - 8) {
+        free(*cache);
+        *cache = NULL;
+        *cache_i = shnum;
+        for (uint64_t i = 0; i < shnum; ++i) {
+            if ((sh[i].sh_flags & SHF_ALLOC) && sh[i].sh_type != SHT_NOBITS &&
+                sh[i].sh_size >= 8 && where >= sh[i].sh_addr &&
+                where - sh[i].sh_addr <= sh[i].sh_size - 8) {
+                *cache = load_section(f, &sh[i], file_size);
+                if (*cache == NULL) {
+                    return true;
+                }
+                *cache_i = i;
+                break;
+            }
+        }
+        if (*cache_i >= shnum) {
+            return true;
+        }
+    }
+    uint64_t value;
+    memcpy(&value, *cache + (where - sh[*cache_i].sh_addr), 8);
+    if (value == 0 || value == UINT64_MAX) {
+        return true;
+    }
+    return endbr_push(targets, value, 0, ENDBR_ADDR);
+}
+
+// Name a target: by its recorded dynsym index, or by reverse value lookup
+// for targets evidenced without a symbol. NULL when nothing matches.
+static const char *endbr_sym_name(const Elf64_Sym *dynsym, size_t ndynsym,
+                                  const char *dynstr, uint64_t dynstr_size,
+                                  uint32_t symi, uint64_t va)
+{
+    if (dynstr == NULL) {
+        return NULL;
+    }
+    if (symi == 0) {
+        for (size_t s = 1; s < ndynsym; ++s) {
+            unsigned st = ELF64_ST_TYPE(dynsym[s].st_info);
+            if ((st == STT_FUNC || st == STT_GNU_IFUNC) &&
+                dynsym[s].st_shndx != SHN_UNDEF && dynsym[s].st_value == va) {
+                symi = (uint32_t) s;
+                break;
+            }
+        }
+        if (symi == 0) {
+            return NULL;
+        }
+    }
+    if (symi >= ndynsym || dynsym[symi].st_name == 0 ||
+        dynsym[symi].st_name >= dynstr_size) {
+        return NULL;
+    }
+    return dynstr + dynsym[symi].st_name;
+}
+
+// Verify that every indirect branch target the ELF metadata evidences begins
+// with ENDBR64 (see check_endbr64_target), and reconcile the result with the
+// binary's IBT property note. Four verdicts: IBT declared and all targets
+// pad -- clean; IBT declared with misses -- each is a #CP fault once IBT is
+// enforced, so every miss is printed regardless of verbosity; IBT not
+// declared but landing pads present -- the compiler emitted CET which the
+// link then lost (the property is ANDed across inputs, so one non-CET
+// object silently disarms the whole binary; Fedora's libzstd ships this
+// way, fully padded with the declaration eaten by its hand-written
+// assembly), one finding, with the per-target detail behind -v; no
+// declaration and no pads -- not an IBT binary, no findings. Returns the
+// finding count, or -1 on tool failure.
+static int check_elf_endbr64(FILE *f, const char *path,
+                             const Elf64_Ehdr *ehdr, uint64_t shnum,
+                             uint64_t file_size, const char *shstrtab,
+                             uint64_t shstrtab_size, bool verbose)
+{
+    // A relocatable object's indirect targets are a compile-time question
+    // (its address-taken evidence dissolves into the final link), and half
+    // its metadata does not exist yet.
+    if (ehdr->e_type == ET_REL) {
+        fprintf(stderr,
+            "%s: -e requires a linked executable or shared object\n", path);
+        return -1;
+    }
+    if (shnum == 0) {
+        printf("ENDBR64: no section headers; nothing to check\n");
+        return 0;
+    }
+
+    int rc = -1;
+    struct endbr_targets targets = {NULL, 0, 0};
+    Elf64_Sym *dynsym = NULL;
+    size_t ndynsym = 0;
+    char *dynstr = NULL;
+    uint64_t dynstr_size = 0;
+    uint8_t **exec_bufs = NULL;
+    uint64_t *fentry = NULL;
+    size_t nfentry = 0;
+    size_t fentry_cap = 0;
+
+    Elf64_Shdr *sh = malloc(shnum * sizeof(*sh));
+    if (sh == NULL ||
+        !read_at(f, (long) ehdr->e_shoff, sh, shnum * sizeof(*sh))) {
+        fprintf(stderr, "%s: failed to read section headers\n", path);
+        goto out;
+    }
+
+    bool ibt = elf_declares_ibt(f, sh, shnum, file_size);
+
+    // The dynamic symbol table names relocation targets and lists the
+    // exported functions, each an indirect target in its own right.
+    for (uint64_t i = 0; i < shnum; ++i) {
+        if (sh[i].sh_type != SHT_DYNSYM ||
+            sh[i].sh_entsize != sizeof(Elf64_Sym)) {
+            continue;
+        }
+        dynsym = (Elf64_Sym *) load_section(f, &sh[i], file_size);
+        if (dynsym == NULL) {
+            break;
+        }
+        ndynsym = sh[i].sh_size / sizeof(Elf64_Sym);
+        if (sh[i].sh_link < shnum) {
+            dynstr = (char *) load_section(f, &sh[sh[i].sh_link], file_size);
+            if (dynstr != NULL) {
+                dynstr_size = sh[sh[i].sh_link].sh_size;
+                dynstr[dynstr_size - 1] = '\0';     // bound every lookup
+            }
+        }
+        break;
+    }
+
+    // Function entries known to the symbol tables (.symtab when the binary
+    // kept one, .dynsym always), for grading the address-relocation
+    // evidence in the verify loop: a baked code pointer is proven a branch
+    // target only when it addresses a function entry. A compare-only label
+    // is NOTYPE and drops out here; a stripped binary loses this evidence
+    // class and nothing else -- erring, as everywhere, toward the false
+    // negative.
+    bool oom = false;
+    for (uint64_t i = 0; i < shnum && !oom; ++i) {
+        if (sh[i].sh_type != SHT_SYMTAB ||
+            sh[i].sh_entsize != sizeof(Elf64_Sym)) {
+            continue;
+        }
+        Elf64_Sym *syms = (Elf64_Sym *) load_section(f, &sh[i], file_size);
+        if (syms == NULL) {
+            continue;
+        }
+        size_t nsyms = sh[i].sh_size / sizeof(Elf64_Sym);
+        for (size_t s = 1; s < nsyms && !oom; ++s) {
+            unsigned st = ELF64_ST_TYPE(syms[s].st_info);
+            if ((st == STT_FUNC || st == STT_GNU_IFUNC) &&
+                syms[s].st_shndx != SHN_UNDEF && syms[s].st_value != 0) {
+                oom |= !u64_push(&fentry, &nfentry, &fentry_cap,
+                    syms[s].st_value);
+            }
+        }
+        free(syms);
+    }
+    for (size_t s = 1; s < ndynsym && !oom; ++s) {
+        unsigned st = ELF64_ST_TYPE(dynsym[s].st_info);
+        if ((st == STT_FUNC || st == STT_GNU_IFUNC) &&
+            dynsym[s].st_shndx != SHN_UNDEF && dynsym[s].st_value != 0) {
+            oom |= !u64_push(&fentry, &nfentry, &fentry_cap,
+                dynsym[s].st_value);
+        }
+    }
+    if (nfentry != 0) {
+        qsort(fentry, nfentry, sizeof(*fentry), u64_cmp);
+    }
+
+    // The entry point is an indirect branch target only for a program with
+    // an interpreter: ld.so transfers to e_entry with an indirect jump
+    // (glibc: _dl_start_user's `jmp *%r12`). A kernel-entered binary --
+    // static, static-PIE, ld.so itself -- starts with the tracker idle and
+    // owes no landing pad there; ld.so's own _start has none, deliberately.
+    bool has_interp = false;
+    if (ehdr->e_phoff != 0 && ehdr->e_phentsize == sizeof(Elf64_Phdr) &&
+        ehdr->e_phoff <= file_size &&
+        ehdr->e_phnum <= (file_size - ehdr->e_phoff) / sizeof(Elf64_Phdr)) {
+        for (uint16_t i = 0; i < ehdr->e_phnum; ++i) {
+            Elf64_Phdr ph;
+            if (!read_at(f, (long) (ehdr->e_phoff + i * sizeof(ph)), &ph,
+                         sizeof(ph))) {
+                break;
+            }
+            if (ph.p_type == PT_INTERP) {
+                has_interp = true;
+                break;
+            }
+        }
+    }
+    if (has_interp && ehdr->e_entry != 0) {
+        oom |= !endbr_push(&targets, ehdr->e_entry, 0, ENDBR_ENTRY);
+    }
+
+    for (uint64_t i = 0; i < shnum && !oom; ++i) {
+        const Elf64_Shdr *s = &sh[i];
+        switch (s->sh_type) {
+        case SHT_PROGBITS:
+            // .init and .fini hold DT_INIT/DT_FINI, which the loader calls
+            // through a function pointer. Identified by name; without a
+            // section string table they are simply not evidenced.
+            if (shstrtab != NULL && s->sh_name < shstrtab_size &&
+                (s->sh_flags & SHF_EXECINSTR) && s->sh_addr != 0) {
+                const char *name = shstrtab + s->sh_name;
+                if (strcmp(name, ".init") == 0 ||
+                    strcmp(name, ".fini") == 0) {
+                    oom |= !endbr_push(&targets, s->sh_addr, 0, ENDBR_INIT);
+                }
+            }
+            break;
+        case SHT_PREINIT_ARRAY:
+        case SHT_INIT_ARRAY:
+        case SHT_FINI_ARRAY: {
+            // Each slot is a function pointer the startup code calls
+            // indirectly. The linker stores the link-time address in the
+            // slot even when a RELATIVE (or packed RELR) relocation also
+            // covers it, so the raw values serve PIE and non-PIE alike.
+            uint8_t *buf = load_section(f, s, file_size);
+            if (buf == NULL) {
+                break;
+            }
+            for (uint64_t off = 0; off + 8 <= s->sh_size && !oom; off += 8) {
+                uint64_t va;
+                memcpy(&va, buf + off, 8);
+                if (va != 0 && va != UINT64_MAX) {
+                    oom |= !endbr_push(&targets, va, 0, ENDBR_ARRAY);
+                }
+            }
+            free(buf);
+            break;
+        }
+        case SHT_RELA: {
+            if (s->sh_entsize != sizeof(Elf64_Rela)) {
+                break;
+            }
+            uint8_t *buf = load_section(f, s, file_size);
+            if (buf == NULL) {
+                break;
+            }
+            size_t n = s->sh_size / sizeof(Elf64_Rela);
+            for (size_t r = 0; r < n && !oom; ++r) {
+                Elf64_Rela rela;
+                memcpy(&rela, buf + r * sizeof(rela), sizeof(rela));
+                uint32_t type = ELF64_R_TYPE(rela.r_info);
+                uint32_t symi = ELF64_R_SYM(rela.r_info);
+                switch (type) {
+                case R_X86_64_JUMP_SLOT:
+                case R_X86_64_GLOB_DAT:
+                case R_X86_64_64:
+                    // Meaningful when the symbol is defined here: the
+                    // runtime slot value is then this object's own function
+                    // entry. Imports resolve elsewhere. A symbolless
+                    // absolute relocation is a baked address, handled like
+                    // RELATIVE.
+                    if (symi != 0 && symi < ndynsym) {
+                        const Elf64_Sym *y = &dynsym[symi];
+                        unsigned st = ELF64_ST_TYPE(y->st_info);
+                        if ((st != STT_FUNC && st != STT_GNU_IFUNC) ||
+                            y->st_shndx == SHN_UNDEF || y->st_value == 0) {
+                            break;
+                        }
+                        uint64_t va = y->st_value;
+                        uint8_t kind =
+                            type == R_X86_64_JUMP_SLOT ? ENDBR_PLT :
+                            type == R_X86_64_GLOB_DAT ? ENDBR_GOT :
+                            ENDBR_ADDR;
+                        if (type == R_X86_64_64) {
+                            va += (uint64_t) rela.r_addend;
+                        }
+                        oom |= !endbr_push(&targets, va, symi, kind);
+                    } else if (type == R_X86_64_64 && rela.r_addend != 0) {
+                        oom |= !endbr_push(&targets,
+                            (uint64_t) rela.r_addend, 0, ENDBR_ADDR);
+                    }
+                    break;
+                case R_X86_64_IRELATIVE:
+                    // The addend is the ifunc resolver, which the loader
+                    // calls indirectly at startup.
+                    if (rela.r_addend != 0) {
+                        oom |= !endbr_push(&targets,
+                            (uint64_t) rela.r_addend, 0, ENDBR_IFUNC);
+                    }
+                    break;
+                case R_X86_64_RELATIVE:
+                    // A baked pointer; one landing in an executable section
+                    // is an address-taken function or label.
+                    if (rela.r_addend != 0) {
+                        oom |= !endbr_push(&targets,
+                            (uint64_t) rela.r_addend, 0, ENDBR_ADDR);
+                    }
+                    break;
+                }
+            }
+            free(buf);
+            break;
+        }
+        case SHT_RELR: {
+            if (s->sh_entsize != 8) {
+                break;
+            }
+            uint8_t *buf = load_section(f, s, file_size);
+            if (buf == NULL) {
+                break;
+            }
+            uint64_t cache_i = shnum;
+            uint8_t *cache = NULL;
+            uint64_t where = 0;
+            size_t n = s->sh_size / 8;
+            for (size_t r = 0; r < n && !oom; ++r) {
+                uint64_t e;
+                memcpy(&e, buf + r * 8, 8);
+                if ((e & 1) == 0) {
+                    oom |= !endbr_relr_slot(f, sh, shnum, file_size, e,
+                        &cache_i, &cache, &targets);
+                    where = e + 8;
+                } else {
+                    for (unsigned b = 1; b < 64 && !oom; ++b) {
+                        if (e & (1ULL << b)) {
+                            oom |= !endbr_relr_slot(f, sh, shnum, file_size,
+                                where + (b - 1) * 8, &cache_i, &cache,
+                                &targets);
+                        }
+                    }
+                    where += 63 * 8;
+                }
+            }
+            free(cache);
+            free(buf);
+            break;
+        }
+        }
+    }
+
+    // Every defined dynamic function symbol is indirectly reachable: a
+    // cross-object call always arrives through the caller's PLT or GOT,
+    // an indirect branch landing here.
+    for (size_t s = 1; s < ndynsym && !oom; ++s) {
+        unsigned st = ELF64_ST_TYPE(dynsym[s].st_info);
+        if ((st == STT_FUNC || st == STT_GNU_IFUNC) &&
+            dynsym[s].st_shndx != SHN_UNDEF && dynsym[s].st_value != 0) {
+            oom |= !endbr_push(&targets, dynsym[s].st_value, (uint32_t) s,
+                ENDBR_EXPORT);
+        }
+    }
+
+    if (oom) {
+        fprintf(stderr, "%s: failed to allocate target list\n", path);
+        goto out;
+    }
+
+    if (targets.n != 0) {
+        qsort(targets.v, targets.n, sizeof(*targets.v), endbr_target_cmp);
+    }
+
+    // The landing pads must be read raw, so these buffers are never masked
+    // by the symbol-table scan restriction. Only targets inside an
+    // executable section are checked: the address-relocation sweep pushes
+    // every baked pointer it sees, and the ones aimed at data drop out here.
+    exec_bufs = calloc(shnum, sizeof(*exec_bufs));
+    if (exec_bufs == NULL) {
+        fprintf(stderr, "%s: failed to allocate section list\n", path);
+        goto out;
+    }
+    for (uint64_t i = 0; i < shnum; ++i) {
+        if (sh[i].sh_type == SHT_PROGBITS &&
+            (sh[i].sh_flags & SHF_EXECINSTR) &&
+            (sh[i].sh_flags & SHF_ALLOC) && sh[i].sh_addr != 0) {
+            exec_bufs[i] = load_section(f, &sh[i], file_size);
+        }
+    }
+
+    size_t checked = 0;
+    size_t misses = 0;
+    uint64_t prev_va = 0;
+    bool have_prev = false;
+    for (size_t t = 0; t < targets.n; ++t) {
+        uint64_t va = targets.v[t].va;
+        if (have_prev && va == prev_va) {
+            continue;       // sorted dedup; the most specific kind is first
+        }
+        prev_va = va;
+        have_prev = true;
+        // Address-taken-only evidence: counts just when the pointer
+        // addresses a known function entry (see enum endbr_kind).
+        if (targets.v[t].kind == ENDBR_ADDR &&
+            !u64_contains(fentry, nfentry, va)) {
+            continue;
+        }
+        uint64_t sec = shnum;
+        for (uint64_t i = 0; i < shnum; ++i) {
+            if (exec_bufs[i] != NULL && va >= sh[i].sh_addr &&
+                va - sh[i].sh_addr < sh[i].sh_size) {
+                sec = i;
+                break;
+            }
+        }
+        if (sec == shnum) {
+            continue;
+        }
+        ++checked;
+        if (check_endbr64_target(exec_bufs[sec], sh[sec].sh_size,
+                                 va - sh[sec].sh_addr)) {
+            continue;
+        }
+        ++misses;
+        if (ibt || verbose) {
+            const char *nm = endbr_sym_name(dynsym, ndynsym, dynstr,
+                dynstr_size, targets.v[t].sym, va);
+            printf("indirect branch target missing ENDBR64: 0x%lx%s%s%s (%s)\n",
+                (unsigned long) va, nm != NULL ? " <" : "",
+                nm != NULL ? nm : "", nm != NULL ? ">" : "",
+                endbr_kind_name[targets.v[t].kind]);
+        }
+    }
+
+    if (checked == 0) {
+        printf("ENDBR64: no indirect branch targets evidenced; "
+            "nothing to check\n");
+        rc = 0;
+    } else if (ibt) {
+        if (misses == 0) {
+            printf("ENDBR64: IBT property note present; all %zu indirect "
+                "branch targets land on ENDBR64\n", checked);
+        } else {
+            printf("ENDBR64: IBT property note present; %zu of %zu indirect "
+                "branch targets missing ENDBR64 (#CP fault when IBT is "
+                "enforced)\n", misses, checked);
+        }
+        rc = (int) misses;
+    } else if (misses < checked) {
+        printf("ENDBR64: no IBT in the property note, but %zu of %zu "
+            "indirect branch targets begin with ENDBR64 (IBT annotation "
+            "lost at link?)\n", checked - misses, checked);
+        if (misses > 0 && !verbose) {
+            printf("  (pass -v to list the %zu targets without one)\n",
+                misses);
+        }
+        rc = (int) misses + 1;
+    } else {
+        printf("ENDBR64: no IBT in the property note and no ENDBR64 "
+            "landing pads; not an IBT binary\n");
+        rc = 0;
+    }
+
+out:
+    if (exec_bufs != NULL) {
+        for (uint64_t i = 0; i < shnum; ++i) {
+            free(exec_bufs[i]);
+        }
+    }
+    free(exec_bufs);
+    free(fentry);
+    free(dynstr);
+    free(dynsym);
+    free(targets.v);
+    free(sh);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
@@ -122,6 +804,7 @@ int main(int argc, char **argv)
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
     bool verbose = false;
     bool scan_all = false;
+    bool endbr = false;
     uint32_t extensions = 0;
     const char *path = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -129,6 +812,8 @@ int main(int argc, char **argv)
             verbose = true;
         } else if (strcmp(argv[i], "-a") == 0) {
             scan_all = true;
+        } else if (strcmp(argv[i], "-e") == 0) {
+            endbr = true;
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             ++i;
             if (strcmp(argv[i], "bmi1") == 0) {
@@ -141,7 +826,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_APX;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                    "usage: %s [-v] [-a] [-e] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -149,14 +834,14 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "usage: %s [-v] [-a] [-e] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+            "usage: %s [-v] [-a] [-e] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }
@@ -320,11 +1005,12 @@ int main(int argc, char **argv)
     // executable section reads like a file offset but on several -- a
     // BOLT-processed library keeps its unmoved functions in .bolt.org.text
     // beside the ones it moved into .text -- is ambiguous without knowing
-    // which section it belongs to. Only -v needs this, so a failure to read
+    // which section it belongs to. -e needs it too, to identify .init and
+    // .fini by name. Only those two callers use it, so a failure to read
     // the table costs the names and nothing else. e_shstrndx holds
     // SHN_XINDEX when the real index does not fit, with the value in section
     // header 0's sh_link (the same overflow convention as e_shnum).
-    if (verbose && shnum != 0) {
+    if ((verbose || endbr) && shnum != 0) {
         uint64_t strndx = ehdr.e_shstrndx;
         if (strndx == SHN_XINDEX) {
             Elf64_Shdr shdr0;
@@ -423,13 +1109,27 @@ int main(int argc, char **argv)
     }
 
     x86lint_summary_print(summary);
+
+    // The ENDBR64 pass is separate from the peephole scan -- its findings
+    // are correctness faults located by virtual address, not encoding
+    // opportunities located by section offset -- so it reports its own block
+    // and only shares the exit code.
+    int endbr_errors = 0;
+    if (endbr) {
+        endbr_errors = check_elf_endbr64(f, path, &ehdr, shnum, file_size,
+            shstrtab, shstrtab_size, verbose);
+        if (endbr_errors < 0) {
+            goto out;
+        }
+    }
+
     if (funcs != NULL) {
         printf("scan restricted to %zu function symbols (-a scans every byte)\n",
             nfuncs);
     }
     printf("%d optimization opportunities in %zu instructions\n",
         errors, x86lint_summary_instructions(summary));
-    rc = errors != 0;
+    rc = errors != 0 || endbr_errors != 0;
 
 out:
     x86lint_summary_destroy(summary);

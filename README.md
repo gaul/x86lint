@@ -684,10 +684,83 @@ and CPU-dispatched BMI-rich variants in the same section. The flags are
 independent, matching their CPUID feature bits: `-m bmi2` does not imply
 `-m bmi1`.
 
+Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
+pads; see the next section.
+
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
-broken run.
+broken run. `-e` findings set the exit status like any other.
+
+## ENDBR64 (CET IBT) verification
+
+With Intel CET's indirect branch tracking enforced, an indirect `JMP` or
+`CALL` must land on an `ENDBR64` instruction or the CPU raises a
+control-protection fault (#CP). The loader turns enforcement on when the
+binary's GNU property note (`.note.gnu.property`) carries the IBT bit, so a
+binary makes two claims that can drift apart: the note says "every indirect
+target is padded," and the code either honors that or does not. `x86lint -e`
+cross-checks them.
+
+Which addresses an indirect branch can reach is not a property of the
+instruction stream -- nothing in the bytes distinguishes a landing site from
+fallthrough code, which is why this is a driver (`-e`) pass over the ELF
+metadata rather than an entry in the check table above. A linked binary
+evidences a checkable subset of its indirect targets:
+
+* the entry point (`e_entry`) of a program with a `PT_INTERP` interpreter --
+  ld.so transfers to it with an indirect jump (`_dl_start_user`'s
+  `jmp *%r12`). A kernel-entered binary -- static, static-PIE, ld.so itself
+  -- starts with the tracker idle and owes no pad there, and ld.so's own
+  `_start` indeed has none, deliberately;
+* `.init` and `.fini` (`DT_INIT`/`DT_FINI`) -- called through pointers;
+* every `.preinit_array`/`.init_array`/`.fini_array` slot;
+* `R_X86_64_JUMP_SLOT` and `R_X86_64_GLOB_DAT` relocations resolving to a
+  definition in the same binary -- the slot's runtime value is that entry;
+* `R_X86_64_IRELATIVE` -- the loader calls the ifunc resolver indirectly;
+* every defined dynamic function symbol -- a cross-object call always
+  arrives through the caller's PLT or GOT, an indirect branch landing here;
+* absolute-address relocations (`R_X86_64_RELATIVE`, `R_X86_64_64`, and the
+  packed `SHT_RELR` form) whose baked pointer lands in an executable
+  section -- vtables and callback tables.
+
+The last class proves only that the address is *taken*, not that it is
+branched to: glibc bakes pointers to bracket labels
+(`__syscall_cancel_arch_start`) that are only ever compared against
+interrupted PCs, and hand-written assembly omits their pads deliberately.
+Address-relocation evidence therefore counts only when the pointer addresses
+a function entry known to `.symtab` or `.dynsym` -- a compare-only label is
+`NOTYPE` and drops out, and a stripped binary loses this one evidence class
+(the tool's usual trade: a false negative over a false claim). The converse
+check -- flagging a *superfluous* `ENDBR64` -- is not attempted at all,
+since a target materialized by a RIP-relative `LEA` leaves no relocation
+behind and absence of evidence proves nothing.
+
+Four verdicts, reconciling the pads against the note:
+
+* IBT declared, all targets padded -- clean;
+* IBT declared, some target bare -- each miss is printed with its address,
+  symbol, and evidence (`#CP` fault the moment tracking is enforced);
+* IBT not declared, but the targets carry pads -- the compiler emitted CET
+  and the link lost it: the linker ANDs the property across all inputs, so
+  a single object built without `-fcf-protection` silently disarms
+  enforcement for the whole binary. One finding; `-v` lists any targets
+  without pads (in a poisoned link, usually the culprit object's);
+* no declaration, no pads -- not an IBT binary; nothing to hold it to, no
+  findings.
+
+Verified against a Fedora system where CET is on by default: `bash` (1,767
+evidenced targets), `libc.so.6` (2,500), `libcrypto.so.3` (5,867, including
+OpenSSL's perlasm), `ld-linux-x86-64.so.2`, and `git` all reconcile
+cleanly, and a Go binary -- Go does not emit IBT -- produces no noise. The
+sweep also caught a real specimen of the third verdict: Fedora's
+`libzstd.so.1` ships all 598 evidenced targets padded but its property note
+carries no `FEATURE_1_AND` at all -- the hand-written Huffman assembly ate
+the declaration at link, so the fully padded library runs unenforced.
+Relocatable objects are rejected: their address-taken evidence dissolves
+into the final link, so the question is only answerable for executables and
+shared objects. The library exports the single-site predicate
+(`check_endbr64_target`); the evidence collection lives in the driver.
 
 ## Mining tools
 

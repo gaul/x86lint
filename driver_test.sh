@@ -94,6 +94,105 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# CET fixtures for -e. The .note.gnu.property section is the same note gcc
+# emits under -fcf-protection (the linker merges it through to the output):
+# cetgood declares IBT and pads its entry point, cetbad declares IBT but
+# does not pad, cetlost pads without declaring (the linker ANDs the note
+# across inputs, so this is what a link poisoned by one non-CET object
+# leaves), and cetso is a shared object whose exported fn_bad lacks its pad.
+cat >"$dir/cetgood.s" <<'EOF'
+    .section .note.gnu.property,"a",@note
+    .p2align 3
+    .long 1f - 0f                       # n_namesz
+    .long 3f - 2f                       # n_descsz
+    .long 5                             # NT_GNU_PROPERTY_TYPE_0
+0:  .asciz "GNU"
+1:  .p2align 3
+2:  .long 0xc0000002                    # GNU_PROPERTY_X86_FEATURE_1_AND
+    .long 4
+    .long 1                             # GNU_PROPERTY_X86_FEATURE_1_IBT
+    .long 0
+3:
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xf3, 0x0f, 0x1e, 0xfa        # endbr64
+    .byte 0xb8, 0x3c, 0x00, 0x00, 0x00  # mov eax, 60 (clean)
+    .byte 0x31, 0xff                    # xor edi, edi (clean)
+    .byte 0x0f, 0x05                    # syscall (clean)
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+cat >"$dir/cetbad.s" <<'EOF'
+    .section .note.gnu.property,"a",@note
+    .p2align 3
+    .long 1f - 0f                       # n_namesz
+    .long 3f - 2f                       # n_descsz
+    .long 5                             # NT_GNU_PROPERTY_TYPE_0
+0:  .asciz "GNU"
+1:  .p2align 3
+2:  .long 0xc0000002                    # GNU_PROPERTY_X86_FEATURE_1_AND
+    .long 4
+    .long 1                             # GNU_PROPERTY_X86_FEATURE_1_IBT
+    .long 0
+3:
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xb8, 0x3c, 0x00, 0x00, 0x00  # mov eax, 60 (clean)
+    .byte 0x31, 0xff                    # xor edi, edi (clean)
+    .byte 0x0f, 0x05                    # syscall (clean)
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+cat >"$dir/cetlost.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xf3, 0x0f, 0x1e, 0xfa        # endbr64
+    .byte 0xb8, 0x3c, 0x00, 0x00, 0x00  # mov eax, 60 (clean)
+    .byte 0x31, 0xff                    # xor edi, edi (clean)
+    .byte 0x0f, 0x05                    # syscall (clean)
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+cat >"$dir/cetso.s" <<'EOF'
+    .section .note.gnu.property,"a",@note
+    .p2align 3
+    .long 1f - 0f                       # n_namesz
+    .long 3f - 2f                       # n_descsz
+    .long 5                             # NT_GNU_PROPERTY_TYPE_0
+0:  .asciz "GNU"
+1:  .p2align 3
+2:  .long 0xc0000002                    # GNU_PROPERTY_X86_FEATURE_1_AND
+    .long 4
+    .long 1                             # GNU_PROPERTY_X86_FEATURE_1_IBT
+    .long 0
+3:
+    .text
+    .globl fn_good
+    .type fn_good, @function
+fn_good:
+    .byte 0xf3, 0x0f, 0x1e, 0xfa        # endbr64
+    .byte 0xc3                          # ret
+    .size fn_good, . - fn_good
+    .globl fn_bad
+    .type fn_bad, @function
+fn_bad:
+    .byte 0xc3                          # ret
+    .size fn_bad, . - fn_bad
+    .section .init_array,"aw",@init_array
+    .p2align 3
+    .quad fn_good
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 for f in finding clean bmi; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
@@ -101,6 +200,26 @@ for f in finding clean bmi; do
         exit 2
     fi
 done
+# The CET executables link as PIE: only a program with an interpreter has an
+# indirectly entered entry point (a kernel-entered static binary starts with
+# the tracker idle), so a static fixture would evidence no targets at all --
+# and plain `cc -nostdlib` with no shared dependencies emits no PT_INTERP
+# either. cleandyn is the clean fixture linked the same way, for the
+# not-an-IBT verdict.
+for f in cetgood cetbad cetlost; do
+    if ! cc -nostdlib -pie -Wl,--build-id=none -o "$dir/$f" "$dir/$f.s"; then
+        echo "driver_test.sh: fixture build failed" >&2
+        exit 2
+    fi
+done
+if ! cc -nostdlib -pie -Wl,--build-id=none \
+        -o "$dir/cleandyn" "$dir/clean.s" ||
+   ! cc -shared -nostdlib -Wl,--build-id=none \
+        -o "$dir/cetso.so" "$dir/cetso.s" ||
+   ! cc -c -o "$dir/clean.o" "$dir/clean.s"; then
+    echo "driver_test.sh: fixture build failed" >&2
+    exit 2
+fi
 
 # Findings fixture, default scan: the trailing out-of-function xchg is
 # masked, so one finding over the four in-function instructions.
@@ -138,6 +257,38 @@ reject 'missing ANDN' "ANDN finding under -m movbe"
 run 1 -m apx "$dir/bmi"
 expect '^ +1 +missing APX NDD$' "count of 1 for missing APX NDD under -m apx"
 reject 'missing MOVBE' "MOVBE finding under -m apx"
+
+# -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
+run 0 "$dir/cetbad"
+reject 'ENDBR64' "ENDBR64 output without -e"
+
+# Note present, entry point padded: clean, exit 0.
+run 0 -e "$dir/cetgood"
+expect '^ENDBR64: IBT property note present; all 1 indirect branch targets land on ENDBR64$'
+
+# Note present, entry point bare: a would-be #CP fault, printed without -v.
+run 1 -e "$dir/cetbad"
+expect '^indirect branch target missing ENDBR64: 0x[0-9a-f]+ \(entry point\)$'
+expect '1 of 1 indirect branch targets missing ENDBR64'
+
+# Pads without the note: the poisoned-link verdict, one finding, exit 1.
+run 1 -e "$dir/cetlost"
+expect 'IBT annotation lost at link\?'
+reject 'missing ENDBR64' "per-target miss on a fully padded binary"
+
+# No IBT declaration, no pads: not an IBT binary, no findings.
+run 0 -e "$dir/cleandyn"
+expect '^ENDBR64: no IBT in the property note and no ENDBR64 landing pads; not an IBT binary$'
+
+# Shared object: fn_bad is reachable through any caller's PLT and unpadded;
+# the miss is named via the dynamic symbol table.
+run 1 -e "$dir/cetso.so"
+expect 'missing ENDBR64: 0x[0-9a-f]+ <fn_bad> \(exported function\)'
+expect '1 of 2 indirect branch targets missing ENDBR64'
+
+# Relocatable objects have no link-time target evidence: tool failure.
+run 2 -e "$dir/clean.o"
+expect 'requires a linked executable or shared object'
 
 # A real binary must never be a tool failure (0 or 1 both fine).
 "$X86LINT" "$X86LINT" >/dev/null 2>&1

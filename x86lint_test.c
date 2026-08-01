@@ -5260,6 +5260,28 @@ static void check_missing_apx_setzu_test(void)
 // An undecodable byte (executable sections routinely embed data) must not
 // abort the scan: linear sweep skips one byte, resyncs, and still flags the
 // instruction that follows. 0x06 (push es) is illegal in 64-bit mode.
+static void check_endbr64_target_test(void)
+{
+    static const uint8_t inst[] = {
+        0xf3, 0x0f, 0x1e, 0xfa,        // endbr64
+        0x90,                          // nop
+        0xf3, 0x0f, 0x1e, 0xfb,        // endbr32 (not a 64-bit landing pad)
+        0x66, 0xf3, 0x0f, 0x1e, 0xfa,  // endbr64 under a redundant prefix
+    };
+
+    assert(check_endbr64_target(inst, sizeof(inst), 0));    // the landing pad
+    assert(!check_endbr64_target(inst, sizeof(inst), 4));   // nop
+    assert(!check_endbr64_target(inst, sizeof(inst), 1));   // mid-instruction
+    assert(!check_endbr64_target(inst, sizeof(inst), 5));   // endbr32
+    // Prefixed variants still decode -- and land -- as ENDBR64; the tracker
+    // matches the instruction, not the canonical four bytes.
+    assert(check_endbr64_target(inst, sizeof(inst), 9));
+    // Out of range, at the end, and truncated: no pad, not a crash.
+    assert(!check_endbr64_target(inst, sizeof(inst), sizeof(inst)));
+    assert(!check_endbr64_target(inst, sizeof(inst), 1000));
+    assert(!check_endbr64_target(inst, 3, 0));              // cut mid-pattern
+}
+
 static void check_decode_resync_test(void)
 {
     static const uint8_t inst[] = {
@@ -5349,6 +5371,7 @@ int main(int argc, char *argv[])
     check_missing_movbe_test();
     check_missing_apx_ndd_test();
     check_missing_apx_setzu_test();
+    check_endbr64_target_test();
     check_decode_resync_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

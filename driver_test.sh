@@ -109,6 +109,19 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Census fixture for -i: one v2 instruction, one v3, the rest baseline.
+cat >"$dir/census.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xf3, 0x0f, 0xb8, 0xc0        # popcnt eax, eax (v2)
+    .byte 0xc5, 0xfd, 0xfc, 0xc0        # vpaddb ymm0, ymm0, ymm0 (v3 AVX2)
+    .byte 0xc3                          # ret (baseline)
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # CET fixtures for -e. The .note.gnu.property section is the same note gcc
 # emits under -fcf-protection (the linker merges it through to the output):
 # cetgood declares IBT+SHSTK and pads its entry point, cetbad declares IBT
@@ -235,7 +248,7 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi notrack; do
+for f in finding clean bmi notrack census; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -305,6 +318,28 @@ reject 'missing MOVBE' "MOVBE finding under -m apx"
 run 1 "$dir/notrack"
 expect '^ +1 +IBT-bypassing NOTRACK call$' "count of 1 for NOTRACK call"
 expect '^1 optimization opportunities in 3 instructions$'
+
+# -i replaces the lint scan with the ISA census: levels attributed, the
+# verdict line present, and none of the lint report's furniture.
+run 0 -i "$dir/census"
+expect '^ISA census: 3 instructions, 0 undecodable bytes skipped$'
+expect '^  x86-64-v2: POPCNT \(1\)$'
+expect '^  x86-64-v3: AVX2 \(1\)$'
+expect '^  x86-64-v4: none$'
+expect '^  highest psABI level: x86-64-v3$'
+expect '^  IFUNC resolvers defined: 0$'
+reject 'optimization opportunities' "lint tail in census mode"
+
+# The census ignores the symbol-table scan restriction (the out-of-function
+# xchg byte pair decodes and counts) and a baseline-only binary says so.
+run 0 -i "$dir/finding"
+expect '^ISA census: 5 instructions, 0 undecodable bytes skipped$'
+expect '^  highest psABI level: baseline x86-64 \(v1\)$'
+reject 'scan restricted' "restricted-scan line in census mode"
+
+# -i -v adds per-extension sample addresses.
+run 0 -i -v "$dir/census"
+expect '^    AVX2 at 0x[0-9a-f]+$' "-v census sample line"
 
 # -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
 run 0 "$dir/cetbad"

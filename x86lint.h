@@ -271,6 +271,48 @@ size_t x86lint_summary_instructions(const x86lint_summary *summary);
 // and jump tables), so coverage was incomplete. Returns 0 for a NULL summary.
 size_t x86lint_summary_skipped(const x86lint_summary *summary);
 
+// A by-extension tally of every instruction decoded, mapped onto the x86-64
+// psABI micro-architecture levels, for auditing what a binary was compiled
+// for: x86-64-v2 (CMPXCHG16B, LAHF-SAHF, POPCNT, SSE3, SSSE3, SSE4.1,
+// SSE4.2), x86-64-v3 (adds AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE,
+// XSAVE), x86-64-v4 (adds AVX-512 F/BW/CD/DQ/VL). Extensions outside the
+// levels (AES-NI, SHA, ADX, CET, the post-v4 AVX-512 families, ...) are
+// tallied separately and never raise the level verdict.
+//
+// The census reports presence, not requirement: code behind IFUNC or branch
+// dispatch (glibc's memcpy variants, Go's runtime feature checks) counts
+// even though the binary still runs on CPUs without the extension.
+// Reachability is not decidable from the instruction stream, so the census
+// answers "was the compiler allowed to use this anywhere"; the driver
+// prints the binary's IFUNC resolver count alongside so dispatch-heavy
+// binaries are recognizable as such. Opaque; NULL is accepted everywhere.
+typedef struct x86lint_census x86lint_census;
+
+x86lint_census *x86lint_census_create(void);
+void x86lint_census_destroy(x86lint_census *census);
+
+// Linear-sweep decode of `len` bytes, tallying each instruction by XED
+// isa-set. An undecodable byte is skipped and the sweep resyncs, tallied
+// like the lint scan's skipped count. `vaddr` is the virtual address of
+// inst[0], used for the sample addresses verbose mode prints.
+void x86lint_census_scan(x86lint_census *census, const uint8_t *inst,
+                         size_t len, uint64_t vaddr);
+
+// Print the census: totals, per-level breakdowns by descending count, the
+// highest level used, and in verbose mode up to four sample addresses per
+// extension (to tell real use from data decoded as code).
+void x86lint_census_print(const x86lint_census *census, bool verbose);
+
+size_t x86lint_census_instructions(const x86lint_census *census);
+size_t x86lint_census_skipped(const x86lint_census *census);
+
+// Instructions tallied at one psABI level: 1 = baseline x86-64, 2..4 =
+// x86-64-v2..v4, 0 = extensions outside the levels.
+size_t x86lint_census_level_count(const x86lint_census *census, int level);
+
+// Highest of levels 2..4 with a nonzero tally, else 1 (baseline).
+int x86lint_census_highest_level(const x86lint_census *census);
+
 // Instruction-set extensions the scanned code's target is known to support.
 // Checks whose suggested replacement is an instruction from one of these sets
 // run only when the caller enables that set: on a target without it the

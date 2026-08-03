@@ -828,14 +828,74 @@ out:
     return rc;
 }
 
+// Count the STT_GNU_IFUNC symbols the binary defines -- its runtime
+// CPU-dispatch surface, printed beside the ISA census so a baseline-built
+// binary with dispatched fast paths (glibc) reads differently from one
+// compiled wholesale for a level. .symtab usually contains the dynamic
+// table's ifuncs plus internal ones, so the tables are not summed; the
+// larger count wins. Returns -1 after printing on a malformed table.
+static long count_ifuncs(FILE *f, const char *path, const Elf64_Ehdr *ehdr,
+                         uint64_t shnum, uint64_t file_size)
+{
+    long best = 0;
+    for (uint64_t i = 0; i < shnum; ++i) {
+        Elf64_Shdr shdr;
+        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(shdr)), &shdr,
+                     sizeof(shdr))) {
+            fprintf(stderr, "%s: failed to read section header %lu\n", path,
+                (unsigned long) i);
+            return -1;
+        }
+        if (shdr.sh_type != SHT_DYNSYM && shdr.sh_type != SHT_SYMTAB) {
+            continue;
+        }
+        if (shdr.sh_entsize != sizeof(Elf64_Sym)) {
+            fprintf(stderr, "%s: unexpected symbol table entry size %lu\n",
+                path, (unsigned long) shdr.sh_entsize);
+            return -1;
+        }
+        if (shdr.sh_offset > file_size ||
+            shdr.sh_size > file_size - shdr.sh_offset) {
+            fprintf(stderr, "%s: symbol table out of bounds\n", path);
+            return -1;
+        }
+        Elf64_Sym *syms = malloc(shdr.sh_size);
+        if (syms == NULL) {
+            fprintf(stderr, "%s: failed to allocate %lu bytes\n", path,
+                (unsigned long) shdr.sh_size);
+            return -1;
+        }
+        if (!read_at(f, (long) shdr.sh_offset, syms, shdr.sh_size)) {
+            fprintf(stderr, "%s: failed to read the symbol table\n", path);
+            free(syms);
+            return -1;
+        }
+        long count = 0;
+        size_t nsyms = shdr.sh_size / sizeof(Elf64_Sym);
+        for (size_t s = 0; s < nsyms; ++s) {
+            if (ELF64_ST_TYPE(syms[s].st_info) == STT_GNU_IFUNC &&
+                syms[s].st_shndx != SHN_UNDEF) {
+                ++count;
+            }
+        }
+        free(syms);
+        if (count > best) {
+            best = count;
+        }
+    }
+    return best;
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
     // dirty scan from a broken run: 0 = clean scan, 1 = opportunities
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
+    // The -i census is informational and never contributes findings.
     bool verbose = false;
     bool scan_all = false;
     bool endbr = false;
+    bool census = false;
     uint32_t extensions = 0;
     const char *path = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -845,6 +905,8 @@ int main(int argc, char **argv)
             scan_all = true;
         } else if (strcmp(argv[i], "-e") == 0) {
             endbr = true;
+        } else if (strcmp(argv[i], "-i") == 0) {
+            census = true;
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             ++i;
             if (strcmp(argv[i], "bmi1") == 0) {
@@ -857,7 +919,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_APX;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                    "usage: %s [-v] [-a] [-e] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -865,14 +927,14 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "usage: %s [-v] [-a] [-e] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+            "usage: %s [-v] [-a] [-e] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }
@@ -887,6 +949,7 @@ int main(int argc, char **argv)
     int rc = 2;
     uint8_t *buf = NULL;
     x86lint_summary *summary = NULL;
+    x86lint_census *census_data = NULL;
     struct func_sym *funcs = NULL;
     size_t nfuncs = 0;
     char *shstrtab = NULL;
@@ -964,8 +1027,10 @@ int main(int argc, char **argv)
     // would silently skip almost every internal function -- a clean report
     // that scanned nothing. With no .symtab (every stripped distro binary)
     // the scan covers whole sections exactly as before; -a forces that even
-    // when symbols exist.
-    if (!scan_all) {
+    // when symbols exist. The census always scans every executable byte --
+    // it is a description of the file, not a per-function report -- so it
+    // skips the restriction the same way -a does.
+    if (!scan_all && !census) {
         for (uint64_t i = 0; i < shnum; ++i) {
             Elf64_Shdr shdr;
             if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)), &shdr,
@@ -1076,6 +1141,16 @@ int main(int argc, char **argv)
     // is skipped and the instruction count reads back as 0.
     summary = x86lint_summary_create();
 
+    // The census, by contrast, IS the whole report of a -i run, so failing
+    // to allocate it degrades to printing zeros; fail hard instead.
+    if (census) {
+        census_data = x86lint_census_create();
+        if (census_data == NULL) {
+            fprintf(stderr, "%s: failed to allocate the ISA census\n", path);
+            goto out;
+        }
+    }
+
     int errors = 0;
     for (uint64_t i = 0; i < shnum; ++i) {
         Elf64_Shdr shdr;
@@ -1112,6 +1187,15 @@ int main(int argc, char **argv)
             goto out;
         }
 
+        if (census) {
+            // The census only tallies; its report prints once, after the
+            // loop, aggregated across sections.
+            x86lint_census_scan(census_data, buf, shdr.sh_size, shdr.sh_addr);
+            free(buf);
+            buf = NULL;
+            continue;
+        }
+
         if (funcs != NULL) {
             mask_non_function_bytes(buf, &shdr, i, ehdr.e_type == ET_REL,
                 funcs, nfuncs);
@@ -1139,7 +1223,17 @@ int main(int argc, char **argv)
         buf = NULL;
     }
 
-    x86lint_summary_print(summary);
+    if (census) {
+        x86lint_census_print(census_data, verbose);
+        long ifuncs = count_ifuncs(f, path, &ehdr, shnum, file_size);
+        if (ifuncs < 0) {
+            goto out;
+        }
+        printf("  IFUNC resolvers defined: %ld%s\n", ifuncs,
+            ifuncs > 0 ? " (runtime CPU dispatch present)" : "");
+    } else {
+        x86lint_summary_print(summary);
+    }
 
     // The ENDBR64 pass is separate from the peephole scan -- its findings
     // are correctness faults located by virtual address, not encoding
@@ -1158,11 +1252,14 @@ int main(int argc, char **argv)
         printf("scan restricted to %zu function symbols (-a scans every byte)\n",
             nfuncs);
     }
-    printf("%d optimization opportunities in %zu instructions\n",
-        errors, x86lint_summary_instructions(summary));
+    if (!census) {
+        printf("%d optimization opportunities in %zu instructions\n",
+            errors, x86lint_summary_instructions(summary));
+    }
     rc = errors != 0 || endbr_errors != 0;
 
 out:
+    x86lint_census_destroy(census_data);
     x86lint_summary_destroy(summary);
     free(shstrtab);
     free(funcs);

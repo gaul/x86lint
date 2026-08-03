@@ -2662,6 +2662,312 @@ void x86lint_summary_print(const x86lint_summary *summary)
     }
 }
 
+#define CENSUS_SAMPLES 4
+
+struct x86lint_census {
+    size_t counts[XED_ISA_SET_LAST];
+    // First few sites per isa-set, so a handful of hits can be checked in a
+    // disassembler: a real AVX2 loop and a jump table misdecoded as VEX
+    // bytes both count, and only the address tells them apart.
+    uint64_t samples[XED_ISA_SET_LAST][CENSUS_SAMPLES];
+    uint8_t nsamples[XED_ISA_SET_LAST];
+    size_t instructions;
+    size_t skipped;
+};
+
+x86lint_census *x86lint_census_create(void)
+{
+    return calloc(1, sizeof(struct x86lint_census));
+}
+
+void x86lint_census_destroy(x86lint_census *census)
+{
+    free(census);
+}
+
+size_t x86lint_census_instructions(const x86lint_census *census)
+{
+    return census == NULL ? 0 : census->instructions;
+}
+
+size_t x86lint_census_skipped(const x86lint_census *census)
+{
+    return census == NULL ? 0 : census->skipped;
+}
+
+// Which psABI micro-architecture level an isa-set belongs to: 2..4 for
+// x86-64-v2..v4, 1 for baseline x86-64, 0 for a real extension outside the
+// levels (AES-NI, SHA, ADX, CET, RTM, the post-v4 AVX-512 families, APX,
+// ...). The level definitions are the psABI's, as implemented by GCC's
+// -march=x86-64-v2/v3/v4.
+static int isa_set_level(xed_isa_set_enum_t s)
+{
+    // x86-64-v4 adds AVX-512 F/BW/CD/DQ/VL. XED splits each of those CPUID
+    // features into per-width isa-sets (AVX512F_128/_256/_512/_SCALAR, the
+    // mask-register ops as AVX512F_KOPW, ...), so match the family by name
+    // prefix. The 128/256-bit forms are the AVX512VL-gated encodings, still
+    // v4 because the level includes VL. The underscore keeps non-level
+    // families out: AVX512_VNNI_128, AVX512_FP16_512 do not match.
+    const char *name = xed_isa_set_enum_t2str(s);
+    if (strncmp(name, "AVX512F_", 8) == 0 ||
+        strncmp(name, "AVX512BW_", 9) == 0 ||
+        strncmp(name, "AVX512CD_", 9) == 0 ||
+        strncmp(name, "AVX512DQ_", 9) == 0) {
+        return 4;
+    }
+
+    switch ((int) s) {
+    // x86-64-v2: CMPXCHG16B, LAHF-SAHF, POPCNT, SSE3, SSSE3, SSE4.1
+    // (XED's SSE4), SSE4.2. SSE3X87 is FISTTP, gated on the SSE3 CPUID bit.
+    case XED_ISA_SET_SSE3:
+    case XED_ISA_SET_SSE3X87:
+    case XED_ISA_SET_SSSE3:
+    case XED_ISA_SET_SSE4:
+    case XED_ISA_SET_SSE42:
+    case XED_ISA_SET_POPCNT:
+    case XED_ISA_SET_CMPXCHG16B:
+    case XED_ISA_SET_LAHF:
+        return 2;
+    // x86-64-v3: AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE, XSAVE.
+    // XSAVEC/XSAVEOPT/XSAVES are separate CPUID bits outside the level, and
+    // AVXAES/AVX_GFNI are VEX forms gated on the AES/GFNI bits, not on AVX
+    // alone: all fall through to 0.
+    case XED_ISA_SET_AVX:
+    case XED_ISA_SET_AVX2:
+    case XED_ISA_SET_AVX2GATHER:
+    case XED_ISA_SET_BMI1:
+    case XED_ISA_SET_BMI2:
+    case XED_ISA_SET_F16C:
+    case XED_ISA_SET_FMA:
+    case XED_ISA_SET_LZCNT:
+    case XED_ISA_SET_MOVBE:
+    case XED_ISA_SET_XSAVE:
+        return 3;
+    // Baseline x86-64: the legacy integer sets through P6, x87/MMX/SSE/SSE2
+    // and their support instructions, and long mode itself.
+    case XED_ISA_SET_I86:
+    case XED_ISA_SET_I186:
+    case XED_ISA_SET_I286REAL:
+    case XED_ISA_SET_I286PROTECTED:
+    case XED_ISA_SET_I386:
+    case XED_ISA_SET_I486:
+    case XED_ISA_SET_I486REAL:
+    case XED_ISA_SET_PENTIUMREAL:
+    case XED_ISA_SET_PENTIUMMMX:
+    case XED_ISA_SET_PPRO:
+    case XED_ISA_SET_PPRO_UD0_LONG:
+    case XED_ISA_SET_PPRO_UD0_SHORT:
+    case XED_ISA_SET_CMOV:
+    case XED_ISA_SET_FCMOV:
+    case XED_ISA_SET_FCOMI:
+    case XED_ISA_SET_X87:
+    case XED_ISA_SET_SSE:
+    case XED_ISA_SET_SSE2:
+    case XED_ISA_SET_SSE2MMX:
+    case XED_ISA_SET_SSEMXCSR:
+    case XED_ISA_SET_SSE_PREFETCH:
+    case XED_ISA_SET_FXSAVE:
+    case XED_ISA_SET_FXSAVE64:
+    case XED_ISA_SET_PAUSE:
+    case XED_ISA_SET_FAT_NOP:
+    case XED_ISA_SET_PREFETCH_NOP:
+    case XED_ISA_SET_CLFSH:
+    case XED_ISA_SET_LONGMODE:
+    case XED_ISA_SET_SEP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+// Display name for an isa-set: XED calls SSE4.1 "SSE4" and SSE4.2 "SSE42";
+// spell those out. With `fold` set, collapse the per-width v4 sets into
+// their CPUID feature (AVX512F_512 -> AVX512F) so a level line reads as
+// features rather than encoding widths.
+static void census_display_name(xed_isa_set_enum_t s, bool fold, char *out,
+                                size_t outlen)
+{
+    const char *name = xed_isa_set_enum_t2str(s);
+    if (s == XED_ISA_SET_SSE4) {
+        name = "SSE4.1";
+    } else if (s == XED_ISA_SET_SSE42) {
+        name = "SSE4.2";
+    }
+    snprintf(out, outlen, "%s", name);
+    if (fold && isa_set_level(s) == 4) {
+        char *underscore = strchr(out + strlen("AVX512"), '_');
+        if (underscore != NULL) {
+            *underscore = '\0';
+        }
+    }
+}
+
+void x86lint_census_scan(x86lint_census *census, const uint8_t *inst,
+                         size_t len, uint64_t vaddr)
+{
+    if (census == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            ++census->skipped;
+            continue;
+        }
+        xed_isa_set_enum_t s = xed_decoded_inst_get_isa_set(&xedd);
+        if ((int) s >= 0 && s < XED_ISA_SET_LAST) {
+            census->counts[s]++;
+            if (census->nsamples[s] < CENSUS_SAMPLES) {
+                census->samples[s][census->nsamples[s]++] = vaddr + i;
+            }
+        }
+        census->instructions++;
+        i += xed_decoded_inst_get_length(&xedd);
+    }
+}
+
+size_t x86lint_census_level_count(const x86lint_census *census, int level)
+{
+    if (census == NULL) {
+        return 0;
+    }
+    size_t total = 0;
+    for (int s = 0; s < XED_ISA_SET_LAST; ++s) {
+        if (census->counts[s] != 0 &&
+            isa_set_level((xed_isa_set_enum_t) s) == level) {
+            total += census->counts[s];
+        }
+    }
+    return total;
+}
+
+int x86lint_census_highest_level(const x86lint_census *census)
+{
+    int highest = 1;
+    if (census == NULL) {
+        return highest;
+    }
+    for (int s = 0; s < XED_ISA_SET_LAST; ++s) {
+        int level = isa_set_level((xed_isa_set_enum_t) s);
+        if (census->counts[s] != 0 && level > highest) {
+            highest = level;
+        }
+    }
+    return highest;
+}
+
+// One "  <label>: FAM (n), FAM (n), ..." line for a level, families by
+// descending count with ties broken by name, "none" when the level is
+// unused. Zero counts are printed as "none" rather than omitted so two
+// census runs diff line-for-line.
+static void census_print_level(const x86lint_census *census, int level,
+                               const char *label)
+{
+    struct {
+        char name[32];
+        size_t count;
+    } fams[XED_ISA_SET_LAST];
+    size_t nfams = 0;
+
+    for (int s = 0; s < XED_ISA_SET_LAST; ++s) {
+        if (census->counts[s] == 0 ||
+            isa_set_level((xed_isa_set_enum_t) s) != level) {
+            continue;
+        }
+        char name[32];
+        census_display_name((xed_isa_set_enum_t) s, true, name, sizeof(name));
+        size_t k = 0;
+        while (k < nfams && strcmp(fams[k].name, name) != 0) {
+            ++k;
+        }
+        if (k == nfams) {
+            snprintf(fams[k].name, sizeof(fams[k].name), "%s", name);
+            fams[k].count = 0;
+            ++nfams;
+        }
+        fams[k].count += census->counts[s];
+    }
+
+    printf("  %s: ", label);
+    if (nfams == 0) {
+        printf("none\n");
+        return;
+    }
+    for (size_t i = 0; i < nfams; ++i) {
+        size_t best = i;
+        for (size_t j = i + 1; j < nfams; ++j) {
+            if (fams[j].count > fams[best].count ||
+                (fams[j].count == fams[best].count &&
+                 strcmp(fams[j].name, fams[best].name) < 0)) {
+                best = j;
+            }
+        }
+        if (best != i) {
+            char tname[32];
+            memcpy(tname, fams[i].name, sizeof(tname));
+            memcpy(fams[i].name, fams[best].name, sizeof(fams[i].name));
+            memcpy(fams[best].name, tname, sizeof(tname));
+            size_t tcount = fams[i].count;
+            fams[i].count = fams[best].count;
+            fams[best].count = tcount;
+        }
+        printf("%s%s (%zu)", i == 0 ? "" : ", ", fams[i].name,
+            fams[i].count);
+    }
+    printf("\n");
+}
+
+void x86lint_census_print(const x86lint_census *census, bool verbose)
+{
+    if (census == NULL) {
+        return;
+    }
+
+    printf("ISA census: %zu instructions, %zu undecodable bytes skipped\n",
+        census->instructions, census->skipped);
+    printf("  baseline x86-64 (v1): %zu\n",
+        x86lint_census_level_count(census, 1));
+    census_print_level(census, 2, "x86-64-v2");
+    census_print_level(census, 3, "x86-64-v3");
+    census_print_level(census, 4, "x86-64-v4");
+    census_print_level(census, 0, "outside the psABI levels");
+
+    int highest = x86lint_census_highest_level(census);
+    if (highest > 1) {
+        printf("  highest psABI level: x86-64-v%d\n", highest);
+    } else {
+        printf("  highest psABI level: baseline x86-64 (v1)\n");
+    }
+
+    if (!verbose) {
+        return;
+    }
+    // Sample addresses per non-baseline set, unfolded (the exact XED
+    // isa-set names the width of each hit), so a suspicious tally can be
+    // checked at a disassembler prompt.
+    for (int s = 0; s < XED_ISA_SET_LAST; ++s) {
+        if (census->counts[s] == 0 ||
+            isa_set_level((xed_isa_set_enum_t) s) == 1) {
+            continue;
+        }
+        char name[32];
+        census_display_name((xed_isa_set_enum_t) s, false, name,
+            sizeof(name));
+        printf("    %s at", name);
+        for (uint8_t k = 0; k < census->nsamples[s]; ++k) {
+            printf("%s 0x%" PRIx64, k == 0 ? "" : ",",
+                census->samples[s][k]);
+        }
+        if (census->counts[s] > census->nsamples[s]) {
+            printf(" (+%zu more)",
+                census->counts[s] - census->nsamples[s]);
+        }
+        printf("\n");
+    }
+}
+
 // In verbose mode print a finding as a one-line summary -- the offending
 // instruction disassembled at its address -- followed by the raw encoding
 // indented beneath it. Non-verbose runs print nothing per finding; the

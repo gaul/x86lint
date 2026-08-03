@@ -699,12 +699,14 @@ independent, matching their CPUID feature bits: `-m bmi2` does not imply
 `-m bmi1`.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
-pads; see the next section.
+pads, and `-i` to replace the lint scan with an ISA census of the binary;
+see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
-broken run. `-e` findings set the exit status like any other.
+broken run. `-e` findings set the exit status like any other; the `-i` census
+is informational and never sets it.
 
 ## ENDBR64 (CET IBT) verification
 
@@ -801,7 +803,54 @@ into the final link, so the question is only answerable for executables and
 shared objects. The library exports the single-site predicate
 (`check_endbr64_target`); the evidence collection lives in the driver.
 
-## Mining tools
+## ISA census (`-i`)
+
+`x86lint -i` replaces the lint scan with a census: every instruction in the
+binary's executable sections, tallied by the XED isa-set it belongs to and
+mapped onto the x86-64 psABI micro-architecture levels -- x86-64-v2
+(CMPXCHG16B, LAHF-SAHF, POPCNT, SSE3, SSSE3, SSE4.1, SSE4.2), x86-64-v3
+(adds AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE, XSAVE), x86-64-v4
+(adds AVX-512 F/BW/CD/DQ/VL). This answers "what was this binary compiled
+for": a distro package built with `-march=x86-64-v3` shows AVX and BMI woven
+through ordinary functions, while a baseline build shows none.
+
+```console
+$ ./x86lint -i /usr/lib64/libc.so.6
+ISA census: 356358 instructions, 0 undecodable bytes skipped
+  baseline x86-64 (v1): 341217
+  x86-64-v2: SSSE3 (315), SSE4.2 (206), SSE4.1 (11)
+  x86-64-v3: AVX2 (3368), AVX (3015), BMI1 (532), BMI2 (146), LZCNT (27), MOVBE (16)
+  x86-64-v4: AVX512F (2038), AVX512BW (1709), AVX512DQ (3)
+  outside the psABI levels: CET (3706), RTM (46), PKU (3)
+  highest psABI level: x86-64-v4
+  IFUNC resolvers defined: 141 (runtime CPU dispatch present)
+```
+
+The census reports presence, not requirement. glibc above runs on any
+x86-64 CPU: its AVX-512 lives in IFUNC-dispatched `memcpy` variants selected
+at load time, which is why the IFUNC resolver count is printed alongside --
+a high level plus many resolvers reads as "baseline binary with dispatched
+fast paths," a high level with none as "compiled wholesale for that level"
+(or, as in OpenSSL and Go binaries, dispatch by plain branches on a
+runtime-probed feature word, which no static count can see). Deciding what
+the binary *requires* would mean proving which instructions execute
+unconditionally on the path from entry, which the instruction stream cannot
+evidence; the census states what the compiler was allowed to emit anywhere,
+and leaves requirement to the note that can prove it (a
+`GNU_PROPERTY_X86_ISA_1_NEEDED` property, when present, is authoritative).
+
+Extensions outside the levels -- AES-NI, PCLMULQDQ, SHA, ADX, CET, RTM, the
+post-v4 AVX-512 families (VNNI, VBMI, VAES, ...), APX -- are tallied on
+their own line and never raise the level verdict, since no `-march=x86-64-vN`
+implies them. The v4 line folds XED's per-width isa-sets into their CPUID
+feature (`AVX512F_512`, `AVX512F_128` and the mask ops all count as
+`AVX512F`); levels with no hits print `none` so two censuses diff
+line-for-line. The census always scans every executable byte (the
+`.symtab` restriction does not apply): a handful of hits can be data
+misdecoded as code, so `-v` prints up to four sample addresses per
+extension to check at a disassembler prompt before trusting a small count,
+and the zero-`none` shape plus the skipped-bytes counter bound how much
+could have been misread.
 
 `tools/` holds the research utilities that feed x86lint's check backlog,
 built separately with `XED_PATH=/path/to/xed make tools`:

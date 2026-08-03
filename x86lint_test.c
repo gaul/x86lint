@@ -5326,6 +5326,57 @@ static void check_decode_resync_test(void)
     x86lint_summary_destroy(summary);
 }
 
+static void census_test(void)
+{
+    x86lint_census *census = x86lint_census_create();
+    assert(census != NULL);
+    static const uint8_t code[] = {
+        0x89, 0xc0,                          // mov eax, eax (baseline)
+        0xf3, 0x0f, 0xb8, 0xc0,              // popcnt eax, eax (v2)
+        0xc5, 0xf8, 0x58, 0xc0,              // vaddps xmm0, xmm0, xmm0 (v3 AVX)
+        0xc5, 0xfd, 0xfc, 0xc0,              // vpaddb ymm0, ymm0, ymm0 (v3 AVX2)
+        0x62, 0xf1, 0x7c, 0x48, 0x58, 0xc0,  // vaddps zmm0, zmm0, zmm0 (v4 AVX512F)
+        0x66, 0x0f, 0x38, 0xdc, 0xc1,        // aesenc xmm0, xmm1 (outside the levels)
+    };
+    x86lint_census_scan(census, code, sizeof(code), 0x1000);
+    assert(x86lint_census_instructions(census) == 6);
+    assert(x86lint_census_skipped(census) == 0);
+    assert(x86lint_census_level_count(census, 1) == 1);
+    assert(x86lint_census_level_count(census, 2) == 1);
+    assert(x86lint_census_level_count(census, 3) == 2);
+    assert(x86lint_census_level_count(census, 4) == 1);
+    assert(x86lint_census_level_count(census, 0) == 1);
+    assert(x86lint_census_highest_level(census) == 4);
+    x86lint_census_destroy(census);
+
+    // Undecodable bytes resync one at a time and tally as skipped, and a
+    // census that decoded nothing reports the baseline level.
+    census = x86lint_census_create();
+    assert(census != NULL);
+    static const uint8_t junk[] = {0x62, 0x00};  // truncated EVEX prefix
+    x86lint_census_scan(census, junk, sizeof(junk), 0);
+    assert(x86lint_census_instructions(census) == 0);
+    assert(x86lint_census_skipped(census) == 2);
+    assert(x86lint_census_highest_level(census) == 1);
+
+    // Tallies accumulate across scans, as the driver's section loop relies
+    // on.
+    static const uint8_t lzcnt[] = {0xf3, 0x0f, 0xbd, 0xc0};  // lzcnt eax, eax (v3)
+    x86lint_census_scan(census, lzcnt, sizeof(lzcnt), 0x2000);
+    assert(x86lint_census_instructions(census) == 1);
+    assert(x86lint_census_level_count(census, 3) == 1);
+    assert(x86lint_census_highest_level(census) == 3);
+    x86lint_census_destroy(census);
+
+    // NULL is accepted everywhere.
+    x86lint_census_scan(NULL, code, sizeof(code), 0);
+    assert(x86lint_census_instructions(NULL) == 0);
+    assert(x86lint_census_skipped(NULL) == 0);
+    assert(x86lint_census_level_count(NULL, 3) == 0);
+    assert(x86lint_census_highest_level(NULL) == 1);
+    x86lint_census_destroy(NULL);
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -5401,6 +5452,7 @@ int main(int argc, char *argv[])
     check_missing_apx_setzu_test();
     check_endbr64_target_test();
     check_decode_resync_test();
+    census_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per
     // category rather than as a bare total (a total alone lets one check

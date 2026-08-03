@@ -2722,6 +2722,7 @@ static int isa_set_level(xed_isa_set_enum_t s)
     case XED_ISA_SET_SSE3:
     case XED_ISA_SET_SSE3X87:
     case XED_ISA_SET_SSSE3:
+    case XED_ISA_SET_SSSE3MMX:
     case XED_ISA_SET_SSE4:
     case XED_ISA_SET_SSE42:
     case XED_ISA_SET_POPCNT:

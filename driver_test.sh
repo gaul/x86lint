@@ -155,6 +155,111 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# A hand-written Go 1.20+ pclntab over two functions, linked stripped: the
+# table is the only code evidence left, exactly the stripped-Go-binary case
+# the source exists for. textStart is stored as 0 the way modern linkers
+# write it ("unused"), so the parse must recover the base from the section
+# start, anchored by the entry point. A trailing xchg sits outside the
+# table's coverage to prove the labeling discriminates.
+cat >"$dir/gopcln.s" <<'EOF'
+    .text
+    .globl _start
+_start:
+    .byte 0xf3, 0x0f, 0xb8, 0xc0        # popcnt eax, eax (v2)
+    .byte 0xc3                          # ret
+f2:
+    .byte 0x31, 0xff                    # xor edi, edi
+    .byte 0x0f, 0x05                    # syscall
+    .byte 0xc3                          # ret
+tend:
+    .byte 0x87, 0xc8                    # xchg outside the functab
+    .section .gopclntab,"a"
+    .p2align 3
+pcln:
+    .long 0xfffffff1                    # Go 1.20+ magic
+    .byte 0, 0                          # pad
+    .byte 1                             # pc quantum
+    .byte 8                             # pointer size
+    .quad 2                             # nfunc
+    .quad 0                             # nfiles
+    .quad 0                             # textStart: 0 since Go dropped it
+    .quad 0, 0, 0, 0                    # funcname/cutab/filetab/pctab
+    .quad ftab - pcln                   # functab offset
+ftab:
+    .long _start - _start, 0            # func 0: entry offset, funcoff
+    .long f2 - _start, 0                # func 1
+    .long tend - _start                 # sentinel: end of the last function
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# The same functions under the Go 1.16-1.17 header: the functab offset
+# sits in header word 6 and the entries are absolute vaddrs (link-time
+# relocations), the layout every pre-1.18 toolchain era shares.
+cat >"$dir/gopcln116.s" <<'EOF'
+    .text
+    .globl _start
+_start:
+    .byte 0xf3, 0x0f, 0xb8, 0xc0        # popcnt eax, eax (v2)
+    .byte 0xc3                          # ret
+f2:
+    .byte 0x31, 0xff                    # xor edi, edi
+    .byte 0x0f, 0x05                    # syscall
+    .byte 0xc3                          # ret
+tend:
+    .byte 0x87, 0xc8                    # xchg outside the functab
+    .section .gopclntab,"a"
+    .p2align 3
+pcln:
+    .long 0xfffffffa                    # Go 1.16-1.17 magic
+    .byte 0, 0                          # pad
+    .byte 1                             # pc quantum
+    .byte 8                             # pointer size
+    .quad 2                             # nfunc
+    .quad 0                             # nfiles
+    .quad 0, 0, 0, 0                    # funcname/cutab/filetab/pctab
+    .quad ftab - pcln                   # functab offset
+ftab:
+    .quad _start, 0                     # func 0: absolute entry, funcoff
+    .quad f2, 0                         # func 1
+    .quad tend                          # sentinel: end of the last function
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# The same table buried at +8 in an anonymous data section: external
+# linking can leave the pclntab without a section of its own, found only
+# by the byte scan.
+cat >"$dir/gopclnscan.s" <<'EOF'
+    .text
+    .globl _start
+_start:
+    .byte 0xf3, 0x0f, 0xb8, 0xc0        # popcnt eax, eax (v2)
+    .byte 0xc3                          # ret
+f2:
+    .byte 0x31, 0xff                    # xor edi, edi
+    .byte 0x0f, 0x05                    # syscall
+    .byte 0xc3                          # ret
+tend:
+    .byte 0x87, 0xc8                    # xchg outside the functab
+    .section .data.rel.ro,"aw"
+    .p2align 3
+    .quad 0                             # not the table start: the scan digs
+pcln:
+    .long 0xfffffff1                    # Go 1.20+ magic
+    .byte 0, 0                          # pad
+    .byte 1                             # pc quantum
+    .byte 8                             # pointer size
+    .quad 2                             # nfunc
+    .quad 0                             # nfiles
+    .quad 0                             # textStart: 0 since Go dropped it
+    .quad 0, 0, 0, 0                    # funcname/cutab/filetab/pctab
+    .quad ftab - pcln                   # functab offset
+ftab:
+    .long _start - _start, 0            # func 0: entry offset, funcoff
+    .long f2 - _start, 0                # func 1
+    .long tend - _start                 # sentinel: end of the last function
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # CET fixtures for -e. The .note.gnu.property section is the same note gcc
 # emits under -fcf-protection (the linker merges it through to the output):
 # cetgood declares IBT+SHSTK and pads its entry point, cetbad declares IBT
@@ -288,6 +393,14 @@ for f in finding clean bmi notrack census isanote; do
         exit 2
     fi
 done
+# The Go fixtures link stripped: the pclntab must carry the evidence alone.
+for f in gopcln gopcln116 gopclnscan; do
+    if ! cc -nostdlib -static -Wl,--build-id=none,-s \
+            -o "$dir/$f" "$dir/$f.s"; then
+        echo "driver_test.sh: fixture build failed" >&2
+        exit 2
+    fi
+done
 # The CET executables link as PIE: only a program with an interpreter has an
 # indirectly entered entry point (a kernel-entered static binary starts with
 # the tracker idle), so a static fixture would evidence no targets at all --
@@ -363,7 +476,7 @@ expect '^  x87 legacy FP: 1 \(control/env 1, 80-bit operands 0, other 0\)$'
 expect '^  highest psABI level: x86-64-v3$'
 # The fixture's sized _start is the code evidence; every byte is inside
 # it, so no family carries an unevidenced annotation.
-expect '^  code evidence: 1 function symbols \+ 0 .eh_frame FDEs covering 11 of 11 executable bytes$'
+expect '^  code evidence: 1 function symbols \+ 0 .eh_frame FDEs \+ 0 Go pclntab functions covering 11 of 11 executable bytes$'
 reject 'unevidenced' "unevidenced annotation with full coverage"
 # Depending on the host binutils, the fixture link either carries no ISA
 # property at all or a synthesized empty ISA_1_USED word; both spellings
@@ -376,6 +489,19 @@ reject 'optimization opportunities' "lint tail in census mode"
 run 0 -i "$dir/isanote"
 expect '^  GNU property ISA note: needed = x86-64-baseline\+x86-64-v2, used = x86-64-baseline\+x86-64-v2\+x86-64-v3\+x86-64-v4$'
 
+# Stripped Go-shaped fixtures: the pclntab is the only evidence left. The
+# named section parses with its base recovered from the section start
+# (textStart stores 0, as modern linkers write it); the sectionless
+# variant is found by the data-section byte scan at a nonzero offset.
+# The trailing xchg decodes but lies past the sentinel: one unevidenced.
+for f in gopcln gopcln116 gopclnscan; do
+    run 0 -i "$dir/$f"
+    expect '^ISA census: 6 instructions, 0 undecodable bytes skipped$'
+    expect '^  x86-64-v2: POPCNT \(1\)$'
+    expect '^  baseline x86-64 \(v1\): 5 \(1 unevidenced\)$'
+    expect '^  code evidence: 0 function symbols \+ 0 .eh_frame FDEs \+ 2 Go pclntab functions covering 10 of 12 executable bytes$'
+done
+
 # The census ignores the symbol-table scan restriction (the out-of-function
 # xchg byte pair decodes and counts) and a baseline-only binary says so.
 run 0 -i "$dir/finding"
@@ -385,7 +511,7 @@ expect '^  highest psABI level: baseline x86-64 \(v1\)$'
 # The out-of-function xchg decodes and counts, but lies outside the
 # sized _start -- the census scans it and labels it.
 expect '^  baseline x86-64 \(v1\): 5 \(1 unevidenced\)$'
-expect '^  code evidence: 1 function symbols \+ 0 .eh_frame FDEs covering 11 of 13 executable bytes$'
+expect '^  code evidence: 1 function symbols \+ 0 .eh_frame FDEs \+ 0 Go pclntab functions covering 11 of 13 executable bytes$'
 reject 'scan restricted' "restricted-scan line in census mode"
 
 # -i -v adds per-extension sample addresses.

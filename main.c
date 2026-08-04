@@ -898,7 +898,8 @@ static long count_ifuncs(FILE *f, const char *path, const Elf64_Ehdr *ehdr,
 // ==== code evidence for the census ===================================
 //
 // Ranges of bytes the toolchain recorded as code: sized STT_FUNC symbols
-// from .symtab and .dynsym, and .eh_frame FDE pc-ranges. The census
+// from .symtab and .dynsym, .eh_frame FDE pc-ranges, and Go pclntab
+// function boundaries (see the section below). The census
 // labels tallies against these (see x86lint_census_set_evidence);
 // tools/cohere is the measurement that put this here after every cheap
 // coherence heuristic failed. Collection is best-effort by design --
@@ -1274,6 +1275,246 @@ static size_t evidence_from_symtab(FILE *f, const Elf64_Shdr *shdr,
     return pushed;
 }
 
+// ==== Go pclntab evidence ============================================
+//
+// Go binaries carry runtime.pclntab, the runtime's own function table.
+// It survives `strip` because traceback needs it at run time, so a
+// stripped Go binary -- which loses both its symbol tables and (having
+// no DWARF unwinder) carries no .eh_frame worth trusting -- still
+// evidences every function boundary. Layout follows the magic in the
+// first word (src/debug/gosym/pclntab.go is the reference): Go
+// 1.2-1.15 (0xfffffffb) and 1.16-1.17 (0xfffffffa) store absolute
+// entry vaddrs as uintptr pairs; 1.18+ (0xfffffff0; 0xfffffff1 from
+// 1.20) stores u32 offsets from the textStart header field. The
+// functab is nfunc (entry, funcoff) pairs plus one lone sentinel entry
+// marking the end of the last function, so function i spans entry[i]
+// to entry[i+1] -- inter-function padding included, which is fine for
+// evidence: the toolchain emitted those bytes deliberately.
+//
+// The table is found by section name (.gopclntab, the internal
+// linker's spelling) or, failing that, by scanning allocated data
+// sections for the header byte pattern -- external linking buries the
+// table in .data.rel.ro with no section of its own. A hit is believed
+// only after full validation: amd64 header fields, in-bounds functab,
+// non-decreasing entries, and the whole span inside the executable
+// sections. gosym distrusts the stored textStart because a loader may
+// rebase the text at run time; here everything is compared against
+// vaddrs from the same unloaded file, so it is consistent by
+// construction.
+
+static uint32_t read_u32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static uint64_t read_u64(const uint8_t *p)
+{
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+
+// Functab field i (2 per function: entry, funcoff): a vaddr in the
+// uintptr eras, an offset from the text base in the u32 era.
+static uint64_t pclntab_entry(const uint8_t *ftab, uint64_t entsize,
+                              uint64_t i)
+{
+    return entsize == 8 ? read_u64(ftab + 2 * i * 8)
+        : read_u32(ftab + 2 * i * 4);
+}
+
+// Does base+entry[k] == pc hold for some function k? Binary search --
+// the functab is address-sorted (validated by the caller).
+static bool pclntab_has_entry(const uint8_t *ftab, uint64_t entsize,
+                              uint64_t nfunc, uint64_t base, uint64_t pc)
+{
+    uint64_t lo = 0;
+    uint64_t hi = nfunc;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        uint64_t v = base + pclntab_entry(ftab, entsize, mid);
+        if (v == pc) {
+            return true;
+        }
+        if (v < pc) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return false;
+}
+
+// Parse one pclntab candidate at tab[0..size), pushing a range per
+// function. Returns the count pushed, 0 if any check fails -- nothing
+// is pushed until the whole table validates, so a rejected candidate
+// leaves no trace. `exec` holds one range per executable section and
+// `entry` is e_entry; both serve validation, which is what makes
+// believing a data-section scan hit safe.
+static size_t pclntab_parse(const uint8_t *tab, uint64_t size,
+                            const struct evidence_build *exec,
+                            uint64_t entry, struct evidence_build *b)
+{
+    if (size < 16 || exec->n == 0) {
+        return 0;
+    }
+    uint32_t magic = read_u32(tab);
+    if (magic != 0xfffffffb && magic != 0xfffffffa &&
+        magic != 0xfffffff0 && magic != 0xfffffff1) {
+        return 0;
+    }
+    // The header tail an amd64 Go toolchain emits: two zero bytes, pc
+    // quantum 1, pointer size 8.
+    if (tab[4] != 0 || tab[5] != 0 || tab[6] != 1 || tab[7] != 8) {
+        return 0;
+    }
+    // 8-byte header words follow; how many, and where the functab
+    // lives, depends on the era. Offsets in the header are relative to
+    // the table start.
+    uint64_t nwords = magic == 0xfffffffb ? 1 : magic == 0xfffffffa ? 7 : 8;
+    if (size - 8 < nwords * 8) {
+        return 0;
+    }
+    uint64_t nfunc = read_u64(tab + 8);
+    uint64_t entsize = magic == 0xfffffff0 || magic == 0xfffffff1 ? 4 : 8;
+    uint64_t ftab_off;
+    uint64_t text_start = 0;
+    switch (magic) {
+    case 0xfffffffb:            // functab abuts the count word
+        ftab_off = 16;
+        break;
+    case 0xfffffffa:            // header word 6
+        ftab_off = read_u64(tab + 8 + 6 * 8);
+        break;
+    default:                    // header words 2 and 7
+        text_start = read_u64(tab + 8 + 2 * 8);
+        ftab_off = read_u64(tab + 8 + 7 * 8);
+        break;
+    }
+    // Bound nfunc by what could possibly fit before multiplying, so a
+    // forged count cannot wrap the size math.
+    if (nfunc == 0 || nfunc > size / (2 * entsize)) {
+        return 0;
+    }
+    uint64_t ftab_size = (2 * nfunc + 1) * entsize;
+    if (ftab_off > size || ftab_size > size - ftab_off) {
+        return 0;
+    }
+    const uint8_t *ftab = tab + ftab_off;
+    uint64_t prev = 0;
+    for (uint64_t i = 0; i <= nfunc; ++i) {
+        uint64_t pc = pclntab_entry(ftab, entsize, i);
+        if (i != 0 && pc < prev) {
+            return 0;
+        }
+        prev = pc;
+    }
+    uint64_t first = pclntab_entry(ftab, entsize, 0);
+    uint64_t last = prev;
+
+    // Resolve the text base the entries are relative to. The uintptr
+    // eras store vaddrs (base 0). The u32 era names its base in the
+    // textStart header word -- but only toolchains around Go 1.18
+    // stored it; later linkers write 0 there ("unused": the runtime
+    // reads moduledata instead), so the base must be recovered. With
+    // internal linking runtime.text is exactly a section start, so
+    // each executable section's start is a candidate. A candidate is
+    // believed when the claimed span fits (the stored word against the
+    // hull of executable sections, a recovered section start against
+    // that one section -- Go text never straddles sections) and the
+    // entry point, when it falls inside the span, is an exact function
+    // start: the functab is the complete function list for its text,
+    // and this is what rejects a csu-shifted base from external
+    // linking, where runtime.text sits behind the host linker's csu
+    // code mid-section and no candidate is right (an honest miss).
+    uint64_t hull_lo = UINT64_MAX;
+    uint64_t hull_hi = 0;
+    for (size_t i = 0; i < exec->n; ++i) {
+        if (exec->r[i].start < hull_lo) {
+            hull_lo = exec->r[i].start;
+        }
+        if (exec->r[i].end > hull_hi) {
+            hull_hi = exec->r[i].end;
+        }
+    }
+    bool have_base = false;
+    uint64_t base = 0;
+    for (size_t c = 0; !have_base && c < 1 + exec->n; ++c) {
+        uint64_t cand;
+        uint64_t span_lo;
+        uint64_t span_hi;
+        if (entsize == 8) {     // vaddrs: base 0 is the only candidate
+            if (c == 1) {
+                break;
+            }
+            cand = 0;
+            span_lo = hull_lo;
+            span_hi = hull_hi;
+        } else if (c == 0) {
+            cand = text_start;
+            span_lo = hull_lo;
+            span_hi = hull_hi;
+        } else {
+            cand = exec->r[c - 1].start;
+            span_lo = exec->r[c - 1].start;
+            span_hi = exec->r[c - 1].end;
+        }
+        if (cand > UINT64_MAX - last ||     // a forged base must not wrap
+            cand + first < span_lo || cand + last > span_hi) {
+            continue;
+        }
+        if (entry >= cand + first && entry < cand + last &&
+            !pclntab_has_entry(ftab, entsize, nfunc, cand, entry)) {
+            continue;
+        }
+        base = cand;
+        have_base = true;
+    }
+    if (!have_base) {
+        return 0;
+    }
+
+    size_t pushed = 0;
+    for (uint64_t i = 0; i < nfunc; ++i) {
+        uint64_t start = base + pclntab_entry(ftab, entsize, i);
+        uint64_t end = base + pclntab_entry(ftab, entsize, i + 1);
+        if (start == end) {     // an aliased entry spans nothing
+            continue;
+        }
+        if (!evidence_push(b, start, end)) {
+            break;
+        }
+        pushed++;
+    }
+    return pushed;
+}
+
+// Hunt a loaded data section for a pclntab header and parse the first
+// candidate that survives validation.
+static size_t pclntab_scan(const uint8_t *sec, uint64_t size,
+                           const struct evidence_build *exec,
+                           uint64_t entry, struct evidence_build *b)
+{
+    if (size < 16) {
+        return 0;
+    }
+    for (uint64_t off = 0; off <= size - 16; ++off) {
+        if (sec[off + 1] != 0xff || sec[off + 2] != 0xff ||
+            sec[off + 3] != 0xff || sec[off + 4] != 0 ||
+            sec[off + 5] != 0 || sec[off + 6] != 1 ||
+            sec[off + 7] != 8) {
+            continue;
+        }
+        size_t n = pclntab_parse(sec + off, size - off, exec, entry, b);
+        if (n != 0) {
+            return n;
+        }
+    }
+    return 0;
+}
+
 static int evidence_cmp(const void *a, const void *b)
 {
     const x86lint_evidence_range *ra = a;
@@ -1397,6 +1638,7 @@ int main(int argc, char **argv)
     struct evidence_build evidence = {NULL, 0, 0};
     size_t evidence_funcs = 0;
     size_t evidence_fdes = 0;
+    size_t evidence_gofuncs = 0;
     uint64_t evidence_covered = 0;
     uint64_t exec_bytes = 0;
     struct func_sym *funcs = NULL;
@@ -1604,29 +1846,76 @@ int main(int argc, char **argv)
         // are section-relative and their .eh_frame unrelocated, so
         // ranges would land in the wrong address space.
         if (ehdr.e_type != ET_REL) {
+            Elf64_Shdr pcln_shdr;
+            bool have_pcln = false;
+            struct evidence_build exec_secs = {NULL, 0, 0};
             for (uint64_t i = 0; i < shnum; ++i) {
                 Elf64_Shdr shdr;
                 if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)),
                              &shdr, sizeof(shdr))) {
                     break;
                 }
+                const char *name = shstrtab != NULL &&
+                    shdr.sh_name < shstrtab_size
+                    ? shstrtab + shdr.sh_name : "";
+                if (shdr.sh_type == SHT_PROGBITS &&
+                    (shdr.sh_flags & SHF_EXECINSTR) && shdr.sh_size != 0) {
+                    // The sections the scan loop below will decode,
+                    // for validating pclntab claims against.
+                    evidence_push(&exec_secs, shdr.sh_addr,
+                        shdr.sh_addr + shdr.sh_size);
+                }
                 if (shdr.sh_type == SHT_SYMTAB ||
                     shdr.sh_type == SHT_DYNSYM) {
                     evidence_funcs +=
                         evidence_from_symtab(f, &shdr, file_size, &evidence);
                 } else if (shdr.sh_type == SHT_PROGBITS &&
-                           shstrtab != NULL &&
-                           shdr.sh_name < shstrtab_size &&
-                           strcmp(shstrtab + shdr.sh_name, ".eh_frame") ==
-                               0) {
+                           strcmp(name, ".eh_frame") == 0) {
                     uint8_t *frame = load_section(f, &shdr, file_size);
                     if (frame != NULL) {
                         evidence_fdes += parse_eh_frame(frame, shdr.sh_size,
                             shdr.sh_addr, &evidence);
                         free(frame);
                     }
+                } else if (shdr.sh_type == SHT_PROGBITS &&
+                           strcmp(name, ".gopclntab") == 0) {
+                    pcln_shdr = shdr;
+                    have_pcln = true;
                 }
             }
+            // The Go table parses after the walk because validation
+            // needs the executable sections. The named section wins;
+            // without one the allocated data sections are scanned for
+            // the header.
+            if (have_pcln) {
+                uint8_t *tab = load_section(f, &pcln_shdr, file_size);
+                if (tab != NULL) {
+                    evidence_gofuncs = pclntab_parse(tab,
+                        pcln_shdr.sh_size, &exec_secs, ehdr.e_entry,
+                        &evidence);
+                    free(tab);
+                }
+            }
+            for (uint64_t i = 0; evidence_gofuncs == 0 && i < shnum; ++i) {
+                Elf64_Shdr shdr;
+                if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)),
+                             &shdr, sizeof(shdr))) {
+                    break;
+                }
+                if (shdr.sh_type != SHT_PROGBITS ||
+                    (shdr.sh_flags & SHF_ALLOC) == 0 ||
+                    (shdr.sh_flags & SHF_EXECINSTR) != 0 ||
+                    shdr.sh_size < 16) {
+                    continue;
+                }
+                uint8_t *sec = load_section(f, &shdr, file_size);
+                if (sec != NULL) {
+                    evidence_gofuncs = pclntab_scan(sec, shdr.sh_size,
+                        &exec_secs, ehdr.e_entry, &evidence);
+                    free(sec);
+                }
+            }
+            free(exec_secs.r);
             evidence.n = evidence_merge(evidence.r, evidence.n,
                 &evidence_covered);
             x86lint_census_set_evidence(census_data, evidence.r,
@@ -1715,13 +2004,14 @@ int main(int argc, char **argv)
         // carries the same "no toolchain claim" weight.
         if (evidence.n != 0) {
             printf("  code evidence: %zu function symbols + %zu .eh_frame "
-                "FDEs covering %lu of %lu executable bytes\n",
-                evidence_funcs, evidence_fdes,
+                "FDEs + %zu Go pclntab functions covering %lu of %lu "
+                "executable bytes\n",
+                evidence_funcs, evidence_fdes, evidence_gofuncs,
                 (unsigned long) evidence_covered,
                 (unsigned long) exec_bytes);
         } else {
             printf("  code evidence: none (no sized function symbols, no "
-                "parsable .eh_frame)\n");
+                "parsable .eh_frame, no Go pclntab)\n");
         }
 
         // The toolchain's own ISA accounting, when it recorded one:

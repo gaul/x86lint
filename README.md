@@ -824,7 +824,7 @@ ISA census: 356358 instructions, 0 undecodable bytes skipped
   outside the psABI levels: CET (3706), RTM (46), PKU (3)
   x87 legacy FP: 428 (control/env 34, 80-bit operands 124, other 270)
   highest psABI level: x86-64-v4
-  code evidence: 9899 function symbols + 3791 .eh_frame FDEs covering 1481413 of 1514109 executable bytes
+  code evidence: 9899 function symbols + 3791 .eh_frame FDEs + 0 Go pclntab functions covering 1481413 of 1514109 executable bytes
   GNU property ISA note: needed = x86-64-baseline, used = x86-64-baseline+x86-64-v2+x86-64-v3+x86-64-v4
   IFUNC resolvers defined: 141 (runtime CPU dispatch present)
 ```
@@ -880,8 +880,18 @@ could have been misread.
 
 The census also labels every tally against the bytes the toolchain
 recorded as code -- sized function symbols from `.symtab` and `.dynsym`
-(stripped distro libraries keep the latter), and `.eh_frame` FDE
-pc-ranges -- because no property of the instruction stream itself can
+(stripped distro libraries keep the latter), `.eh_frame` FDE
+pc-ranges, and Go `pclntab` function boundaries, the runtime's own
+table, kept through `strip` because traceback needs it: a stripped
+pure-Go binary loses both symbol tables and has no unwind data worth
+the name, yet keeps every function boundary this way (all four header
+eras back to Go 1.2 parse; the table is found by section name or by
+scanning the data sections, and believed only after the whole functab
+validates against the executable sections and the entry point --
+modern linkers store a dead `textStart` word, so the base is recovered
+from the section layout, and when external linking makes every
+candidate wrong the table is honestly dropped) -- because no property
+of the instruction stream itself can
 tell a real instruction from a phantom: `tools/cohere` measured run
 length, gap adjacency, and self-synchronization consensus all failing
 at exactly that (a GHC binary's phantom x87 reaches 92% consensus;

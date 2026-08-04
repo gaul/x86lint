@@ -335,8 +335,9 @@ size_t x86lint_census_x87_count(const x86lint_census *census,
 // Code-evidence labeling. The census cannot tell a real instruction from
 // a phantom decode of data-in-text (tools/cohere measured every cheap
 // coherence heuristic failing at exactly that), but the toolchain often
-// recorded which bytes it meant as code: sized STT_FUNC symbols and
-// .eh_frame FDE pc-ranges. With evidence installed, every tally is also
+// recorded which bytes it meant as code: sized STT_FUNC symbols,
+// .eh_frame FDE pc-ranges, and Go pclntab function boundaries (which
+// survive `strip`). With evidence installed, every tally is also
 // counted as evidenced or not, and the report annotates families whose
 // hits fall outside all evidence. The semantics are asymmetric by
 // design: inside evidence lends trust; outside means only "no toolchain

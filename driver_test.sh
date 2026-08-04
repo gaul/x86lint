@@ -109,6 +109,33 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Attribution fixture: two sized functions holding two and one findings,
+# plus an unsized label (no .size) holding a fourth -- the masked scan
+# still reaches it (unsized coverage extends to the section end) but
+# attribution, sized-only, books it against no function.
+cat >"$dir/perfunc.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x87, 0xc8                    # 0x0: xchg eax, ecx (finding)
+    .byte 0x87, 0xc8                    # 0x2: xchg eax, ecx (finding)
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .globl f2
+    .type f2, @function
+f2:
+    .byte 0x87, 0xc8                    # 0x5: xchg eax, ecx (finding)
+    .byte 0xc3                          # ret
+    .size f2, . - f2
+    .globl f3
+    .type f3, @function
+f3:
+    .byte 0x87, 0xc8                    # 0x8: xchg eax, ecx (finding)
+    .byte 0xc3                          # ret
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # Census fixture for -i: one v2 instruction, one v3, one x87 control
 # instruction, the rest baseline.
 cat >"$dir/census.s" <<'EOF'
@@ -386,7 +413,7 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi notrack census isanote; do
+for f in finding clean bmi notrack census isanote perfunc; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -444,6 +471,39 @@ expect '^oversized XCHG encoding at offset: 0x5' "-v finding line at 0x5"
 run 0 "$dir/clean"
 expect '^0 optimization opportunities in 3 instructions$'
 reject '^Optimization opportunities by type:$' "by-type table on a clean scan"
+
+# Attribution: findings tally per containing function beside the by-type
+# table, top offenders first, with the unsized f3's finding in the honest
+# outside-every-range row.
+run 1 "$dir/perfunc"
+expect '^Optimization opportunities by function:$'
+expect '^ +2 +_start$'
+expect '^ +1 +f2$'
+expect '^ +1 +outside every function range$'
+expect '^4 optimization opportunities in 7 instructions$'
+# -v names the holder inline with its function-relative offset; the
+# unsized f3's line stays bare.
+run 1 -v "$dir/perfunc"
+expect '^oversized XCHG encoding at offset: 0x2 \(_start\+0x2\): '
+expect '^oversized XCHG encoding at offset: 0x5 \(f2\+0x0\): '
+expect '^oversized XCHG encoding at offset: 0x8: ' "bare -v line for unsized f3"
+
+# -f restricts the scan to one named function, in lint and census mode
+# both; an unsized or unknown name is a tool failure, as is combining -f
+# with -a.
+run 1 -f f2 "$dir/perfunc"
+expect "^scan restricted to function 'f2': 1 site, 3 bytes$"
+expect '^1 optimization opportunities in 2 instructions$'
+reject '_start' "findings from outside the -f target"
+run 0 -i -f f2 "$dir/perfunc"
+expect '^ISA census: 2 instructions, 0 undecodable bytes skipped$'
+expect 'covering 3 of 3 executable bytes$'
+expect "^scan restricted to function 'f2': 1 site, 3 bytes$"
+run 2 -f f3 "$dir/perfunc"
+expect "no sized function symbol named 'f3'"
+run 2 -f nosuch "$dir/perfunc"
+run 2 -a -f f2 "$dir/perfunc"
+expect 'mutually exclusive'
 
 # Extension-gated checks: the fixture is clean at baseline; each -m enables
 # exactly its own finding (the bits are independent).

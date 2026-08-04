@@ -36,6 +36,7 @@ struct func_sym {
     uint64_t value;     // st_value: a vaddr, or a section offset in ET_REL
     uint64_t size;      // st_size: 0 for an unsized assembly label
     uint16_t shndx;     // st_shndx: the holding section, for ET_REL matching
+    const char *name;   // into the table's strtab; NULL when unnamed
 };
 
 struct func_range {
@@ -50,6 +51,21 @@ static int func_range_cmp(const void *a, const void *b)
         return ra->start < rb->start ? -1 : 1;
     }
     return 0;
+}
+
+// Order for the attribution table: start ascending, then end descending
+// so the widest of co-located aliases sorts first (the later, contained
+// ones drop), then name so alias choice is deterministic.
+static int attr_range_cmp(const void *a, const void *b)
+{
+    const x86lint_func_range *ra = a, *rb = b;
+    if (ra->start != rb->start) {
+        return ra->start < rb->start ? -1 : 1;
+    }
+    if (ra->end != rb->end) {
+        return ra->end > rb->end ? -1 : 1;
+    }
+    return strcmp(ra->name, rb->name);
 }
 
 // Overwrite every byte of a section's copy that lies outside the symbol
@@ -1583,6 +1599,7 @@ int main(int argc, char **argv)
     bool census = false;
     uint32_t extensions = 0;
     const char *path = NULL;
+    const char *fname = NULL;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
@@ -1590,6 +1607,8 @@ int main(int argc, char **argv)
             scan_all = true;
         } else if (strcmp(argv[i], "-e") == 0) {
             endbr = true;
+        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+            fname = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0) {
             census = true;
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -1604,7 +1623,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_APX;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -1612,15 +1631,21 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
             argv[0]);
+        return 2;
+    }
+    // -a widens the scan to every byte and -f narrows it to one function;
+    // combining them has no coherent meaning.
+    if (fname != NULL && scan_all) {
+        fprintf(stderr, "%s: -a and -f are mutually exclusive\n", argv[0]);
         return 2;
     }
 
@@ -1643,6 +1668,10 @@ int main(int argc, char **argv)
     uint64_t exec_bytes = 0;
     struct func_sym *funcs = NULL;
     size_t nfuncs = 0;
+    char **strtabs = NULL;      // the loaded symbol string tables, which
+    size_t nstrtabs = 0;        // func_sym names point into
+    x86lint_func_range *attr = NULL;
+    size_t nattr = 0;
     char *shstrtab = NULL;
     uint64_t shstrtab_size = 0;
 
@@ -1713,15 +1742,21 @@ int main(int argc, char **argv)
     }
 
     // Load the function ranges from the symbol table, if the binary kept
-    // one. Only SHT_SYMTAB qualifies: the dynamic table survives stripping
-    // but lists exported functions only, and restricting the scan to those
-    // would silently skip almost every internal function -- a clean report
-    // that scanned nothing. With no .symtab (every stripped distro binary)
-    // the scan covers whole sections exactly as before; -a forces that even
-    // when symbols exist. The census always scans every executable byte --
-    // it is a description of the file, not a per-function report -- so it
-    // skips the restriction the same way -a does.
-    if (!scan_all && !census) {
+    // one. Only SHT_SYMTAB qualifies for the default restriction: the
+    // dynamic table survives stripping but lists exported functions only,
+    // and restricting the scan to those would silently skip almost every
+    // internal function -- a clean report that scanned nothing. With no
+    // .symtab (every stripped distro binary) the scan covers whole
+    // sections exactly as before; -a forces that even when symbols exist.
+    // The census always scans every executable byte -- it is a
+    // description of the file, not a per-function report -- so it skips
+    // the restriction the same way -a does. -f NAME is different on both
+    // counts: an explicit request for one function is meaningful in every
+    // mode, and naming an exported function of a stripped library is its
+    // point, so it loads always and draws on .dynsym too. Names ride
+    // along for -f matching and finding attribution; their string tables
+    // stay live in strtabs[].
+    if ((!scan_all && !census) || fname != NULL) {
         for (uint64_t i = 0; i < shnum; ++i) {
             Elf64_Shdr shdr;
             if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)), &shdr,
@@ -1730,7 +1765,8 @@ int main(int argc, char **argv)
                     path, (unsigned long) i);
                 goto out;
             }
-            if (shdr.sh_type != SHT_SYMTAB) {
+            if (shdr.sh_type != SHT_SYMTAB &&
+                (fname == NULL || shdr.sh_type != SHT_DYNSYM)) {
                 continue;
             }
             if (shdr.sh_entsize != sizeof(Elf64_Sym)) {
@@ -1745,7 +1781,7 @@ int main(int argc, char **argv)
             }
             size_t nsyms = shdr.sh_size / sizeof(Elf64_Sym);
             if (nsyms == 0) {
-                break;
+                continue;
             }
             Elf64_Sym *syms = malloc(shdr.sh_size);
             if (syms == NULL) {
@@ -1758,13 +1794,32 @@ int main(int argc, char **argv)
                 free(syms);
                 goto out;
             }
-            funcs = malloc(nsyms * sizeof(*funcs));
-            if (funcs == NULL) {
+            // The table's string table. Best-effort: without it the
+            // symbols still restrict the scan, they just have no names.
+            char *strs = NULL;
+            uint64_t strs_size = 0;
+            Elf64_Shdr strhdr;
+            if (shdr.sh_link < shnum &&
+                read_at(f, (long) (ehdr.e_shoff +
+                                   shdr.sh_link * sizeof(strhdr)),
+                        &strhdr, sizeof(strhdr)) &&
+                strhdr.sh_size != 0) {
+                strs = (char *) load_section(f, &strhdr, file_size);
+                if (strs != NULL) {
+                    strs_size = strhdr.sh_size;
+                    strs[strs_size - 1] = '\0';     // bound every name
+                }
+            }
+            struct func_sym *grown = realloc(funcs,
+                (nfuncs + nsyms) * sizeof(*funcs));
+            if (grown == NULL) {
                 fprintf(stderr, "%s: failed to allocate symbol ranges\n",
                     path);
                 free(syms);
+                free(strs);
                 goto out;
             }
+            funcs = grown;
             for (size_t s = 0; s < nsyms; ++s) {
                 unsigned type = ELF64_ST_TYPE(syms[s].st_info);
                 if ((type != STT_FUNC && type != STT_GNU_IFUNC) ||
@@ -1774,16 +1829,104 @@ int main(int argc, char **argv)
                 funcs[nfuncs].value = syms[s].st_value;
                 funcs[nfuncs].size = syms[s].st_size;
                 funcs[nfuncs].shndx = syms[s].st_shndx;
+                funcs[nfuncs].name = strs != NULL &&
+                    syms[s].st_name < strs_size
+                    ? strs + syms[s].st_name : NULL;
                 ++nfuncs;
             }
             free(syms);
-            // A table with no function symbols at all (some strippers keep
-            // it but drop the types) must not exclude every byte.
-            if (nfuncs == 0) {
-                free(funcs);
-                funcs = NULL;
+            if (strs != NULL) {
+                char **g = realloc(strtabs,
+                    (nstrtabs + 1) * sizeof(*strtabs));
+                if (g == NULL) {
+                    free(strs);
+                    goto out;
+                }
+                strtabs = g;
+                strtabs[nstrtabs++] = strs;
             }
-            break;
+            if (fname == NULL) {
+                break;      // the first .symtab is the restriction set
+            }
+        }
+        // A table with no function symbols at all (some strippers keep
+        // it but drop the types) must not exclude every byte.
+        if (nfuncs == 0) {
+            free(funcs);
+            funcs = NULL;
+        }
+    }
+
+    // -f: keep only the named function. Sized symbols only (an unsized
+    // assembly label has no known extent) and deduplicated by address --
+    // the same function appears in .symtab and .dynsym, and legitimately
+    // more than once by value under IFUNC aliasing.
+    if (fname != NULL) {
+        if (ehdr.e_type == ET_REL) {
+            fprintf(stderr,
+                "%s: -f requires a linked executable or shared object\n",
+                path);
+            goto out;
+        }
+        size_t kept = 0;
+        for (size_t s = 0; s < nfuncs; ++s) {
+            if (funcs[s].name == NULL || strcmp(funcs[s].name, fname) != 0 ||
+                funcs[s].size == 0) {
+                continue;
+            }
+            bool dup = false;
+            for (size_t k = 0; k < kept; ++k) {
+                if (funcs[k].value == funcs[s].value) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                funcs[kept++] = funcs[s];
+            }
+        }
+        if (kept == 0) {
+            fprintf(stderr, "%s: no sized function symbol named '%s'\n",
+                path, fname);
+            goto out;
+        }
+        nfuncs = kept;
+    }
+
+    // Attribution: hand the summary the named function ranges, sorted and
+    // disjoint, so findings tally per function and -v names the holder.
+    // Sized symbols only -- a finding in unsized-label code lands in the
+    // honest outside-every-range row -- and none for ET_REL, whose
+    // section-relative symbol values share no address space (the same
+    // rule the census evidence follows). Aliases collapse to one name
+    // (start ascending, end descending, then name, so the widest range
+    // wins and ties break deterministically); overlaps are clipped.
+    if (!census && funcs != NULL && ehdr.e_type != ET_REL) {
+        attr = malloc(nfuncs * sizeof(*attr));
+        if (attr != NULL) {
+            size_t n = 0;
+            for (size_t s = 0; s < nfuncs; ++s) {
+                if (funcs[s].name == NULL || funcs[s].name[0] == '\0' ||
+                    funcs[s].size == 0) {
+                    continue;
+                }
+                attr[n].start = funcs[s].value;
+                attr[n].end = funcs[s].value + funcs[s].size;
+                attr[n].name = funcs[s].name;
+                ++n;
+            }
+            qsort(attr, n, sizeof(*attr), attr_range_cmp);
+            size_t m = 0;
+            for (size_t s = 0; s < n; ++s) {
+                if (m > 0 && attr[s].start < attr[m - 1].end) {
+                    if (attr[s].end <= attr[m - 1].end) {
+                        continue;       // contained alias: drop
+                    }
+                    attr[s].start = attr[m - 1].end;    // clip the overlap
+                }
+                attr[m++] = attr[s];
+            }
+            nattr = m;      // installed into the summary once it exists
         }
     }
 
@@ -1831,6 +1974,9 @@ int main(int argc, char **argv)
     // A NULL summary (allocation failure) is tolerated by the API: tallying
     // is skipped and the instruction count reads back as 0.
     summary = x86lint_summary_create();
+    if (attr != NULL) {
+        x86lint_summary_set_functions(summary, attr, nattr);
+    }
 
     // The census, by contrast, IS the whole report of a -i run, so failing
     // to allocate it degrades to printing zeros; fail hard instead.
@@ -1961,9 +2107,27 @@ int main(int argc, char **argv)
 
         if (census) {
             // The census only tallies; its report prints once, after the
-            // loop, aggregated across sections.
-            x86lint_census_scan(census_data, buf, shdr.sh_size, shdr.sh_addr);
-            exec_bytes += shdr.sh_size;
+            // loop, aggregated across sections. Under -f only the named
+            // function's slices are scanned -- the per-function census
+            // that answers "what level is this one IFUNC target".
+            if (fname != NULL) {
+                for (size_t s = 0; s < nfuncs; ++s) {
+                    if (funcs[s].value < shdr.sh_addr ||
+                        funcs[s].value - shdr.sh_addr >= shdr.sh_size) {
+                        continue;
+                    }
+                    uint64_t off = funcs[s].value - shdr.sh_addr;
+                    uint64_t len = funcs[s].size > shdr.sh_size - off
+                        ? shdr.sh_size - off : funcs[s].size;
+                    x86lint_census_scan(census_data, buf + off, len,
+                        funcs[s].value);
+                    exec_bytes += len;
+                }
+            } else {
+                x86lint_census_scan(census_data, buf, shdr.sh_size,
+                    shdr.sh_addr);
+                exec_bytes += shdr.sh_size;
+            }
             free(buf);
             buf = NULL;
             continue;
@@ -1985,8 +2149,8 @@ int main(int argc, char **argv)
                 (unsigned long) shdr.sh_addr, (unsigned long) shdr.sh_size);
         }
 
-        int n = check_instructions(buf, shdr.sh_size, verbose, summary,
-            extensions);
+        int n = check_instructions(buf, shdr.sh_size, shdr.sh_addr, verbose,
+            summary, extensions);
         if (n < 0) {
             goto out;
         }
@@ -2001,7 +2165,25 @@ int main(int argc, char **argv)
 
         // What backed the unevidenced labels -- or that nothing did, in
         // which case no instruction was labeled and the whole census
-        // carries the same "no toolchain claim" weight.
+        // carries the same "no toolchain claim" weight. Under -f only the
+        // named slices were scanned, so the coverage figure is clipped to
+        // them: evidence elsewhere in the file labeled nothing here.
+        if (fname != NULL && evidence.n != 0) {
+            uint64_t covered = 0;
+            for (size_t r = 0; r < evidence.n; ++r) {
+                for (size_t s = 0; s < nfuncs; ++s) {
+                    uint64_t lo = evidence.r[r].start > funcs[s].value
+                        ? evidence.r[r].start : funcs[s].value;
+                    uint64_t fend = funcs[s].value + funcs[s].size;
+                    uint64_t hi = evidence.r[r].end < fend
+                        ? evidence.r[r].end : fend;
+                    if (hi > lo) {
+                        covered += hi - lo;
+                    }
+                }
+            }
+            evidence_covered = covered;
+        }
         if (evidence.n != 0) {
             printf("  code evidence: %zu function symbols + %zu .eh_frame "
                 "FDEs + %zu Go pclntab functions covering %lu of %lu "
@@ -2075,7 +2257,14 @@ int main(int argc, char **argv)
         }
     }
 
-    if (funcs != NULL) {
+    if (fname != NULL) {
+        uint64_t fbytes = 0;
+        for (size_t s = 0; s < nfuncs; ++s) {
+            fbytes += funcs[s].size;
+        }
+        printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
+            fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
+    } else if (funcs != NULL) {
         printf("scan restricted to %zu function symbols (-a scans every byte)\n",
             nfuncs);
     }
@@ -2089,6 +2278,11 @@ out:
     x86lint_census_destroy(census_data);
     free(evidence.r);
     x86lint_summary_destroy(summary);
+    free(attr);
+    for (size_t s = 0; s < nstrtabs; ++s) {
+        free(strtabs[s]);
+    }
+    free(strtabs);
     free(shstrtab);
     free(funcs);
     free(buf);

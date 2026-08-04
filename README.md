@@ -684,6 +684,34 @@ binary can hold several executable sections -- a BOLT-processed library keeps
 the functions it did not move in `.bolt.org.text` beside those it moved into
 `.text` -- and without the banner their offsets are indistinguishable.
 
+When the binary kept its symbols, findings are also attributed to the
+function that holds them: each `-v` line gains a `(name+0xoff)` suffix
+that jumps straight to the site in a disassembler, and the summary adds
+a by-function companion table -- the top ten offenders, the tail summed
+into a residue line -- so a whole-binary count reads as "and here is
+where to start":
+
+```console
+Optimization opportunities by function:
+     356  __strcasecmp_l_sse2
+     356  __strncasecmp_l_sse2
+     252  __strcmp_sse2
+     ...
+   49334  in 32480 more functions
+```
+
+Attribution uses sized function symbols only; a finding in code reached
+through an unsized assembly label lands in an honest
+`outside every function range` row rather than the wrong neighbor.
+
+Pass `-f NAME` to restrict the scan to the one function named NAME --
+"lint just this function". Unlike the default restriction, `-f` also
+draws on the dynamic symbol table, so naming an exported function of a
+stripped library works; every sized symbol spelled NAME is scanned (a
+versioned export like glibc's two `memcpy`s has several sites), and the
+count line reflects only their instructions. `-f` combines with `-i`
+for a per-function census; see that section.
+
 Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` to declare that the
 binary's target supports those instruction-set extensions, enabling the
 checks that suggest replacing a baseline sequence with an instruction from
@@ -847,6 +875,25 @@ what its inputs were allowed to emit -- the same quantity the census
 measures from the bytes, and a cross-check on it). glibc above declares
 `needed = baseline`: it requires only v1, everything higher being reached
 through dispatch, exactly as the resolver count suggests.
+
+`-f NAME` narrows the census to the one named function, which turns
+"dispatch is present" into "and here is what each target actually uses"
+-- the per-target level question a whole-binary census cannot answer,
+one command per IFUNC variant:
+
+```console
+$ for fn in __memmove_avx512_unaligned_erms __memmove_avx_unaligned_erms \
+            __memmove_sse2_unaligned_erms; do
+>   ./x86lint -i -f $fn /usr/lib64/libc.so.6 | grep highest
+> done
+  highest psABI level: x86-64-v4
+  highest psABI level: x86-64-v3
+  highest psABI level: baseline x86-64 (v1)
+```
+
+The coverage figure on the `code evidence` line is clipped to the
+scanned slices, and the file-level lines (the property note, the
+resolver count) keep reporting the whole binary they describe.
 
 Extensions outside the levels -- AES-NI, PCLMULQDQ, SHA, ADX, CET, RTM, the
 post-v4 AVX-512 families (VNNI, VBMI, VAES, ...), APX -- are tallied on

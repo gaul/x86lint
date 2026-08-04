@@ -271,6 +271,30 @@ size_t x86lint_summary_instructions(const x86lint_summary *summary);
 // and jump tables), so coverage was incomplete. Returns 0 for a NULL summary.
 size_t x86lint_summary_skipped(const x86lint_summary *summary);
 
+// A named function's address range, for attributing findings to the
+// function that contains them.
+typedef struct {
+    uint64_t start;     // vaddr, inclusive
+    uint64_t end;       // vaddr, exclusive
+    const char *name;
+} x86lint_func_range;
+
+// Install the function ranges consulted when a finding is tallied: each
+// finding's address (the scan's vaddr plus the finding's offset) is
+// looked up here, verbose finding lines gain a "(name+0xoff)" suffix,
+// and the summary prints a by-function table beside the by-type one.
+// `funcs` must be sorted by start, non-overlapping, and outlive the
+// summary along with the names it points to; the summary does not copy
+// or free them. NULL/0 (the default) disables attribution.
+void x86lint_summary_set_functions(x86lint_summary *summary,
+                                   const x86lint_func_range *funcs,
+                                   size_t count);
+
+// Findings attributed to funcs[idx] of the installed table. Always 0
+// when no table is installed.
+size_t x86lint_summary_function_findings(const x86lint_summary *summary,
+                                         size_t idx);
+
 // A by-extension tally of every instruction decoded, mapped onto the x86-64
 // psABI micro-architecture levels, for auditing what a binary was compiled
 // for: x86-64-v2 (CMPXCHG16B, LAHF-SAHF, POPCNT, SSE3, SSSE3, SSE4.1,
@@ -403,12 +427,16 @@ enum x86lint_extensions {
 // binary with data in its code section can skip hundreds of thousands of
 // bytes. In verbose mode each finding is printed as a one-line summary
 // followed by its offending encoding; otherwise nothing is printed per finding
-// (the caller's summary is the whole report). If summary is non-NULL, every
-// finding is tallied into it by type and the decoded-instruction and
-// skipped-byte counts are accumulated. extensions is a bitwise OR of
+// (the caller's summary is the whole report). vaddr is the address of
+// inst[0], added to finding offsets when attributing them against the
+// summary's installed function table (pass 0 when addresses do not
+// matter). If summary is non-NULL, every finding is tallied into it by
+// type and function and the decoded-instruction and skipped-byte counts
+// are accumulated. extensions is a bitwise OR of
 // enum x86lint_extensions values; 0 restricts the scan to baseline x86-64
 // checks.
-int check_instructions(const uint8_t *inst, size_t len, bool verbose,
-                       x86lint_summary *summary, uint32_t extensions);
+int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
+                       bool verbose, x86lint_summary *summary,
+                       uint32_t extensions);
 
 #endif

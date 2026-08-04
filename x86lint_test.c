@@ -90,7 +90,7 @@ static int count_findings(const uint8_t *inst, size_t len,
     stdout = mem;
     // verbose=true so each finding prints its "<name> at offset:" line into
     // the captured buffer for the per-category count below.
-    int total = check_instructions(inst, len, true, NULL, extensions);
+    int total = check_instructions(inst, len, 0, true, NULL, extensions);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -5319,11 +5319,50 @@ static void check_decode_resync_test(void)
 
     x86lint_summary *summary = x86lint_summary_create();
     assert(summary != NULL);
-    int findings = check_instructions(inst, sizeof(inst), false, summary, 0);
+    int findings = check_instructions(inst, sizeof(inst), 0, false, summary, 0);
     assert(findings == 1);                              // not -1; scan continued
     assert(x86lint_summary_skipped(summary) == 1);      // the one bad byte
     assert(x86lint_summary_instructions(summary) == 2); // nop + push, not the byte
     x86lint_summary_destroy(summary);
+}
+
+static void summary_functions_test(void)
+{
+    // Two findings at offsets 0 and 7, one instruction between them, so
+    // with the scan based at 0x1000 the finding addresses are 0x1000
+    // (inside f1), and 0x1007 (past f2's end: outside every range).
+    static const uint8_t inst[] = {
+        0x68, 0x01, 0x00, 0x00, 0x00,  // push 0x1 (oversized immediate)
+        0x87, 0xc8,                    // xchg eax, ecx (oversized XCHG)
+        0x87, 0xc8,                    // xchg eax, ecx (oversized XCHG)
+    };
+    static const x86lint_func_range funcs[] = {
+        {0x1000, 0x1005, "f1"},
+        {0x1005, 0x1007, "f2"},
+    };
+
+    x86lint_summary *summary = x86lint_summary_create();
+    assert(summary != NULL);
+    x86lint_summary_set_functions(summary, funcs, 2);
+    int findings = check_instructions(inst, sizeof(inst), 0x1000, false,
+        summary, 0);
+    assert(findings == 3);
+    assert(x86lint_summary_function_findings(summary, 0) == 1);
+    assert(x86lint_summary_function_findings(summary, 1) == 1);
+    assert(x86lint_summary_function_findings(summary, 2) == 0);  // range check
+    x86lint_summary_destroy(summary);
+
+    // Without a table the accessor reads zero and scans are unaffected.
+    summary = x86lint_summary_create();
+    assert(summary != NULL);
+    assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary,
+        0) == 3);
+    assert(x86lint_summary_function_findings(summary, 0) == 0);
+    x86lint_summary_destroy(summary);
+
+    // NULL summary still tolerated with attribution in the code path.
+    assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
+        0) == 3);
 }
 
 static void census_test(void)
@@ -5495,6 +5534,7 @@ int main(int argc, char *argv[])
     check_missing_apx_setzu_test();
     check_endbr64_target_test();
     check_decode_resync_test();
+    summary_functions_test();
     census_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

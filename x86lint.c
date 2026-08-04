@@ -2574,6 +2574,15 @@ struct x86lint_summary {
     size_t count;
     size_t instructions;   // total decoded instructions across all runs
     size_t skipped;        // undecodable bytes skipped during resync
+    // Function attribution (x86lint_summary_set_functions): caller-owned
+    // sorted ranges, a parallel per-function tally, findings landing in
+    // no range, and the vaddr of the buffer currently being scanned
+    // (set by check_instructions from its vaddr argument).
+    const x86lint_func_range *funcs;
+    size_t nfuncs;
+    size_t *func_hits;
+    size_t nofunc_hits;
+    uint64_t base;
 };
 
 x86lint_summary *x86lint_summary_create(void)
@@ -2583,7 +2592,57 @@ x86lint_summary *x86lint_summary_create(void)
 
 void x86lint_summary_destroy(x86lint_summary *summary)
 {
+    if (summary != NULL) {
+        free(summary->func_hits);
+    }
     free(summary);
+}
+
+void x86lint_summary_set_functions(x86lint_summary *summary,
+                                   const x86lint_func_range *funcs,
+                                   size_t count)
+{
+    if (summary == NULL) {
+        return;
+    }
+    free(summary->func_hits);
+    summary->func_hits = count != 0 ? calloc(count, sizeof(size_t)) : NULL;
+    if (summary->func_hits == NULL) {   // includes allocation failure:
+        summary->funcs = NULL;          // attribution quietly stays off
+        summary->nfuncs = 0;
+        return;
+    }
+    summary->funcs = funcs;
+    summary->nfuncs = count;
+}
+
+size_t x86lint_summary_function_findings(const x86lint_summary *summary,
+                                         size_t idx)
+{
+    if (summary == NULL || summary->func_hits == NULL ||
+        idx >= summary->nfuncs) {
+        return 0;
+    }
+    return summary->func_hits[idx];
+}
+
+// The installed function containing vaddr, or nfuncs for none. Binary
+// search over the sorted, non-overlapping ranges.
+static size_t summary_func_at(const x86lint_summary *summary, uint64_t vaddr)
+{
+    size_t lo = 0;
+    size_t hi = summary->nfuncs;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (vaddr < summary->funcs[mid].start) {
+            hi = mid;
+        } else if (vaddr >= summary->funcs[mid].end) {
+            lo = mid + 1;
+        } else {
+            return mid;
+        }
+    }
+    return summary->nfuncs;
 }
 
 size_t x86lint_summary_instructions(const x86lint_summary *summary)
@@ -2597,12 +2656,23 @@ size_t x86lint_summary_skipped(const x86lint_summary *summary)
 }
 
 // Tally one finding by its name (a stable string literal owned by the check
-// table). Linear scan -- the table is tiny. Silently ignores a NULL summary
-// and the (cannot-happen with the current check set) overflow.
-static void summary_add(x86lint_summary *summary, const char *name)
+// table) and, when a function table is installed, by the function holding
+// the finding's address. Linear scan for the by-type entry -- the table is
+// tiny. Silently ignores a NULL summary and the (cannot-happen with the
+// current check set) overflow.
+static void summary_add(x86lint_summary *summary, const char *name,
+                        size_t offset)
 {
     if (summary == NULL || name == NULL) {
         return;
+    }
+    if (summary->func_hits != NULL) {
+        size_t k = summary_func_at(summary, summary->base + offset);
+        if (k < summary->nfuncs) {
+            summary->func_hits[k]++;
+        } else {
+            summary->nofunc_hits++;
+        }
     }
     for (size_t i = 0; i < summary->count; ++i) {
         if (strcmp(summary->entries[i].name, name) == 0) {
@@ -2651,6 +2721,61 @@ void x86lint_summary_print(const x86lint_summary *summary)
                 summary->entries[order[i]].name);
         }
         printf("\n");
+    }
+
+    // The by-function companion table: the top offenders, so a whole-binary
+    // count reads as "and here is where to start". Capped -- a large binary
+    // spreads findings over thousands of functions -- with the tail summed
+    // into a residue line, and findings outside every installed range (the
+    // -a scan reaches such bytes) reported as their own honest row.
+    if (summary->func_hits != NULL) {
+        size_t attributed = 0;
+        size_t nhit = 0;
+        for (size_t i = 0; i < summary->nfuncs; ++i) {
+            attributed += summary->func_hits[i];
+            nhit += summary->func_hits[i] != 0;
+        }
+        if (attributed + summary->nofunc_hits > 0) {
+            enum { TOP = 10 };
+            size_t top[TOP];
+            size_t ntop = 0;
+            for (size_t i = 0; i < summary->nfuncs; ++i) {
+                if (summary->func_hits[i] == 0) {
+                    continue;
+                }
+                size_t j = ntop;
+                while (j > 0 &&
+                       summary->func_hits[top[j - 1]] <
+                           summary->func_hits[i]) {
+                    if (j < TOP) {
+                        top[j] = top[j - 1];
+                    }
+                    --j;
+                }
+                if (j < TOP) {
+                    top[j] = i;
+                    if (ntop < TOP) {
+                        ++ntop;
+                    }
+                }
+            }
+            printf("Optimization opportunities by function:\n");
+            size_t shown = 0;
+            for (size_t i = 0; i < ntop; ++i) {
+                printf("  %6zu  %s\n", summary->func_hits[top[i]],
+                    summary->funcs[top[i]].name);
+                shown += summary->func_hits[top[i]];
+            }
+            if (nhit > ntop) {
+                printf("  %6zu  in %zu more functions\n",
+                    attributed - shown, nhit - ntop);
+            }
+            if (summary->nofunc_hits > 0) {
+                printf("  %6zu  outside every function range\n",
+                    summary->nofunc_hits);
+            }
+            printf("\n");
+        }
     }
 
     // Undecodable bytes mean the section interleaves data with code (common in
@@ -3143,10 +3268,12 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
 }
 
 // In verbose mode print a finding as a one-line summary -- the offending
-// instruction disassembled at its address -- followed by the raw encoding
-// indented beneath it. Non-verbose runs print nothing per finding; the
-// caller's summary is the whole report.
-static void report_finding(const char *name, size_t offset, bool verbose,
+// instruction disassembled at its address, suffixed with the containing
+// function when the summary carries a table -- followed by the raw
+// encoding indented beneath it. Non-verbose runs print nothing per
+// finding; the caller's summary is the whole report.
+static void report_finding(const x86lint_summary *summary, const char *name,
+                           size_t offset, bool verbose,
                            const xed_decoded_inst_t *xedd, const uint8_t *bytes)
 {
     if (!verbose) {
@@ -3158,7 +3285,16 @@ static void report_finding(const char *name, size_t offset, bool verbose,
                             offset, NULL, NULL)) {
         disasm[0] = '\0';
     }
-    printf("%s at offset: 0x%zx: %s\n", name, offset, disasm);
+    printf("%s at offset: 0x%zx", name, offset);
+    if (summary != NULL && summary->func_hits != NULL) {
+        uint64_t vaddr = summary->base + offset;
+        size_t k = summary_func_at(summary, vaddr);
+        if (k < summary->nfuncs) {
+            printf(" (%s+0x%lx)", summary->funcs[k].name,
+                (unsigned long) (vaddr - summary->funcs[k].start));
+        }
+    }
+    printf(": %s\n", disasm);
 
     printf("  ");
     int insn_len = xed_decoded_inst_get_length(xedd);
@@ -5753,10 +5889,17 @@ static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
                                   xmm_dep_mitigation);
 }
 
-int check_instructions(const uint8_t *inst, size_t len, bool verbose,
-                       x86lint_summary *summary, uint32_t extensions)
+int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
+                       bool verbose, x86lint_summary *summary,
+                       uint32_t extensions)
 {
     int errors = 0;
+
+    // Findings attribute against the installed function table at
+    // vaddr + offset; keep the base current for this buffer.
+    if (summary != NULL) {
+        summary->base = vaddr;
+    }
 
     // The immediately preceding decoded instruction, for the one backward-
     // looking gate (check_mov_self's already-zero-extended case). have_prev is
@@ -5855,8 +5998,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
                     continue;
                 }
             }
-            summary_add(summary, checks[i].name);
-            report_finding(checks[i].name, offset, verbose, &xedd,
+            summary_add(summary, checks[i].name, offset);
+            report_finding(summary, checks[i].name, offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5872,8 +6015,9 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         size_t redundant_test_offset;
         if (flags_test_redundant(inst, len, branch_targets, next, &xedd,
                                  &redundant_test, &redundant_test_offset)) {
-            summary_add(summary, "redundant TEST after flags");
-            report_finding("redundant TEST after flags", redundant_test_offset,
+            summary_add(summary, "redundant TEST after flags",
+                        redundant_test_offset);
+            report_finding(summary, "redundant TEST after flags", redundant_test_offset,
                 verbose, &redundant_test, inst + redundant_test_offset);
             ++errors;
         }
@@ -5883,8 +6027,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // against the lea (at `offset`), the removable instruction. See
         // lea_foldable_into_memop.
         if (lea_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "LEA foldable into memory");
-            report_finding("LEA foldable into memory", offset, verbose, &xedd,
+            summary_add(summary, "LEA foldable into memory", offset);
+            report_finding(summary, "LEA foldable into memory", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5893,8 +6037,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // next instruction's immediate, leaving reg dead. Reported against the
         // mov (at `offset`), the removable instruction. See mov_const_foldable.
         if (mov_const_foldable(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "MOV constant foldable");
-            report_finding("MOV constant foldable", offset, verbose, &xedd,
+            summary_add(summary, "MOV constant foldable", offset);
+            report_finding(summary, "MOV constant foldable", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5905,8 +6049,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // load_foldable_into_extend.
         if (load_foldable_into_extend(inst, len, branch_targets, next,
                                       &xedd)) {
-            summary_add(summary, "load foldable into extend");
-            report_finding("load foldable into extend", offset, verbose, &xedd,
+            summary_add(summary, "load foldable into extend", offset);
+            report_finding(summary, "load foldable into extend", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5916,8 +6060,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // the three-operand lea dest, [srcA + addend], saving the mov.
         // Reported against the mov (at `offset`). See mov_add_foldable_to_lea.
         if (mov_add_foldable_to_lea(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "MOV+ADD foldable to LEA");
-            report_finding("MOV+ADD foldable to LEA", offset, verbose, &xedd,
+            summary_add(summary, "MOV+ADD foldable to LEA", offset);
+            report_finding(summary, "MOV+ADD foldable to LEA", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5928,8 +6072,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // shift_pair_foldable_to_extend.
         if (shift_pair_foldable_to_extend(inst, len, branch_targets, next,
                                           &xedd)) {
-            summary_add(summary, "shift pair foldable into extend");
-            report_finding("shift pair foldable into extend", offset, verbose,
+            summary_add(summary, "shift pair foldable into extend", offset);
+            report_finding(summary, "shift pair foldable into extend", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }
@@ -5939,8 +6083,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // a byte shorter. Reported against the cmp (at `offset`). See
         // cmp_one_branch_foldable.
         if (cmp_one_branch_foldable(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "suboptimal CMP one");
-            report_finding("suboptimal CMP one", offset, verbose, &xedd,
+            summary_add(summary, "suboptimal CMP one", offset);
+            report_finding(summary, "suboptimal CMP one", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5950,8 +6094,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // Reported against the setcc (at `offset`). See redundant_test_after_setcc.
         if (redundant_test_after_setcc(inst, len, branch_targets, next,
                                        &xedd)) {
-            summary_add(summary, "redundant TEST after SETcc");
-            report_finding("redundant TEST after SETcc", offset, verbose, &xedd,
+            summary_add(summary, "redundant TEST after SETcc", offset);
+            report_finding(summary, "redundant TEST after SETcc", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5963,8 +6107,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         xed_decoded_inst_t inverting_xor;
         if (setcc_xor_one_invertible(inst, len, branch_targets, next, &xedd,
                                      &inverting_xor)) {
-            summary_add(summary, "suboptimal SETcc inversion");
-            report_finding("suboptimal SETcc inversion", offset, verbose, &xedd,
+            summary_add(summary, "suboptimal SETcc inversion", offset);
+            report_finding(summary, "suboptimal SETcc inversion", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -5987,12 +6131,12 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if (setcc_movzx_zero_extend(inst, len, branch_targets, next, &xedd,
                                     &widen_movzx)) {
             if ((extensions & X86LINT_EXT_APX) != 0) {
-                summary_add(summary, "missing APX SETZU");
-                report_finding("missing APX SETZU", offset, verbose, &xedd,
+                summary_add(summary, "missing APX SETZU", offset);
+                report_finding(summary, "missing APX SETZU", offset, verbose, &xedd,
                     inst + offset);
             } else {
-                summary_add(summary, "suboptimal SETcc zero-extension");
-                report_finding("suboptimal SETcc zero-extension", next,
+                summary_add(summary, "suboptimal SETcc zero-extension", next);
+                report_finding(summary, "suboptimal SETcc zero-extension", next,
                     verbose, &widen_movzx, inst + next);
             }
             ++errors;
@@ -6004,8 +6148,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // not_and_foldable_to_andn.
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             not_and_foldable_to_andn(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "missing ANDN");
-            report_finding("missing ANDN", offset, verbose, &xedd,
+            summary_add(summary, "missing ANDN", offset);
+            report_finding(summary, "missing ANDN", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6016,8 +6160,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // lea_and_foldable_to_blsr.
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             lea_and_foldable_to_blsr(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "missing BLSR");
-            report_finding("missing BLSR", offset, verbose, &xedd,
+            summary_add(summary, "missing BLSR", offset);
+            report_finding(summary, "missing BLSR", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6029,8 +6173,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             lea_xor_foldable_to_blsmsk(inst, len, branch_targets, next,
                                        &xedd)) {
-            summary_add(summary, "missing BLSMSK");
-            report_finding("missing BLSMSK", offset, verbose, &xedd,
+            summary_add(summary, "missing BLSMSK", offset);
+            report_finding(summary, "missing BLSMSK", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6042,8 +6186,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             mov_neg_and_foldable_to_blsi(inst, len, branch_targets, next,
                                          &xedd)) {
-            summary_add(summary, "missing BLSI");
-            report_finding("missing BLSI", offset, verbose, &xedd,
+            summary_add(summary, "missing BLSI", offset);
+            report_finding(summary, "missing BLSI", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6060,8 +6204,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         else if ((extensions & X86LINT_EXT_APX) != 0 &&
             mov_op_foldable_to_apx_ndd(inst, len, branch_targets, next,
                                        &xedd)) {
-            summary_add(summary, "missing APX NDD");
-            report_finding("missing APX NDD", offset, verbose, &xedd,
+            summary_add(summary, "missing APX NDD", offset);
+            report_finding(summary, "missing APX NDD", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6073,8 +6217,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         if ((extensions & X86LINT_EXT_MOVBE) != 0 &&
             mov_bswap_foldable_to_movbe(inst, len, branch_targets, next,
                                         &xedd)) {
-            summary_add(summary, "missing MOVBE");
-            report_finding("missing MOVBE", offset, verbose, &xedd,
+            summary_add(summary, "missing MOVBE", offset);
+            report_finding(summary, "missing MOVBE", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6088,8 +6232,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // instruction. See redundant_reextension.
         if (have_prev && redundant_reextension(&prev, &xedd) &&
             !branch_target_in(branch_targets, offset, offset + 1)) {
-            summary_add(summary, "redundant re-extension");
-            report_finding("redundant re-extension", offset, verbose, &xedd,
+            summary_add(summary, "redundant re-extension", offset);
+            report_finding(summary, "redundant re-extension", offset, verbose, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6100,8 +6244,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // cores; a zero idiom just before the count breaks it. See
         // popcnt_false_dep.
         if (popcnt_false_dep(&xedd, &dep_history)) {
-            summary_add(summary, "missing POPCNT dependency break");
-            report_finding("missing POPCNT dependency break", offset, verbose,
+            summary_add(summary, "missing POPCNT dependency break", offset);
+            report_finding(summary, "missing POPCNT dependency break", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }
@@ -6112,8 +6256,8 @@ int check_instructions(const uint8_t *inst, size_t len, bool verbose,
         // predecessor did not rewrite carries a false dependency; a vector
         // zero idiom just before breaks it. See sse_merge_false_dep.
         if (sse_merge_false_dep(&xedd, &dep_history)) {
-            summary_add(summary, "missing SSE dependency break");
-            report_finding("missing SSE dependency break", offset, verbose,
+            summary_add(summary, "missing SSE dependency break", offset);
+            report_finding(summary, "missing SSE dependency break", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }

@@ -122,6 +122,37 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# A census fixture carrying the toolchain ISA accounting (-mneeded style):
+# ISA_1_NEEDED says baseline+v2, ISA_1_USED all four levels. Properties in
+# one note must be sorted by ascending pr_type: NEEDED (0xc0008002) before
+# USED (0xc0010002).
+cat >"$dir/isanote.s" <<'EOF'
+    .section .note.gnu.property,"a",@note
+    .p2align 3
+    .long 1f - 0f                       # n_namesz
+    .long 3f - 2f                       # n_descsz
+    .long 5                             # NT_GNU_PROPERTY_TYPE_0
+0:  .asciz "GNU"
+1:  .p2align 3
+2:  .long 0xc0008002                    # GNU_PROPERTY_X86_ISA_1_NEEDED
+    .long 4
+    .long 0x3                           # baseline | v2
+    .long 0
+    .long 0xc0010002                    # GNU_PROPERTY_X86_ISA_1_USED
+    .long 4
+    .long 0xf                           # baseline | v2 | v3 | v4
+    .long 0
+3:
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0xf3, 0x0f, 0xb8, 0xc0        # popcnt eax, eax (v2)
+    .byte 0xc3                          # ret (baseline)
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # CET fixtures for -e. The .note.gnu.property section is the same note gcc
 # emits under -fcf-protection (the linker merges it through to the output):
 # cetgood declares IBT+SHSTK and pads its entry point, cetbad declares IBT
@@ -248,7 +279,7 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi notrack census; do
+for f in finding clean bmi notrack census isanote; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -327,8 +358,16 @@ expect '^  x86-64-v2: POPCNT \(1\)$'
 expect '^  x86-64-v3: AVX2 \(1\)$'
 expect '^  x86-64-v4: none$'
 expect '^  highest psABI level: x86-64-v3$'
+# Depending on the host binutils, the fixture link either carries no ISA
+# property at all or a synthesized empty ISA_1_USED word; both spellings
+# are correct census output for "the toolchain recorded nothing usable".
+expect '^  GNU property ISA note: (none|used = 0)$'
 expect '^  IFUNC resolvers defined: 0$'
 reject 'optimization opportunities' "lint tail in census mode"
+
+# A binary whose toolchain recorded its ISA levels reports both words.
+run 0 -i "$dir/isanote"
+expect '^  GNU property ISA note: needed = x86-64-baseline\+x86-64-v2, used = x86-64-baseline\+x86-64-v2\+x86-64-v3\+x86-64-v4$'
 
 # The census ignores the symbol-table scan restriction (the out-of-function
 # xchg byte pair decodes and counts) and a baseline-only binary says so.

@@ -823,6 +823,7 @@ ISA census: 356358 instructions, 0 undecodable bytes skipped
   x86-64-v4: AVX512F (2038), AVX512BW (1709), AVX512DQ (3)
   outside the psABI levels: CET (3706), RTM (46), PKU (3)
   highest psABI level: x86-64-v4
+  GNU property ISA note: needed = x86-64-baseline, used = x86-64-baseline+x86-64-v2+x86-64-v3+x86-64-v4
   IFUNC resolvers defined: 141 (runtime CPU dispatch present)
 ```
 
@@ -836,8 +837,14 @@ runtime-probed feature word, which no static count can see). Deciding what
 the binary *requires* would mean proving which instructions execute
 unconditionally on the path from entry, which the instruction stream cannot
 evidence; the census states what the compiler was allowed to emit anywhere,
-and leaves requirement to the note that can prove it (a
-`GNU_PROPERTY_X86_ISA_1_NEEDED` property, when present, is authoritative).
+and reports the note that can state requirement when the toolchain recorded
+one: the `GNU property ISA note` line prints the
+`GNU_PROPERTY_X86_ISA_1_NEEDED` word (authoritative -- the loader refuses to
+run the binary below that level) and the `_USED` word (the linker's union of
+what its inputs were allowed to emit -- the same quantity the census
+measures from the bytes, and a cross-check on it). glibc above declares
+`needed = baseline`: it requires only v1, everything higher being reached
+through dispatch, exactly as the resolver count suggests.
 
 Extensions outside the levels -- AES-NI, PCLMULQDQ, SHA, ADX, CET, RTM, the
 post-v4 AVX-512 families (VNNI, VBMI, VAES, ...), APX -- are tallied on

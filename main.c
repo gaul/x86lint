@@ -261,18 +261,19 @@ static uint8_t *load_section(FILE *f, const Elf64_Shdr *shdr,
     return buf;
 }
 
-// The GNU property note's GNU_PROPERTY_X86_FEATURE_1_AND word: an
-// NT_GNU_PROPERTY_TYPE_0 note named "GNU" holding the CET feature bits,
-// IBT (bit 0) and SHSTK (bit 1). The loader enables enforcement from
-// exactly these bits, so the word is the binary's claim of correctness;
-// returns 0 when no note carries it. Property notes are 8-aligned in
-// ELF64; other note sections (build-id) use 4, hence the per-section
-// alignment. Each property is {u32 pr_type, u32 pr_datasz, data padded
-// to 8}.
-static uint32_t elf_feature_1_and(FILE *f, const Elf64_Shdr *sh,
-                                  uint64_t shnum, uint64_t file_size)
+// One word from the GNU property note (an NT_GNU_PROPERTY_TYPE_0 note named
+// "GNU"): pr_type selects which -- GNU_PROPERTY_X86_FEATURE_1_AND holds the
+// CET bits the loader enables enforcement from, GNU_PROPERTY_X86_ISA_1_NEEDED
+// and _USED hold the psABI level masks the toolchain recorded (what the
+// binary requires to run at all vs. what it was allowed to emit anywhere).
+// *out is written only when the word is present; the return value says so.
+// Property notes are 8-aligned in ELF64; other note sections (build-id) use
+// 4, hence the per-section alignment. Each property is {u32 pr_type,
+// u32 pr_datasz, data padded to 8}.
+static bool elf_property_word(FILE *f, const Elf64_Shdr *sh, uint64_t shnum,
+                              uint64_t file_size, uint32_t want_pr_type,
+                              uint32_t *out)
 {
-    uint32_t feat = 0;
     bool found = false;
     for (uint64_t i = 0; i < shnum && !found; ++i) {
         if (sh[i].sh_type != SHT_NOTE) {
@@ -310,10 +311,8 @@ static uint32_t elf_feature_1_and(FILE *f, const Elf64_Shdr *sh,
                     if (pr_datasz > dend - (p + 8)) {
                         break;
                     }
-                    if (!found &&
-                        pr_type == GNU_PROPERTY_X86_FEATURE_1_AND &&
-                        pr_datasz >= 4) {
-                        memcpy(&feat, buf + p + 8, 4);
+                    if (!found && pr_type == want_pr_type && pr_datasz >= 4) {
+                        memcpy(out, buf + p + 8, 4);
                         found = true;
                     }
                     p += 8 + (((uint64_t) pr_datasz + 7) & ~(uint64_t) 7);
@@ -323,6 +322,16 @@ static uint32_t elf_feature_1_and(FILE *f, const Elf64_Shdr *sh,
         }
         free(buf);
     }
+    return found;
+}
+
+// The CET feature word, for the -e pass; returns 0 when no note carries it.
+static uint32_t elf_feature_1_and(FILE *f, const Elf64_Shdr *sh,
+                                  uint64_t shnum, uint64_t file_size)
+{
+    uint32_t feat = 0;
+    elf_property_word(f, sh, shnum, file_size, GNU_PROPERTY_X86_FEATURE_1_AND,
+        &feat);
     return feat;
 }
 
@@ -886,6 +895,30 @@ static long count_ifuncs(FILE *f, const char *path, const Elf64_Ehdr *ehdr,
     return best;
 }
 
+// Spell a GNU_PROPERTY_X86_ISA_1_* mask as its psABI level names, plus any
+// residue bits a future psABI level would add, so the output never silently
+// drops a bit it does not know.
+static void print_isa_mask(uint32_t mask)
+{
+    static const char *const names[] = {
+        "x86-64-baseline", "x86-64-v2", "x86-64-v3", "x86-64-v4",
+    };
+    if (mask == 0) {
+        printf("0");
+        return;
+    }
+    bool first = true;
+    for (int b = 0; b < 4; ++b) {
+        if (mask & (1u << b)) {
+            printf("%s%s", first ? "" : "+", names[b]);
+            first = false;
+        }
+    }
+    if ((mask & ~0xfu) != 0) {
+        printf("%s0x%x", first ? "" : "+", (unsigned) (mask & ~0xfu));
+    }
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
@@ -1225,6 +1258,45 @@ int main(int argc, char **argv)
 
     if (census) {
         x86lint_census_print(census_data, verbose);
+
+        // The toolchain's own ISA accounting, when it recorded one:
+        // ISA_1_NEEDED is the authoritative baseline requirement (the loader
+        // refuses to run the binary below it), ISA_1_USED the linker's union
+        // of what the objects were allowed to emit anywhere -- the same
+        // quantity the census measures from the bytes.
+        if (shnum != 0) {
+            Elf64_Shdr *sh = malloc(shnum * sizeof(*sh));
+            if (sh == NULL ||
+                !read_at(f, (long) ehdr.e_shoff, sh, shnum * sizeof(*sh))) {
+                fprintf(stderr, "%s: failed to read section headers\n", path);
+                free(sh);
+                goto out;
+            }
+            uint32_t needed = 0;
+            uint32_t used = 0;
+            bool have_needed = elf_property_word(f, sh, shnum, file_size,
+                GNU_PROPERTY_X86_ISA_1_NEEDED, &needed);
+            bool have_used = elf_property_word(f, sh, shnum, file_size,
+                GNU_PROPERTY_X86_ISA_1_USED, &used);
+            free(sh);
+            if (have_needed || have_used) {
+                printf("  GNU property ISA note:");
+                if (have_needed) {
+                    printf(" needed = ");
+                    print_isa_mask(needed);
+                }
+                if (have_used) {
+                    printf("%s used = ", have_needed ? "," : "");
+                    print_isa_mask(used);
+                }
+                printf("\n");
+            } else {
+                printf("  GNU property ISA note: none\n");
+            }
+        } else {
+            printf("  GNU property ISA note: none\n");
+        }
+
         long ifuncs = count_ifuncs(f, path, &ehdr, shnum, file_size);
         if (ifuncs < 0) {
             goto out;

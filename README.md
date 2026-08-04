@@ -877,6 +877,8 @@ extension to check at a disassembler prompt before trusting a small count,
 and the zero-`none` shape plus the skipped-bytes counter bound how much
 could have been misread.
 
+## Mining tools
+
 `tools/` holds the research utilities that feed x86lint's check backlog,
 built separately with `XED_PATH=/path/to/xed make tools`:
 
@@ -896,6 +898,17 @@ built separately with `XED_PATH=/path/to/xed make tools`:
   statistic can see: dead definitions, redundant reloads of one address,
   re-materialized constants, and zero compares of a value whose producer
   already set the flags.
+* `tools/cohere` measured whether cheap per-instruction "coherence"
+  signals -- run length between undecodable gaps, gap adjacency, and
+  three-walk self-synchronization consensus -- can separate real
+  instructions from phantom decodes of data-in-text, toward gating the
+  census. All three fail on ground truth (a GHC binary's phantom x87
+  reaches 92% consensus: self-sync is a decoder property, and junk
+  converges onto its own stable chain); what separates every tested
+  case instead is toolchain evidence, `.symtab` ranges and `.eh_frame`
+  FDEs. The tool's header records the measurements; the census keeps
+  reporting raw tallies plus honesty metrics until that evidence
+  labeling is built.
 
 Both restrict the scan to the symbol table's function ranges exactly as
 the driver does, so no pair or distance spans two functions or is mined

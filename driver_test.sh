@@ -361,6 +361,10 @@ expect '^  x86-64-v3: AVX2 \(1\)$'
 expect '^  x86-64-v4: none$'
 expect '^  x87 legacy FP: 1 \(control/env 1, 80-bit operands 0, other 0\)$'
 expect '^  highest psABI level: x86-64-v3$'
+# The fixture's sized _start is the code evidence; every byte is inside
+# it, so no family carries an unevidenced annotation.
+expect '^  code evidence: 1 function symbols \+ 0 .eh_frame FDEs covering 11 of 11 executable bytes$'
+reject 'unevidenced' "unevidenced annotation with full coverage"
 # Depending on the host binutils, the fixture link either carries no ISA
 # property at all or a synthesized empty ISA_1_USED word; both spellings
 # are correct census output for "the toolchain recorded nothing usable".
@@ -378,6 +382,10 @@ run 0 -i "$dir/finding"
 expect '^ISA census: 5 instructions, 0 undecodable bytes skipped$'
 expect '^  x87 legacy FP: none$'
 expect '^  highest psABI level: baseline x86-64 \(v1\)$'
+# The out-of-function xchg decodes and counts, but lies outside the
+# sized _start -- the census scans it and labels it.
+expect '^  baseline x86-64 \(v1\): 5 \(1 unevidenced\)$'
+expect '^  code evidence: 1 function symbols \+ 0 .eh_frame FDEs covering 11 of 13 executable bytes$'
 reject 'scan restricted' "restricted-scan line in census mode"
 
 # -i -v adds per-extension sample addresses.

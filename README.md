@@ -824,6 +824,7 @@ ISA census: 356358 instructions, 0 undecodable bytes skipped
   outside the psABI levels: CET (3706), RTM (46), PKU (3)
   x87 legacy FP: 428 (control/env 34, 80-bit operands 124, other 270)
   highest psABI level: x86-64-v4
+  code evidence: 9899 function symbols + 3791 .eh_frame FDEs covering 1481413 of 1514109 executable bytes
   GNU property ISA note: needed = x86-64-baseline, used = x86-64-baseline+x86-64-v2+x86-64-v3+x86-64-v4
   IFUNC resolvers defined: 141 (runtime CPU dispatch present)
 ```
@@ -877,6 +878,25 @@ extension to check at a disassembler prompt before trusting a small count,
 and the zero-`none` shape plus the skipped-bytes counter bound how much
 could have been misread.
 
+The census also labels every tally against the bytes the toolchain
+recorded as code -- sized function symbols from `.symtab` and `.dynsym`
+(stripped distro libraries keep the latter), and `.eh_frame` FDE
+pc-ranges -- because no property of the instruction stream itself can
+tell a real instruction from a phantom: `tools/cohere` measured run
+length, gap adjacency, and self-synchronization consensus all failing
+at exactly that (a GHC binary's phantom x87 reaches 92% consensus;
+junk converges onto its own stable decode chain). A family with hits
+outside all evidence prints as `FAM (n, u unevidenced)`, and the
+`code evidence` line reports what backed the labels. The semantics are
+deliberately asymmetric: *inside* evidence lends trust -- OpenSSL's
+`XOP (88)` carries no annotation because every hit sits in a real
+function, and they are indeed its Bulldozer SHA-1 paths -- while
+*unevidenced* means only "no toolchain claim", never "phantom": GHC
+emits no FDEs for Haskell code, so a shellcheck census flags all 30864
+x87 hits (correctly: they are info tables), but real Haskell code is
+equally unlabeled there. Evidence quality varies by build; when a
+binary has none at all, nothing is labeled and the line says so.
+
 ## Mining tools
 
 `tools/` holds the research utilities that feed x86lint's check backlog,
@@ -906,9 +926,9 @@ built separately with `XED_PATH=/path/to/xed make tools`:
   reaches 92% consensus: self-sync is a decoder property, and junk
   converges onto its own stable chain); what separates every tested
   case instead is toolchain evidence, `.symtab` ranges and `.eh_frame`
-  FDEs. The tool's header records the measurements; the census keeps
-  reporting raw tallies plus honesty metrics until that evidence
-  labeling is built.
+  FDEs. The tool's header records the measurements; the census's
+  evidence labeling (the `unevidenced` annotations and `code evidence`
+  line) is what they argued into existence.
 
 Both restrict the scan to the symbol table's function ranges exactly as
 the driver does, so no pair or distance spans two functions or is mined

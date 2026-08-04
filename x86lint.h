@@ -332,6 +332,35 @@ enum x86lint_x87_kind {
 size_t x86lint_census_x87_count(const x86lint_census *census,
                                 enum x86lint_x87_kind kind);
 
+// Code-evidence labeling. The census cannot tell a real instruction from
+// a phantom decode of data-in-text (tools/cohere measured every cheap
+// coherence heuristic failing at exactly that), but the toolchain often
+// recorded which bytes it meant as code: sized STT_FUNC symbols and
+// .eh_frame FDE pc-ranges. With evidence installed, every tally is also
+// counted as evidenced or not, and the report annotates families whose
+// hits fall outside all evidence. The semantics are asymmetric by
+// design: inside evidence lends trust; outside means only "no toolchain
+// claim" -- GHC emits no FDEs for Haskell code, some builds strip unwind
+// tables -- never "phantom".
+typedef struct {
+    uint64_t start;     // vaddr, inclusive
+    uint64_t end;       // vaddr, exclusive
+} x86lint_evidence_range;
+
+// Install the evidence ranges consulted by subsequent scans. `ranges`
+// must be sorted by start, non-overlapping, and outlive the census; the
+// census does not copy or free them. NULL/0 (the default) disables
+// labeling: nothing is counted unevidenced and no annotations print.
+void x86lint_census_set_evidence(x86lint_census *census,
+                                 const x86lint_evidence_range *ranges,
+                                 size_t count);
+
+// Instructions tallied at one psABI level (same buckets as
+// x86lint_census_level_count) whose site lay outside every evidence
+// range. Always 0 when no evidence is installed.
+size_t x86lint_census_level_unevidenced(const x86lint_census *census,
+                                        int level);
+
 // Highest of levels 2..4 with a nonzero tally, else 1 (baseline).
 int x86lint_census_highest_level(const x86lint_census *census);
 

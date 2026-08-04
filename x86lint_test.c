@@ -5369,6 +5369,24 @@ static void census_test(void)
     assert(x86lint_census_level_count(census, 1) == 3);
     assert(x86lint_census_level_count(census, 2) == 1);
     assert(x86lint_census_highest_level(census) == 2);
+    // Without evidence installed nothing is labeled.
+    assert(x86lint_census_level_unevidenced(census, 1) == 0);
+    assert(x86lint_census_level_unevidenced(census, 2) == 0);
+    x86lint_census_destroy(census);
+
+    // Evidence labeling: a range covering only the first two
+    // instructions leaves faddp (level 1) and fisttp (level 2)
+    // unevidenced. Labeling happens at scan time, so the evidence is
+    // installed first.
+    census = x86lint_census_create();
+    assert(census != NULL);
+    static const x86lint_evidence_range evidence[] = {{0x3000, 0x3004}};
+    x86lint_census_set_evidence(census, evidence, 1);
+    x86lint_census_scan(census, x87, sizeof(x87), 0x3000);
+    assert(x86lint_census_level_count(census, 1) == 3);
+    assert(x86lint_census_level_unevidenced(census, 1) == 1);
+    assert(x86lint_census_level_unevidenced(census, 2) == 1);
+    assert(x86lint_census_level_unevidenced(census, 0) == 0);
     x86lint_census_destroy(census);
 
     // Undecodable bytes resync one at a time and tally as skipped, and a
@@ -5396,6 +5414,8 @@ static void census_test(void)
     assert(x86lint_census_skipped(NULL) == 0);
     assert(x86lint_census_level_count(NULL, 3) == 0);
     assert(x86lint_census_x87_count(NULL, X86LINT_X87_CONTROL) == 0);
+    assert(x86lint_census_level_unevidenced(NULL, 1) == 0);
+    x86lint_census_set_evidence(NULL, NULL, 0);
     assert(x86lint_census_highest_level(NULL) == 1);
     x86lint_census_destroy(NULL);
 }

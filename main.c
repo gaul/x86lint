@@ -895,6 +895,417 @@ static long count_ifuncs(FILE *f, const char *path, const Elf64_Ehdr *ehdr,
     return best;
 }
 
+// ==== code evidence for the census ===================================
+//
+// Ranges of bytes the toolchain recorded as code: sized STT_FUNC symbols
+// from .symtab and .dynsym, and .eh_frame FDE pc-ranges. The census
+// labels tallies against these (see x86lint_census_set_evidence);
+// tools/cohere is the measurement that put this here after every cheap
+// coherence heuristic failed. Collection is best-effort by design --
+// evidence is optional metadata, so a malformed table or an exotic
+// pointer encoding ends or skips parsing rather than failing the run,
+// and whatever was gathered before still labels (missing evidence only
+// widens the honest "no toolchain claim" bucket).
+
+struct evidence_build {
+    x86lint_evidence_range *r;
+    size_t n;
+    size_t cap;
+};
+
+static bool evidence_push(struct evidence_build *b, uint64_t start,
+                          uint64_t end)
+{
+    if (end <= start) {
+        return true;
+    }
+    if (b->n == b->cap) {
+        size_t cap = b->cap == 0 ? 64 : b->cap * 2;
+        x86lint_evidence_range *r = realloc(b->r, cap * sizeof(*r));
+        if (r == NULL) {
+            return false;
+        }
+        b->r = r;
+        b->cap = cap;
+    }
+    b->r[b->n].start = start;
+    b->r[b->n].end = end;
+    b->n++;
+    return true;
+}
+
+static bool read_uleb(const uint8_t *buf, uint64_t limit, uint64_t *off,
+                      uint64_t *out)
+{
+    uint64_t v = 0;
+    unsigned shift = 0;
+    while (*off < limit && shift < 64) {
+        uint8_t byte = buf[(*off)++];
+        v |= (uint64_t) (byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            *out = v;
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+static bool read_sleb(const uint8_t *buf, uint64_t limit, uint64_t *off,
+                      int64_t *out)
+{
+    uint64_t v = 0;
+    unsigned shift = 0;
+    while (*off < limit && shift < 64) {
+        uint8_t byte = buf[(*off)++];
+        v |= (uint64_t) (byte & 0x7f) << shift;
+        shift += 7;
+        if ((byte & 0x80) == 0) {
+            if (shift < 64 && (byte & 0x40) != 0) {
+                v |= ~UINT64_C(0) << shift;
+            }
+            *out = (int64_t) v;
+            return true;
+        }
+    }
+    return false;
+}
+
+// One DW_EH_PE-encoded pointer at buf[*off], advancing past it. `pc` is
+// the vaddr of the field, the base pcrel values are relative to. Only
+// the encodings compilers emit into .eh_frame are supported: the fixed
+// and LEB formats with absolute or pcrel application. Anything else
+// (datarel, aligned, indirect) returns false and the caller skips the
+// entry -- conservative, never wrong.
+static bool read_eh_pointer(const uint8_t *buf, uint64_t limit,
+                            uint64_t *off, uint8_t enc, uint64_t pc,
+                            uint64_t *out)
+{
+    if (enc == 0xff) {          // DW_EH_PE_omit
+        return false;
+    }
+    uint64_t v;
+    switch (enc & 0x0f) {
+    case 0x00:                  // absptr
+    case 0x04:                  // udata8
+    case 0x0c: {                // sdata8
+        if (limit - *off < 8 || *off > limit) {
+            return false;
+        }
+        memcpy(&v, buf + *off, 8);
+        *off += 8;
+        break;
+    }
+    case 0x01: {                // uleb128
+        if (!read_uleb(buf, limit, off, &v)) {
+            return false;
+        }
+        break;
+    }
+    case 0x09: {                // sleb128
+        int64_t sv;
+        if (!read_sleb(buf, limit, off, &sv)) {
+            return false;
+        }
+        v = (uint64_t) sv;
+        break;
+    }
+    case 0x02: {                // udata2
+        uint16_t u;
+        if (limit - *off < 2 || *off > limit) {
+            return false;
+        }
+        memcpy(&u, buf + *off, 2);
+        *off += 2;
+        v = u;
+        break;
+    }
+    case 0x0a: {                // sdata2
+        int16_t s;
+        if (limit - *off < 2 || *off > limit) {
+            return false;
+        }
+        memcpy(&s, buf + *off, 2);
+        *off += 2;
+        v = (uint64_t) (int64_t) s;
+        break;
+    }
+    case 0x03: {                // udata4
+        uint32_t u;
+        if (limit - *off < 4 || *off > limit) {
+            return false;
+        }
+        memcpy(&u, buf + *off, 4);
+        *off += 4;
+        v = u;
+        break;
+    }
+    case 0x0b: {                // sdata4
+        int32_t s;
+        if (limit - *off < 4 || *off > limit) {
+            return false;
+        }
+        memcpy(&s, buf + *off, 4);
+        *off += 4;
+        v = (uint64_t) (int64_t) s;
+        break;
+    }
+    default:
+        return false;
+    }
+    switch (enc & 0x70) {
+    case 0x00:                  // absolute
+        break;
+    case 0x10:                  // pcrel
+        v += pc;
+        break;
+    default:
+        return false;
+    }
+    if ((enc & 0x80) != 0) {    // indirect
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+// Walk .eh_frame collecting FDE pc-ranges. Each entry is {u32 length,
+// u32 id, ...}: id 0 is a CIE, whose augmentation string dictates how
+// its FDEs encode their pointers; any other id is an FDE whose id field
+// points back that many bytes to its CIE. Returns the FDE count parsed.
+static size_t parse_eh_frame(const uint8_t *buf, uint64_t size,
+                             uint64_t sec_vaddr, struct evidence_build *b)
+{
+    struct {
+        uint64_t off;
+        uint8_t enc;
+        bool usable;
+    } cies[64];
+    size_t ncies = 0;
+    size_t nfdes = 0;
+
+    uint64_t off = 0;
+    while (off + 8 <= size) {
+        uint32_t len32;
+        memcpy(&len32, buf + off, 4);
+        off += 4;
+        if (len32 == 0) {           // terminator
+            break;
+        }
+        if (len32 == 0xffffffffu) { // 64-bit DWARF: unseen in .eh_frame
+            break;
+        }
+        if (len32 > size - off) {
+            break;
+        }
+        uint64_t next = off + len32;
+        uint64_t id_off = off;
+        uint32_t id;
+        if (next - off < 4) {
+            break;
+        }
+        memcpy(&id, buf + off, 4);
+        off += 4;
+
+        if (id == 0) {
+            // CIE: dig the 'R' (FDE pointer encoding) out of the
+            // augmentation, defaulting to absptr when there is none.
+            uint8_t enc = 0x00;
+            bool usable = true;
+            if (off >= next) {
+                break;
+            }
+            uint8_t version = buf[off++];
+            if (version != 1 && version != 3 && version != 4) {
+                usable = false;
+            }
+            const uint8_t *nul = memchr(buf + off, 0, next - off);
+            if (nul == NULL) {
+                break;
+            }
+            const char *aug = (const char *) buf + off;
+            off = (uint64_t) (nul - buf) + 1;
+            if (usable && version == 4) {
+                if (next - off < 2 || buf[off + 1] != 0) {
+                    usable = false;     // segmented: not supported
+                } else {
+                    off += 2;           // address_size, segment_size
+                }
+            }
+            uint64_t uleb;
+            int64_t sleb;
+            if (usable &&
+                (!read_uleb(buf, next, &off, &uleb) ||      // code align
+                 !read_sleb(buf, next, &off, &sleb))) {     // data align
+                usable = false;
+            }
+            if (usable) {               // return-address register
+                if (version == 1) {
+                    if (off >= next) {
+                        usable = false;
+                    } else {
+                        off++;
+                    }
+                } else if (!read_uleb(buf, next, &off, &uleb)) {
+                    usable = false;
+                }
+            }
+            if (usable && aug[0] == 'z') {
+                uint64_t aug_len;
+                if (!read_uleb(buf, next, &off, &aug_len) ||
+                    aug_len > next - off) {
+                    usable = false;
+                }
+                for (const char *a = aug + 1; usable && *a != '\0'; ++a) {
+                    switch (*a) {
+                    case 'R':
+                        if (off >= next) {
+                            usable = false;
+                        } else {
+                            enc = buf[off++];
+                        }
+                        break;
+                    case 'L':
+                        if (off >= next) {
+                            usable = false;
+                        } else {
+                            off++;      // LSDA encoding byte
+                        }
+                        break;
+                    case 'P': {
+                        // Personality: an encoding byte then a pointer
+                        // in that encoding, skipped by reading it.
+                        if (off >= next) {
+                            usable = false;
+                            break;
+                        }
+                        uint8_t penc = buf[off++];
+                        uint64_t ignored;
+                        if (!read_eh_pointer(buf, next, &off, penc,
+                                             sec_vaddr + off, &ignored)) {
+                            usable = false;
+                        }
+                        break;
+                    }
+                    case 'S':           // signal frame
+                    case 'B':           // BTI/PAuth markers
+                        break;
+                    default:
+                        usable = false;
+                    }
+                }
+            } else if (usable && aug[0] != '\0') {
+                usable = false;         // legacy "eh" augmentation
+            }
+            if (ncies < sizeof(cies) / sizeof(cies[0])) {
+                cies[ncies].off = id_off - 4;   // CIE starts at its length
+                cies[ncies].enc = enc;
+                cies[ncies].usable = usable;
+                ncies++;
+            }
+        } else {
+            // FDE: its id field holds the distance back to its CIE.
+            uint64_t cie_off;
+            if ((uint64_t) id > id_off) {
+                off = next;
+                continue;
+            }
+            cie_off = id_off - id;
+            uint8_t enc = 0x00;
+            bool usable = false;
+            for (size_t c = 0; c < ncies; ++c) {
+                if (cies[c].off == cie_off) {
+                    enc = cies[c].enc;
+                    usable = cies[c].usable;
+                    break;
+                }
+            }
+            uint64_t loc;
+            uint64_t range;
+            if (usable &&
+                read_eh_pointer(buf, next, &off, enc, sec_vaddr + off,
+                                &loc) &&
+                // address_range shares the format but is an absolute
+                // count: mask the application bits off.
+                read_eh_pointer(buf, next, &off, enc & 0x0f,
+                                sec_vaddr + off, &range) &&
+                range < UINT64_MAX - loc) {
+                if (!evidence_push(b, loc, loc + range)) {
+                    return nfdes;
+                }
+                nfdes++;
+            }
+        }
+        off = next;
+    }
+    return nfdes;
+}
+
+// Sized function symbols from one symbol table section.
+static size_t evidence_from_symtab(FILE *f, const Elf64_Shdr *shdr,
+                                   uint64_t file_size,
+                                   struct evidence_build *b)
+{
+    if (shdr->sh_entsize != sizeof(Elf64_Sym)) {
+        return 0;
+    }
+    uint8_t *raw = load_section(f, shdr, file_size);
+    if (raw == NULL) {
+        return 0;
+    }
+    const Elf64_Sym *syms = (const Elf64_Sym *) raw;
+    size_t nsyms = shdr->sh_size / sizeof(Elf64_Sym);
+    size_t pushed = 0;
+    for (size_t s = 0; s < nsyms; ++s) {
+        unsigned type = ELF64_ST_TYPE(syms[s].st_info);
+        if ((type != STT_FUNC && type != STT_GNU_IFUNC) ||
+            syms[s].st_shndx == SHN_UNDEF || syms[s].st_value == 0 ||
+            syms[s].st_size == 0 ||
+            syms[s].st_size > UINT64_MAX - syms[s].st_value) {
+            continue;
+        }
+        if (!evidence_push(b, syms[s].st_value,
+                           syms[s].st_value + syms[s].st_size)) {
+            break;
+        }
+        pushed++;
+    }
+    free(raw);
+    return pushed;
+}
+
+static int evidence_cmp(const void *a, const void *b)
+{
+    const x86lint_evidence_range *ra = a;
+    const x86lint_evidence_range *rb = b;
+    return ra->start < rb->start ? -1 : ra->start > rb->start ? 1 : 0;
+}
+
+// Sort, merge overlaps in place (FDEs duplicate symbol ranges all the
+// time), and return the merged count; *covered gets the byte total.
+static size_t evidence_merge(x86lint_evidence_range *r, size_t n,
+                             uint64_t *covered)
+{
+    *covered = 0;
+    if (n == 0) {
+        return 0;
+    }
+    qsort(r, n, sizeof(*r), evidence_cmp);
+    size_t out = 0;
+    for (size_t i = 1; i < n; ++i) {
+        if (r[i].start <= r[out].end) {
+            if (r[i].end > r[out].end) {
+                r[out].end = r[i].end;
+            }
+        } else {
+            *covered += r[out].end - r[out].start;
+            r[++out] = r[i];
+        }
+    }
+    *covered += r[out].end - r[out].start;
+    return out + 1;
+}
+
 // Spell a GNU_PROPERTY_X86_ISA_1_* mask as its psABI level names, plus any
 // residue bits a future psABI level would add, so the output never silently
 // drops a bit it does not know.
@@ -983,6 +1394,11 @@ int main(int argc, char **argv)
     uint8_t *buf = NULL;
     x86lint_summary *summary = NULL;
     x86lint_census *census_data = NULL;
+    struct evidence_build evidence = {NULL, 0, 0};
+    size_t evidence_funcs = 0;
+    size_t evidence_fdes = 0;
+    uint64_t evidence_covered = 0;
+    uint64_t exec_bytes = 0;
     struct func_sym *funcs = NULL;
     size_t nfuncs = 0;
     char *shstrtab = NULL;
@@ -1139,7 +1555,7 @@ int main(int argc, char **argv)
     // the table costs the names and nothing else. e_shstrndx holds
     // SHN_XINDEX when the real index does not fit, with the value in section
     // header 0's sh_link (the same overflow convention as e_shnum).
-    if ((verbose || endbr) && shnum != 0) {
+    if ((verbose || endbr || census) && shnum != 0) {
         uint64_t strndx = ehdr.e_shstrndx;
         if (strndx == SHN_XINDEX) {
             Elf64_Shdr shdr0;
@@ -1181,6 +1597,40 @@ int main(int argc, char **argv)
         if (census_data == NULL) {
             fprintf(stderr, "%s: failed to allocate the ISA census\n", path);
             goto out;
+        }
+
+        // Code evidence, gathered before the scan so every tally can be
+        // labeled. Relocatable objects are skipped: their symbol values
+        // are section-relative and their .eh_frame unrelocated, so
+        // ranges would land in the wrong address space.
+        if (ehdr.e_type != ET_REL) {
+            for (uint64_t i = 0; i < shnum; ++i) {
+                Elf64_Shdr shdr;
+                if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)),
+                             &shdr, sizeof(shdr))) {
+                    break;
+                }
+                if (shdr.sh_type == SHT_SYMTAB ||
+                    shdr.sh_type == SHT_DYNSYM) {
+                    evidence_funcs +=
+                        evidence_from_symtab(f, &shdr, file_size, &evidence);
+                } else if (shdr.sh_type == SHT_PROGBITS &&
+                           shstrtab != NULL &&
+                           shdr.sh_name < shstrtab_size &&
+                           strcmp(shstrtab + shdr.sh_name, ".eh_frame") ==
+                               0) {
+                    uint8_t *frame = load_section(f, &shdr, file_size);
+                    if (frame != NULL) {
+                        evidence_fdes += parse_eh_frame(frame, shdr.sh_size,
+                            shdr.sh_addr, &evidence);
+                        free(frame);
+                    }
+                }
+            }
+            evidence.n = evidence_merge(evidence.r, evidence.n,
+                &evidence_covered);
+            x86lint_census_set_evidence(census_data, evidence.r,
+                evidence.n);
         }
     }
 
@@ -1224,6 +1674,7 @@ int main(int argc, char **argv)
             // The census only tallies; its report prints once, after the
             // loop, aggregated across sections.
             x86lint_census_scan(census_data, buf, shdr.sh_size, shdr.sh_addr);
+            exec_bytes += shdr.sh_size;
             free(buf);
             buf = NULL;
             continue;
@@ -1258,6 +1709,20 @@ int main(int argc, char **argv)
 
     if (census) {
         x86lint_census_print(census_data, verbose);
+
+        // What backed the unevidenced labels -- or that nothing did, in
+        // which case no instruction was labeled and the whole census
+        // carries the same "no toolchain claim" weight.
+        if (evidence.n != 0) {
+            printf("  code evidence: %zu function symbols + %zu .eh_frame "
+                "FDEs covering %lu of %lu executable bytes\n",
+                evidence_funcs, evidence_fdes,
+                (unsigned long) evidence_covered,
+                (unsigned long) exec_bytes);
+        } else {
+            printf("  code evidence: none (no sized function symbols, no "
+                "parsable .eh_frame)\n");
+        }
 
         // The toolchain's own ISA accounting, when it recorded one:
         // ISA_1_NEEDED is the authoritative baseline requirement (the loader
@@ -1332,6 +1797,7 @@ int main(int argc, char **argv)
 
 out:
     x86lint_census_destroy(census_data);
+    free(evidence.r);
     x86lint_summary_destroy(summary);
     free(shstrtab);
     free(funcs);

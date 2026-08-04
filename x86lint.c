@@ -2680,7 +2680,42 @@ struct x86lint_census {
     size_t x87[3];
     uint64_t x87_other_samples[CENSUS_SAMPLES];
     uint8_t x87_other_nsamples;
+    // Code evidence (see x86lint_census_set_evidence): borrowed sorted
+    // ranges, and per-set / x87-family tallies of the hits outside all
+    // of them.
+    const x86lint_evidence_range *evidence;
+    size_t nevidence;
+    size_t unevidenced[XED_ISA_SET_LAST];
+    size_t x87_unevidenced;
 };
+
+void x86lint_census_set_evidence(x86lint_census *census,
+                                 const x86lint_evidence_range *ranges,
+                                 size_t count)
+{
+    if (census == NULL) {
+        return;
+    }
+    census->evidence = ranges;
+    census->nevidence = count;
+}
+
+static bool evidence_contains(const x86lint_census *census, uint64_t vaddr)
+{
+    size_t lo = 0;
+    size_t hi = census->nevidence;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (vaddr < census->evidence[mid].start) {
+            hi = mid;
+        } else if (vaddr >= census->evidence[mid].end) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
 
 x86lint_census *x86lint_census_create(void)
 {
@@ -2869,9 +2904,17 @@ void x86lint_census_scan(x86lint_census *census, const uint8_t *inst,
             if (census->nsamples[s] < CENSUS_SAMPLES) {
                 census->samples[s][census->nsamples[s]++] = vaddr + i;
             }
+            bool unevidenced = census->nevidence != 0 &&
+                !evidence_contains(census, vaddr + i);
+            if (unevidenced) {
+                census->unevidenced[s]++;
+            }
             if (isa_set_is_x87(s)) {
                 enum x86lint_x87_kind kind = x87_kind(&xedd);
                 census->x87[kind]++;
+                if (unevidenced) {
+                    census->x87_unevidenced++;
+                }
                 if (kind == X86LINT_X87_OTHER &&
                     census->x87_other_nsamples < CENSUS_SAMPLES) {
                     census->x87_other_samples[census->x87_other_nsamples++] =
@@ -2882,6 +2925,22 @@ void x86lint_census_scan(x86lint_census *census, const uint8_t *inst,
         census->instructions++;
         i += xed_decoded_inst_get_length(&xedd);
     }
+}
+
+size_t x86lint_census_level_unevidenced(const x86lint_census *census,
+                                        int level)
+{
+    if (census == NULL) {
+        return 0;
+    }
+    size_t total = 0;
+    for (int s = 0; s < XED_ISA_SET_LAST; ++s) {
+        if (census->unevidenced[s] != 0 &&
+            isa_set_level((xed_isa_set_enum_t) s) == level) {
+            total += census->unevidenced[s];
+        }
+    }
+    return total;
 }
 
 size_t x86lint_census_x87_count(const x86lint_census *census,
@@ -2926,13 +2985,15 @@ int x86lint_census_highest_level(const x86lint_census *census)
 // One "  <label>: FAM (n), FAM (n), ..." line for a level, families by
 // descending count with ties broken by name, "none" when the level is
 // unused. Zero counts are printed as "none" rather than omitted so two
-// census runs diff line-for-line.
+// census runs diff line-for-line. With evidence installed, a family
+// with hits outside all of it prints as "FAM (n, u unevidenced)".
 static void census_print_level(const x86lint_census *census, int level,
                                const char *label)
 {
     struct {
         char name[32];
         size_t count;
+        size_t unev;
     } fams[XED_ISA_SET_LAST];
     size_t nfams = 0;
 
@@ -2950,9 +3011,11 @@ static void census_print_level(const x86lint_census *census, int level,
         if (k == nfams) {
             snprintf(fams[k].name, sizeof(fams[k].name), "%s", name);
             fams[k].count = 0;
+            fams[k].unev = 0;
             ++nfams;
         }
         fams[k].count += census->counts[s];
+        fams[k].unev += census->unevidenced[s];
     }
 
     printf("  %s: ", label);
@@ -2977,9 +3040,16 @@ static void census_print_level(const x86lint_census *census, int level,
             size_t tcount = fams[i].count;
             fams[i].count = fams[best].count;
             fams[best].count = tcount;
+            size_t tunev = fams[i].unev;
+            fams[i].unev = fams[best].unev;
+            fams[best].unev = tunev;
         }
-        printf("%s%s (%zu)", i == 0 ? "" : ", ", fams[i].name,
+        printf("%s%s (%zu", i == 0 ? "" : ", ", fams[i].name,
             fams[i].count);
+        if (fams[i].unev != 0) {
+            printf(", %zu unevidenced", fams[i].unev);
+        }
+        printf(")");
     }
     printf("\n");
 }
@@ -2992,8 +3062,13 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
 
     printf("ISA census: %zu instructions, %zu undecodable bytes skipped\n",
         census->instructions, census->skipped);
-    printf("  baseline x86-64 (v1): %zu\n",
+    printf("  baseline x86-64 (v1): %zu",
         x86lint_census_level_count(census, 1));
+    size_t base_unev = x86lint_census_level_unevidenced(census, 1);
+    if (base_unev != 0) {
+        printf(" (%zu unevidenced)", base_unev);
+    }
+    printf("\n");
     census_print_level(census, 2, "x86-64-v2");
     census_print_level(census, 3, "x86-64-v3");
     census_print_level(census, 4, "x86-64-v4");
@@ -3010,9 +3085,13 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
         printf("  x87 legacy FP: none\n");
     } else {
         printf("  x87 legacy FP: %zu (control/env %zu, 80-bit operands %zu, "
-            "other %zu)\n", x87_total, census->x87[X86LINT_X87_CONTROL],
+            "other %zu", x87_total, census->x87[X86LINT_X87_CONTROL],
             census->x87[X86LINT_X87_EIGHTY_BIT],
             census->x87[X86LINT_X87_OTHER]);
+        if (census->x87_unevidenced != 0) {
+            printf("; %zu unevidenced", census->x87_unevidenced);
+        }
+        printf(")\n");
     }
 
     int highest = x86lint_census_highest_level(census);

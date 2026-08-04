@@ -310,6 +310,28 @@ size_t x86lint_census_skipped(const x86lint_census *census);
 // x86-64-v2..v4, 0 = extensions outside the levels.
 size_t x86lint_census_level_count(const x86lint_census *census, int level);
 
+// The x87 line is a cross-cutting annotation: x87-family instructions
+// (isa-sets X87, FCMOV, FCOMI, and SSE3X87's FISTTP) keep their psABI
+// level in the counts above -- x87 IS baseline -- and are additionally
+// split three ways here. Control/env covers the FPU-state instructions
+// (FLDCW, FNSTSW, FNSAVE, ...) that ordinary fenv manipulation emits;
+// 80-bit covers any instruction touching a ten-byte memory operand,
+// the long-double traffic the SysV ABI legitimately routes through x87.
+// The split exists because intent is only judgeable per binary, not per
+// instruction: legitimate long-double code is dominated by bare
+// register-stack arithmetic between its FLDT/FSTPT edges, so "other"
+// beside 80-bit traffic reads as long-double implementation, while
+// "other" in a binary with ZERO 80-bit operands cannot be long double
+// and reads as -mfpmath=387 leakage or ported 32-bit assembly.
+enum x86lint_x87_kind {
+    X86LINT_X87_CONTROL,     // FPU environment/state management
+    X86LINT_X87_EIGHTY_BIT,  // touches an 80-bit (tbyte) memory operand
+    X86LINT_X87_OTHER,       // register-stack arithmetic, narrow loads, ...
+};
+
+size_t x86lint_census_x87_count(const x86lint_census *census,
+                                enum x86lint_x87_kind kind);
+
 // Highest of levels 2..4 with a nonzero tally, else 1 (baseline).
 int x86lint_census_highest_level(const x86lint_census *census);
 

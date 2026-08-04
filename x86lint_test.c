@@ -5347,6 +5347,28 @@ static void census_test(void)
     assert(x86lint_census_level_count(census, 4) == 1);
     assert(x86lint_census_level_count(census, 0) == 1);
     assert(x86lint_census_highest_level(census) == 4);
+    assert(x86lint_census_x87_count(census, X86LINT_X87_OTHER) == 0);
+    x86lint_census_destroy(census);
+
+    // The x87 annotation splits per instruction: control/env, 80-bit
+    // memory operands, bare-stack "other". FISTTP (isa-set SSE3X87)
+    // counts at v2 in the ladder AND joins the x87 line.
+    census = x86lint_census_create();
+    assert(census != NULL);
+    static const uint8_t x87[] = {
+        0xd9, 0x28,  // fldcw [rax] (control/env)
+        0xdb, 0x28,  // fld tbyte ptr [rax] (80-bit)
+        0xde, 0xc1,  // faddp st(1), st (other)
+        0xdb, 0x08,  // fisttp dword ptr [rax] (v2 + other)
+    };
+    x86lint_census_scan(census, x87, sizeof(x87), 0x3000);
+    assert(x86lint_census_instructions(census) == 4);
+    assert(x86lint_census_x87_count(census, X86LINT_X87_CONTROL) == 1);
+    assert(x86lint_census_x87_count(census, X86LINT_X87_EIGHTY_BIT) == 1);
+    assert(x86lint_census_x87_count(census, X86LINT_X87_OTHER) == 2);
+    assert(x86lint_census_level_count(census, 1) == 3);
+    assert(x86lint_census_level_count(census, 2) == 1);
+    assert(x86lint_census_highest_level(census) == 2);
     x86lint_census_destroy(census);
 
     // Undecodable bytes resync one at a time and tally as skipped, and a
@@ -5373,6 +5395,7 @@ static void census_test(void)
     assert(x86lint_census_instructions(NULL) == 0);
     assert(x86lint_census_skipped(NULL) == 0);
     assert(x86lint_census_level_count(NULL, 3) == 0);
+    assert(x86lint_census_x87_count(NULL, X86LINT_X87_CONTROL) == 0);
     assert(x86lint_census_highest_level(NULL) == 1);
     x86lint_census_destroy(NULL);
 }

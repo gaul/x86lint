@@ -2673,6 +2673,13 @@ struct x86lint_census {
     uint8_t nsamples[XED_ISA_SET_LAST];
     size_t instructions;
     size_t skipped;
+    // The x87 annotation (see enum x86lint_x87_kind in the header). Only
+    // the "other" bucket keeps samples: control/env and 80-bit sites are
+    // expected in ordinary binaries, but bare-stack arithmetic is what a
+    // reader chases to judge whether x87 was intended.
+    size_t x87[3];
+    uint64_t x87_other_samples[CENSUS_SAMPLES];
+    uint8_t x87_other_nsamples;
 };
 
 x86lint_census *x86lint_census_create(void)
@@ -2803,6 +2810,45 @@ static void census_display_name(xed_isa_set_enum_t s, bool fold, char *out,
     }
 }
 
+// The x87 family for the census annotation: the legacy stack FPU proper,
+// its P6-era conditional forms, and SSE3's FISTTP (an x87 instruction
+// gated on the SSE3 CPUID bit -- it converts from st(0), so its presence
+// is x87-usage evidence even though the ladder counts it at v2).
+static bool isa_set_is_x87(xed_isa_set_enum_t s)
+{
+    return s == XED_ISA_SET_X87 || s == XED_ISA_SET_FCMOV ||
+        s == XED_ISA_SET_FCOMI || s == XED_ISA_SET_SSE3X87;
+}
+
+// Split one x87-family instruction for the annotation. Per-instruction
+// facts only -- intent is judged per binary (see the header comment on
+// enum x86lint_x87_kind).
+static enum x86lint_x87_kind x87_kind(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_FLDCW:
+    case XED_ICLASS_FNSTCW:
+    case XED_ICLASS_FNSTSW:
+    case XED_ICLASS_FNCLEX:
+    case XED_ICLASS_FNINIT:
+    case XED_ICLASS_FWAIT:
+    case XED_ICLASS_FLDENV:
+    case XED_ICLASS_FNSTENV:
+    case XED_ICLASS_FNSAVE:
+    case XED_ICLASS_FRSTOR:
+        return X86LINT_X87_CONTROL;
+    default:
+        break;
+    }
+    unsigned n = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (unsigned i = 0; i < n; ++i) {
+        if (xed_decoded_inst_get_memory_operand_length(xedd, i) == 10) {
+            return X86LINT_X87_EIGHTY_BIT;
+        }
+    }
+    return X86LINT_X87_OTHER;
+}
+
 void x86lint_census_scan(x86lint_census *census, const uint8_t *inst,
                          size_t len, uint64_t vaddr)
 {
@@ -2823,10 +2869,28 @@ void x86lint_census_scan(x86lint_census *census, const uint8_t *inst,
             if (census->nsamples[s] < CENSUS_SAMPLES) {
                 census->samples[s][census->nsamples[s]++] = vaddr + i;
             }
+            if (isa_set_is_x87(s)) {
+                enum x86lint_x87_kind kind = x87_kind(&xedd);
+                census->x87[kind]++;
+                if (kind == X86LINT_X87_OTHER &&
+                    census->x87_other_nsamples < CENSUS_SAMPLES) {
+                    census->x87_other_samples[census->x87_other_nsamples++] =
+                        vaddr + i;
+                }
+            }
         }
         census->instructions++;
         i += xed_decoded_inst_get_length(&xedd);
     }
+}
+
+size_t x86lint_census_x87_count(const x86lint_census *census,
+                                enum x86lint_x87_kind kind)
+{
+    if (census == NULL || (int) kind < 0 || (int) kind > X86LINT_X87_OTHER) {
+        return 0;
+    }
+    return census->x87[kind];
 }
 
 size_t x86lint_census_level_count(const x86lint_census *census, int level)
@@ -2935,6 +2999,22 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
     census_print_level(census, 4, "x86-64-v4");
     census_print_level(census, 0, "outside the psABI levels");
 
+    // Cross-cutting annotation, not a level: these instructions are also
+    // counted above (x87 is baseline; FISTTP is v2). "other" beside 80-bit
+    // traffic reads as long-double implementation; "other" with zero
+    // 80-bit operands cannot be long double and points at -mfpmath=387
+    // leakage or ported 32-bit assembly.
+    size_t x87_total = census->x87[X86LINT_X87_CONTROL] +
+        census->x87[X86LINT_X87_EIGHTY_BIT] + census->x87[X86LINT_X87_OTHER];
+    if (x87_total == 0) {
+        printf("  x87 legacy FP: none\n");
+    } else {
+        printf("  x87 legacy FP: %zu (control/env %zu, 80-bit operands %zu, "
+            "other %zu)\n", x87_total, census->x87[X86LINT_X87_CONTROL],
+            census->x87[X86LINT_X87_EIGHTY_BIT],
+            census->x87[X86LINT_X87_OTHER]);
+    }
+
     int highest = x86lint_census_highest_level(census);
     if (highest > 1) {
         printf("  highest psABI level: x86-64-v%d\n", highest);
@@ -2964,6 +3044,20 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
         if (census->counts[s] > census->nsamples[s]) {
             printf(" (+%zu more)",
                 census->counts[s] - census->nsamples[s]);
+        }
+        printf("\n");
+    }
+    // The x87 "other" sites are the ones a reader chases to judge intent;
+    // the level-1 sample suppression above would otherwise hide them.
+    if (census->x87_other_nsamples > 0) {
+        printf("    x87 other at");
+        for (uint8_t k = 0; k < census->x87_other_nsamples; ++k) {
+            printf("%s 0x%" PRIx64, k == 0 ? "" : ",",
+                census->x87_other_samples[k]);
+        }
+        if (census->x87[X86LINT_X87_OTHER] > census->x87_other_nsamples) {
+            printf(" (+%zu more)",
+                census->x87[X86LINT_X87_OTHER] - census->x87_other_nsamples);
         }
         printf("\n");
     }

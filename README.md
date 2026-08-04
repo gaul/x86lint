@@ -822,6 +822,7 @@ ISA census: 356358 instructions, 0 undecodable bytes skipped
   x86-64-v3: AVX2 (3368), AVX (3015), BMI1 (532), BMI2 (146), LZCNT (27), MOVBE (16)
   x86-64-v4: AVX512F (2038), AVX512BW (1709), AVX512DQ (3)
   outside the psABI levels: CET (3706), RTM (46), PKU (3)
+  x87 legacy FP: 428 (control/env 34, 80-bit operands 124, other 270)
   highest psABI level: x86-64-v4
   GNU property ISA note: needed = x86-64-baseline, used = x86-64-baseline+x86-64-v2+x86-64-v3+x86-64-v4
   IFUNC resolvers defined: 141 (runtime CPU dispatch present)
@@ -849,7 +850,24 @@ through dispatch, exactly as the resolver count suggests.
 Extensions outside the levels -- AES-NI, PCLMULQDQ, SHA, ADX, CET, RTM, the
 post-v4 AVX-512 families (VNNI, VBMI, VAES, ...), APX -- are tallied on
 their own line and never raise the level verdict, since no `-march=x86-64-vN`
-implies them. The v4 line folds XED's per-width isa-sets into their CPUID
+implies them.
+
+The `x87 legacy FP` line is a cross-cutting annotation, not a level: the
+x87-family instructions (isa-sets X87, FCMOV, FCOMI, plus SSE3's FISTTP)
+keep their place in the level counts -- x87 *is* baseline -- and are
+additionally split into FPU control/environment instructions (`FLDCW`,
+`FNSTSW`, ..., what ordinary `fesetround` compiles to), instructions
+touching an 80-bit `tbyte` memory operand, and everything else. The split
+exists because intent is only judgeable per binary, never per instruction:
+the SysV ABI deliberately keeps `long double` on x87, and a legitimate
+long-double function is dominated by bare register-stack arithmetic
+between its `FLDT`/`FSTPT` edges (glibc's own line above reads exactly so:
+`strtold` and `printf %%Lf` machinery). "Other" *beside* 80-bit traffic is
+long-double implementation; "other" in a binary with **zero** 80-bit
+operands cannot be long double, and reads as `-mfpmath=387` leakage or
+assembly ported from 32-bit habits -- Fedora's `libavutil` is a live
+specimen (`x87 legacy FP: 19 (control/env 4, 80-bit operands 0, other
+15)`), and `-v`'s `x87 other at ...` samples lead straight to the sites. The v4 line folds XED's per-width isa-sets into their CPUID
 feature (`AVX512F_512`, `AVX512F_128` and the mask ops all count as
 `AVX512F`); levels with no hits print `none` so two censuses diff
 line-for-line. The census always scans every executable byte (the

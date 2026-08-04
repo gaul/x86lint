@@ -109,7 +109,8 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-# Census fixture for -i: one v2 instruction, one v3, the rest baseline.
+# Census fixture for -i: one v2 instruction, one v3, one x87 control
+# instruction, the rest baseline.
 cat >"$dir/census.s" <<'EOF'
     .text
     .globl _start
@@ -117,6 +118,7 @@ cat >"$dir/census.s" <<'EOF'
 _start:
     .byte 0xf3, 0x0f, 0xb8, 0xc0        # popcnt eax, eax (v2)
     .byte 0xc5, 0xfd, 0xfc, 0xc0        # vpaddb ymm0, ymm0, ymm0 (v3 AVX2)
+    .byte 0xd9, 0x28                    # fldcw [rax] (x87 control/env)
     .byte 0xc3                          # ret (baseline)
     .size _start, . - _start
     .section .note.GNU-stack, "", @progbits
@@ -353,10 +355,11 @@ expect '^1 optimization opportunities in 3 instructions$'
 # -i replaces the lint scan with the ISA census: levels attributed, the
 # verdict line present, and none of the lint report's furniture.
 run 0 -i "$dir/census"
-expect '^ISA census: 3 instructions, 0 undecodable bytes skipped$'
+expect '^ISA census: 4 instructions, 0 undecodable bytes skipped$'
 expect '^  x86-64-v2: POPCNT \(1\)$'
 expect '^  x86-64-v3: AVX2 \(1\)$'
 expect '^  x86-64-v4: none$'
+expect '^  x87 legacy FP: 1 \(control/env 1, 80-bit operands 0, other 0\)$'
 expect '^  highest psABI level: x86-64-v3$'
 # Depending on the host binutils, the fixture link either carries no ISA
 # property at all or a synthesized empty ISA_1_USED word; both spellings
@@ -373,6 +376,7 @@ expect '^  GNU property ISA note: needed = x86-64-baseline\+x86-64-v2, used = x8
 # xchg byte pair decodes and counts) and a baseline-only binary says so.
 run 0 -i "$dir/finding"
 expect '^ISA census: 5 instructions, 0 undecodable bytes skipped$'
+expect '^  x87 legacy FP: none$'
 expect '^  highest psABI level: baseline x86-64 \(v1\)$'
 reject 'scan restricted' "restricted-scan line in census mode"
 

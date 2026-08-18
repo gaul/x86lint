@@ -2141,8 +2141,19 @@ static uint32_t flag_set_to_mask(const xed_flag_set_t *fs)
 // unconditional ones and distinguishes them only by the instruction-level
 // may_write marker, so the walk keeps a concern live across any may_write
 // instruction.
-static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
-                             uint32_t concerns)
+// The walk proper, with one opt-in refinement: when `call_kills` is set, a
+// CALL concludes DEAD rather than LIVE, by the same ABI argument the RET case
+// rests on -- neither the SysV nor the Win64 ABI preserves flags across
+// calls, so the callee (and the code resuming after it) receives them
+// undefined and cannot legitimately read the caller's values. The general
+// walk (the flags_live_after wrapper below, and every established caller)
+// keeps the conservative reading of a call as unknown control flow;
+// shift_test_redundant opts in because its motivating consumer branches
+// straight to a cold-path call (rustc's panic_count::is_zero_slow_path),
+// which the conservative reading would suppress wholesale.
+static bool flags_live_after_ext(const uint8_t *inst, size_t len,
+                                 size_t offset, uint32_t concerns,
+                                 bool call_kills)
 {
     const int MAX_LOOKAHEAD = 16;
     uint32_t live = concerns;
@@ -2156,6 +2167,9 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
 
         xed_category_enum_t category = xed_decoded_inst_get_category(&xedd);
         if (category == XED_CATEGORY_RET) {
+            return false;
+        }
+        if (call_kills && category == XED_CATEGORY_CALL) {
             return false;
         }
         if (category == XED_CATEGORY_CALL ||
@@ -2184,6 +2198,12 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
     }
 
     return live != 0;
+}
+
+static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
+                             uint32_t concerns)
+{
+    return flags_live_after_ext(inst, len, offset, concerns, false);
 }
 
 // Instruction classes that unconditionally overwrite bits 32-63 of a GPR when
@@ -3633,6 +3653,173 @@ static bool flags_test_redundant(const uint8_t *inst, size_t len,
         // Arithmetic producers diverge from the test on CF/OF; suppress while
         // either might still be read past the test.
         if (divergent != 0 && flags_live_after(inst, len, after, divergent)) {
+            return false;
+        }
+        *test_offset_out = cur;
+        return true;
+    }
+    return false;
+}
+
+// Multi-instruction peephole, the shift sibling of flags_test_redundant. A
+// SHL/SHR/SAR of a register whose count is statically nonzero -- an immediate
+// whose masked value (& 63 for 64-bit operands, & 31 otherwise) is not zero,
+// or the by-one D0/D1 forms -- sets SF/ZF/PF from its result exactly as
+// test reg, reg on that register would, so the test recomputes flags the
+// shift already produced:
+//
+//   shl rax, 1 ; test rax, rax ; jne L   ->   shl rax, 1 ; jne L
+//
+// The general fold excludes shifts because a CL or masked-to-zero count
+// writes no flags (see flags_test_redundant); a statically nonzero count
+// closes exactly that hole. The SDM defines SF/ZF/PF "according to the
+// result" for every nonzero masked count (oversized counts included), so
+// those three duplicate the test's unconditionally. The divergence is CF/OF:
+// the test clears both where the shift leaves CF = the last bit shifted out
+// (undefined for oversized counts) and OF defined only for count 1 -- so, as
+// with the arithmetic producers, CF and OF must be dead past the test.
+//
+// Unlike the arithmetic producers, the dominant real-world consumer is a
+// branch: rustc/LLVM emit shl rax, 1 ; test rax, rax ; jne for libstd's
+// panic-counter check (x & ~(1 << 63)) == 0 -- X86ISelDAGToDAG's
+// immediate-TEST shrink builds the SHL behind the shl-to-add pattern's back,
+// and LLVM's compare peephole refuses shift counts 1-3 to keep the SHL
+// convertible to LEA, leaving hundreds of dead tests in ordinary Rust
+// binaries. The straight-line CF/OF walk is conservative at any branch, so
+// that consumer gets the cmp_one_branch_foldable treatment instead: when the
+// instruction after the test is a Jcc reading neither CF nor OF (JZ/JNZ,
+// JS/JNS, JP/JNP), both successors are walked (an out-of-buffer target is
+// conservatively rejected). Any other follower takes the straight-line walk.
+// Every walk here uses the call-kills reading (flags_live_after_ext): flags
+// do not survive a call in either ABI -- the argument the walk's RET case
+// already rests on -- and the panic-counter branch targets the cold-path
+// call directly, so the conservative reading would suppress the very shape
+// this fold exists for.
+// No guard is needed against an edge onto the Jcc itself: the Jcc is not
+// rewritten, and a path that jumps straight to it never executed the test,
+// so its flags arrive unchanged either way.
+//
+// Register destinations only (the CL form carries CL in REG1 and is not
+// statically nonzero, cf. check_shl_one; a memory destination produces no
+// register for the test to read). Rotates are no producers -- ROL/ROR write
+// only CF/OF, never SF/ZF/PF -- and SHLD/SHRD are left out: an oversized
+// count leaves their result undefined, not merely their CF. The test must
+// match the shift's register at its exact width, may sit past
+// flags_gap_transparent instructions within the shared window, and no direct
+// edge may enter between producer and test. Reported at the test, the
+// removable instruction. Composes with check_shl_one: shl reg, 1 ->
+// add reg, reg preserves every flag this fold reasons about, so both
+// rewrites apply together (add rax, rax ; jne).
+static bool shift_test_redundant(const uint8_t *inst, size_t len,
+                                 const uint8_t *branch_targets,
+                                 size_t after_producer,
+                                 const xed_decoded_inst_t *producer,
+                                 xed_decoded_inst_t *test_out,
+                                 size_t *test_offset_out)
+{
+    switch (xed_decoded_inst_get_iclass(producer)) {
+    case XED_ICLASS_SHL:
+    case XED_ICLASS_SHR:
+    case XED_ICLASS_SAR:
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(producer) > 0) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(producer, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    // The CL-count form carries the count register as REG1 (cf.
+    // check_shl_one); its runtime count may mask to zero, writing no flags.
+    if (xed_decoded_inst_get_reg(producer, XED_OPERAND_REG1) == XED_REG_CL) {
+        return false;
+    }
+    // The D0/D1 forms encode a count of 1 implicitly; the C0/C1 forms carry
+    // an imm8 the hardware masks to 6 bits for 64-bit operands and 5
+    // otherwise. Only a nonzero masked count writes SF/ZF/PF.
+    uint64_t count = 1;
+    if (xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(producer))) {
+        count = xed_decoded_inst_get_unsigned_immediate(producer);
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(producer);
+    if ((count & (width == 64 ? 63 : 31)) == 0) {
+        return false;
+    }
+    xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(dest);
+
+    // test dest, dest within the shared window, past transparent gaps --
+    // exactly as in flags_test_redundant.
+    size_t cur = after_producer;
+    for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
+        if (cur >= len) {
+            return false;
+        }
+        decode_init(test_out);
+        if (xed_decode(test_out, inst + cur, len - cur) != XED_ERROR_NONE) {
+            return false;
+        }
+        size_t after = cur + xed_decoded_inst_get_length(test_out);
+
+        if (xed_decoded_inst_get_iclass(test_out) != XED_ICLASS_TEST ||
+            xed_decoded_inst_number_of_memory_operands(test_out) > 0 ||
+            xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG0) != dest ||
+            xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) != dest) {
+            if (!flags_gap_transparent(test_out, dest_enc)) {
+                return false;
+            }
+            cur = after;
+            continue;
+        }
+
+        // An incoming direct edge past the producer reaches the test without
+        // the shift's flags.
+        if (branch_target_in(branch_targets, after_producer, after)) {
+            return false;
+        }
+
+        // CF/OF diverge and must be dead past the test. A directly following
+        // Jcc that reads neither gets the both-successors walk (cf.
+        // cmp_one_branch_foldable); anything else the straight-line walk,
+        // conservative at branches. All three walks use the call-kills
+        // reading: flags do not survive a call in either ABI, and the
+        // motivating consumer branches straight to a cold-path call.
+        if (after < len) {
+            xed_decoded_inst_t jcc;
+            decode_init(&jcc);
+            if (xed_decode(&jcc, inst + after, len - after) ==
+                    XED_ERROR_NONE) {
+                switch (xed_decoded_inst_get_iclass(&jcc)) {
+                case XED_ICLASS_JZ:
+                case XED_ICLASS_JNZ:
+                case XED_ICLASS_JS:
+                case XED_ICLASS_JNS:
+                case XED_ICLASS_JP:
+                case XED_ICLASS_JNP: {
+                    size_t fall = after + xed_decoded_inst_get_length(&jcc);
+                    if (flags_live_after_ext(inst, len, fall,
+                                             FLAG_CF | FLAG_OF, true)) {
+                        return false;
+                    }
+                    int64_t target = (int64_t) fall +
+                        xed_decoded_inst_get_branch_displacement(&jcc);
+                    if (target < 0 || (uint64_t) target >= (uint64_t) len ||
+                        flags_live_after_ext(inst, len, (size_t) target,
+                                             FLAG_CF | FLAG_OF, true)) {
+                        return false;
+                    }
+                    *test_offset_out = cur;
+                    return true;
+                }
+                default:
+                    break;
+                }
+            }
+        }
+        if (flags_live_after_ext(inst, len, after, FLAG_CF | FLAG_OF, true)) {
             return false;
         }
         *test_offset_out = cur;
@@ -6019,6 +6206,21 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                         redundant_test_offset);
             report_finding(summary, "redundant TEST after flags", redundant_test_offset,
                 verbose, &redundant_test, inst + redundant_test_offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a SHL/SHR/SAR by a statically nonzero
+        // count already set SF/ZF/PF, so test reg, reg on the shifted
+        // register recomputes them; a following CF/OF-blind Jcc is handled
+        // by scanning both successors. Reported at the test's offset, the
+        // removable instruction. See shift_test_redundant.
+        if (shift_test_redundant(inst, len, branch_targets, next, &xedd,
+                                 &redundant_test, &redundant_test_offset)) {
+            summary_add(summary, "redundant TEST after shift",
+                        redundant_test_offset);
+            report_finding(summary, "redundant TEST after shift",
+                redundant_test_offset, verbose, &redundant_test,
+                inst + redundant_test_offset);
             ++errors;
         }
 

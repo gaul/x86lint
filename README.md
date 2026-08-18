@@ -447,6 +447,27 @@ and only for flags -- the ABI guarantees they do not survive it.
     always, and the SETcc too when AL is dead. Only JE/JNE and an exact-width
     TEST AL, AL match, gated on every arithmetic flag being dead on both
     successors (a direct branch's target is a known offset, so both are scanned)
+* redundant TEST after shift
+  - `48D1E0 4885C0 75xx` (SHL RAX, 1; TEST RAX, RAX; JNE) -- a SHL/SHR/SAR of
+    a register by a statically nonzero count (a nonzero masked immediate, or
+    the by-one D0/D1 forms) already set SF/ZF/PF from its result, so the TEST
+    recomputes flags the shift produced; branch on them directly. This closes,
+    for the counts that are provably nonzero, the hole that keeps shifts out
+    of "redundant TEST after flags" (a CL or masked-to-zero count writes no
+    flags). CF/OF still diverge -- the shift's CF is the last bit shifted out
+    where TEST clears it -- so both must be dead past the TEST; because the
+    dominant consumer is a branch, a directly following JZ/JNZ/JS/JNS/JP/JNP
+    (the CF/OF-blind conditions) is scanned on both successors instead of
+    straight-line only (cf. redundant TEST after SETcc), and the walks treat
+    a CALL as flag death -- neither ABI preserves flags across calls, and the
+    motivating branch targets the cold-path call directly. Rotates never
+    qualify: they write only CF/OF. The motivating shape is rustc/LLVM's
+    panic-counter check `(x & ~(1 << 63)) == 0`, compiled to SHL RAX, 1;
+    TEST RAX, RAX; JNE -- LLVM's TEST-immediate shrink creates the SHL behind
+    its shl-to-add pattern's back and its compare peephole refuses shift
+    counts 1-3 (kept convertible to LEA), so the dead TEST ships in every
+    Rust binary. Composes with "suboptimal SHL one": both rewrites together
+    leave ADD RAX, RAX; JNE
 * redundant TEST immediate
   - `A9 FFFFFFFF` instead of `85C0` (TEST EAX, -1 -> TEST EAX, EAX; an all-ones
     mask sets identical flags)

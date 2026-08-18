@@ -2569,6 +2569,179 @@ static void check_redundant_flags_test(void)
     ASSERT_FINDINGS(gap_add_jb, "redundant TEST after flags", 0);
 }
 
+// Multi-instruction peephole: a SHL/SHR/SAR of a register by a statically
+// nonzero count -- a nonzero masked immediate, or the by-one D0/D1 forms --
+// sets SF/ZF/PF exactly as test reg, reg would, so a following test on the
+// shifted register is redundant. CF/OF diverge, so their readers suppress; a
+// directly following CF/OF-blind Jcc (JZ/JNZ/JS/JNS/JP/JNP) is scanned on
+// both successors. check_instructions reports against the test.
+static void check_redundant_shift_test(void)
+{
+    // shr rax, 1 ; test rax, rax ; jne ; ret ; ret -- the by-one D0/D1 forms
+    // carry no immediate but their count is statically 1; jne reads only ZF
+    // and CF/OF are dead on both successors (ret).
+    static const uint8_t shr_one_test_jne[] = {
+        0x48, 0xD1, 0xE8,  // 0: shr rax, 1
+        0x48, 0x85, 0xC0,  // 3: test rax, rax
+        0x75, 0x01,        // 6: jne 9
+        0xC3,              // 8: ret
+        0xC3,              // 9: ret
+    };
+    ASSERT_FINDINGS(shr_one_test_jne, "redundant TEST after shift", 1);
+
+    // The flagship: shl rax, 1 ; test rax, rax ; jne -- rustc/LLVM's
+    // panic-counter shape ((x & ~(1 << 63)) == 0). check_shl_one flags the
+    // same shl (add rax, rax is the better doubling), so the fixture carries
+    // both findings; together the rewrites leave add rax, rax ; jne.
+    static const uint8_t shl_one_test_jne[] = {
+        0x48, 0xD1, 0xE0,  // 0: shl rax, 1
+        0x48, 0x85, 0xC0,  // 3: test rax, rax
+        0x75, 0x01,        // 6: jne 9
+        0xC3,              // 8: ret
+        0xC3,              // 9: ret
+    };
+    int total;
+    assert(count_findings(shl_one_test_jne, sizeof(shl_one_test_jne),
+                          "redundant TEST after shift", &total, 0) == 1);
+    assert(total == 2);
+    assert(count_findings(shl_one_test_jne, sizeof(shl_one_test_jne),
+                          "suboptimal SHL one", &total, 0) == 1);
+
+    // shr ecx, 2 ; test ecx, ecx ; jz -- any of the three shifts, any
+    // nonzero immediate, matched at the shift's width.
+    static const uint8_t shr_imm_test_jz[] = {
+        0xC1, 0xE9, 0x02,  // 0: shr ecx, 2
+        0x85, 0xC9,        // 3: test ecx, ecx
+        0x74, 0x01,        // 5: jz 8
+        0xC3,              // 7: ret
+        0xC3,              // 8: ret
+    };
+    ASSERT_FINDINGS(shr_imm_test_jz, "redundant TEST after shift", 1);
+
+    // sar rax, 3 ; test rax, rax ; ret -- no branch: the straight-line walk,
+    // where RET makes CF/OF dead.
+    static const uint8_t sar_test_ret[] = {
+        0x48, 0xC1, 0xF8, 0x03,  // sar rax, 3
+        0x48, 0x85, 0xC0,        // test rax, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(sar_test_ret, "redundant TEST after shift", 1);
+
+    // The shared window: the test may sit past instructions that write
+    // neither the flags nor the tested register (flags_gap_transparent).
+    const int one_gap = APX_NDD_WINDOW >= 3 ? 1 : 0;
+    static const uint8_t shr_gap_test[] = {
+        0x48, 0xC1, 0xE8, 0x05,  // shr rax, 5
+        0x48, 0x89, 0xCB,        // mov rbx, rcx
+        0x48, 0x85, 0xC0,        // test rax, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(shr_gap_test, "redundant TEST after shift", one_gap);
+
+    // shl rax, cl -- a CL count may mask to zero and write no flags: not a
+    // producer (the hole that keeps shifts out of the general fold).
+    static const uint8_t shl_cl_test[] = {
+        0x48, 0xD3, 0xE0,  // shl rax, cl
+        0x48, 0x85, 0xC0,  // test rax, rax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(shl_cl_test, "redundant TEST after shift", 0);
+
+    // shl rax, 64 -- the hardware masks the count to zero: no flags written.
+    static const uint8_t shl_masked_zero_test[] = {
+        0x48, 0xC1, 0xE0, 0x40,  // shl rax, 64
+        0x48, 0x85, 0xC0,        // test rax, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(shl_masked_zero_test, "redundant TEST after shift", 0);
+
+    // rol rax, 1 -- rotates write only CF/OF, never SF/ZF/PF: the test
+    // computes flags the rotate did not.
+    static const uint8_t rol_test[] = {
+        0x48, 0xD1, 0xC0,  // rol rax, 1
+        0x48, 0x85, 0xC0,  // test rax, rax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(rol_test, "redundant TEST after shift", 0);
+
+    // shl rax, 2 ; test ; jb -- the branch reads CF, which the test cleared
+    // and the shift left as the last bit shifted out: suppress. (Count 2
+    // sidesteps check_shl_one's separate finding on by-one shls.)
+    static const uint8_t shl_test_jb[] = {
+        0x48, 0xC1, 0xE0, 0x02,  // shl rax, 2
+        0x48, 0x85, 0xC0,        // test rax, rax
+        0x72, 0x00,              // jb +0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(shl_test_jb, "redundant TEST after shift", 0);
+
+    // shl rax, 2 ; test ; jne ; adc -- the fall-through successor reads CF:
+    // suppress despite the ZF-only branch.
+    static const uint8_t shl_test_jne_adc[] = {
+        0x48, 0xC1, 0xE0, 0x02,  // 0: shl rax, 2
+        0x48, 0x85, 0xC0,        // 4: test rax, rax
+        0x75, 0x03,              // 7: jne 12
+        0x83, 0xD2, 0x00,        // 9: adc edx, 0
+        0xC3,                    // 12: ret
+    };
+    ASSERT_FINDINGS(shl_test_jne_adc, "redundant TEST after shift", 0);
+
+    // shl rax, 2 ; test eax, eax -- width mismatch: the narrow test reads SF
+    // at bit 31 where the 64-bit shift set it at bit 63 (and, writing flags,
+    // it also ends the window).
+    static const uint8_t shl_test_narrow[] = {
+        0x48, 0xC1, 0xE0, 0x02,  // shl rax, 2
+        0x85, 0xC0,              // test eax, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(shl_test_narrow, "redundant TEST after shift", 0);
+
+    // An incoming direct edge onto the test reaches it without the shift:
+    // suppress (shared window guard).
+    static const uint8_t shl_test_edge_on_test[] = {
+        0x48, 0xC1, 0xE0, 0x02,  // 0: shl rax, 2
+        0x48, 0x85, 0xC0,        // 4: test rax, rax  <- branch target
+        0xEB, 0xFB,              // 7: jmp 4
+    };
+    ASSERT_FINDINGS(shl_test_edge_on_test, "redundant TEST after shift", 0);
+
+    // A jne whose target lies outside the scanned bytes cannot be walked:
+    // conservatively suppress.
+    static const uint8_t shl_test_jne_out[] = {
+        0x48, 0xC1, 0xE0, 0x02,  // 0: shl rax, 2
+        0x48, 0x85, 0xC0,        // 4: test rax, rax
+        0x75, 0x10,              // 7: jne 25 (out of buffer)
+        0xC3,                    // 9: ret
+    };
+    ASSERT_FINDINGS(shl_test_jne_out, "redundant TEST after shift", 0);
+
+    // shl rax, 2 ; test ; jne over a call -- the walks use the call-kills
+    // reading: flags do not survive a call in either ABI (the argument the
+    // RET case rests on), so a successor that immediately calls leaves CF/OF
+    // dead. This is the real panic-counter shape, whose jne targets
+    // call is_zero_slow_path.
+    static const uint8_t shl_test_jne_call[] = {
+        0x48, 0xC1, 0xE0, 0x02,        // 0: shl rax, 2
+        0x48, 0x85, 0xC0,              // 4: test rax, rax
+        0x75, 0x03,                    // 7: jne 12
+        0x31, 0xC9,                    // 9: xor ecx, ecx
+        0xC3,                          // 11: ret
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // 12: call +0
+        0xC3,                          // 17: ret
+    };
+    ASSERT_FINDINGS(shl_test_jne_call, "redundant TEST after shift", 1);
+
+    // sar rax, 3 ; test ; call -- the straight-line walk with the same
+    // call-kills reading.
+    static const uint8_t sar_test_call[] = {
+        0x48, 0xC1, 0xF8, 0x03,        // sar rax, 3
+        0x48, 0x85, 0xC0,              // test rax, rax
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call +0
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
+}
+
 // Multi-instruction peephole: lea reg, [addr] whose address the next
 // instruction consumes as its memory base folds into that operand, so the lea
 // disappears. check_instructions reports it against the lea when reg is dead
@@ -5513,6 +5686,7 @@ int main(int argc, char *argv[])
     check_redundant_reextension_test();
     check_upper32_identity_gate_test();
     check_redundant_flags_test();
+    check_redundant_shift_test();
     check_lea_fold_test();
     check_mov_const_fold_test();
     check_load_extend_fold_test();

@@ -289,7 +289,8 @@ and only for flags -- the ABI guarantees they do not survive it.
     RSQRTSS. Not flagged when the source is the destination (a real
     dependency the xor would destroy), for the VEX and EVEX forms (whose
     third operand names the merge source outright -- the fix there is to
-    choose that operand, a different rewrite), or when the preceding
+    choose that operand, a different rewrite reported separately as a stale
+    VEX merge operand), or when the preceding
     instruction already rewrote the whole register, whether by a
     same-register vector XOR or by any full producer. ADDSD and the other
     scalar arithmetic merge identically and are never flagged: their
@@ -297,6 +298,21 @@ and only for flags -- the ABI guarantees they do not survive it.
     input distinction that keeps BSF/BSR out of the POPCNT check. A memory
     source needs no exception, unlike POPCNT's -- the address is built from
     general-purpose registers a vector zero idiom cannot disturb
+* stale VEX merge operand
+  - `C5EA5AD1` (VCVTSS2SD XMM2, XMM2, XMM1) -- the VEX and EVEX three-operand
+    forms of the same scalar family name the merge source outright, so
+    passing the data source (or a register known dead) as that operand makes
+    the destination a pure output at no cost: the fix is operand
+    substitution, not insertion, and the fixed encoding is the same length.
+    Flagged when the merge operand is neither the data source nor freshly
+    rewritten (the same suppression window as the SSE check). This includes
+    the destination-as-merge shape above and assemblers that fill vvvv with
+    the "unused" 1111b pattern on an instruction that reads vvvv, which
+    names xmm0 and silently serializes behind its last producer --
+    SpiderMonkey's JIT emitted exactly that for every Math.floor
+    (VROUNDSD XMM15, XMM0, XMM1, 1). For the integer conversions there is
+    no XMM source to reuse, so as with the legacy forms only a fresh merge
+    register is clean. Masked EVEX forms are skipped
 * missing SHLX/SHRX/SARX (only with `-m bmi2`)
   - `D3E0` (SHL EAX, CL) -- SHLX EAX, EAX, ECX (BMI2) shifts without touching
     any flag, dropping the flag-merge uops CL-count shifts cost on Intel

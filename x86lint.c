@@ -6029,7 +6029,8 @@ static bool redefines_xmm_full(const xed_decoded_inst_t *xedd,
 //   * the VEX and EVEX forms (vcvtss2sd xmm0, xmm1, xmm2): the merge source
 //     is a third operand the encoding names outright, so the fix is to give
 //     that operand a register already known dead rather than to insert
-//     anything -- a different rewrite, and one this check would misreport;
+//     anything -- a different rewrite this check would misreport, covered
+//     separately by vex_merge_false_dep;
 //   * a previous instruction that already rewrote the whole register
 //     (`prev`, NULL at the buffer start and after a resync): the compilers'
 //     xor shape, or any adjacent full producer -- re-flagging mitigated code
@@ -6068,6 +6069,75 @@ static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
         // the vector destination's -- the comparison simply never fires
         // there, which is the right answer.
         xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        if (xed_get_largest_enclosing_register(src) == parent) {
+            return false;
+        }
+    }
+    return !dep_broken_in_history(history, parent, redefines_xmm_full,
+                                  xmm_dep_mitigation);
+}
+
+// The VEX and EVEX sibling of sse_merge_false_dep. The three-operand forms
+// of the same scalar instructions name the merge source outright -- VEX.vvvv
+// supplies the destination's untouched upper bits -- so no insertion is
+// needed: passing the data source (or any register known dead) as the merge
+// operand makes the destination a pure output at no cost, the same length as
+// any other register choice. The hazard is a merge register that is neither
+// the source nor fresh, and two shapes of it reach real code:
+//
+//   vcvtsd2ss xmm2, xmm2, xmm1  -- the destination as merge operand
+//     reproduces the legacy form's false dependency in an encoding that
+//     could have avoided it for free;
+//   vroundsd xmm15, xmm0, xmm1, 1  -- an assembler that fills vvvv with the
+//     "unused" 1111b pattern on an instruction that reads vvvv names xmm0,
+//     silently serializing every round behind xmm0's last producer
+//     (SpiderMonkey's JIT emitted exactly this for Math.floor).
+//
+// Not flagged:
+//   * a merge operand equal to the data source (vcvtsd2ss xmm2, xmm1, xmm1):
+//     the canonical dependency-free form, since the merge reads a register
+//     the instruction already waits for;
+//   * an integer or memory data source (VCVTSI2SD and friends, memory forms)
+//     when the merge register was freshly rewritten: with no XMM source to
+//     reuse, a zero idiom on the merge register is the only fix, exactly as
+//     for the legacy forms, and the same suppression window recognizes it;
+//   * a masked EVEX form: XED surfaces the opmask as the second register
+//     operand, which fails the XMM class test below, erring toward silence.
+//
+// Unlike sse_merge_false_dep this advisory's rewrite is operand
+// substitution, not insertion, so it is size-neutral and unconditionally
+// profitable when an XMM source exists.
+static bool vex_merge_false_dep(const xed_decoded_inst_t *xedd,
+                                const struct dep_history *history)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_VCVTSI2SD:
+    case XED_ICLASS_VCVTSI2SS:
+    case XED_ICLASS_VCVTSS2SD:
+    case XED_ICLASS_VCVTSD2SS:
+    case XED_ICLASS_VSQRTSD:
+    case XED_ICLASS_VSQRTSS:
+    case XED_ICLASS_VROUNDSD:
+    case XED_ICLASS_VROUNDSS:
+    case XED_ICLASS_VRCPSS:
+    case XED_ICLASS_VRSQRTSS:
+        break;
+    default:
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t merge = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    if (xed_reg_class(dst) != XED_REG_CLASS_XMM ||
+        xed_reg_class(merge) != XED_REG_CLASS_XMM) {
+        return false;
+    }
+    xed_reg_enum_t parent = xed_get_largest_enclosing_register(merge);
+    if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+        // For the integer conversions the third operand is a GPR, whose
+        // enclosing register can never match the merge's -- the comparison
+        // simply never fires there, which is the right answer: there is no
+        // XMM source to reuse.
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG2);
         if (xed_get_largest_enclosing_register(src) == parent) {
             return false;
         }
@@ -6460,6 +6530,17 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (sse_merge_false_dep(&xedd, &dep_history)) {
             summary_add(summary, "missing SSE dependency break", offset);
             report_finding(summary, "missing SSE dependency break", offset, verbose,
+                &xedd, inst + offset);
+            ++errors;
+        }
+
+        // The VEX/EVEX counterpart: the three-operand scalar forms name the
+        // merge source outright, so a merge operand that is neither the data
+        // source nor freshly rewritten is a false dependency the encoding
+        // could have avoided for free. See vex_merge_false_dep.
+        if (vex_merge_false_dep(&xedd, &dep_history)) {
+            summary_add(summary, "stale VEX merge operand", offset);
+            report_finding(summary, "stale VEX merge operand", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }

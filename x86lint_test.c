@@ -4012,9 +4012,10 @@ static void check_sse_merge_false_dep_test(void)
     ASSERT_FINDINGS(addsd, "missing SSE dependency break", 0);
 
     // VEX names the merge source outright, so the fix is to choose that
-    // operand, not to insert a zero idiom: a different rewrite, not flagged.
+    // operand, not to insert a zero idiom: a different rewrite, left to
+    // vex_merge_false_dep (the clean form here fires neither check).
     static const uint8_t vex[] = {
-        0xC5, 0xF2, 0x5A, 0xC2,  // vcvtss2sd xmm0, xmm1, xmm2
+        0xC5, 0xEA, 0x5A, 0xC2,  // vcvtss2sd xmm0, xmm2, xmm2
     };
     ASSERT_FINDINGS(vex, "missing SSE dependency break", 0);
 
@@ -4094,6 +4095,65 @@ static void check_sse_merge_false_dep_test(void)
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
     ASSERT_FINDINGS(movhps, "missing SSE dependency break", 1);
+}
+
+// Advisory: the VEX three-operand scalar forms name their merge source, so
+// a merge operand that is neither the data source nor freshly rewritten is
+// a false dependency the encoding could avoid for free -- pass the data
+// source (or a register known dead) as the merge operand instead.
+static void check_vex_merge_false_dep_test(void)
+{
+    // Destination as merge operand: the legacy false dependency reproduced
+    // in an encoding that names the merge outright.
+    static const uint8_t stale_dest[] = {
+        0xC5, 0xEA, 0x5A, 0xD1,  // vcvtss2sd xmm2, xmm2, xmm1
+    };
+    ASSERT_FINDINGS(stale_dest, "stale VEX merge operand", 1);
+
+    // Source as merge operand: the canonical dependency-free form.
+    static const uint8_t merge_source[] = {
+        0xC5, 0xF2, 0x5A, 0xD1,  // vcvtss2sd xmm2, xmm1, xmm1
+    };
+    ASSERT_FINDINGS(merge_source, "stale VEX merge operand", 0);
+
+    // An "unused" 1111b vvvv on an instruction that reads vvvv names xmm0,
+    // serializing every round behind xmm0's last producer -- the encoding
+    // SpiderMonkey's JIT emitted for Math.floor.
+    static const uint8_t round_xmm0[] = {
+        0xC4, 0x63, 0x79, 0x0B, 0xF9, 0x01,  // vroundsd xmm15, xmm0, xmm1, 1
+    };
+    ASSERT_FINDINGS(round_xmm0, "stale VEX merge operand", 1);
+
+    static const uint8_t round_source[] = {
+        0xC4, 0x63, 0x71, 0x0B, 0xF9, 0x01,  // vroundsd xmm15, xmm1, xmm1, 1
+    };
+    ASSERT_FINDINGS(round_source, "stale VEX merge operand", 0);
+
+    static const uint8_t sqrt_stale[] = {
+        0xC5, 0xEB, 0x51, 0xD1,  // vsqrtsd xmm2, xmm2, xmm1
+    };
+    ASSERT_FINDINGS(sqrt_stale, "stale VEX merge operand", 1);
+
+    // An integer source lives in a GPR, so there is no XMM source to reuse:
+    // only a freshly rewritten merge register is clean, exactly as for the
+    // legacy forms.
+    static const uint8_t int_bare[] = {
+        0xC5, 0xEB, 0x2A, 0xD0,  // vcvtsi2sd xmm2, xmm2, eax
+    };
+    ASSERT_FINDINGS(int_bare, "stale VEX merge operand", 1);
+
+    static const uint8_t int_mitigated[] = {
+        0xC5, 0xE8, 0x57, 0xD2,  // vxorps xmm2, xmm2, xmm2
+        0xC5, 0xEB, 0x2A, 0xD0,  // vcvtsi2sd xmm2, xmm2, eax
+    };
+    ASSERT_FINDINGS(int_mitigated, "stale VEX merge operand", 0);
+
+    // A memory source likewise has nothing to reuse, and the stale merge
+    // register still costs the dependency.
+    static const uint8_t mem_src[] = {
+        0xC5, 0xFA, 0x5A, 0x00,  // vcvtss2sd xmm0, xmm0, dword ptr [rax]
+    };
+    ASSERT_FINDINGS(mem_src, "stale VEX merge operand", 1);
 }
 
 // not rX ; and rX, rY folds to andn rX, rX, rY -- but only when the caller
@@ -5698,6 +5758,7 @@ int main(int argc, char *argv[])
     check_setcc_invert_test();
     check_popcnt_false_dep_test();
     check_sse_merge_false_dep_test();
+    check_vex_merge_false_dep_test();
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_blsmsk_test();

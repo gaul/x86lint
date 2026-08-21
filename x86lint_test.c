@@ -4076,7 +4076,10 @@ static void check_sse_merge_false_dep_test(void)
     // A partial write leaves the upper lanes -- and the dependency -- in
     // place. XED reports MOVSS's destination written-only in both forms, so
     // telling the merging register form from the zeroing memory form is the
-    // suppression's other correction.
+    // suppression's other correction. The register movss escapes the
+    // merging-scalar-move finding here only because the cvt behind it reads
+    // its destination at 64 bits -- wider than the 32 the movss wrote --
+    // which that check's forward gate takes as blend evidence.
     static const uint8_t movss_reg[] = {
         0xF3, 0x0F, 0x10, 0xC3,  // movss xmm0, xmm3
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
@@ -4154,6 +4157,163 @@ static void check_vex_merge_false_dep_test(void)
         0xC5, 0xFA, 0x5A, 0x00,  // vcvtss2sd xmm0, xmm0, dword ptr [rax]
     };
     ASSERT_FINDINGS(mem_src, "stale VEX merge operand", 1);
+}
+
+// Advisory: a register-to-register MOVSS/MOVSD merges where MOVAPS would
+// copy the whole register a byte shorter, dependency-free and eliminable at
+// rename; the VEX forms merge from their explicit vvvv operand the same way.
+// A downstream read of the destination wider than the moved element proves
+// the merge a deliberate blend and suppresses. See scalar_move_false_dep.
+static void check_scalar_move_false_dep_test(void)
+{
+    static const uint8_t movsd_stale[] = {
+        0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
+    };
+    ASSERT_FINDINGS(movsd_stale, "merging scalar move", 1);
+
+    static const uint8_t movss_stale[] = {
+        0xF3, 0x0F, 0x10, 0xCA,  // movss xmm1, xmm2
+    };
+    ASSERT_FINDINGS(movss_stale, "merging scalar move", 1);
+
+    // The load form zeroes the upper lanes and the store form writes no
+    // register: neither merges.
+    static const uint8_t movsd_load[] = {
+        0xF2, 0x0F, 0x10, 0x08,  // movsd xmm1, qword ptr [rax]
+    };
+    ASSERT_FINDINGS(movsd_load, "merging scalar move", 0);
+
+    static const uint8_t movsd_store[] = {
+        0xF2, 0x0F, 0x11, 0x08,  // movsd qword ptr [rax], xmm1
+    };
+    ASSERT_FINDINGS(movsd_store, "merging scalar move", 0);
+
+    // Same register: a pure no-op, not a merge hazard.
+    static const uint8_t movsd_self[] = {
+        0xF2, 0x0F, 0x10, 0xC0,  // movsd xmm0, xmm0
+    };
+    ASSERT_FINDINGS(movsd_self, "merging scalar move", 0);
+
+    // An adjacent full producer leaves the merge one instruction stale;
+    // suppressed as everywhere in the family.
+    static const uint8_t fresh_dest[] = {
+        0x0F, 0x28, 0xCB,        // movaps xmm1, xmm3
+        0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
+    };
+    ASSERT_FINDINGS(fresh_dest, "merging scalar move", 0);
+
+    // The zero-idiom mitigation suppresses through the window, not just
+    // adjacency.
+    static const uint8_t mitigated_window[] = {
+        0x0F, 0x57, 0xC9,        // xorps xmm1, xmm1
+        0x0F, 0x28, 0xE5,        // movaps xmm4, xmm5
+        0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
+    };
+    ASSERT_FINDINGS(mitigated_window, "merging scalar move", 0);
+
+    // VEX with a merge operand that is neither the source nor fresh.
+    static const uint8_t vmovsd_stale[] = {
+        0xC5, 0xEB, 0x10, 0xCB,  // vmovsd xmm1, xmm2, xmm3
+    };
+    ASSERT_FINDINGS(vmovsd_stale, "merging scalar move", 1);
+
+    static const uint8_t vmovss_stale[] = {
+        0xC5, 0xEA, 0x10, 0xCB,  // vmovss xmm1, xmm2, xmm3
+    };
+    ASSERT_FINDINGS(vmovss_stale, "merging scalar move", 1);
+
+    // Destination as merge operand: the legacy hazard reproduced in an
+    // encoding that names the merge outright.
+    static const uint8_t vmovsd_dest_merge[] = {
+        0xC5, 0xF3, 0x10, 0xCB,  // vmovsd xmm1, xmm1, xmm3
+    };
+    ASSERT_FINDINGS(vmovsd_dest_merge, "merging scalar move", 1);
+
+    // Merge equal to the source: a full copy of xmm3, however spelled.
+    static const uint8_t vmovsd_full_copy[] = {
+        0xC5, 0xE3, 0x10, 0xCB,  // vmovsd xmm1, xmm3, xmm3
+    };
+    ASSERT_FINDINGS(vmovsd_full_copy, "merging scalar move", 0);
+
+    // Destination equal to the source: as a move this would be a no-op, so
+    // the shape only ever means the deliberate blend.
+    static const uint8_t vmovsd_blend_self[] = {
+        0xC5, 0xEB, 0x10, 0xC9,  // vmovsd xmm1, xmm2, xmm1
+    };
+    ASSERT_FINDINGS(vmovsd_blend_self, "merging scalar move", 0);
+
+    static const uint8_t vmovsd_load[] = {
+        0xC5, 0xFB, 0x10, 0x08,  // vmovsd xmm1, qword ptr [rax]
+    };
+    ASSERT_FINDINGS(vmovsd_load, "merging scalar move", 0);
+
+    // A masked EVEX form surfaces the opmask as the second register
+    // operand and is skipped: the mask makes the merge deliberate.
+    static const uint8_t evex_masked[] = {
+        0x62, 0xF1, 0xF7, 0x09, 0x10, 0xCB,  // vmovsd xmm1{k1}, xmm2, xmm3
+    };
+    ASSERT_FINDINGS(evex_masked, "merging scalar move", 0);
+
+    // The forward gate: gcc's SSE2 vectorized shape, a movss merging one
+    // recomputed lane into a pair whose both lanes are then stored -- the
+    // movq reads 64 bits where the movss wrote 32, so the merged lane is
+    // live and the "move" is a deliberate blend.
+    static const uint8_t blend_store[] = {
+        0xF3, 0x0F, 0x10, 0xC2,        // movss xmm0, xmm2
+        0x66, 0x0F, 0xD6, 0x40, 0x08,  // movq qword ptr [rax+8], xmm0
+    };
+    ASSERT_FINDINGS(blend_store, "merging scalar move", 0);
+
+    // Likewise a single-precision move whose result is consumed at double
+    // width: bits 32-63 came from the merge.
+    static const uint8_t double_read[] = {
+        0xF3, 0x0F, 0x10, 0xCA,        // movss xmm1, xmm2
+        0xF2, 0x0F, 0x11, 0x48, 0x08,  // movsd qword ptr [rax+8], xmm1
+    };
+    ASSERT_FINDINGS(double_read, "merging scalar move", 0);
+
+    // A scalar consumer reads only the moved element: no blend evidence,
+    // the finding stands.
+    static const uint8_t scalar_read[] = {
+        0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
+        0xF2, 0x0F, 0x58, 0xCB,  // addsd xmm1, xmm3
+    };
+    ASSERT_FINDINGS(scalar_read, "merging scalar move", 1);
+
+    // A full redefinition kills the merged lanes before anything reads
+    // them: dead, so the finding stands.
+    static const uint8_t redefined_after[] = {
+        0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
+        0x0F, 0x28, 0xCC,        // movaps xmm1, xmm4
+    };
+    ASSERT_FINDINGS(redefined_after, "merging scalar move", 1);
+
+    // An escape ends the walk with the finding standing: glibc's fmax
+    // moves the chosen argument into the return register and returns, and
+    // a double-returning function's caller cannot read the upper lanes.
+    static const uint8_t escape_ret[] = {
+        0xF2, 0x0F, 0x10, 0xC1,  // movsd xmm0, xmm1
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(escape_ret, "merging scalar move", 1);
+
+    // The walk follows an unconditional direct branch -- gcc enters loops
+    // with a jump into the middle, and the blend's vector consumer sits at
+    // the target.
+    static const uint8_t blend_past_jmp[] = {
+        0xF3, 0x0F, 0x10, 0xC2,  // movss xmm0, xmm2
+        0xEB, 0x02,              // jmp +2
+        0x90, 0x90,              // nop; nop (jumped over)
+        0x0F, 0x11, 0x00,        // movups xmmword ptr [rax], xmm0
+    };
+    ASSERT_FINDINGS(blend_past_jmp, "merging scalar move", 0);
+
+    // An indirect branch cannot be followed: the finding stands.
+    static const uint8_t escape_indirect[] = {
+        0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
+        0xFF, 0xE0,              // jmp rax
+    };
+    ASSERT_FINDINGS(escape_indirect, "merging scalar move", 1);
 }
 
 // not rX ; and rX, rY folds to andn rX, rX, rY -- but only when the caller
@@ -5759,6 +5919,7 @@ int main(int argc, char *argv[])
     check_popcnt_false_dep_test();
     check_sse_merge_false_dep_test();
     check_vex_merge_false_dep_test();
+    check_scalar_move_false_dep_test();
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_blsmsk_test();

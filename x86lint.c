@@ -6146,6 +6146,192 @@ static bool vex_merge_false_dep(const xed_decoded_inst_t *xedd,
                                   xmm_dep_mitigation);
 }
 
+// Forward gate for scalar_move_false_dep: the intent test the backward
+// window cannot provide. Walks forward from `offset` and returns true when
+// some straight-line instruction reads a register of `parent` wider than
+// `moved_bits` before the register is fully redefined -- proof that the
+// lanes a scalar move merged are live data, i.e. that the move is a
+// deliberate blend. XED's decoded operand lengths carry exactly this
+// distinction: a scalar consumer reads its element (ADDSD's destination and
+// UCOMISD's operands read 64 bits, a MOVQ store reads 64), while a vector
+// consumer reads the register (MOVUPS stores 128, VADDSD's merge operand
+// reads 128), so "wider than the element the move wrote" is one comparison.
+//
+// The endings run against reg_upper32_live_after's every-uncertainty-
+// suppresses bias, deliberately. An unconditional direct branch is followed
+// -- one successor keeps the walk straight-line -- but any other control
+// transfer, the lookahead bound, or running out of bytes ends the walk
+// with the finding standing: this
+// gate serves an advisory, and the family's founding assumption -- code
+// that keeps scalars in vector registers never wants the upper lanes --
+// is applied where the walk cannot see, because treating an escape as
+// blend evidence would erase the population the check exists for (glibc's
+// fmax moves the chosen argument into the return register and returns; the
+// caller of a double-returning function cannot read the upper lanes). A
+// decode failure still suppresses: garbage downstream argues the site is
+// not code this reasoning is about.
+static bool xmm_read_above_width_ahead(const uint8_t *inst, size_t len,
+                                       size_t offset, xed_reg_enum_t parent,
+                                       unsigned moved_bits)
+{
+    const int MAX_LOOKAHEAD = 16;
+
+    for (int step = 0; step < MAX_LOOKAHEAD && offset < len; ++step) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+            return true;
+        }
+
+        // Reads before the kill below: an instruction can read the merged
+        // lanes and then redefine the register.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned nops = xed_inst_noperands(xi);
+        for (unsigned i = 0; i < nops; ++i) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t name = xed_operand_name(op);
+            if (!xed_operand_is_register(name) || !xed_operand_read(op)) {
+                continue;
+            }
+            if (xed_get_largest_enclosing_register(
+                    xed_decoded_inst_get_reg(&xedd, name)) != parent) {
+                continue;
+            }
+            if (xed_decoded_inst_operand_length_bits(&xedd, i) > moved_bits) {
+                return true;
+            }
+        }
+
+        xed_category_enum_t category = xed_decoded_inst_get_category(&xedd);
+        if (category == XED_CATEGORY_UNCOND_BR) {
+            // An unconditional direct branch has exactly one successor, so
+            // following it keeps the walk straight-line (cf. redundant TEST
+            // after SETcc, which scans a direct branch's known target). The
+            // shape that needs this is gcc's loop entry, a jump into the
+            // loop's middle: the blend's vector consumer sits at the
+            // target, one hop away. The step bound already caps a backward
+            // jump's revisits. An indirect or out-of-buffer target is an
+            // escape like any other transfer: the finding stands.
+            if (xed_decoded_inst_get_branch_displacement_width(&xedd) == 0) {
+                return false;
+            }
+            int64_t target = (int64_t) offset +
+                xed_decoded_inst_get_length(&xedd) +
+                xed_decoded_inst_get_branch_displacement(&xedd);
+            if (target < 0 || (uint64_t) target >= (uint64_t) len) {
+                return false;
+            }
+            offset = (size_t) target;
+            continue;
+        }
+        if (category == XED_CATEGORY_CALL ||
+            category == XED_CATEGORY_RET ||
+            category == XED_CATEGORY_COND_BR ||
+            category == XED_CATEGORY_SYSCALL ||
+            category == XED_CATEGORY_SYSRET ||
+            category == XED_CATEGORY_INTERRUPT) {
+            return false;
+        }
+
+        if (redefines_xmm_full(&xedd, parent)) {
+            return false;
+        }
+
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+
+    return false;
+}
+
+// The moves of the same scalar family. Between registers MOVSS and MOVSD
+// copy one element and merge the rest -- the legacy forms from the
+// destination's old value, VMOVSS/VMOVSD from their explicit vvvv operand --
+// so a move that meant "copy the scalar" pays the family's false dependency.
+// Unlike the conversions the instruction itself is avoidable: MOVAPS copies
+// the whole register a byte shorter (VMOVAPS at the same length), reads
+// nothing but its source, and is eliminated at rename on current cores,
+// which a merging move -- a real two-input uop -- never is. So the fix is
+// neither an insertion nor an operand choice but a different instruction,
+// strictly better whenever the upper lanes are dead, which is why these
+// iclasses get their own finding rather than joining the two checks above
+// (each names a fix that would be wrong here).
+//
+// The register form is also SSE2's idiom for a genuine two-source blend --
+// the one consumer of these merge semantics that means them -- and there
+// MOVAPS would corrupt the result, so unlike the rest of the family this
+// check must read intent, with the forward gate above: a blend's
+// destination is consumed as a vector (git's gcc-vectorized delta loops
+// merge a paddd lane into a psubd pair and immediately store both lanes
+// with movq -- 64 bits, wider than the 32 the movss wrote), while a moved
+// scalar is consumed at its own width or escapes. Compilers with SSE4.1
+// available spell live blends BLENDPS/BLENDPD instead, so the merging
+// spelling on newer code selects for the move intent to begin with. A blend
+// whose vector consumer sits past a branch or beyond the lookahead is still
+// misflagged -- the accepted, now-narrower residue of an advisory.
+//
+// Not flagged:
+//   * the memory forms: the load direction zeroes the upper lanes outright
+//     and the store direction writes no register at all;
+//   * a same-register legacy move (movsd xmm0, xmm0), a pure no-op;
+//   * a VEX merge operand equal to the data source (vmovsd xmm1, xmm2,
+//     xmm2): every bit then comes from the source -- a full copy, however
+//     spelled;
+//   * a VEX destination equal to the data source (vmovsd xmm1, xmm2, xmm1):
+//     as a move it would be a no-op, so the shape only ever means the blend;
+//   * a masked EVEX form: the opmask surfaces as the second register
+//     operand and fails the XMM class test, erring toward silence;
+//   * a merge input freshly rewritten (the family's suppression window):
+//     one instruction of staleness is not worth flagging;
+//   * a destination read wider than the moved element downstream (the
+//     forward gate): the merged lanes are live, so the merge is the point.
+static bool scalar_move_false_dep(const xed_decoded_inst_t *xedd,
+                                  const struct dep_history *history,
+                                  const uint8_t *inst, size_t len,
+                                  size_t next_offset)
+{
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    bool vex;
+    switch (iclass) {
+    case XED_ICLASS_MOVSS:
+    case XED_ICLASS_MOVSD_XMM:
+        vex = false;
+        break;
+    case XED_ICLASS_VMOVSS:
+    case XED_ICLASS_VMOVSD:
+        vex = true;
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) != 0) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t merge = xed_decoded_inst_get_reg(
+        xedd, vex ? XED_OPERAND_REG1 : XED_OPERAND_REG0);
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(
+        xedd, vex ? XED_OPERAND_REG2 : XED_OPERAND_REG1);
+    if (xed_reg_class(dst) != XED_REG_CLASS_XMM ||
+        xed_reg_class(merge) != XED_REG_CLASS_XMM) {
+        return false;
+    }
+    xed_reg_enum_t src_parent = xed_get_largest_enclosing_register(src);
+    xed_reg_enum_t merge_parent = xed_get_largest_enclosing_register(merge);
+    if (src_parent == merge_parent ||
+        src_parent == xed_get_largest_enclosing_register(dst)) {
+        return false;
+    }
+    if (dep_broken_in_history(history, merge_parent, redefines_xmm_full,
+                              xmm_dep_mitigation)) {
+        return false;
+    }
+    unsigned moved_bits =
+        (iclass == XED_ICLASS_MOVSS || iclass == XED_ICLASS_VMOVSS) ? 32 : 64;
+    return !xmm_read_above_width_ahead(
+        inst, len, next_offset, xed_get_largest_enclosing_register(dst),
+        moved_bits);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
                        uint32_t extensions)
@@ -6541,6 +6727,18 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (vex_merge_false_dep(&xedd, &dep_history)) {
             summary_add(summary, "stale VEX merge operand", offset);
             report_finding(summary, "stale VEX merge operand", offset, verbose,
+                &xedd, inst + offset);
+            ++errors;
+        }
+
+        // The family's moves: a register-to-register MOVSS/MOVSD (or a
+        // VMOVSS/VMOVSD whose merge operand is neither the source nor
+        // fresh) merges where MOVAPS would copy -- a false dependency and
+        // a lost move elimination in one, unless a downstream vector read
+        // proves the merge a deliberate blend. See scalar_move_false_dep.
+        if (scalar_move_false_dep(&xedd, &dep_history, inst, len, next)) {
+            summary_add(summary, "merging scalar move", offset);
+            report_finding(summary, "merging scalar move", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }

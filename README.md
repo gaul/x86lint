@@ -313,6 +313,29 @@ and only for flags -- the ABI guarantees they do not survive it.
     (VROUNDSD XMM15, XMM0, XMM1, 1). For the integer conversions there is
     no XMM source to reuse, so as with the legacy forms only a fresh merge
     register is clean. Masked EVEX forms are skipped
+* merging scalar move
+  - `F20F10CA` (MOVSD XMM1, XMM2) -- between registers MOVSS and MOVSD copy
+    one element and merge the rest, the legacy forms from the destination's
+    old value and VMOVSS/VMOVSD from their explicit vvvv operand, so a move
+    that meant "copy the scalar" pays the same false dependency as the
+    family above. Unlike the conversions the instruction itself is
+    avoidable: MOVAPS copies the whole register a byte shorter (VMOVAPS at
+    the same length), reads nothing but its source, and is eliminated at
+    rename on current cores, which a merging move -- a real two-input uop
+    -- never is. Flagged when the merge input is neither the data source
+    nor freshly rewritten (the family's suppression window). The register
+    form is also SSE2's idiom for a genuine two-source blend, the one
+    consumer of these merge semantics that means them and the one place
+    MOVAPS would corrupt the result, so this check alone adds a forward
+    gate: a downstream read of the destination wider than the moved element
+    -- git's gcc-vectorized loops movss-merge a recomputed lane and
+    immediately movq-store both lanes -- proves the merged lanes live and
+    suppresses, while a scalar-width consumer or an escape (glibc's fmax
+    moves the chosen argument to the return register and returns) leaves
+    the finding standing. A blend whose vector consumer sits past a branch
+    or beyond the lookahead is still misflagged -- the accepted, narrowed
+    residue of an advisory. The memory forms zero the upper lanes and are
+    never flagged; masked EVEX forms are skipped
 * missing SHLX/SHRX/SARX (only with `-m bmi2`)
   - `D3E0` (SHL EAX, CL) -- SHLX EAX, EAX, ECX (BMI2) shifts without touching
     any flag, dropping the flag-merge uops CL-count shifts cost on Intel

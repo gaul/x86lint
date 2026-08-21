@@ -6467,6 +6467,58 @@ static bool narrow_move_merge(const xed_decoded_inst_t *xedd,
         width);
 }
 
+// True for a legacy-encoded SSE instruction that touches an XMM register.
+// xed_classify_sse is encoding-exclusive -- the VEX and EVEX spellings
+// classify as AVX and AVX512 -- and the XMM-operand requirement drops the
+// non-vector members of the SSE ISA sets (SFENCE, LDMXCSR, PREFETCH) and
+// the MMX-register forms, none of which the transition machinery below is
+// about.
+static bool legacy_sse_with_xmm(const xed_decoded_inst_t *xedd)
+{
+    if (!xed_classify_sse(xedd)) {
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        xed_operand_enum_t name = xed_operand_name(xed_inst_operand(xi, i));
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        if (xed_reg_class(xed_decoded_inst_get_reg(xedd, name)) ==
+                XED_REG_CLASS_XMM) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when the instruction writes any of ymm0-15 or zmm0-15, dirtying
+// upper state legacy SSE can see. Registers 16-31 have no legacy alias, so
+// writes there leave every SSE-visible upper half as it was; VEX.128
+// writes zero their own register's upper bits but say nothing about the
+// other fifteen, so they neither set nor clear the state.
+static bool writes_wide_vector(const xed_decoded_inst_t *xedd)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+            continue;
+        }
+        xed_reg_enum_t r = xed_decoded_inst_get_reg(xedd, name);
+        if ((xed_reg_class(r) == XED_REG_CLASS_YMM &&
+             r - XED_REG_YMM0 < 16) ||
+            (xed_reg_class(r) == XED_REG_CLASS_ZMM &&
+             r - XED_REG_ZMM0 < 16)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
                        uint32_t extensions)
@@ -6490,6 +6542,13 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
     // dep_history); wider than `prev`, which the adjacency-only gates keep.
     struct dep_history dep_history;
     dep_history_reset(&dep_history);
+
+    // True while the upper halves of ymm0-15 are provably dirty on every
+    // path reaching the current instruction: a 256- or 512-bit write to
+    // them was seen on this straight-line run, with no VZEROUPPER/VZEROALL,
+    // no control transfer, and no incoming branch edge since. See the
+    // AVX-SSE transition block below.
+    bool ymm_upper_dirty = false;
 
     // Direct branch targets for the multi-instruction windows (see
     // collect_branch_targets). NULL on allocation failure, which
@@ -6516,6 +6575,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             }
             have_prev = false;
             dep_history_reset(&dep_history);
+            ymm_upper_dirty = false;
             offset += 1;
             continue;
         }
@@ -6888,6 +6948,69 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             report_finding(summary, "merging narrow move", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
+        }
+
+        // AVX-SSE transition. A legacy SSE instruction preserves bits
+        // 255:128 of its destination's ymm register, so executing one
+        // while any of ymm0-15 carries dirty upper state costs: Sandy
+        // Bridge through Broadwell take an ~70-cycle state save on the
+        // first such instruction (and another restore returning to 256-bit
+        // code), and from Skylake every legacy SSE instruction in dirty
+        // state carries a false dependency on its destination's stale
+        // upper half instead -- a merge input, exactly the scalar-merge
+        // hazard at 128-bit scale. AMD cores take no penalty; the finding
+        // targets Intel. The fix is VZEROUPPER after the last 256-bit use
+        // (what compilers emit before every return and call when ymm was
+        // touched -- which is why compiled code is clean and the
+        // population is hand-written assembly and JIT output), or the VEX
+        // spelling of the SSE code, which does not merge.
+        //
+        // The state machine claims DIRTY only when it is provable on
+        // every path here: a ymm0-15/zmm0-15 write seen on this
+        // straight-line run, killed by VZEROUPPER/VZEROALL or an
+        // XRSTOR-family state load, by any control transfer (a callee may
+        // clean the state; past a RET or JMP the next bytes are another
+        // context), and -- the merge point -- by an incoming direct
+        // branch edge, whose path may arrive clean. A conditional
+        // branch's fallthrough keeps the state. Edges the sweep cannot
+        // see (indirect branches, jump tables) are the linear sweep's
+        // documented residual and err here toward silence only if they
+        // LAND mid-run unobserved -- collect_branch_targets marks every
+        // direct target, and an unseen indirect edge could only make a
+        // flagged site reachable with clean uppers, where the rewrite
+        // (vzeroupper, or the VEX spelling) stays harmless.
+        if (branch_target_in(branch_targets, offset, offset + 1)) {
+            ymm_upper_dirty = false;
+        }
+        if (ymm_upper_dirty && legacy_sse_with_xmm(&xedd)) {
+            summary_add(summary, "AVX-SSE transition", offset);
+            report_finding(summary, "AVX-SSE transition", offset, verbose,
+                &xedd, inst + offset);
+            ++errors;
+        }
+        switch (xed_decoded_inst_get_iclass(&xedd)) {
+        case XED_ICLASS_VZEROUPPER:
+        case XED_ICLASS_VZEROALL:
+        case XED_ICLASS_XRSTOR:
+        case XED_ICLASS_XRSTOR64:
+        case XED_ICLASS_XRSTORS:
+        case XED_ICLASS_XRSTORS64:
+        case XED_ICLASS_FXRSTOR:
+        case XED_ICLASS_FXRSTOR64:
+            ymm_upper_dirty = false;
+            break;
+        default: {
+            xed_category_enum_t cat = xed_decoded_inst_get_category(&xedd);
+            if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_RET ||
+                cat == XED_CATEGORY_UNCOND_BR ||
+                cat == XED_CATEGORY_SYSCALL || cat == XED_CATEGORY_SYSRET ||
+                cat == XED_CATEGORY_INTERRUPT) {
+                ymm_upper_dirty = false;
+            } else if (writes_wide_vector(&xedd)) {
+                ymm_upper_dirty = true;
+            }
+            break;
+        }
         }
 
         prev = xedd;

@@ -4475,6 +4475,114 @@ static void check_narrow_move_merge_test(void)
     assert(total == 1);
 }
 
+// A legacy SSE instruction executed while ymm0-15 upper state is provably
+// dirty pays the AVX-SSE transition (state save through Broadwell, a false
+// dependency per instruction from Skylake). Dirty is claimed only when a
+// ymm/zmm write is on the same straight-line run with no vzeroupper, no
+// control transfer, and no incoming branch edge. See the AVX-SSE
+// transition block in check_instructions.
+static void check_avx_sse_transition_test(void)
+{
+    static const uint8_t dirty_sse[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(dirty_sse, "AVX-SSE transition", 1);
+
+    static const uint8_t cleaned[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0xC5, 0xF8, 0x77,        // vzeroupper
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(cleaned, "AVX-SSE transition", 0);
+
+    static const uint8_t cleaned_all[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0xC5, 0xFC, 0x77,        // vzeroall
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(cleaned_all, "AVX-SSE transition", 0);
+
+    // Cleaning and re-dirtying: the state machine follows.
+    static const uint8_t redirtied[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0xC5, 0xF8, 0x77,        // vzeroupper
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(redirtied, "AVX-SSE transition", 1);
+
+    // A VEX.128 write zeroes only its own register's upper bits: it
+    // neither dirties nor cleans.
+    static const uint8_t vex128_only[] = {
+        0xC5, 0xF8, 0x28, 0xCA,  // vmovaps xmm1, xmm2
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(vex128_only, "AVX-SSE transition", 0);
+
+    // The VEX spelling does not merge: not flagged however dirty.
+    static const uint8_t vex_consumer[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0xC5, 0xF0, 0x58, 0xC2,  // vaddps xmm0, xmm1, xmm2
+    };
+    ASSERT_FINDINGS(vex_consumer, "AVX-SSE transition", 0);
+
+    // An incoming direct branch edge may arrive clean: the merge point
+    // drops the claim.
+    static const uint8_t branch_target[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0x74, 0x00,              // je +0 (next instruction is a target)
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(branch_target, "AVX-SSE transition", 0);
+
+    // A callee may clean the state: a control transfer drops the claim.
+    static const uint8_t call_between[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0xE8, 0x03, 0x00, 0x00, 0x00,  // call +3 (past the buffer)
+        0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(call_between, "AVX-SSE transition", 0);
+
+    // A 256-bit load dirties like any other ymm write.
+    static const uint8_t ymm_load[] = {
+        0xC5, 0xFC, 0x28, 0x08,  // vmovaps ymm1, ymmword ptr [rax]
+        0x0F, 0x58, 0xCA,        // addps xmm1, xmm2
+    };
+    ASSERT_FINDINGS(ymm_load, "AVX-SSE transition", 1);
+
+    // A legacy SSE store still executes as SSE: flagged (the pre-Skylake
+    // state save does not care that no register is written).
+    static const uint8_t sse_store[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0x0F, 0x29, 0x00,        // movaps xmmword ptr [rax], xmm0
+    };
+    ASSERT_FINDINGS(sse_store, "AVX-SSE transition", 1);
+
+    // The SSE ISA sets' non-vector members (fences, prefetch) touch no
+    // XMM register and are not flagged.
+    static const uint8_t fence[] = {
+        0xC5, 0xF4, 0x58, 0xC2,  // vaddps ymm0, ymm1, ymm2
+        0x0F, 0xAE, 0xF8,        // sfence
+    };
+    ASSERT_FINDINGS(fence, "AVX-SSE transition", 0);
+
+    // A 512-bit write dirties the same state.
+    static const uint8_t zmm_write[] = {
+        0x62, 0xF1, 0x74, 0x48, 0x58, 0xC2,  // vaddps zmm0, zmm1, zmm2
+        0x0F, 0x28, 0xDC,                    // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(zmm_write, "AVX-SSE transition", 1);
+
+    // ymm16-31 have no legacy alias: writes there leave every SSE-visible
+    // upper half as it was.
+    static const uint8_t ymm16_write[] = {
+        0x62, 0xA1, 0x74, 0x20, 0x58, 0xC2,  // vaddps ymm16, ymm17, ymm18
+        0x0F, 0x28, 0xDC,                    // movaps xmm3, xmm4
+    };
+    ASSERT_FINDINGS(ymm16_write, "AVX-SSE transition", 0);
+}
+
 // not rX ; and rX, rY folds to andn rX, rX, rY -- but only when the caller
 // declared BMI1 available (-m bmi1), and only when PF, which AND defines and
 // ANDN leaves undefined, is dead. See not_and_foldable_to_andn.
@@ -6080,6 +6188,7 @@ int main(int argc, char *argv[])
     check_vex_merge_false_dep_test();
     check_scalar_move_false_dep_test();
     check_narrow_move_merge_test();
+    check_avx_sse_transition_test();
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_blsmsk_test();

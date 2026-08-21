@@ -123,6 +123,29 @@ and only for flags -- the ABI guarantees they do not survive it.
 
 ## Implemented analyses
 
+* AVX-SSE transition
+  - `C5F458C2 0F28DC` (VADDPS YMM0, YMM1, YMM2; MOVAPS XMM3, XMM4) -- a
+    legacy SSE instruction preserves bits 255:128 of its destination's ymm
+    register, so executing one while any of ymm0-15 carries dirty upper
+    state costs: Sandy Bridge through Broadwell take an ~70-cycle state
+    save on the first such instruction (and another restore on returning
+    to 256-bit code), and from Skylake every legacy SSE instruction in
+    dirty state instead carries a false dependency on its destination's
+    stale upper half -- the scalar-merge hazard at 128-bit scale. AMD
+    cores take no penalty. The fix is VZEROUPPER after the last 256-bit
+    use, or the VEX spelling of the SSE code, which does not merge.
+    Compilers emit the VZEROUPPER before every return and call when ymm
+    was touched, so compiled code is clean and the population is
+    hand-written assembly and JIT output. Flagged only while dirtiness is
+    provable on every path to the instruction: a ymm0-15/zmm0-15 write on
+    the same straight-line run, with no VZEROUPPER/VZEROALL or
+    XRSTOR-family state load, no intervening control transfer (a callee
+    may clean the state), and no incoming direct branch edge (whose path
+    may arrive clean) -- writes to ymm16-31 have no legacy alias and do
+    not count, and a VEX.128 write zeroes only its own register's upper
+    bits, so it neither sets nor clears the state. An unseen indirect
+    edge could only reach a flagged site with clean uppers, where both
+    fixes stay harmless
 * IBT-bypassing NOTRACK call
   - `3E FFD0` (NOTRACK CALL RAX) -- the 3E prefix exempts this one indirect
     call from CET indirect-branch tracking: the CPU will not require an

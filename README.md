@@ -105,7 +105,12 @@ instructions) starting at the successor.
   `lea eax, [...]` (oversized LEA width) still writes the register, swapping
   the address's upper half for zeros, so a predecessor's zeroing of the
   destination -- overwritten either way -- proves nothing, and that check
-  runs the forward gate alone.
+  runs the forward gate alone. The boundary also parameterizes: the merging
+  narrow move check runs the same walk at bit 8 or 16
+  (`reg_bits_above_live_after`), where a high-byte register read observes
+  bits 15:8 and a same-register 32/64-bit XOR or SUB counts as the kill it
+  is rather than the read XED records -- compilers end a value's life with
+  exactly that idiom.
 
 Both scans share one bias: reads count inclusively and redefinitions
 exclusively, so every uncertainty -- a decode error, an unfollowable branch,
@@ -336,6 +341,33 @@ and only for flags -- the ABI guarantees they do not survive it.
     or beyond the lookahead is still misflagged -- the accepted, narrowed
     residue of an advisory. The memory forms zero the upper lanes and are
     never flagged; masked EVEX forms are skipped
+* merging narrow move
+  - `8A06` (MOV AL, [RSI]) -- the general-purpose sibling: an 8- or 16-bit
+    register-destination MOV (a load or a register copy) writes only the
+    low bits of its parent and merges the rest, and on every current core
+    that merge is a real input -- Sandy Bridge's separate low-byte renaming
+    was dropped in Haswell, and AMD never renamed partials, so the narrow
+    write itself serializes behind the register's last producer, however
+    unrelated. MOVZX (or MOVSX where the sign is wanted) performs the same
+    load or copy writing the register whole: one uop either way, the byte
+    forms one byte longer, the word forms the same length (the 66 prefix
+    trades for the 0F escape), the dependency gone. Unlike the vector
+    family the soundness condition is exactly computable, so this is a
+    gated equivalence rewrite, not an advisory: flagged only when the bits
+    at and above the written width are provably dead (register liveness at
+    the matching boundary), which silences the deliberate byte-packing
+    merge -- it reads the parent wide downstream -- and every escape,
+    since a narrow value crossing a RET or branch may be the low end of a
+    register whose upper bits carry real data. Store forms write no
+    register; immediate sources are a different trade (three extra bytes,
+    and the 16-bit-immediate shape is already the LCP finding); a
+    high-byte destination has no extending spelling (reading AH as a
+    source stays the efficient extraction and is never flagged); the
+    same-register copy is redundant MOV reg, reg; a load whose next
+    instruction extends it in place is load foldable into extend; and
+    8/16-bit arithmetic merges identically but has no same-cost full-width
+    spelling with its flags and width semantics, so nothing sound can be
+    suggested there
 * missing SHLX/SHRX/SARX (only with `-m bmi2`)
   - `D3E0` (SHL EAX, CL) -- SHLX EAX, EAX, ECX (BMI2) shifts without touching
     any flag, dropping the flag-merge uops CL-count shifts cost on Intel

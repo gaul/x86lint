@@ -2277,30 +2277,47 @@ static bool redefines_reg_ge32(const xed_decoded_inst_t *xedd,
     return false;
 }
 
-// Walk forward from byte `offset` to decide whether bits 32-63 of the 64-bit
-// GPR `reg64` might be read by a downstream instruction before being redefined.
-// Returns true (LIVE) on yes or unknown; the dispatcher suppresses a finding
-// whose rewrite would disturb those bits when this returns true. This is the
-// register analogue of flags_live_after, built to answer the one register
-// question the optimizations here raise: mov r32, r32's only effect beyond
-// identity is zero-extending bits 32-63, so removing it is sound exactly when
-// those bits are dead. Only the 64-bit register name reads them -- a read of
-// eax/ax/al does not -- so the match is width-aware.
+static bool gpr_dep_mitigation(const xed_decoded_inst_t *xedd,
+                               xed_reg_enum_t parent);
+
+// Walk forward from byte `offset` to decide whether the bits of `parent` at
+// or above bit `width_bits` might be read by a downstream instruction before
+// being redefined. Returns true (LIVE) on yes or unknown; the dispatcher
+// suppresses a finding whose rewrite would disturb those bits when this
+// returns true. This is the register analogue of flags_live_after, built for
+// the register questions the optimizations here raise, each naming its own
+// boundary: mov r32, r32's only effect beyond identity is zero-extending
+// bits 32-63, so removing it is sound exactly when those are dead
+// (width_bits 32, via the reg_upper32_live_after wrapper below), and an 8-
+// or 16-bit MOV rewritten to MOVZX zero-extends from its own width, sound
+// exactly when everything above it is dead (the merging narrow move check).
 //
-// Returns false (DEAD) only when an instruction unconditionally redefines those
-// bits with no dependence on their prior value: a 32-bit write zero-extends
-// into them, a 64-bit write sets them (see reg_kill_iclass), with no
-// intervening read.
+// A read observes the bits when it names a form wider than the boundary --
+// for the classic 32 case that is only the 64-bit name -- or serves as a
+// memory base or index wider than the boundary; and below 16 a high-byte
+// register read (AH/BH/CH/DH) observes bits 15:8 however narrow its own
+// width. Two write shapes end the walk DEAD: the whitelisted unconditional
+// 32- or 64-bit writers (redefines_reg_ge32; a 32-bit write zero-extends,
+// so both redefine every bit down to bit 8), and -- below 32 only -- a
+// same-register 32/64-bit XOR or SUB first, because XED records the zero
+// idiom as reading its destination while the renamer-recognized result
+// depends on nothing, and compilers end a value's life with exactly that
+// idiom. At 32 the idiom question does not arise for the wrapper's callers
+// the same way: a 64-bit self-XOR has always counted as a read there, and
+// loosening tested behavior is a separate decision from parameterizing the
+// walk. Ordinary reads are matched before kills, since an instruction can
+// read the register and then redefine it (add rax, rbx).
 //
 // Conservative LIVE on: decode error; ANY control transfer, RET included (a
-// register may escape as a return value or a callee-saved register, neither of
-// which a linear forward walk can rule out -- unlike flags, which no ABI
-// preserves across RET, so flags_live_after treats RET as DEAD); running out of
-// input; reaching the lookahead bound. Reads are matched inclusively
+// register may escape as a return value or a callee-saved register, neither
+// of which a linear forward walk can rule out -- unlike flags, which no ABI
+// preserves across RET, so flags_live_after treats RET as DEAD); running out
+// of input; reaching the lookahead bound. Reads are matched inclusively
 // (conditional reads count) and kills exclusively (only the whitelisted
 // unconditional writers), so every uncertainty resolves toward LIVE.
-static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
-                                   size_t offset, xed_reg_enum_t reg64)
+static bool reg_bits_above_live_after(const uint8_t *inst, size_t len,
+                                      size_t offset, xed_reg_enum_t parent,
+                                      unsigned width_bits)
 {
     const int MAX_LOOKAHEAD = 16;
 
@@ -2311,25 +2328,37 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
             return true;
         }
 
-        // A read of the full 64-bit register -- as an explicit or implicit
-        // operand, or as a memory base or index -- observes bits 32-63. Matched
-        // before the kill below, since an instruction can read the register and
-        // then redefine it (e.g. add rax, rbx). Reading a 32/16/8 sub-register
-        // does not touch bits 32-63, so compare the 64-bit name exactly.
+        if (width_bits < 32 && gpr_dep_mitigation(&xedd, parent)) {
+            return false;
+        }
+
         const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
         unsigned nops = xed_inst_noperands(xi);
         for (unsigned i = 0; i < nops; ++i) {
             const xed_operand_t *op = xed_inst_operand(xi, i);
             xed_operand_enum_t name = xed_operand_name(op);
-            if (xed_operand_is_register(name) && xed_operand_read(op) &&
-                xed_decoded_inst_get_reg(&xedd, name) == reg64) {
+            if (!xed_operand_is_register(name) || !xed_operand_read(op)) {
+                continue;
+            }
+            xed_reg_enum_t r = xed_decoded_inst_get_reg(&xedd, name);
+            if (xed_get_largest_enclosing_register(r) != parent) {
+                continue;
+            }
+            bool high8 = r == XED_REG_AH || r == XED_REG_BH ||
+                         r == XED_REG_CH || r == XED_REG_DH;
+            if (high8 ? width_bits < 16
+                      : xed_get_register_width_bits64(r) > width_bits) {
                 return true;
             }
         }
         int nmem = xed_decoded_inst_number_of_memory_operands(&xedd);
         for (int m = 0; m < nmem; ++m) {
-            if (xed_decoded_inst_get_base_reg(&xedd, m) == reg64 ||
-                xed_decoded_inst_get_index_reg(&xedd, m) == reg64) {
+            xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&xedd, m);
+            xed_reg_enum_t index = xed_decoded_inst_get_index_reg(&xedd, m);
+            if ((xed_get_largest_enclosing_register(base) == parent &&
+                 xed_get_register_width_bits64(base) > width_bits) ||
+                (xed_get_largest_enclosing_register(index) == parent &&
+                 xed_get_register_width_bits64(index) > width_bits)) {
                 return true;
             }
         }
@@ -2346,9 +2375,7 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
             return true;
         }
 
-        // An unconditional 32- or 64-bit write to the register redefines bits
-        // 32-63 independent of their prior value: DEAD.
-        if (redefines_reg_ge32(&xedd, reg64)) {
+        if (redefines_reg_ge32(&xedd, parent)) {
             return false;
         }
 
@@ -2356,6 +2383,14 @@ static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
     }
 
     return true;
+}
+
+// The classic boundary: bits 32-63 of the 64-bit GPR reg64, where only the
+// 64-bit register name reads them. See reg_bits_above_live_after.
+static bool reg_upper32_live_after(const uint8_t *inst, size_t len,
+                                   size_t offset, xed_reg_enum_t reg64)
+{
+    return reg_bits_above_live_after(inst, len, offset, reg64, 32);
 }
 
 // reg_concern hook (see struct check_entry) shared by the checks whose rewrite
@@ -6332,6 +6367,106 @@ static bool scalar_move_false_dep(const xed_decoded_inst_t *xedd,
         moved_bits);
 }
 
+// The general-purpose sibling of the merging scalar move: an 8- or 16-bit
+// register-destination MOV writes only the low bits of its parent and
+// merges the rest, and on every current core that merge is a real input --
+// Sandy Bridge's separate low-byte renaming was dropped in Haswell, and AMD
+// never renamed partials, so the narrow write itself reads the register's
+// old value and serializes behind its last producer, however unrelated.
+// MOVZX (or MOVSX, where the sign is wanted) performs the same load or
+// copy writing the register whole: same one uop, the byte forms one byte
+// longer (8A 06 -> 0F B6 06), the word forms the same length (the 66
+// prefix trades for the 0F escape: 66 8B 06 -> 0F B7 06), and the false
+// dependency gone. gcc and clang emit the extending forms for narrow
+// values pervasively, which is why a surviving bare narrow MOV is worth a
+// look.
+//
+// Unlike the vector family this rewrite's soundness condition is exactly
+// computable here: MOVZX differs from MOV only in the bits at and above
+// the written width, so the finding is gated by reg_bits_above_live_after
+// -- the deliberate merge (packing bytes into a wider value) reads the
+// parent wide downstream and suppresses itself, and an escape suppresses
+// too, because a narrow value crossing a RET or branch may be the low end
+// of a register whose upper bits carry real data (a struct returned in
+// RAX with one byte freshly stored). That makes this a gated equivalence
+// rewrite in the mov-eax-eax family, not an advisory: every reported site
+// is provably safe to rewrite within the walk's stated conservatism.
+//
+// Not flagged:
+//   * store forms (mov [mem], al): no register write at all;
+//   * immediate sources: mov al, 5 widens to the 5-byte mov eax, 5 --
+//     three bytes for the dependency is a different trade, and the
+//     16-bit-immediate shape is already the length-changing prefix stall
+//     finding;
+//   * a high-byte destination (mov ah, [mem]): no extending spelling
+//     writes bits 15:8, so the fix is restructuring, not substitution
+//     (reading AH as a source is fine -- movzx eax, ah remains the
+//     efficient byte extraction);
+//   * a segment or other non-GPR source: MOVZX cannot encode it;
+//   * a same-register copy (mov al, al): redundant MOV reg, reg already
+//     flags the pure no-op;
+//   * a narrow load whose next instruction extends the loaded register
+//     in place: that pair is the load-foldable-into-extend finding, whose
+//     one-instruction fix subsumes this one;
+//   * 8/16-bit arithmetic (add al, bl): it merges identically, but no
+//     same-cost full-width spelling preserves its flags and width
+//     semantics, so there is nothing sound to suggest.
+static bool narrow_move_merge(const xed_decoded_inst_t *xedd,
+                              const uint8_t *inst, size_t len,
+                              size_t next_offset)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV ||
+        xed_decoded_inst_get_immediate_width_bits(xedd) != 0) {
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    const xed_operand_t *op0 = xed_inst_operand(xi, 0);
+    if (xed_operand_name(op0) != XED_OPERAND_REG0 ||
+        !xed_operand_written(op0)) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    unsigned width = xed_get_register_width_bits64(dst);
+    if (width != 8 && width != 16) {
+        return false;
+    }
+    if (dst == XED_REG_AH || dst == XED_REG_BH || dst == XED_REG_CH ||
+        dst == XED_REG_DH) {
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(xedd) == 0) {
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+        if (src == dst || xed_reg_class(src) != XED_REG_CLASS_GPR) {
+            return false;
+        }
+    }
+    if (next_offset < len) {
+        xed_decoded_inst_t ext;
+        decode_init(&ext);
+        if (xed_decode(&ext, inst + next_offset, len - next_offset) ==
+                XED_ERROR_NONE) {
+            switch (xed_decoded_inst_get_iclass(&ext)) {
+            case XED_ICLASS_MOVZX:
+            case XED_ICLASS_MOVSX:
+            case XED_ICLASS_MOVSXD:
+                if (xed_decoded_inst_number_of_memory_operands(&ext) == 0 &&
+                    xed_decoded_inst_get_reg(&ext, XED_OPERAND_REG1) == dst) {
+                    return false;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    return !reg_bits_above_live_after(
+        inst, len, next_offset, xed_get_largest_enclosing_register(dst),
+        width);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
                        uint32_t extensions)
@@ -6739,6 +6874,18 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (scalar_move_false_dep(&xedd, &dep_history, inst, len, next)) {
             summary_add(summary, "merging scalar move", offset);
             report_finding(summary, "merging scalar move", offset, verbose,
+                &xedd, inst + offset);
+            ++errors;
+        }
+
+        // Its general-purpose sibling: an 8- or 16-bit register-destination
+        // MOV merges into its parent, and MOVZX performs the same load or
+        // copy writing the register whole -- a gated equivalence rewrite,
+        // reported only when the bits above the written width are provably
+        // dead. See narrow_move_merge.
+        if (narrow_move_merge(&xedd, inst, len, next)) {
+            summary_add(summary, "merging narrow move", offset);
+            report_finding(summary, "merging narrow move", offset, verbose,
                 &xedd, inst + offset);
             ++errors;
         }

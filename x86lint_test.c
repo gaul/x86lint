@@ -3019,12 +3019,18 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(other_family, "load foldable into extend", 0);
 
     // mov al, [rsi] ; movzx eax, cl -- the extension reads CL, not the loaded
-    // AL: suppress.
+    // AL: no fold. The load itself, its byte instantly buried by the
+    // full-width movzx, is a merging narrow move finding instead.
     static const uint8_t other_source[] = {
         0x8A, 0x06,        // mov al, [rsi]
         0x0F, 0xB6, 0xC1,  // movzx eax, cl
     };
-    ASSERT_FINDINGS(other_source, "load foldable into extend", 0);
+    int total;
+    assert(count_findings(other_source, sizeof(other_source),
+                          "load foldable into extend", &total, 0) == 0);
+    assert(count_findings(other_source, sizeof(other_source),
+                          "merging narrow move", &total, 0) == 1);
+    assert(total == 1);
 
     // mov [rsi], al ; movzx eax, al -- the mov is a store, not a load: suppress.
     static const uint8_t store[] = {
@@ -4314,6 +4320,159 @@ static void check_scalar_move_false_dep_test(void)
         0xFF, 0xE0,              // jmp rax
     };
     ASSERT_FINDINGS(escape_indirect, "merging scalar move", 1);
+}
+
+// Gated equivalence rewrite: an 8- or 16-bit register-destination MOV
+// merges into its parent, and MOVZX performs the same load or copy writing
+// the register whole -- flagged only when the bits at and above the written
+// width are provably dead. See narrow_move_merge.
+static void check_narrow_move_merge_test(void)
+{
+    // Byte load consumed at byte width, register then rewritten whole: the
+    // self-XOR counts as the kill it is, not the read XED records.
+    static const uint8_t byte_load_dead[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0x88, 0x07,        // mov byte ptr [rdi], al
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(byte_load_dead, "merging narrow move", 1);
+
+    // A wide read downstream: the merge is wanted (a value built by bytes).
+    static const uint8_t wide_read[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0x89, 0x07,        // mov dword ptr [rdi], eax
+    };
+    ASSERT_FINDINGS(wide_read, "merging narrow move", 0);
+
+    // A high-byte read observes bits 15:8, inside a byte write's span.
+    static const uint8_t high8_read[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0x88, 0x27,        // mov byte ptr [rdi], ah
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(high8_read, "merging narrow move", 0);
+
+    // ...but outside a word write's: the word finding survives it.
+    static const uint8_t word_high8_read[] = {
+        0x66, 0x8B, 0x06,  // mov ax, word ptr [rsi]
+        0x88, 0x27,        // mov byte ptr [rdi], ah
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(word_high8_read, "merging narrow move", 1);
+
+    // An escape: the merged register may carry real upper bits out (a
+    // struct returned in RAX with one byte freshly stored). Conservative
+    // silence, unlike the vector sibling.
+    static const uint8_t escape_ret[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(escape_ret, "merging narrow move", 0);
+
+    // A data XOR reads the old value: only the self form is a kill.
+    static const uint8_t xor_other_reg[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0x31, 0xD8,        // xor eax, ebx
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(xor_other_reg, "merging narrow move", 0);
+
+    // Word load: the movzx spelling is even size-neutral (66 8B vs 0F B7),
+    // and a 16-bit read of the written register observes nothing above it.
+    static const uint8_t word_load_dead[] = {
+        0x66, 0x8B, 0x06,  // mov ax, word ptr [rsi]
+        0x66, 0x89, 0x07,  // mov word ptr [rdi], ax
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(word_load_dead, "merging narrow move", 1);
+
+    // Register copy form, REX registers included.
+    static const uint8_t reg_copy_dead[] = {
+        0x88, 0xD8,        // mov al, bl
+        0x88, 0x07,        // mov byte ptr [rdi], al
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(reg_copy_dead, "merging narrow move", 1);
+
+    static const uint8_t rex_load_dead[] = {
+        0x44, 0x8A, 0x06,  // mov r8b, byte ptr [rsi]
+        0x44, 0x88, 0x07,  // mov byte ptr [rdi], r8b
+        0x45, 0x31, 0xC0,  // xor r8d, r8d
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(rex_load_dead, "merging narrow move", 1);
+
+    // An immediate source is a different trade: never flagged.
+    static const uint8_t imm_src[] = {
+        0xB0, 0x05,        // mov al, 5
+        0x88, 0x07,        // mov byte ptr [rdi], al
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(imm_src, "merging narrow move", 0);
+
+    // A high-byte destination has no extending spelling.
+    static const uint8_t high8_dest[] = {
+        0x8A, 0x26,        // mov ah, byte ptr [rsi]
+        0x88, 0x27,        // mov byte ptr [rdi], ah
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(high8_dest, "merging narrow move", 0);
+
+    // MOVZX cannot take a segment source: never flagged.
+    static const uint8_t seg_source[] = {
+        0x66, 0x8C, 0xD8,  // mov ax, ds
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(seg_source, "merging narrow move", 0);
+
+    // The load may address through its own parent -- the extending load
+    // reads memory at the same point with the same base.
+    static const uint8_t self_base[] = {
+        0x8A, 0x00,        // mov al, byte ptr [rax]
+        0x88, 0x03,        // mov byte ptr [rbx], al
+        0x31, 0xC0,        // xor eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(self_base, "merging narrow move", 1);
+
+    // A downstream address built on the parent observes all its bits.
+    static const uint8_t base_read[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0x8B, 0x18,        // mov ebx, dword ptr [rax]
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(base_read, "merging narrow move", 0);
+
+    // The load+extend pair is load foldable into extend's finding alone.
+    static const uint8_t folded[] = {
+        0x8A, 0x06,        // mov al, byte ptr [rsi]
+        0x0F, 0xB6, 0xC0,  // movzx eax, al
+    };
+    int total;
+    assert(count_findings(folded, sizeof(folded),
+                          "load foldable into extend", &total, 0) == 1);
+    assert(count_findings(folded, sizeof(folded),
+                          "merging narrow move", &total, 0) == 0);
+    assert(total == 1);
+
+    // A self-copy is redundant MOV reg, reg, not a merge finding.
+    static const uint8_t self_copy[] = {
+        0x88, 0xC0,        // mov al, al
+        0xC3,              // ret
+    };
+    assert(count_findings(self_copy, sizeof(self_copy),
+                          "redundant MOV reg, reg", &total, 0) == 1);
+    assert(count_findings(self_copy, sizeof(self_copy),
+                          "merging narrow move", &total, 0) == 0);
+    assert(total == 1);
 }
 
 // not rX ; and rX, rY folds to andn rX, rX, rY -- but only when the caller
@@ -5920,6 +6079,7 @@ int main(int argc, char *argv[])
     check_sse_merge_false_dep_test();
     check_vex_merge_false_dep_test();
     check_scalar_move_false_dep_test();
+    check_narrow_move_merge_test();
     check_missing_andn_test();
     check_missing_blsr_test();
     check_missing_blsmsk_test();

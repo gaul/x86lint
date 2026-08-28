@@ -323,11 +323,12 @@ than a byte patch.
 
 ## Investigated and closed (2026-08 sweep)
 
-Candidates measured and rejected, recorded so they are not
-re-investigated. The first two are the sharper warnings: one looked
-like a 20x coverage gap until the sites were dumped, and the other
-looked like the largest dead-code population in the corpus until it
-was traced to a build flag.
+Candidates measured and set aside, recorded so they are not
+re-investigated. Most are rejected outright; the last is sound and
+merely blocked on a knob the tool does not have. The first two are the
+sharper warnings: one looked like a 20x coverage gap until the sites
+were dumped, and the other looked like the largest dead-code population
+in the corpus until it was traced to a build flag.
 
 | Pattern | Rewrite | Measured |
 | --- | --- | --- |
@@ -337,7 +338,69 @@ was traced to a build flag.
 | `LEA` + `CMOVcc` reading its result | fold the address into the CMOV's memory operand | **Unsound**, 10,679 sites. `CMOVcc r, m` loads unconditionally regardless of the condition; the LEA does not load at all. Any site where the address is only conditionally valid would fault |
 | sole-use load + shift reading it | fold into the shift | **Not encodable**, 19,729 sites. A shift takes a memory operand only as its destination, and these consume the loaded value as the shifted operand with a register destination |
 | redundant reload of one address (`reload\|same`, `reload\|copy`) | reuse the first value | **7,237** across the corpus (libc 196/Minsn, bash 205, libxul 228, go 108) -- real, and an order of magnitude below every family in the sections above. Worth revisiting only after those ship |
+| `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** See the note below |
 | `XOR r32, r32` + `XOR r32, r32` | -- | **28,516 sites and nothing to fix.** The most frequent flag-coupled pair in the corpus after the compare/branch families, and it is two independent zeroing idioms; the `fdead` tag says only that the first's flag write is dead, which is true of every zeroing idiom |
+
+**The bit-scan defensive default: right answer, wrong core.** A compiler
+writing `mov r8d, 0x40 ; tzcnt r8, rsi` is providing the zero-source
+answer, an idiom that exists because `BSF`/`BSR` leave their destination
+*undefined* when the source is zero (real silicon preserves it, which is
+what the sequence relies on). `TZCNT`/`LZCNT` have no such hole: they
+are defined to return the operand size and they write the destination
+unconditionally, so for those spellings the `MOV` is dead outright.
+
+The family splits **BSR 1,067, TZCNT 305, BSF 3** across 1,375 pairscan
+sites, so counting the shape unsplit overstates the candidate by 4.5x.
+The discriminator is mechanical, and the constant itself carries it:
+
+```
+mov  r8d, 0x40      0x40 == 64 == the operand size TZCNT already returns.  Dead.
+tzcnt r8, rsi
+
+mov  ecx, 0x7f      0x7f is a sentinel, not an answer.
+bsr  rcx, rdx
+xor  ecx, 0x3f      127^63 = 64 for the zero case; index^63 = 63-index otherwise.
+```
+
+Every dumped TZCNT site in libxul -- **108 of 108**, 81 at 64 and 27 at
+32 -- has the constant exactly equal to the operand size, with no
+exceptions. So the check would be easy to write and easy to gate.
+
+**What blocks it is that the same `MOV` is the false-dependency break.**
+`TZCNT` and `LZCNT` treat their destination as a phantom input through
+Broadwell, the same erratum class as `POPCNT`, and a `mov r32, imm32` is
+a full write with no input, so it cuts the chain. The shipped
+"missing POPCNT dependency break" check says exactly this: it declines
+to flag a site "when the preceding instruction already redefined the
+register -- the mitigation gcc and clang emit", and it names LZCNT and
+TZCNT as affected through Broadwell. The motivating site makes the
+conflict concrete:
+
+```
+mov   r8d, DWORD PTR [rdi+0x20]     <- R8 written
+add   r8d, 0xfffffff0               <- and again
+mov   QWORD PTR gs:[r8+0x8], rsi
+mov   r8d, 0x40                     <- dead value, live mitigation
+tzcnt r8, rsi
+```
+
+Without the `MOV` the TZCNT inherits a false dependency on that
+load-and-add chain, and x86lint would flag the same address with the
+opposite advice. Two shipped checks fighting over one instruction is
+worse than either finding.
+
+So the fold is correct **only on Skylake and later**, where the phantom
+input is gone and the `MOV` is 5-6 bytes and a uop of pure waste. That
+makes it a target-microarchitecture-gated check, and `-m` is not that
+axis: it selects ISA features -- whether an encoding exists -- not which
+core is being tuned for. Adding a target axis for one 305-site check is
+a poor trade. Adding it for the family may not be: this row, the
+POPCNT/LZCNT/TZCNT dependency break, the length-changing prefix stall,
+and the **37,037 slow-LEA folds excluded from "ADD foldable into LEA"**
+all carry per-core caveats that currently live in prose. A `-t` knob
+would turn several of them into gates at once, and would make this row
+and the slow-LEA folds reportable on the same day. That is the argument
+for building the axis rather than the check.
 
 ## Not yet measured
 
@@ -347,7 +410,6 @@ earns a row above.
 
 | Item | Notes |
 | --- | --- |
-| `MOV r, imm` + `TZCNT`/`LZCNT` | 1,375 pairscan sites tagged `waw` (the mov's value overwritten unread), and the split across the family is the whole point: **BSR 1,067, TZCNT 305, BSF 3**. `BSF`/`BSR` leave the destination undefined for a zero source, so the preceding `MOV` is what gives it a defined value and is not dead. `TZCNT`/`LZCNT` define it as the operand size, so for those the `MOV` is dead outright -- a 305-site candidate, not a 1,375-site one. Counting the shape without splitting it would have overstated this by 4.5x |
 | one-operand `MUL` whose low half is dead | 415 `dep,waw` sites (`mul rdx ; mov rax, rdx`, the low half in RAX overwritten unread). `MULX` (BMI2) produces the high half without writing RAX/RDX, so this is a `-m bmi2` candidate alongside the shipped SHLX/SHRX/SARX and ANDN checks. MULX is unsigned-only, so the 517 one-operand `IMUL` sites in the same shape do not qualify |
 | `MOV r, r` + shift/ALU (the APX NDD shape) | 270,543 adjacent sites, the second-largest family in the corpus. Already covered by "missing APX NDD" under `-m apx`; recorded here only so the size of the population is not mistaken for an uncovered one |
 | split macro-fusion pairs | Informational, the class armlint files under its `-a` audit idea: a `CMP`/`TEST` separated from its `Jcc` cannot fuse. Needs the per-core fusion tables from the optimization manual, and has no rewrite -- it is a scheduling complaint, not a peephole |

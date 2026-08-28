@@ -279,7 +279,7 @@ that closed itself.
 
 | Check | Reports | Population at d1 | Notes |
 | --- | --- | --- | --- |
-| ~~LEA foldable into memory~~ | libxul **1,326**; go 153; libc 0 | libxul 14,923; go 658; libc 254 | **Investigated and mostly closed.** The 12x figure was the wrong measurement: `defuse`'s `lea->addr` counts a LEA whose sole use is an address and asks nothing about whether the combined address is *encodable* or the register provably dead. See the breakdown below; the check gained 111 findings from one real fix and the rest of the residue is refusals it should be making |
+| ~~LEA foldable into memory~~ | libxul **1,359**; go **184**; libc **2** | libxul 14,923; go 658; libc 254 | **Investigated and mostly closed.** The 12x figure was the wrong measurement: `defuse`'s `lea->addr` counts a LEA whose sole use is an address and asks nothing about whether the combined address is *encodable* or the register provably dead. See the breakdown below; the check gained 111 findings from a liveness fix and 87 more from the RIP-relative arm, and the rest of the residue is refusals it should be making |
 | redundant TEST after flags | libxul 556; libc 7; go 4 | `cmp0` d1: logic 329, arith 1,637, **test-width 405** | The logic and arith rows are covered (the check searches a window, not just d1, and arith is an upper bound gated on CF/OF deadness, exactly as documented). The test-width row -- 405 sites, 357 of them libxul -- is the check's exact-register match refusing a TEST that names a different width of the producer's register. That refusal is deliberate and sound (`AND EAX, EBX` clears bits 63:32 where `TEST RAX, RAX` reads a sign bit the narrow form never sees); the open question is whether the narrowing direction, where the producer is the *wider* one, is admissible |
 
 **Breaking down the LEA fold's residue.** Classifying every adjacent
@@ -304,15 +304,22 @@ both-successors split written for the compare fold -- took libxul from
 `lea rdi, [rsi+rdi*4] ; cmp [rdi], r14d ; je`. It did nothing for libc,
 whose residue is encodability rather than liveness.
 
-The **RIP-relative arm** is the one piece still unimplemented, and it
-is small. `lea rax, [rip+X] ; mov r14, [rax]` is `mov r14, [rip+X']`,
-which the assembler resolves; but RIP-relative addressing admits no
-index, and **95% of the RIP pairs feed an indexed consumer** -- the
-jump-table and global-array shape `lea rax, [rip+X] ; mov ecx,
-[rax+rdx*4]`, which has no one-instruction spelling. What is left is
-**89 sites** (libxul 88, libc 1), and it carries the actionability
-caveat armlint records for `adrp`+`add`: the LEA usually carries a
-relocation, so this is a codegen suggestion rather than a byte patch.
+The **RIP-relative arm** has since shipped, and it is the one
+prediction in this file that landed. `lea rax, [rip+X] ; mov r14, [rax]`
+is `mov r14, [rip+X']`, which the assembler resolves; but RIP-relative
+addressing admits no index, and **95% of the RIP pairs feed an indexed
+consumer** -- the jump-table and global-array shape `lea rax, [rip+X] ;
+mov ecx, [rax+rdx*4]`, which has no one-instruction spelling. Sizing it
+that way, through the condition the *rewrite* imposes rather than the
+shape, predicted **89 sites**; the check reports **87** (libxul 33, go
+31, libstdc++ 13, libcrypto 8, libc 2). Every earlier row in this file
+overstated its rewrite by between 5x and 300x, and the difference is
+not the tools -- it is that this estimate applied the encodability
+condition before counting, and the others did not.
+
+It carries the actionability caveat armlint records for `adrp`+`add`:
+where the LEA holds a relocation this is a codegen suggestion rather
+than a byte patch.
 
 ## Investigated and closed (2026-08 sweep)
 

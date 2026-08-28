@@ -2891,6 +2891,49 @@ static void check_lea_fold_test(void)
         0x48, 0x89, 0xD6,        // mov rsi, rdx (reads rdx)
     };
     ASSERT_FINDINGS(branch_one_live, "LEA foldable into memory", 0);
+
+    // lea rax, [rip+X] ; mov rcx, [rax] -> mov rcx, [rip+X'], the address of a
+    // static object loaded directly. The assembler recomputes the displacement
+    // from the symbol; the anchor moves by at most the pair's length.
+    static const uint8_t rip_relative[] = {
+        0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,  // lea rax, [rip+0x10]
+        0x48, 0x8B, 0x08,                          // mov rcx, [rax]
+        0x48, 0x89, 0xD0,                          // mov rax, rdx (kills rax)
+    };
+    ASSERT_FINDINGS(rip_relative, "LEA foldable into memory", 1);
+
+    // The consumer's own displacement folds into the RIP one.
+    static const uint8_t rip_with_disp[] = {
+        0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,  // lea rax, [rip+0x10]
+        0x48, 0x8B, 0x48, 0x08,                    // mov rcx, [rax+0x8]
+        0x48, 0x89, 0xD0,                          // mov rax, rdx
+    };
+    ASSERT_FINDINGS(rip_with_disp, "LEA foldable into memory", 1);
+
+    // The consumer overwriting the address register is deadness enough here too.
+    static const uint8_t rip_overwrite[] = {
+        0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,  // lea rax, [rip+0x10]
+        0x48, 0x8B, 0x00,                          // mov rax, [rax]
+    };
+    ASSERT_FINDINGS(rip_overwrite, "LEA foldable into memory", 1);
+
+    // lea rax, [rip+X] ; mov ecx, [rax+rdx*4] -- RIP-relative addressing admits
+    // no index, so the jump-table and global-array shape has no one-instruction
+    // spelling. This is 95% of the RIP-relative pairs in the corpus.
+    static const uint8_t rip_indexed_consumer[] = {
+        0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,  // lea rax, [rip+0x10]
+        0x8B, 0x0C, 0x90,                          // mov ecx, [rax+rdx*4]
+        0x48, 0x89, 0xD0,                          // mov rax, rdx
+    };
+    ASSERT_FINDINGS(rip_indexed_consumer, "LEA foldable into memory", 0);
+
+    // The address register read after the consumer keeps the lea alive.
+    static const uint8_t rip_dest_live[] = {
+        0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,  // lea rax, [rip+0x10]
+        0x48, 0x8B, 0x08,                          // mov rcx, [rax]
+        0x48, 0x89, 0xC2,                          // mov rdx, rax (reads rax)
+    };
+    ASSERT_FINDINGS(rip_dest_live, "LEA foldable into memory", 0);
 }
 
 // Multi-instruction peephole: mov reg, imm followed by an instruction that uses

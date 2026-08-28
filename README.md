@@ -216,10 +216,20 @@ argue for or against each, live in [TODO.md](TODO.md).
     Deadness is proved down BOTH successors of a directly following Jcc, since
     a folded address is very often consumed by a compare the next instruction
     branches on (`LEA RDI, [RSI+RDI*4]; CMP [RDI], R14D; JE`) and a
-    straight-line walk gives up there. Not folded: a RIP-relative producer,
-    whose displacement is measured from the following instruction, and which
-    in any case feeds an indexed consumer 95% of the time -- and RIP-relative
-    addressing admits no index
+    straight-line walk gives up there.
+  - A RIP-relative producer folds the same way, into a consumer that is itself
+    RIP-relative: `LEA RAX, [RIP+X]; MOV RCX, [RAX]` -> `MOV RCX, [RIP+X']`,
+    the address of a static object loaded directly, seven bytes and an
+    instruction shorter. The surviving instruction stands where the pair did,
+    so its RIP anchor moves by at most the pair's length and the assembler
+    recomputes the displacement from the symbol -- the check range-tests with
+    headroom for that shift rather than modelling the encoder's choice. Since
+    RIP-relative addressing admits neither a base nor an index, the consumer
+    must carry neither, which is what keeps the arm small: 95% of the
+    RIP-relative pairs in the corpus are the jump-table and global-array shape
+    `LEA RAX, [RIP+X]; MOV ECX, [RAX+RDX*4]`, which no single instruction
+    spells. Where the producer's LEA carries a relocation this is a codegen
+    suggestion rather than a byte patch
 * length-changing prefix stall
   - `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
     immediate's length (imm32 -> imm16) defeats the pre-decoder's length

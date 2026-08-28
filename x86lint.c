@@ -4098,11 +4098,20 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
         return false;
     }
 
-    // The lea's address components must be 64-bit GPRs or absent; RIP-relative
-    // (register class IP) and 32-bit-address (GPR32) forms fail this test.
+    // Two kinds of producer. A RIP-relative lea materializes the address of a
+    // static object, and folds into a consumer that is itself RIP-relative --
+    // which admits neither a base nor an index, so the consumer must carry
+    // neither (checked below). Otherwise the lea's address components must be
+    // 64-bit GPRs or absent, which also excludes the 32-bit-address (GPR32)
+    // forms.
     xed_reg_enum_t base_l = xed_decoded_inst_get_base_reg(lea, 0);
     xed_reg_enum_t index_l = xed_decoded_inst_get_index_reg(lea, 0);
-    if (base_l != XED_REG_INVALID &&
+    bool rip_producer = xed_reg_class(base_l) == XED_REG_CLASS_IP;
+    if (rip_producer) {
+        if (index_l != XED_REG_INVALID) {
+            return false;
+        }
+    } else if (base_l != XED_REG_INVALID &&
         (xed_reg_class(base_l) != XED_REG_CLASS_GPR ||
          xed_get_register_width_bits64(base_l) != 64)) {
         return false;
@@ -4153,14 +4162,27 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
     }
 
     // At most one index between the two, and the displacements sum within 32
-    // signed bits.
-    if (index_l != XED_REG_INVALID &&
+    // signed bits. A RIP-relative result admits no index at all, which is what
+    // keeps this arm small: the dominant RIP shape is the jump table and the
+    // global array, lea rax, [rip+X] ; mov ecx, [rax+rdx*4], and no single
+    // instruction spells it.
+    if ((index_l != XED_REG_INVALID || rip_producer) &&
         xed_decoded_inst_get_index_reg(&consumer, 0) != XED_REG_INVALID) {
         return false;
     }
     int64_t disp = xed_decoded_inst_get_memory_displacement(lea, 0) +
                    xed_decoded_inst_get_memory_displacement(&consumer, 0);
-    if (disp < INT32_MIN || disp > INT32_MAX) {
+    if (rip_producer) {
+        // The surviving instruction stands where the pair did, so its RIP
+        // anchor -- the end of the instruction, which the displacement is
+        // measured from -- moves by at most the pair's length. The assembler
+        // computes the exact value from the symbol; the check only has to know
+        // one exists, so the range test carries headroom for the shift rather
+        // than modelling the encoder's choice.
+        if (disp < (int64_t) INT32_MIN + 64 || disp > (int64_t) INT32_MAX - 64) {
+            return false;
+        }
+    } else if (disp < INT32_MIN || disp > INT32_MAX) {
         return false;
     }
 

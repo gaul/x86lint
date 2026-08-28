@@ -1,10 +1,11 @@
 #!/bin/sh
 # Smoke test for the ELF driver (main.c): section walk, symbol-table scan
 # restriction and its -a override, -v per-finding lines with section-relative
-# offsets, the summary tail, and the grep-convention exit codes (0 clean scan,
-# 1 opportunities found, 2 tool failure). Fixtures are tiny static ELFs
-# assembled with the system toolchain at run time; instructions are spelled
-# as .byte so the assembler cannot pick different encodings.
+# offsets, the --json document, the summary tail, and the grep-convention
+# exit codes (0 clean scan, 1 opportunities found, 2 tool failure).
+# Fixtures are tiny static ELFs assembled with the system toolchain at run
+# time; instructions are spelled as .byte so the assembler cannot pick
+# different encodings.
 set -u
 
 X86LINT=${X86LINT:-./x86lint}
@@ -504,6 +505,69 @@ expect "no sized function symbol named 'f3'"
 run 2 -f nosuch "$dir/perfunc"
 run 2 -a -f f2 "$dir/perfunc"
 expect 'mutually exclusive'
+
+# --json: the same findings the -v scan reports, as one streamable document
+# keyed by absolute address. The human report's furniture -- the by-type
+# table and the restriction line -- must not leak into it.
+run 1 --json "$dir/finding"
+expect '^\{"file": ' "JSON document opening"
+expect '"check": "oversized XCHG encoding"'
+expect '"function": "_start"'
+expect '"restriction": \{"symbols": 1\}'
+expect '"instructions": 4'
+expect '"opportunities": 1'
+reject '^Optimization opportunities by type:$' "by-type table under --json"
+reject '^scan restricted to' "restriction prose under --json"
+reject 'optimization opportunities in' "summary tail under --json"
+
+# A clean scan is an empty findings array, not an absent one, and still 0.
+run 0 --json "$dir/clean"
+expect '"findings": \[$'
+expect '"opportunities": 0'
+
+# -a drops the restriction entirely; -f reports which function it kept.
+run 1 --json -a "$dir/finding"
+expect '"opportunities": 2'
+reject '"restriction"' "restriction key under -a"
+run 1 --json -f f2 "$dir/perfunc"
+expect '"restriction": \{"function": "f2", "sites": 1, "bytes": 3\}'
+expect '"opportunities": 1'
+
+# --json owns stdout, so the reports that would interleave with it are
+# refused rather than silently dropped.
+run 2 --json -v "$dir/finding"
+expect 'cannot be combined'
+run 2 --json -i "$dir/finding"
+expect 'cannot be combined'
+run 2 --json -e "$dir/finding"
+expect 'cannot be combined'
+
+# A file the driver rejects leaves no half-written document behind.
+"$X86LINT" --json "$dir/finding.s" >"$dir/out" 2>/dev/null
+if [ -s "$dir/out" ]; then
+    fail "--json wrote a partial document for a non-ELF input"
+fi
+
+# Structural check where a JSON parser is at hand: the document parses, its
+# array length agrees with the total it reports, and the findings carry the
+# absolute addresses of the fixture's four xchg sites.
+if command -v python3 >/dev/null 2>&1; then
+    "$X86LINT" --json -a "$dir/perfunc" >"$dir/out.json" 2>/dev/null
+    python3 - "$dir/out.json" <<'PYEOF' || fail "--json validation failed"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["opportunities"] == 4, d["opportunities"]
+assert len(d["findings"]) == d["opportunities"], "array length disagrees"
+addrs = [f["vaddr"] for f in d["findings"]]
+assert [a - addrs[0] for a in addrs] == [0, 2, 5, 8], addrs
+for f in d["findings"]:
+    assert f["check"] == "oversized XCHG encoding", f
+    assert f["length"] == 2 and f["bytes"] == "87c8", f
+    assert f["section"] == ".text", f
+PYEOF
+else
+    echo "driver_test.sh: no python3, skipping --json structural check" >&2
+fi
 
 # Extension-gated checks: the fixture is clean at baseline; each -m enables
 # exactly its own finding (the bits are independent).

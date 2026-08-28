@@ -765,7 +765,8 @@ address" -- the form needed to join findings against anything else keyed by
 address, such as an execution profile that weights each opportunity by how
 often the instruction it names actually runs. It is independent of both
 `summary` and `verbose`, so a consumer wanting only the per-finding stream
-passes `NULL` for the summary and `false` for verbose.
+passes `NULL` for the summary and `false` for verbose. The driver's `--json`
+mode is built on it.
 
 x86lint can also read arbitrary 64-bit ELF executables directly. When the
 binary kept its symbol table (`.symtab`), the scan is restricted to the byte
@@ -852,6 +853,46 @@ surrounding bytes is unsound for binaries like glibc that keep baseline code
 and CPU-dispatched BMI-rich variants in the same section. The flags are
 independent, matching their CPUID feature bits: `-m bmi2` does not imply
 `-m bmi1`.
+
+Pass `--json` to replace the human report with the findings as a JSON
+document, one object per line inside a `findings` array:
+
+```console
+$ ./x86lint --json /bin/ls
+{"file": "/bin/ls",
+  "findings": [
+    {"vaddr": 8468, "check": "oversized immediate", "section": ".text", "length": 5, "bytes": "6800000000", "text": "push 0x0"},
+    ...
+  ],
+  "instructions": 22705,
+  "skipped": 0,
+  "opportunities": 282
+}
+```
+
+`vaddr` is the offending instruction's **absolute** address -- not the
+section-relative offset `-v` prints -- and is a number rather than a hex
+string so that it composes with arithmetic. That is the point of the mode:
+findings become joinable against anything else keyed by address, and the
+join worth making is an execution profile, which turns a static count of
+opportunities into a dynamic one. How often a compiler *emits* a suboptimal
+encoding is a poor proxy for what it costs; one inside an interpreter
+dispatch loop outweighs thousands in cold initialization code, and only a
+profile can tell the two apart. `function` and `function_offset` appear when
+the binary kept symbols to attribute against, and `restriction` carries what
+narrowed the scan -- `{"symbols": N}` by default, `{"function": ..., "sites":
+N, "bytes": N}` under `-f`, and absent under `-a` -- so that a partial scan
+is not read as a clean sweep of the whole file.
+
+Findings are written as they are found rather than collected first, so a
+large binary streams instead of accumulating tens of thousands of objects in
+memory; the totals close the document because the scan only knows them then.
+Section and symbol names are copied from the file verbatim, so a binary whose
+string tables are not UTF-8 yields strings that are not either. The exit
+status is unchanged, and a file the driver rejects leaves stdout empty rather
+than half a document. `--json` describes the peephole scan alone: `-v`, `-i`
+and `-e` are separate reports whose output would interleave with it, and the
+driver refuses the combination rather than choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
 pads, and `-i` to replace the lint scan with an ISA census of the binary;

@@ -1587,6 +1587,121 @@ static void print_isa_mask(uint32_t mask)
     }
 }
 
+// --json: the findings as a machine-readable stream, for a consumer that
+// joins them against something else keyed by address -- most usefully an
+// execution profile, so each opportunity can be weighted by how often the
+// instruction it names actually runs. Findings print as they are found
+// rather than accumulating in an array: a large binary yields tens of
+// thousands of them, and the per-finding callback exists precisely so that
+// nothing has to be buffered to report them. The totals therefore land after
+// the findings, being unknown until the scan ends.
+//
+// The document covers the peephole scan only. -i and -e are separate reports
+// with separate shapes, and interleaving either with this one would produce
+// neither valid JSON nor a coherent schema, so the driver rejects the
+// combination rather than choosing for the caller.
+struct json_ctx {
+    const char *section;                // section being scanned; "" if unnamed
+    const x86lint_func_range *funcs;    // sorted and disjoint; NULL when the
+    size_t nfuncs;                      // scan has no attribution table
+    bool any;                           // a finding has already been written
+};
+
+// Write s as a JSON string. Escapes what the grammar requires -- the quote,
+// the backslash, and every control character -- and passes bytes >= 0x80
+// through unchanged: section and symbol names are copied out of the file
+// verbatim, so a binary whose string tables are not UTF-8 yields strings that
+// are not either, the same bytes nm and objdump reproduce.
+static void json_string(const char *s)
+{
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *) s; *p != '\0'; ++p) {
+        switch (*p) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\b': fputs("\\b", stdout);  break;
+        case '\f': fputs("\\f", stdout);  break;
+        case '\n': fputs("\\n", stdout);  break;
+        case '\r': fputs("\\r", stdout);  break;
+        case '\t': fputs("\\t", stdout);  break;
+        default:
+            if (*p < 0x20) {
+                printf("\\u%04x", (unsigned) *p);
+            } else {
+                putchar((char) *p);
+            }
+        }
+    }
+    putchar('"');
+}
+
+// The installed function containing vaddr, or NULL. The ranges are the ones
+// handed to the summary: sorted by start and non-overlapping, so a binary
+// search decides it.
+static const x86lint_func_range *json_func_at(const struct json_ctx *j,
+                                              uint64_t vaddr)
+{
+    size_t lo = 0;
+    size_t hi = j->nfuncs;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (vaddr < j->funcs[mid].start) {
+            hi = mid;
+        } else if (vaddr >= j->funcs[mid].end) {
+            lo = mid + 1;
+        } else {
+            return &j->funcs[mid];
+        }
+    }
+    return NULL;
+}
+
+// One finding, one line: compact enough to grep and to stream through jq,
+// and small enough that a scan yielding tens of thousands of them stays
+// readable. vaddr is a number rather than a hex string so that it composes
+// with arithmetic -- range tests against a code object, sums of profile
+// weights -- which is the whole point of reporting the absolute address.
+// The disassembly is formatted at that address, so branch targets read as
+// addresses the same profile can name.
+static void json_finding(void *ctx, const char *name, uint64_t vaddr,
+                         const xed_decoded_inst_t *xedd, const uint8_t *bytes)
+{
+    struct json_ctx *j = ctx;
+
+    printf("%s\n    {\"vaddr\": %lu, \"check\": ", j->any ? "," : "",
+        (unsigned long) vaddr);
+    json_string(name);
+    j->any = true;
+
+    printf(", \"section\": ");
+    json_string(j->section);
+
+    const x86lint_func_range *fn = j->funcs != NULL
+        ? json_func_at(j, vaddr) : NULL;
+    if (fn != NULL) {
+        printf(", \"function\": ");
+        json_string(fn->name);
+        printf(", \"function_offset\": %lu",
+            (unsigned long) (vaddr - fn->start));
+    }
+
+    unsigned length = xed_decoded_inst_get_length(xedd);
+    printf(", \"length\": %u, \"bytes\": \"", length);
+    for (unsigned i = 0; i < length; ++i) {
+        printf("%02x", bytes[i]);
+    }
+    putchar('"');
+
+    char disasm[96];
+    if (!xed_format_context(XED_SYNTAX_INTEL, xedd, disasm, sizeof(disasm),
+                            vaddr, NULL, NULL)) {
+        disasm[0] = '\0';
+    }
+    printf(", \"text\": ");
+    json_string(disasm);
+    putchar('}');
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
@@ -1597,6 +1712,7 @@ int main(int argc, char **argv)
     bool scan_all = false;
     bool endbr = false;
     bool census = false;
+    bool json = false;
     uint32_t extensions = 0;
     const char *path = NULL;
     const char *fname = NULL;
@@ -1611,6 +1727,8 @@ int main(int argc, char **argv)
             fname = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0) {
             census = true;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            json = true;
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             ++i;
             if (strcmp(argv[i], "bmi1") == 0) {
@@ -1623,7 +1741,8 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_APX;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
+                "[-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -1631,14 +1750,16 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
+                "[-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
+                "[-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }
@@ -1646,6 +1767,15 @@ int main(int argc, char **argv)
     // combining them has no coherent meaning.
     if (fname != NULL && scan_all) {
         fprintf(stderr, "%s: -a and -f are mutually exclusive\n", argv[0]);
+        return 2;
+    }
+    // --json reports the peephole scan and nothing else: -v would interleave
+    // prose with the document, and -i and -e are separate reports whose
+    // shapes this schema does not describe. Refused rather than resolved,
+    // since either choice would surprise half the callers.
+    if (json && (verbose || census || endbr)) {
+        fprintf(stderr, "%s: --json cannot be combined with -v, -i or -e\n",
+            argv[0]);
         return 2;
     }
 
@@ -1936,11 +2066,12 @@ int main(int argc, char **argv)
     // BOLT-processed library keeps its unmoved functions in .bolt.org.text
     // beside the ones it moved into .text -- is ambiguous without knowing
     // which section it belongs to. -e needs it too, to identify .init and
-    // .fini by name. Only those two callers use it, so a failure to read
-    // the table costs the names and nothing else. e_shstrndx holds
+    // .fini by name, and --json names the section in every finding. Only
+    // those callers use it, so a failure to read the table costs the names
+    // and nothing else. e_shstrndx holds
     // SHN_XINDEX when the real index does not fit, with the value in section
     // header 0's sh_link (the same overflow convention as e_shnum).
-    if ((verbose || endbr || census) && shnum != 0) {
+    if ((verbose || endbr || census || json) && shnum != 0) {
         uint64_t strndx = ehdr.e_shstrndx;
         if (strndx == SHN_XINDEX) {
             Elf64_Shdr shdr0;
@@ -2069,6 +2200,22 @@ int main(int argc, char **argv)
         }
     }
 
+    // Opened here, after every way the file itself can be rejected: a tool
+    // failure during ELF parsing then leaves stdout empty rather than half a
+    // document. A failure inside the scan loop below can still truncate it,
+    // which the exit status reports and the diagnostic on stderr explains.
+    struct json_ctx jctx = {
+        .section = "",
+        .funcs = attr,
+        .nfuncs = nattr,
+        .any = false,
+    };
+    if (json) {
+        printf("{\"file\": ");
+        json_string(path);
+        printf(",\n  \"findings\": [");
+    }
+
     int errors = 0;
     for (uint64_t i = 0; i < shnum; ++i) {
         Elf64_Shdr shdr;
@@ -2138,19 +2285,22 @@ int main(int argc, char **argv)
                 funcs, nfuncs);
         }
 
+        const char *sec_name = shstrtab != NULL &&
+            shdr.sh_name < shstrtab_size ? shstrtab + shdr.sh_name : "";
+
         // Name the section the following findings belong to, and give the
         // address their offsets are relative to, so a site can be located in
         // a disassembly.
         if (verbose) {
-            const char *name = shstrtab != NULL && shdr.sh_name < shstrtab_size
-                ? shstrtab + shdr.sh_name : "";
             printf("== section %lu%s%s: vaddr 0x%lx, %lu bytes ==\n",
-                (unsigned long) i, name[0] != '\0' ? " " : "", name,
+                (unsigned long) i, sec_name[0] != '\0' ? " " : "", sec_name,
                 (unsigned long) shdr.sh_addr, (unsigned long) shdr.sh_size);
         }
+        jctx.section = sec_name;
 
         int n = check_instructions(buf, shdr.sh_size, shdr.sh_addr, verbose,
-            summary, extensions, NULL, NULL);
+            summary, extensions, json ? json_finding : NULL,
+            json ? &jctx : NULL);
         if (n < 0) {
             goto out;
         }
@@ -2240,7 +2390,7 @@ int main(int argc, char **argv)
         }
         printf("  IFUNC resolvers defined: %ld%s\n", ifuncs,
             ifuncs > 0 ? " (runtime CPU dispatch present)" : "");
-    } else {
+    } else if (!json) {
         x86lint_summary_print(summary);
     }
 
@@ -2257,20 +2407,44 @@ int main(int argc, char **argv)
         }
     }
 
+    uint64_t fbytes = 0;
     if (fname != NULL) {
-        uint64_t fbytes = 0;
         for (size_t s = 0; s < nfuncs; ++s) {
             fbytes += funcs[s].size;
         }
-        printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
-            fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
-    } else if (funcs != NULL) {
-        printf("scan restricted to %zu function symbols (-a scans every byte)\n",
-            nfuncs);
     }
-    if (!census) {
-        printf("%d optimization opportunities in %zu instructions\n",
-            errors, x86lint_summary_instructions(summary));
+    if (json) {
+        // The totals close the document because the scan only knows them
+        // now. What narrowed the scan rides along in the same terms the
+        // human report prints here, so that a restricted scan -- or one that
+        // resynchronized past undecodable bytes -- is not read as a clean
+        // sweep of the whole file.
+        printf("\n  ],\n");
+        if (fname != NULL) {
+            printf("  \"restriction\": {\"function\": ");
+            json_string(fname);
+            printf(", \"sites\": %zu, \"bytes\": %lu},\n",
+                nfuncs, (unsigned long) fbytes);
+        } else if (funcs != NULL) {
+            printf("  \"restriction\": {\"symbols\": %zu},\n", nfuncs);
+        }
+        printf("  \"instructions\": %zu,\n"
+               "  \"skipped\": %zu,\n"
+               "  \"opportunities\": %d\n}\n",
+            x86lint_summary_instructions(summary),
+            x86lint_summary_skipped(summary), errors);
+    } else {
+        if (fname != NULL) {
+            printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
+                fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
+        } else if (funcs != NULL) {
+            printf("scan restricted to %zu function symbols "
+                "(-a scans every byte)\n", nfuncs);
+        }
+        if (!census) {
+            printf("%d optimization opportunities in %zu instructions\n",
+                errors, x86lint_summary_instructions(summary));
+        }
     }
     rc = errors != 0 || endbr_errors != 0;
 

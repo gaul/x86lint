@@ -739,8 +739,9 @@ found, which a test can assert is zero:
 int lint(const uint8_t *inst, size_t len)
 {
     xed_tables_init();
-    return check_instructions(inst, len, /*verbose=*/false, /*summary=*/NULL,
-                              /*extensions=*/0);
+    return check_instructions(inst, len, /*vaddr=*/0, /*verbose=*/false,
+                              /*summary=*/NULL, /*extensions=*/0,
+                              /*on_finding=*/NULL, /*ctx=*/NULL);
 }
 ```
 
@@ -754,6 +755,17 @@ incomplete coverage of a data-laden section is not mistaken for a clean scan.
 extensions the code's target supports; checks that suggest an instruction
 from one of those sets run only when its bit is enabled, and 0 keeps the scan
 to baseline x86-64.
+
+The optional `on_finding` callback is called once per opportunity, with `ctx`
+as its first argument, the finding's name, the absolute address of the
+offending instruction (the `vaddr` argument plus the finding's offset), and
+that instruction's decoded form and raw encoding. Where the summary answers
+"how many of each kind", the callback answers "which instruction, at what
+address" -- the form needed to join findings against anything else keyed by
+address, such as an execution profile that weights each opportunity by how
+often the instruction it names actually runs. It is independent of both
+`summary` and `verbose`, so a consumer wanting only the per-finding stream
+passes `NULL` for the summary and `false` for verbose.
 
 x86lint can also read arbitrary 64-bit ELF executables directly. When the
 binary kept its symbol table (`.symtab`), the scan is restricted to the byte

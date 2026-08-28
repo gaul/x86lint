@@ -2150,7 +2150,7 @@ int main(int argc, char **argv)
         }
 
         int n = check_instructions(buf, shdr.sh_size, shdr.sh_addr, verbose,
-            summary, extensions);
+            summary, extensions, NULL, NULL);
         if (n < 0) {
             goto out;
         }

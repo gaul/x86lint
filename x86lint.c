@@ -3359,6 +3359,35 @@ static void report_finding(const x86lint_summary *summary, const char *name,
     printf("\n\n");
 }
 
+// The sinks a finding is reported to, bundled so that a check site hands a
+// finding to all of them in one call and they cannot drift apart in what
+// they report. vaddr is check_instructions' own argument, kept here to turn
+// a finding's buffer offset into the absolute address the callback reports;
+// the summary tracks the same base separately, for its function attribution.
+struct finding_sink {
+    x86lint_summary *summary;
+    bool verbose;
+    x86lint_finding_fn on_finding;
+    void *ctx;
+    uint64_t vaddr;
+};
+
+// Report one finding: tally it, print it under verbose, and hand it to the
+// caller's callback. name and offset identify the offending instruction --
+// for a multi-instruction peephole, the one of the matched window that the
+// rewrite removes -- and xedd and bytes are that instruction's decoded form
+// and raw encoding.
+static void emit_finding(const struct finding_sink *sink, const char *name,
+                         size_t offset, const xed_decoded_inst_t *xedd,
+                         const uint8_t *bytes)
+{
+    summary_add(sink->summary, name, offset);
+    report_finding(sink->summary, name, offset, sink->verbose, xedd, bytes);
+    if (sink->on_finding != NULL) {
+        sink->on_finding(sink->ctx, name, sink->vaddr + offset, xedd, bytes);
+    }
+}
+
 struct check_entry {
     bool (*fn)(const xed_decoded_inst_t *);
     const char *name;
@@ -6521,9 +6550,19 @@ static bool writes_wide_vector(const xed_decoded_inst_t *xedd)
 
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
-                       uint32_t extensions)
+                       uint32_t extensions, x86lint_finding_fn on_finding,
+                       void *ctx)
 {
     int errors = 0;
+
+    // Where every finding raised below is reported; see emit_finding.
+    const struct finding_sink sink = {
+        .summary = summary,
+        .verbose = verbose,
+        .on_finding = on_finding,
+        .ctx = ctx,
+        .vaddr = vaddr,
+    };
 
     // Findings attribute against the installed function table at
     // vaddr + offset; keep the base current for this buffer.
@@ -6636,9 +6675,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                     continue;
                 }
             }
-            summary_add(summary, checks[i].name, offset);
-            report_finding(summary, checks[i].name, offset, verbose, &xedd,
-                inst + offset);
+            emit_finding(&sink, checks[i].name, offset, &xedd, inst + offset);
             ++errors;
         }
 
@@ -6653,10 +6690,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         size_t redundant_test_offset;
         if (flags_test_redundant(inst, len, branch_targets, next, &xedd,
                                  &redundant_test, &redundant_test_offset)) {
-            summary_add(summary, "redundant TEST after flags",
-                        redundant_test_offset);
-            report_finding(summary, "redundant TEST after flags", redundant_test_offset,
-                verbose, &redundant_test, inst + redundant_test_offset);
+            emit_finding(&sink, "redundant TEST after flags",
+                redundant_test_offset, &redundant_test,
+                inst + redundant_test_offset);
             ++errors;
         }
 
@@ -6667,10 +6703,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // removable instruction. See shift_test_redundant.
         if (shift_test_redundant(inst, len, branch_targets, next, &xedd,
                                  &redundant_test, &redundant_test_offset)) {
-            summary_add(summary, "redundant TEST after shift",
-                        redundant_test_offset);
-            report_finding(summary, "redundant TEST after shift",
-                redundant_test_offset, verbose, &redundant_test,
+            emit_finding(&sink, "redundant TEST after shift",
+                redundant_test_offset, &redundant_test,
                 inst + redundant_test_offset);
             ++errors;
         }
@@ -6680,8 +6714,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // against the lea (at `offset`), the removable instruction. See
         // lea_foldable_into_memop.
         if (lea_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "LEA foldable into memory", offset);
-            report_finding(summary, "LEA foldable into memory", offset, verbose, &xedd,
+            emit_finding(&sink, "LEA foldable into memory", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6690,8 +6723,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // next instruction's immediate, leaving reg dead. Reported against the
         // mov (at `offset`), the removable instruction. See mov_const_foldable.
         if (mov_const_foldable(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "MOV constant foldable", offset);
-            report_finding(summary, "MOV constant foldable", offset, verbose, &xedd,
+            emit_finding(&sink, "MOV constant foldable", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6702,8 +6734,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // load_foldable_into_extend.
         if (load_foldable_into_extend(inst, len, branch_targets, next,
                                       &xedd)) {
-            summary_add(summary, "load foldable into extend", offset);
-            report_finding(summary, "load foldable into extend", offset, verbose, &xedd,
+            emit_finding(&sink, "load foldable into extend", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6713,8 +6744,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // the three-operand lea dest, [srcA + addend], saving the mov.
         // Reported against the mov (at `offset`). See mov_add_foldable_to_lea.
         if (mov_add_foldable_to_lea(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "MOV+ADD foldable to LEA", offset);
-            report_finding(summary, "MOV+ADD foldable to LEA", offset, verbose, &xedd,
+            emit_finding(&sink, "MOV+ADD foldable to LEA", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6725,8 +6755,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // shift_pair_foldable_to_extend.
         if (shift_pair_foldable_to_extend(inst, len, branch_targets, next,
                                           &xedd)) {
-            summary_add(summary, "shift pair foldable into extend", offset);
-            report_finding(summary, "shift pair foldable into extend", offset, verbose,
+            emit_finding(&sink, "shift pair foldable into extend", offset,
                 &xedd, inst + offset);
             ++errors;
         }
@@ -6736,8 +6765,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // a byte shorter. Reported against the cmp (at `offset`). See
         // cmp_one_branch_foldable.
         if (cmp_one_branch_foldable(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "suboptimal CMP one", offset);
-            report_finding(summary, "suboptimal CMP one", offset, verbose, &xedd,
+            emit_finding(&sink, "suboptimal CMP one", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6747,8 +6775,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // Reported against the setcc (at `offset`). See redundant_test_after_setcc.
         if (redundant_test_after_setcc(inst, len, branch_targets, next,
                                        &xedd)) {
-            summary_add(summary, "redundant TEST after SETcc", offset);
-            report_finding(summary, "redundant TEST after SETcc", offset, verbose, &xedd,
+            emit_finding(&sink, "redundant TEST after SETcc", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6760,8 +6787,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         xed_decoded_inst_t inverting_xor;
         if (setcc_xor_one_invertible(inst, len, branch_targets, next, &xedd,
                                      &inverting_xor)) {
-            summary_add(summary, "suboptimal SETcc inversion", offset);
-            report_finding(summary, "suboptimal SETcc inversion", offset, verbose, &xedd,
+            emit_finding(&sink, "suboptimal SETcc inversion", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6784,13 +6810,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (setcc_movzx_zero_extend(inst, len, branch_targets, next, &xedd,
                                     &widen_movzx)) {
             if ((extensions & X86LINT_EXT_APX) != 0) {
-                summary_add(summary, "missing APX SETZU", offset);
-                report_finding(summary, "missing APX SETZU", offset, verbose, &xedd,
+                emit_finding(&sink, "missing APX SETZU", offset, &xedd,
                     inst + offset);
             } else {
-                summary_add(summary, "suboptimal SETcc zero-extension", next);
-                report_finding(summary, "suboptimal SETcc zero-extension", next,
-                    verbose, &widen_movzx, inst + next);
+                emit_finding(&sink, "suboptimal SETcc zero-extension", next,
+                    &widen_movzx, inst + next);
             }
             ++errors;
         }
@@ -6801,9 +6825,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // not_and_foldable_to_andn.
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             not_and_foldable_to_andn(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "missing ANDN", offset);
-            report_finding(summary, "missing ANDN", offset, verbose, &xedd,
-                inst + offset);
+            emit_finding(&sink, "missing ANDN", offset, &xedd, inst + offset);
             ++errors;
         }
 
@@ -6813,9 +6835,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // lea_and_foldable_to_blsr.
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             lea_and_foldable_to_blsr(inst, len, branch_targets, next, &xedd)) {
-            summary_add(summary, "missing BLSR", offset);
-            report_finding(summary, "missing BLSR", offset, verbose, &xedd,
-                inst + offset);
+            emit_finding(&sink, "missing BLSR", offset, &xedd, inst + offset);
             ++errors;
         }
 
@@ -6826,9 +6846,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             lea_xor_foldable_to_blsmsk(inst, len, branch_targets, next,
                                        &xedd)) {
-            summary_add(summary, "missing BLSMSK", offset);
-            report_finding(summary, "missing BLSMSK", offset, verbose, &xedd,
-                inst + offset);
+            emit_finding(&sink, "missing BLSMSK", offset, &xedd, inst + offset);
             ++errors;
         }
 
@@ -6839,9 +6857,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
             mov_neg_and_foldable_to_blsi(inst, len, branch_targets, next,
                                          &xedd)) {
-            summary_add(summary, "missing BLSI", offset);
-            report_finding(summary, "missing BLSI", offset, verbose, &xedd,
-                inst + offset);
+            emit_finding(&sink, "missing BLSI", offset, &xedd, inst + offset);
             ++errors;
         }
         // Multi-instruction peephole, only when the caller enabled APX:
@@ -6857,8 +6873,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         else if ((extensions & X86LINT_EXT_APX) != 0 &&
             mov_op_foldable_to_apx_ndd(inst, len, branch_targets, next,
                                        &xedd)) {
-            summary_add(summary, "missing APX NDD", offset);
-            report_finding(summary, "missing APX NDD", offset, verbose, &xedd,
+            emit_finding(&sink, "missing APX NDD", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6870,9 +6885,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if ((extensions & X86LINT_EXT_MOVBE) != 0 &&
             mov_bswap_foldable_to_movbe(inst, len, branch_targets, next,
                                         &xedd)) {
-            summary_add(summary, "missing MOVBE", offset);
-            report_finding(summary, "missing MOVBE", offset, verbose, &xedd,
-                inst + offset);
+            emit_finding(&sink, "missing MOVBE", offset, &xedd, inst + offset);
             ++errors;
         }
 
@@ -6885,8 +6898,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // instruction. See redundant_reextension.
         if (have_prev && redundant_reextension(&prev, &xedd) &&
             !branch_target_in(branch_targets, offset, offset + 1)) {
-            summary_add(summary, "redundant re-extension", offset);
-            report_finding(summary, "redundant re-extension", offset, verbose, &xedd,
+            emit_finding(&sink, "redundant re-extension", offset, &xedd,
                 inst + offset);
             ++errors;
         }
@@ -6897,8 +6909,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // cores; a zero idiom just before the count breaks it. See
         // popcnt_false_dep.
         if (popcnt_false_dep(&xedd, &dep_history)) {
-            summary_add(summary, "missing POPCNT dependency break", offset);
-            report_finding(summary, "missing POPCNT dependency break", offset, verbose,
+            emit_finding(&sink, "missing POPCNT dependency break", offset,
                 &xedd, inst + offset);
             ++errors;
         }
@@ -6909,9 +6920,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // predecessor did not rewrite carries a false dependency; a vector
         // zero idiom just before breaks it. See sse_merge_false_dep.
         if (sse_merge_false_dep(&xedd, &dep_history)) {
-            summary_add(summary, "missing SSE dependency break", offset);
-            report_finding(summary, "missing SSE dependency break", offset, verbose,
-                &xedd, inst + offset);
+            emit_finding(&sink, "missing SSE dependency break", offset, &xedd,
+                inst + offset);
             ++errors;
         }
 
@@ -6920,9 +6930,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // source nor freshly rewritten is a false dependency the encoding
         // could have avoided for free. See vex_merge_false_dep.
         if (vex_merge_false_dep(&xedd, &dep_history)) {
-            summary_add(summary, "stale VEX merge operand", offset);
-            report_finding(summary, "stale VEX merge operand", offset, verbose,
-                &xedd, inst + offset);
+            emit_finding(&sink, "stale VEX merge operand", offset, &xedd,
+                inst + offset);
             ++errors;
         }
 
@@ -6932,9 +6941,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // a lost move elimination in one, unless a downstream vector read
         // proves the merge a deliberate blend. See scalar_move_false_dep.
         if (scalar_move_false_dep(&xedd, &dep_history, inst, len, next)) {
-            summary_add(summary, "merging scalar move", offset);
-            report_finding(summary, "merging scalar move", offset, verbose,
-                &xedd, inst + offset);
+            emit_finding(&sink, "merging scalar move", offset, &xedd,
+                inst + offset);
             ++errors;
         }
 
@@ -6944,9 +6952,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // reported only when the bits above the written width are provably
         // dead. See narrow_move_merge.
         if (narrow_move_merge(&xedd, inst, len, next)) {
-            summary_add(summary, "merging narrow move", offset);
-            report_finding(summary, "merging narrow move", offset, verbose,
-                &xedd, inst + offset);
+            emit_finding(&sink, "merging narrow move", offset, &xedd,
+                inst + offset);
             ++errors;
         }
 
@@ -6983,9 +6990,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             ymm_upper_dirty = false;
         }
         if (ymm_upper_dirty && legacy_sse_with_xmm(&xedd)) {
-            summary_add(summary, "AVX-SSE transition", offset);
-            report_finding(summary, "AVX-SSE transition", offset, verbose,
-                &xedd, inst + offset);
+            emit_finding(&sink, "AVX-SSE transition", offset, &xedd,
+                inst + offset);
             ++errors;
         }
         switch (xed_decoded_inst_get_iclass(&xedd)) {

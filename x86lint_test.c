@@ -90,7 +90,8 @@ static int count_findings(const uint8_t *inst, size_t len,
     stdout = mem;
     // verbose=true so each finding prints its "<name> at offset:" line into
     // the captured buffer for the per-category count below.
-    int total = check_instructions(inst, len, 0, true, NULL, extensions);
+    int total = check_instructions(inst, len, 0, true, NULL, extensions,
+        NULL, NULL);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -5979,7 +5980,8 @@ static void check_decode_resync_test(void)
 
     x86lint_summary *summary = x86lint_summary_create();
     assert(summary != NULL);
-    int findings = check_instructions(inst, sizeof(inst), 0, false, summary, 0);
+    int findings = check_instructions(inst, sizeof(inst), 0, false, summary,
+        0, NULL, NULL);
     assert(findings == 1);                              // not -1; scan continued
     assert(x86lint_summary_skipped(summary) == 1);      // the one bad byte
     assert(x86lint_summary_instructions(summary) == 2); // nop + push, not the byte
@@ -6005,7 +6007,7 @@ static void summary_functions_test(void)
     assert(summary != NULL);
     x86lint_summary_set_functions(summary, funcs, 2);
     int findings = check_instructions(inst, sizeof(inst), 0x1000, false,
-        summary, 0);
+        summary, 0, NULL, NULL);
     assert(findings == 3);
     assert(x86lint_summary_function_findings(summary, 0) == 1);
     assert(x86lint_summary_function_findings(summary, 1) == 1);
@@ -6016,13 +6018,86 @@ static void summary_functions_test(void)
     summary = x86lint_summary_create();
     assert(summary != NULL);
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary,
-        0) == 3);
+        0, NULL, NULL) == 3);
     assert(x86lint_summary_function_findings(summary, 0) == 0);
     x86lint_summary_destroy(summary);
 
     // NULL summary still tolerated with attribution in the code path.
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
-        0) == 3);
+        0, NULL, NULL) == 3);
+}
+
+// Records the per-finding callback's arguments so the test can assert on
+// the whole stream a scan produced.
+struct finding_log {
+    size_t count;
+    uint64_t vaddr[8];
+    const char *name[8];
+    uint8_t first_byte[8];
+    unsigned length[8];
+};
+
+static void finding_log_cb(void *ctx, const char *name, uint64_t vaddr,
+                           const xed_decoded_inst_t *xedd,
+                           const uint8_t *bytes)
+{
+    struct finding_log *log = ctx;
+    assert(log->count < sizeof(log->vaddr) / sizeof(log->vaddr[0]));
+    log->vaddr[log->count] = vaddr;
+    log->name[log->count] = name;
+    log->first_byte[log->count] = bytes[0];
+    log->length[log->count] = xed_decoded_inst_get_length(xedd);
+    log->count++;
+}
+
+static void finding_callback_test(void)
+{
+    // summary_functions_test's pattern: three findings, one each at offsets
+    // 0, 5 and 7 of the buffer.
+    static const uint8_t inst[] = {
+        0x68, 0x01, 0x00, 0x00, 0x00,  // push 0x1 (oversized immediate)
+        0x87, 0xc8,                    // xchg eax, ecx (oversized XCHG)
+        0x87, 0xc8,                    // xchg eax, ecx (oversized XCHG)
+    };
+
+    // The callback needs neither a summary nor verbose; here it is the whole
+    // report.
+    struct finding_log log = {0};
+    int findings = check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
+        0, finding_log_cb, &log);
+    assert(findings == 3);
+    assert(log.count == 3);
+
+    // Addresses are absolute -- the scan's vaddr plus the finding's offset --
+    // which is what makes them joinable against a profile keyed by address.
+    assert(log.vaddr[0] == 0x1000);
+    assert(log.vaddr[1] == 0x1005);
+    assert(log.vaddr[2] == 0x1007);
+
+    // bytes and xedd describe the instruction the finding names, not the
+    // buffer it was found in.
+    assert(log.first_byte[0] == 0x68 && log.length[0] == 5);
+    assert(log.first_byte[1] == 0x87 && log.length[1] == 2);
+    assert(log.first_byte[2] == 0x87 && log.length[2] == 2);
+
+    // The name is the check table's own literal -- the same pointer the
+    // summary tallies under -- so identity compares as well as strcmp.
+    assert(strcmp(log.name[0], "oversized immediate") == 0);
+    assert(strcmp(log.name[1], "oversized XCHG encoding") == 0);
+    assert(log.name[1] == log.name[2]);
+
+    // Callback and summary are independent sinks: both see every finding.
+    x86lint_summary *summary = x86lint_summary_create();
+    assert(summary != NULL);
+    struct finding_log both = {0};
+    assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary, 0,
+        finding_log_cb, &both) == 3);
+    assert(both.count == 3);
+    x86lint_summary_destroy(summary);
+
+    // A NULL callback leaves the scan exactly as it was.
+    assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL, 0,
+        NULL, NULL) == 3);
 }
 
 static void census_test(void)
@@ -6200,6 +6275,7 @@ int main(int argc, char *argv[])
     check_endbr64_target_test();
     check_decode_resync_test();
     summary_functions_test();
+    finding_callback_test();
     census_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

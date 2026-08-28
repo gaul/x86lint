@@ -389,6 +389,31 @@ size_t x86lint_census_level_unevidenced(const x86lint_census *census,
 // Highest of levels 2..4 with a nonzero tally, else 1 (baseline).
 int x86lint_census_highest_level(const x86lint_census *census);
 
+// Called once per finding, in the order findings are reported, when passed
+// to check_instructions. The summary answers "how many of each kind"; this
+// answers "which instruction, at what address" -- the form a consumer needs
+// to join findings against something else keyed by address, such as an
+// execution profile that weights each finding by how often the instruction
+// it names actually runs.
+//
+// name is the finding's stable string literal, the same pointer the summary
+// tallies under and verbose mode prints, so it may be compared by identity
+// as well as by strcmp. vaddr is the offending instruction's absolute
+// address: check_instructions' vaddr argument plus the finding's offset.
+// xedd and bytes are that instruction's decoded form and its raw encoding,
+// both valid only for the duration of the call -- a consumer that keeps
+// either must copy it.
+//
+// A multi-instruction peephole matches a window but reports one instruction
+// of it, the one its rewrite removes, and that is the instruction named
+// here; the rest of the window is not reported. Two checks can therefore
+// fire at the same vaddr, and a finding can name an instruction the scan has
+// not reached yet, so findings do not arrive in strictly increasing address
+// order.
+typedef void (*x86lint_finding_fn)(void *ctx, const char *name, uint64_t vaddr,
+                                   const xed_decoded_inst_t *xedd,
+                                   const uint8_t *bytes);
+
 // Instruction-set extensions the scanned code's target is known to support.
 // Checks whose suggested replacement is an instruction from one of these sets
 // run only when the caller enables that set: on a target without it the
@@ -434,9 +459,13 @@ enum x86lint_extensions {
 // type and function and the decoded-instruction and skipped-byte counts
 // are accumulated. extensions is a bitwise OR of
 // enum x86lint_extensions values; 0 restricts the scan to baseline x86-64
-// checks.
+// checks. If on_finding is non-NULL it is invoked once per finding with ctx
+// as its first argument; it is independent of both summary and verbose, so a
+// consumer wanting only the per-finding stream passes NULL for the summary
+// and false for verbose.
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
-                       uint32_t extensions);
+                       uint32_t extensions, x86lint_finding_fn on_finding,
+                       void *ctx);
 
 #endif

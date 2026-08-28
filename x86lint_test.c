@@ -3049,6 +3049,141 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
 }
 
+// Multi-instruction peephole: a load whose sole use is the CMP or TEST that
+// follows it folds into that compare, which takes the memory operand directly;
+// check_instructions reports it against the load. The compare must name the
+// loaded register exactly (so the widths agree) and the register must be dead
+// afterwards, proved down both successors of a following Jcc. Fixtures use ECX
+// rather than the accumulator to avoid the implicit-register short-form checks.
+static void check_load_compare_fold_test(void)
+{
+    // mov ecx, [rsi] ; test ecx, ecx -> cmp dword [rsi], 0.
+    static const uint8_t zero_test[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0x85, 0xC9,        // test ecx, ecx
+        0x89, 0xD1,        // mov ecx, edx (kills ecx)
+    };
+    ASSERT_FINDINGS(zero_test, "load foldable into compare", 1);
+
+    // mov ecx, [rsi] ; cmp ecx, 5 -> cmp dword [rsi], 5.
+    static const uint8_t cmp_imm[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0x83, 0xF9, 0x05,  // cmp ecx, 5
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    ASSERT_FINDINGS(cmp_imm, "load foldable into compare", 1);
+
+    // mov rcx, [rsi] ; cmp rcx, rbx -> cmp qword [rsi], rbx.
+    static const uint8_t cmp_reg[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x39, 0xD9,  // cmp rcx, rbx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(cmp_reg, "load foldable into compare", 1);
+
+    // mov rcx, [rsi] ; cmp rbx, rcx -> cmp rbx, qword [rsi]. The loaded
+    // register is the compare's second operand, which folds just as well: the
+    // memory operand lands in whichever slot held it.
+    static const uint8_t cmp_reg_reversed[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x39, 0xCB,  // cmp rbx, rcx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(cmp_reg_reversed, "load foldable into compare", 1);
+
+    // mov ecx, [rsi] ; cmp rcx, rbx -- the compare reads 64 bits of which the
+    // load wrote 32, so cmp qword [rsi], rbx would read four bytes the
+    // original never did: suppress.
+    static const uint8_t width_mismatch[] = {
+        0x8B, 0x0E,              // mov ecx, [rsi]
+        0x48, 0x39, 0xD9,        // cmp rcx, rbx
+        0x48, 0x89, 0xD1,        // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(width_mismatch, "load foldable into compare", 0);
+
+    // mov [rsi], ecx ; test ecx, ecx -- the mov is a store: nothing to fold.
+    static const uint8_t store[] = {
+        0x89, 0x0E,        // mov [rsi], ecx
+        0x85, 0xC9,        // test ecx, ecx
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    ASSERT_FINDINGS(store, "load foldable into compare", 0);
+
+    // mov ecx, edx ; test ecx, ecx -- register to register, so there is no
+    // memory operand to fold.
+    static const uint8_t reg_move[] = {
+        0x89, 0xD1,        // mov ecx, edx
+        0x85, 0xC9,        // test ecx, ecx
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    ASSERT_FINDINGS(reg_move, "load foldable into compare", 0);
+
+    // mov ecx, [rsi] ; test ecx, ecx ; mov edx, ecx -- the loaded value is read
+    // after the compare, so the fold would lose it.
+    static const uint8_t still_live[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0x85, 0xC9,        // test ecx, ecx
+        0x89, 0xCA,        // mov edx, ecx (reads ecx)
+    };
+    ASSERT_FINDINGS(still_live, "load foldable into compare", 0);
+
+    // mov rcx, [rsi] ; cmp rcx, rcx -- a compare of the loaded value with
+    // itself, which no one-operand form spells. (The TEST of that shape is the
+    // zero test above and does fold.)
+    static const uint8_t cmp_self[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x39, 0xC9,  // cmp rcx, rcx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(cmp_self, "load foldable into compare", 0);
+
+    // mov rcx, [rsi] ; cmp rcx, [rbx] -- the compare already carries a memory
+    // operand, and one instruction cannot hold two.
+    static const uint8_t cmp_mem[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x3B, 0x0B,  // cmp rcx, [rbx]
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(cmp_mem, "load foldable into compare", 0);
+
+    // The dominant shape: the compare feeds a Jcc, so the loaded value dies on
+    // two paths rather than one. Both successors overwrite ecx, so it is dead.
+    static const uint8_t branch_both_dead[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0x85, 0xC9,        // test ecx, ecx
+        0x75, 0x02,        // jne +2 (to the mov ecx, ebx below)
+        0x89, 0xD1,        // mov ecx, edx
+        0x89, 0xD9,        // mov ecx, ebx
+    };
+    ASSERT_FINDINGS(branch_both_dead, "load foldable into compare", 1);
+
+    // The same shape with the branch target reading ecx: one live successor is
+    // enough to suppress.
+    static const uint8_t branch_one_live[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0x85, 0xC9,        // test ecx, ecx
+        0x75, 0x02,        // jne +2 (to the mov edx, ecx below)
+        0x89, 0xD1,        // mov ecx, edx
+        0x89, 0xCA,        // mov edx, ecx (reads ecx)
+    };
+    ASSERT_FINDINGS(branch_one_live, "load foldable into compare", 0);
+
+    // A narrow load feeding the same compare is this finding, not the merging
+    // narrow move its width would otherwise raise: deleting the load beats
+    // widening it.
+    static const uint8_t narrow[] = {
+        0x8A, 0x0E,        // mov cl, [rsi]
+        0x84, 0xC9,        // test cl, cl
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    int total;
+    assert(count_findings(narrow, sizeof(narrow),
+                          "load foldable into compare", &total, 0) == 1);
+    assert(count_findings(narrow, sizeof(narrow),
+                          "merging narrow move", &total, 0) == 0);
+    assert(total == 1);
+}
+
 // Multi-instruction peephole: mov dest, srcA ; add dest, srcB is the
 // three-operand lea dest, [srcA + srcB]. check_instructions reports it against
 // the mov when the arithmetic flags the add would set are dead.
@@ -6252,6 +6387,7 @@ int main(int argc, char *argv[])
     check_lea_fold_test();
     check_mov_const_fold_test();
     check_load_extend_fold_test();
+    check_load_compare_fold_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();

@@ -123,6 +123,9 @@ and only for flags -- the ABI guarantees they do not survive it.
 
 ## Implemented analyses
 
+Candidate checks not yet implemented, with the corpus populations that
+argue for or against each, live in [TODO.md](TODO.md).
+
 * AVX-SSE transition
   - `C5F458C2 0F28DC` (VADDPS YMM0, YMM1, YMM2; MOVAPS XMM3, XMM4) -- a
     legacy SSE instruction preserves bits 255:128 of its destination's ymm
@@ -187,6 +190,28 @@ and only for flags -- the ABI guarantees they do not survive it.
     32-bit operands, needs upper-16 liveness this tool does not track. A
     66-prefixed imm16 whose value fits imm8 is already the
     oversized-immediate finding, whose narrowing removes the LCP by itself
+* load foldable into compare
+  - `8B0E 85C9` (MOV ECX, [RSI]; TEST ECX, ECX) -- a load whose only use is the
+    CMP or TEST that follows it folds into that compare, which takes a memory
+    operand directly: CMP DWORD [RSI], 0. One instruction and one register
+    write disappear. Also `CMP reg, imm` (-> CMP mem, imm), `CMP reg, reg2` and
+    `CMP reg2, reg` (-> the memory operand in whichever slot held the loaded
+    register). The zero-test arm needs no flag argument: TEST r, r and
+    CMP r/m, 0 agree on every flag, both setting SF/ZF/PF from the value and
+    clearing CF/OF, since subtracting zero neither borrows nor overflows. The
+    other arms keep their own opcode and so their own flag semantics. The
+    compare must name the loaded register exactly, since MOV ECX, [M];
+    CMP RCX, RBX compares 64 bits of which the load wrote 32, and the register
+    must be dead after the compare -- proved down BOTH successors of a directly
+    following Jcc, because a compare's whole purpose is the branch that reads
+    it, and stopping the liveness walk there would suppress the population
+    (measured: 1 finding across glibc with the straight-line walk, 73 with the
+    branch split). Suppresses the merging-narrow-move finding on a narrow load
+    of the same shape, whose fix this one subsumes. Composes with "suboptimal
+    CMP zero": on a loaded register both fire, and taking this one subsumes it.
+    Not folded: a compare that already has a memory operand, and CMP whose two
+    operands are both the loaded register (CMP RAX, RAX compares a value with
+    itself, which no one-operand form spells)
 * load foldable into extend
   - `8A06 0FB6C0` (MOV AL, [RSI]; MOVZX EAX, AL) -- a narrow load then an
     in-place sign/zero-extension is a single extending load: MOVZX EAX, byte
@@ -387,7 +412,9 @@ and only for flags -- the ABI guarantees they do not survive it.
     high-byte destination has no extending spelling (reading AH as a
     source stays the efficient extraction and is never flagged); the
     same-register copy is redundant MOV reg, reg; a load whose next
-    instruction extends it in place is load foldable into extend; and
+    instruction extends it in place is load foldable into extend, and one
+    whose next instruction compares it and lets it die is load foldable into
+    compare; and
     8/16-bit arithmetic merges identically but has no same-cost full-width
     spelling with its flags and width semantics, so nothing sound can be
     suggested there

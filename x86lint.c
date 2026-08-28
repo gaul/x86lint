@@ -4344,6 +4344,194 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
            xed_get_largest_enclosing_register(dest);
 }
 
+// True when `xedd` reads any sub-register of `reg64` -- an explicit or implicit
+// register operand, or a memory base or index. The read scan reg_live_after
+// runs at each step, factored out for the branch split below.
+static bool inst_reads_reg64(const xed_decoded_inst_t *xedd,
+                             xed_reg_enum_t reg64)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (xed_operand_is_register(name) && xed_operand_read(op) &&
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(xedd, name)) == reg64) {
+            return true;
+        }
+    }
+    int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (int m = 0; m < nmem; ++m) {
+        xed_reg_enum_t b = xed_decoded_inst_get_base_reg(xedd, m);
+        xed_reg_enum_t x = xed_decoded_inst_get_index_reg(xedd, m);
+        if ((b != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(b) == reg64) ||
+            (x != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(x) == reg64)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// reg_live_after ends its walk conservatively at any control transfer, and for
+// the compare fold below that transfer is almost always the very next
+// instruction: the point of a compare is the branch that reads its flags.
+// Calling the loaded value live there suppresses nearly the whole population --
+// measured at one finding across glibc against the 370 adjacent sites the
+// corpus sweep counts, a 370x undercount that looked like a working check.
+//
+// A conditional branch reads flags, not GPRs, so it observes nothing of the
+// value; it only splits the paths on which the value could still be read. So
+// split: at a direct Jcc that reads no part of the register, run reg_live_after
+// down both successors and call the value dead only when both agree. This is
+// the register-side twin of the CF/OF both-successors walk in
+// shift_test_redundant, and like it goes exactly one level deep -- a second
+// branch inside either successor ends that walk LIVE on its own.
+//
+// Everything else defers to reg_live_after unchanged and stays LIVE: an
+// indirect or out-of-buffer target, a decode failure, and a conditional branch
+// that does read the register (JRCXZ, the LOOP family).
+static bool reg_live_after_branch(const uint8_t *inst, size_t len,
+                                  size_t offset, xed_reg_enum_t reg64)
+{
+    if (offset < len) {
+        xed_decoded_inst_t jcc;
+        decode_init(&jcc);
+        if (xed_decode(&jcc, inst + offset, len - offset) == XED_ERROR_NONE &&
+            xed_decoded_inst_get_category(&jcc) == XED_CATEGORY_COND_BR &&
+            xed_decoded_inst_get_branch_displacement_width(&jcc) != 0 &&
+            !inst_reads_reg64(&jcc, reg64)) {
+            size_t fall = offset + xed_decoded_inst_get_length(&jcc);
+            int64_t target = (int64_t) fall +
+                xed_decoded_inst_get_branch_displacement(&jcc);
+            if (target < 0 || (uint64_t) target >= (uint64_t) len) {
+                return true;
+            }
+            return reg_live_after(inst, len, fall, reg64) ||
+                   reg_live_after(inst, len, (size_t) target, reg64);
+        }
+    }
+    return reg_live_after(inst, len, offset, reg64);
+}
+
+// Multi-instruction peephole. A load whose only use is the CMP or TEST that
+// immediately follows it is one instruction: x86's compare forms take a memory
+// operand directly, so the load folds into the compare and the register write
+// disappears with it.
+//
+//   mov eax, [rdx+4] ; test eax, eax   -> cmp dword [rdx+4], 0
+//   mov eax, [rdx+4] ; cmp eax, 5      -> cmp dword [rdx+4], 5
+//   mov rax, [rsi]   ; cmp rax, rbx    -> cmp qword [rsi], rbx
+//   mov rax, [rsi]   ; cmp rbx, rax    -> cmp rbx, qword [rsi]
+//
+// `load` is the already-decoded producer ending at `cmp_offset`; on a match the
+// function returns true and the caller reports against the load, the removable
+// instruction. Adjacency only: the corpus distance histograms put this family
+// overwhelmingly at distance one, and a gap would need the register-independence
+// proof the copy folds carry, which nothing here yet needs.
+//
+// Soundness. The compare's own semantics are untouched -- the same operation
+// reads the same value at the same width -- so the only question is where that
+// value comes from, and both spellings read it from the same address at the
+// same width exactly once (MMIO-safe). Two conditions carry it:
+//
+//   * the compare must name the load's destination EXACTLY, not a sub- or
+//     super-register of it. mov eax, [m] ; cmp rax, rbx compares 64 bits of
+//     which the load wrote 32, and cmp qword [m], rbx would read eight bytes
+//     where the original read four;
+//   * the destination must be dead after the compare (reg_live_after), since
+//     the fold stops writing it.
+//
+// The zero-test arm is the one that needs no flag argument at all: TEST r, r and
+// CMP r/m, 0 agree on every flag -- both set SF/ZF/PF from the value and clear
+// CF/OF, since subtracting zero neither borrows nor overflows -- so the rewrite
+// is flag-exact, not flag-gated. The other arms keep their own opcode and thus
+// their own flag semantics unchanged.
+//
+// A loaded register that also addresses the load needs no special case:
+// mov rax, [rax] ; test rax, rax folds to cmp qword [rax], 0, which reads [rax]
+// at rax's pre-load value -- the very address the load used.
+//
+// Not folded:
+//   * a compare that already has a memory operand: one x86 instruction cannot
+//     hold two;
+//   * CMP whose two operands are both the loaded register (cmp rax, rax): the
+//     comparison is with itself, not with a value the memory holds, so there is
+//     no one-operand spelling of it. The TEST form of the same shape is the
+//     zero test above and does fold;
+//   * a store (mov [mem], reg) or a register-to-register mov: no load to fold;
+//   * a non-GPR destination.
+//
+// Composes with "suboptimal CMP zero", which rewrites cmp reg, 0 to
+// test reg, reg: applied to a loaded register both fire, at different offsets,
+// and taking this one subsumes the other.
+static bool load_foldable_into_compare(const uint8_t *inst, size_t len,
+                                       const uint8_t *branch_targets,
+                                       size_t cmp_offset,
+                                       const xed_decoded_inst_t *load)
+{
+    // Producer: mov reg, [mem] -- a GPR loaded from a single memory source.
+    if (xed_decoded_inst_get_iclass(load) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(load) != 1 ||
+        !xed_decoded_inst_mem_read(load, 0) ||
+        xed_decoded_inst_mem_written(load, 0)) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(load, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+
+    // Consumer: an adjacent register-only CMP or TEST naming dest exactly.
+    if (cmp_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t cmp;
+    decode_init(&cmp);
+    if (xed_decode(&cmp, inst + cmp_offset, len - cmp_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&cmp);
+    if ((cic != XED_ICLASS_CMP && cic != XED_ICLASS_TEST) ||
+        xed_decoded_inst_number_of_memory_operands(&cmp) != 0) {
+        return false;
+    }
+
+    // Exactly one of the compare's two register operands must be dest, which
+    // the fold replaces with the load's memory operand. Both being dest is the
+    // zero test, which folds for TEST alone.
+    const xed_inst_t *xi = xed_decoded_inst_inst(&cmp);
+    unsigned nops = xed_inst_noperands(xi);
+    unsigned matches = 0;
+    for (unsigned i = 0; i < nops; ++i) {
+        xed_operand_enum_t name = xed_operand_name(xed_inst_operand(xi, i));
+        if ((name == XED_OPERAND_REG0 || name == XED_OPERAND_REG1) &&
+            xed_decoded_inst_get_reg(&cmp, name) == dest) {
+            ++matches;
+        }
+    }
+    if (matches == 0 || (matches == 2 && cic != XED_ICLASS_TEST)) {
+        return false;
+    }
+
+    // An incoming direct edge onto the compare reaches it without the load;
+    // folding the load into it would break that path.
+    if (branch_target_in(branch_targets, cmp_offset,
+            cmp_offset + xed_decoded_inst_get_length(&cmp))) {
+        return false;
+    }
+
+    // The loaded value must be dead after the compare, which stops writing it.
+    // Through the branch that reads the compare, since that branch is where
+    // this family's values almost always end. See reg_live_after_branch.
+    size_t after = cmp_offset + xed_decoded_inst_get_length(&cmp);
+    return !reg_live_after_branch(inst, len, after,
+                                  xed_get_largest_enclosing_register(dest));
+}
+
 // Window support for the copy folds below -- mov_add_foldable_to_lea and
 // the APX NDD fold share this proof and the APX_NDD_WINDOW bound: may the
 // scan look through `gap` -- is it provably independent of deleting the
@@ -6437,11 +6625,15 @@ static bool scalar_move_false_dep(const xed_decoded_inst_t *xedd,
 //   * a narrow load whose next instruction extends the loaded register
 //     in place: that pair is the load-foldable-into-extend finding, whose
 //     one-instruction fix subsumes this one;
+//   * a narrow load whose next instruction compares the loaded register and
+//     lets it die: that pair is the load-foldable-into-compare finding, which
+//     deletes the narrow write outright rather than widening it;
 //   * 8/16-bit arithmetic (add al, bl): it merges identically, but no
 //     same-cost full-width spelling preserves its flags and width
 //     semantics, so there is nothing sound to suggest.
 static bool narrow_move_merge(const xed_decoded_inst_t *xedd,
                               const uint8_t *inst, size_t len,
+                              const uint8_t *branch_targets,
                               size_t next_offset)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV ||
@@ -6490,6 +6682,10 @@ static bool narrow_move_merge(const xed_decoded_inst_t *xedd,
                 break;
             }
         }
+    }
+    if (load_foldable_into_compare(inst, len, branch_targets, next_offset,
+                                   xedd)) {
+        return false;
     }
     return !reg_bits_above_live_after(
         inst, len, next_offset, xed_get_largest_enclosing_register(dst),
@@ -6739,6 +6935,17 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             ++errors;
         }
 
+        // Multi-instruction peephole: a load whose sole use is the CMP or TEST
+        // that follows it is one instruction, since the compare takes the
+        // memory operand directly. Reported against the load (at `offset`),
+        // the removable instruction. See load_foldable_into_compare.
+        if (load_foldable_into_compare(inst, len, branch_targets, next,
+                                       &xedd)) {
+            emit_finding(&sink, "load foldable into compare", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
         // Multi-instruction peephole: mov dest, srcA followed by an add into
         // dest -- add dest, srcB, add/sub dest, imm, or inc/dec dest -- is
         // the three-operand lea dest, [srcA + addend], saving the mov.
@@ -6951,7 +7158,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // copy writing the register whole -- a gated equivalence rewrite,
         // reported only when the bits above the written width are provably
         // dead. See narrow_move_merge.
-        if (narrow_move_merge(&xedd, inst, len, next)) {
+        if (narrow_move_merge(&xedd, inst, len, branch_targets, next)) {
             emit_finding(&sink, "merging narrow move", offset, &xedd,
                 inst + offset);
             ++errors;

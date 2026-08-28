@@ -157,11 +157,14 @@ measure the check against the sweep that motivated it.
 
 The x86 twin of armlint's highest-yield shipped checks
 (`check_add_ldr_imm_offset`, 8,428 findings; `check_add_ldr_str_multi_fold`,
-3,804). x86lint folds `LEA` into a memory operand but not `ADD`.
+3,804). x86lint folded `LEA` into a memory operand but not `ADD`; it
+now does both, and the ADD half turned out to be two orders of
+magnitude smaller than its AArch64 model, for a reason worth the
+paragraphs below.
 
 | Pattern | Rewrite | 2026-08 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
-| `ADD`/`SUB`/`INC`/`DEC` whose sole use is as the base of a following access | fold into the addressing mode: `ADD RCX, 1` ; `MOVZX EAX, BYTE [RCX]` -> `MOVZX EAX, BYTE [RCX+1]` | **219,285.** libc 630 (1793), libstdc++ 2,190 (6126), bash 498 (1960), libcrypto 1,774 (2142), libxul 213,679 (7103), go 514 (311) |
+| ~~`ADD`/`SUB`/`INC`/`DEC` whose sole use is as the base of a following access~~ | ~~fold into the addressing mode~~ | **Done: "ADD foldable into memory".** Swept population 219,285; realized **710** (libxul 706, go 2, bash 1, libstdc++ 1, libc 0, libcrypto 0, ld.so 0) -- a 309x overcount, and the reason is the sharpest of the three. See the LEA-displacement note below |
 | `LEA` + `ADD`/`SUB` reading its result | one `LEA`: `LEA RAX, [RBX+8]` ; `ADD RDX, RAX` -> `LEA RDX, [RDX+RBX+8]` | **45,779.** libc 176 (501), libstdc++ 128 (358), bash 36 (142), libcrypto 103 (124), libxul 44,761 (1488), go 575 (348) |
 
 Both reuse the register-liveness machinery behind "LEA foldable into
@@ -171,6 +174,45 @@ gate that check does not: `LEA` writes no flags and `ADD`/`SUB` do, so
 the fold is legal only where the flags are dead past it. `SUB` by an
 immediate folds as a negated displacement; `SUB` by a register does
 not fold at all, since an addressing mode cannot negate its index.
+
+**Why the ADD fold is nearly empty on x86, and why armlint's twin is
+not.** 710 findings against 219,285 swept sites is the largest
+overcount in this file, and unlike the ALU fold's it is not an operand
+role that explains it. It is that **x86 has LEA and AArch64 does
+not**. An AArch64 compiler with no three-operand address instruction
+must materialize a scratch address with `add x8, x0, #16`, and x8 then
+dies into the single access that uses it -- which is exactly the shape
+`check_add_ldr_imm_offset` folds 8,428 times. An x86 compiler reaches
+for `LEA` in that role, where x86lint already folds it, and emits
+`ADD` almost only to advance a pointer in place, where the destination
+stays live by construction because the next iteration needs it.
+
+An independent objdump pass over libc makes this concrete. Of **716**
+adjacent ADD-then-memory-base pairs: **378** have the destination
+provably live, **311** end at a control transfer within sixteen
+instructions, and the **27** that are dead are every one of them
+`sub rD, rS`, which no addressing mode can spell. libc's true
+population is **0**, which is what the check reports. The most
+instructive site is the one the compiler had already solved:
+
+```
+add r12, 0x1 ; mov BYTE PTR [r12-0x1], al
+```
+
+The `-1` is already folded into the store's displacement, and the
+increment survives because r12 is the live loop pointer. That is the
+opposite of a fold opportunity, and it is the modal shape of the
+219,285.
+
+What is left is a C++ and Rust check: **706 of the 710 are libxul**,
+across 523 functions, in naga, webrender, neqo, `core::slice::sort`
+and SpiderMonkey -- rustc and clang at -O2 emitting `add reg, imm`
+into a value that dies in one access. It is the third family in a row
+whose realized population inverts by language, and the third whose
+shape count said nothing useful about its size. A borrowed check needs
+its host architecture's own measurement, not the donor's finding
+count: armlint's 8,428 predicted nothing here, because the fact that
+made it large on AArch64 -- no LEA -- is false on x86.
 
 Real sites, from glibc:
 

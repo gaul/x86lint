@@ -3049,6 +3049,136 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
 }
 
+// Multi-instruction peephole: add/sub/inc/dec whose sum the next instruction
+// uses as a memory base folds into that operand's own base+index*scale+disp;
+// check_instructions reports it against the add. Beyond the LEA fold's
+// conditions the arithmetic writes flags the addressing mode does not, so those
+// must be dead -- every fixture below therefore ends in an instruction that
+// overwrites them: test rbx, rbx, after a mov ecx, edx that kills rcx where the
+// consumer does not.
+static void check_add_memop_fold_test(void)
+{
+    // add rcx, 8 ; mov rax, [rcx] -> mov rax, [rcx+8].
+    static const uint8_t imm_addend[] = {
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x8B, 0x01,        // mov rax, [rcx]
+        0x89, 0xD1,              // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,        // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(imm_addend, "ADD foldable into memory", 1);
+
+    // add rcx, rbx ; mov rax, [rcx] -> mov rax, [rcx+rbx].
+    static const uint8_t reg_addend[] = {
+        0x48, 0x01, 0xD9,  // add rcx, rbx
+        0x48, 0x8B, 0x01,  // mov rax, [rcx]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(reg_addend, "ADD foldable into memory", 1);
+
+    // dec rcx ; mov rax, [rcx] -> mov rax, [rcx-1]. INC and DEC leave CF alone,
+    // so only the flags they do write have to be dead.
+    static const uint8_t dec_addend[] = {
+        0x48, 0xFF, 0xC9,  // dec rcx
+        0x48, 0x8B, 0x01,  // mov rax, [rcx]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(dec_addend, "ADD foldable into memory", 1);
+
+    // add rcx, 8 ; mov rcx, [rcx] -> mov rcx, [rcx+8]. The consumer overwrites
+    // the sum itself, which is deadness enough; the base is read before the
+    // destination is written.
+    static const uint8_t consumer_overwrites[] = {
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x8B, 0x09,        // mov rcx, [rcx]
+        0x48, 0x85, 0xDB,        // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(consumer_overwrites, "ADD foldable into memory", 1);
+
+    // add rcx, 8 ; lea rax, [rcx+0x10] -> lea rax, [rcx+0x18]. A LEA consumer
+    // folds like any other: XED reports its agen as a memory operand.
+    static const uint8_t lea_consumer[] = {
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x8D, 0x41, 0x10,  // lea rax, [rcx+0x10]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(lea_consumer, "ADD foldable into memory", 1);
+
+    // add rcx, 8 ; mov rax, [rcx] ; mov rdx, rcx -- the sum is read after the
+    // consumer, so deleting the add would lose it. This is the shape that keeps
+    // the check near-empty on C code: an increment of a live loop pointer.
+    static const uint8_t dest_live[] = {
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x8B, 0x01,        // mov rax, [rcx]
+        0x48, 0x89, 0xCA,        // mov rdx, rcx (reads rcx)
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS(dest_live, "ADD foldable into memory", 0);
+
+    // add rcx, 8 ; mov rax, [rcx] ; adc rdx, rbx -- the ADC reads the carry the
+    // add set, which an addressing mode does not produce.
+    static const uint8_t flags_live[] = {
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x8B, 0x01,        // mov rax, [rcx]
+        0x48, 0x13, 0xD3,        // adc rdx, rbx (reads CF)
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(flags_live, "ADD foldable into memory", 0);
+
+    // sub rcx, rbx ; mov rax, [rcx] -- an addressing mode cannot negate an
+    // index, so a register subtrahend has no folded spelling.
+    static const uint8_t sub_register[] = {
+        0x48, 0x29, 0xD9,  // sub rcx, rbx
+        0x48, 0x8B, 0x01,  // mov rax, [rcx]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(sub_register, "ADD foldable into memory", 0);
+
+    // add rcx, 8 ; mov [rcx], rcx -- the sum is the stored value as well as the
+    // base, so it stays live once the base folds away.
+    static const uint8_t dest_as_data[] = {
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x89, 0x09,        // mov [rcx], rcx
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(dest_as_data, "ADD foldable into memory", 0);
+
+    // add rcx, rbx ; mov rax, [rcx+rdx*4] -- the consumer already has an index,
+    // and one addressing mode holds only one.
+    static const uint8_t two_indexes[] = {
+        0x48, 0x01, 0xD9,        // add rcx, rbx
+        0x48, 0x8B, 0x04, 0x91,  // mov rax, [rcx+rdx*4]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(two_indexes, "ADD foldable into memory", 0);
+
+    // add ecx, 8 ; mov rax, [rcx] -- the 32-bit add truncates the sum and
+    // zero-extends it, where the 64-bit addressing mode would not.
+    static const uint8_t add32[] = {
+        0x83, 0xC1, 0x08,  // add ecx, 8
+        0x48, 0x8B, 0x01,  // mov rax, [rcx]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(add32, "ADD foldable into memory", 0);
+
+    // add rcx, rsp ; mov rax, [rcx] -- RSP is not a legal SIB index, and the
+    // scale-1 swap that would make it the base is not attempted.
+    static const uint8_t rsp_addend[] = {
+        0x48, 0x01, 0xE1,  // add rcx, rsp
+        0x48, 0x8B, 0x01,  // mov rax, [rcx]
+        0x89, 0xD1,        // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(rsp_addend, "ADD foldable into memory", 0);
+}
+
 // Multi-instruction peephole: a load whose sole use is the CMP or TEST that
 // follows it folds into that compare, which takes the memory operand directly;
 // check_instructions reports it against the load. The compare must name the
@@ -6515,6 +6645,7 @@ int main(int argc, char *argv[])
     check_load_extend_fold_test();
     check_load_compare_fold_test();
     check_load_alu_fold_test();
+    check_add_memop_fold_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();

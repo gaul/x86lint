@@ -126,6 +126,24 @@ and only for flags -- the ABI guarantees they do not survive it.
 Candidate checks not yet implemented, with the corpus populations that
 argue for or against each, live in [TODO.md](TODO.md).
 
+* ADD foldable into memory
+  - `4883C108 488B01` (ADD RCX, 8; MOV RAX, [RCX]) -- an ADD advancing a
+    pointer is an address computation spelled as arithmetic, and the consumer's
+    own base+index*scale+disp does it for free in the AGU: MOV RAX, [RCX+8].
+    The producer contributes ADD reg, imm as a displacement, SUB reg, imm and
+    INC/DEC as a negated or unit one, and ADD reg, reg as a scale-1 index; a
+    LEA consumer folds like any other. SUB by a register has no spelling, since
+    an addressing mode cannot negate an index, and neither does an addend of
+    RSP, which is not a legal SIB index. Encodability is the LEA fold's -- at
+    most one index between producer and consumer, displacements summing within
+    signed 32 bits -- and so is the register argument: the destination must
+    appear in the consumer only as the memory base, and its summed value must
+    be dead. Its PRE-ADD value is what the folded address reads, which is the
+    point: with the ADD gone the register still holds it. The one gate the LEA
+    fold does not need is flags: LEA writes none and this arithmetic writes
+    all of them (INC/DEC all but CF), so they must be provably dead past the
+    consumer. A 32-bit ADD is excluded, since it truncates the sum and
+    zero-extends where the 64-bit addressing mode would not
 * AVX-SSE transition
   - `C5F458C2 0F28DC` (VADDPS YMM0, YMM1, YMM2; MOVAPS XMM3, XMM4) -- a
     legacy SSE instruction preserves bits 255:128 of its destination's ymm

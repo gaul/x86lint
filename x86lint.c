@@ -4125,6 +4125,270 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
     return !reg_live_after(inst, len, after, dest);
 }
 
+// True when `xedd` reads any sub-register of `reg64` -- an explicit or implicit
+// register operand, or a memory base or index. The read scan reg_live_after
+// runs at each step, factored out for the branch split below.
+static bool inst_reads_reg64(const xed_decoded_inst_t *xedd,
+                             xed_reg_enum_t reg64)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (xed_operand_is_register(name) && xed_operand_read(op) &&
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(xedd, name)) == reg64) {
+            return true;
+        }
+    }
+    int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (int m = 0; m < nmem; ++m) {
+        xed_reg_enum_t b = xed_decoded_inst_get_base_reg(xedd, m);
+        xed_reg_enum_t x = xed_decoded_inst_get_index_reg(xedd, m);
+        if ((b != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(b) == reg64) ||
+            (x != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(x) == reg64)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// reg_live_after ends its walk conservatively at any control transfer, and for
+// the compare fold below that transfer is almost always the very next
+// instruction: the point of a compare is the branch that reads its flags.
+// Calling the loaded value live there suppresses nearly the whole population --
+// measured at one finding across glibc against the 370 adjacent sites the
+// corpus sweep counts, a 370x undercount that looked like a working check.
+//
+// A conditional branch reads flags, not GPRs, so it observes nothing of the
+// value; it only splits the paths on which the value could still be read. So
+// split: at a direct Jcc that reads no part of the register, run reg_live_after
+// down both successors and call the value dead only when both agree. This is
+// the register-side twin of the CF/OF both-successors walk in
+// shift_test_redundant, and like it goes exactly one level deep -- a second
+// branch inside either successor ends that walk LIVE on its own.
+//
+// Everything else defers to reg_live_after unchanged and stays LIVE: an
+// indirect or out-of-buffer target, a decode failure, and a conditional branch
+// that does read the register (JRCXZ, the LOOP family).
+static bool reg_live_after_branch(const uint8_t *inst, size_t len,
+                                  size_t offset, xed_reg_enum_t reg64)
+{
+    if (offset < len) {
+        xed_decoded_inst_t jcc;
+        decode_init(&jcc);
+        if (xed_decode(&jcc, inst + offset, len - offset) == XED_ERROR_NONE &&
+            xed_decoded_inst_get_category(&jcc) == XED_CATEGORY_COND_BR &&
+            xed_decoded_inst_get_branch_displacement_width(&jcc) != 0 &&
+            !inst_reads_reg64(&jcc, reg64)) {
+            size_t fall = offset + xed_decoded_inst_get_length(&jcc);
+            int64_t target = (int64_t) fall +
+                xed_decoded_inst_get_branch_displacement(&jcc);
+            if (target < 0 || (uint64_t) target >= (uint64_t) len) {
+                return true;
+            }
+            return reg_live_after(inst, len, fall, reg64) ||
+                   reg_live_after(inst, len, (size_t) target, reg64);
+        }
+    }
+    return reg_live_after(inst, len, offset, reg64);
+}
+
+// Multi-instruction peephole, the arithmetic sibling of the LEA fold above. An
+// ADD advancing a pointer is an address computation spelled as arithmetic, and
+// the consumer's own base + index*scale + disp does it for free in the AGU:
+//
+//   add rcx, 1   ; movzx eax, byte [rcx]  -> movzx eax, byte [rcx+1]
+//   add rax, rcx ; mov r14, [rax]         -> mov r14, [rax+rcx]
+//   add r14, rbx ; movsx eax, byte [r14+0x18] -> movsx eax, byte [r14+rbx+0x18]
+//   sub rcx, 8   ; mov rax, [rcx]         -> mov rax, [rcx-8]
+//
+// `add` is the already-decoded producer ending at `consumer_offset`; on a match
+// the caller reports against it, the removable instruction. This is the x86
+// twin of armlint's check_add_ldr_imm_offset, the highest-yield check in that
+// analyzer.
+//
+// The producer contributes a virtual address that replaces its destination in
+// the consumer's memory operand, exactly as the LEA fold substitutes the LEA's:
+//
+//   add rD, imm  ->  base rD, disp +imm      inc rD  ->  base rD, disp +1
+//   sub rD, imm  ->  base rD, disp -imm      dec rD  ->  base rD, disp -1
+//   add rD, rS   ->  base rD, index rS, scale 1
+//
+// SUB by a register has no spelling: an addressing mode cannot negate an index.
+// So does an addend of RSP, which is not a legal SIB index -- the scale-1 pair
+// could be swapped to make RSP the base, but the shape is rare enough not to
+// earn the case. Encodability is otherwise the LEA fold's: at most one index
+// between producer and consumer, and the displacements must sum within signed
+// 32 bits.
+//
+// Soundness adds one gate to the LEA fold's argument, and it is the whole
+// difference between the two: LEA writes no flags and ADD/SUB/INC/DEC write
+// theirs, so every flag the producer sets must be dead past the consumer or the
+// deletion loses a value something reads. INC and DEC leave CF alone and are
+// gated on the rest.
+//
+// The rest is the LEA fold's reasoning unchanged. The destination must appear in
+// the consumer ONLY as the memory base -- never as the index, never read as a
+// data operand -- and its post-ADD value must be dead, either because the
+// consumer overwrites it or because the walk proves it unread. Its PRE-ADD value
+// is what the folded address reads, and that is the point: with the ADD gone the
+// register still holds it. Nothing between the two can disturb either value,
+// since the pair is adjacent, and within one instruction the base is read before
+// any destination is written, so add rcx, rbx ; mov rbx, [rcx] folds to
+// mov rbx, [rcx+rbx] correctly.
+//
+// A 32-bit ADD is excluded: it truncates the sum to 32 bits and zero-extends,
+// where the folded 64-bit addressing mode would not, so the two disagree
+// whenever the sum exceeds 32 bits.
+static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
+                                    const uint8_t *branch_targets,
+                                    size_t consumer_offset,
+                                    const xed_decoded_inst_t *add)
+{
+    // Producer: a register-destination add/sub/inc/dec at 64 bits. A memory
+    // destination (including every locked form) computes no register address.
+    xed_iclass_enum_t pic = xed_decoded_inst_get_iclass(add);
+    uint32_t flags_written;
+    switch (pic) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+        flags_written = FLAG_ARITH;
+        break;
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+        // inc/dec leave CF untouched, so only the flags they write can be lost.
+        flags_written = FLAG_ARITH & ~FLAG_CF;
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(add) != 0) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(add, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(dest) != 64) {
+        return false;
+    }
+
+    // The address the producer computes, in the consumer's own terms.
+    xed_reg_enum_t index_p = XED_REG_INVALID;
+    int64_t disp_p;
+    if (pic == XED_ICLASS_INC) {
+        disp_p = 1;
+    } else if (pic == XED_ICLASS_DEC) {
+        disp_p = -1;
+    } else if (xed_operand_values_has_immediate(
+                   xed_decoded_inst_operands_const(add))) {
+        int64_t imm = xed_decoded_inst_get_signed_immediate(add);
+        if (imm == 0) {
+            return false;   // the add/sub is check_add_sub_zero's
+        }
+        disp_p = (pic == XED_ICLASS_SUB) ? -imm : imm;
+        if (disp_p < INT32_MIN || disp_p > INT32_MAX) {
+            return false;   // sub rdx, INT32_MIN alone
+        }
+    } else {
+        if (pic == XED_ICLASS_SUB) {
+            return false;   // an addressing mode cannot negate an index
+        }
+        index_p = xed_decoded_inst_get_reg(add, XED_OPERAND_REG1);
+        if (xed_reg_class(index_p) != XED_REG_CLASS_GPR ||
+            xed_get_register_width_bits64(index_p) != 64 ||
+            index_p == XED_REG_RSP) {
+            return false;
+        }
+        disp_p = 0;
+    }
+
+    // Consumer: one memory operand based on dest, dest not also its index, no
+    // fs/gs override. (A LEA consumer qualifies: XED reports its agen as a
+    // memory operand, and the addresses compose the same way.)
+    if (consumer_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t consumer;
+    decode_init(&consumer);
+    if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&consumer) != 1 ||
+        xed_decoded_inst_get_base_reg(&consumer, 0) != dest ||
+        xed_decoded_inst_get_index_reg(&consumer, 0) == dest) {
+        return false;
+    }
+    xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(&consumer, 0);
+    if (seg == XED_REG_FS || seg == XED_REG_GS) {
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the add.
+    if (branch_target_in(branch_targets, consumer_offset,
+            consumer_offset + xed_decoded_inst_get_length(&consumer))) {
+        return false;
+    }
+
+    // A control-transfer consumer does not fall through to the linear next
+    // instruction, so the walks below would read the wrong bytes.
+    xed_category_enum_t cat = xed_decoded_inst_get_category(&consumer);
+    if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_RET ||
+        cat == XED_CATEGORY_UNCOND_BR || cat == XED_CATEGORY_COND_BR ||
+        cat == XED_CATEGORY_SYSCALL || cat == XED_CATEGORY_SYSRET ||
+        cat == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+
+    // At most one index between the two, and the displacements sum within 32
+    // signed bits.
+    if (index_p != XED_REG_INVALID &&
+        xed_decoded_inst_get_index_reg(&consumer, 0) != XED_REG_INVALID) {
+        return false;
+    }
+    int64_t disp = disp_p +
+        xed_decoded_inst_get_memory_displacement(&consumer, 0);
+    if (disp < INT32_MIN || disp > INT32_MAX) {
+        return false;
+    }
+
+    // dest must appear only as the base: never read as a data operand, else it
+    // stays live after the base folds away. Note a full overwrite.
+    const xed_inst_t *xi = xed_decoded_inst_inst(&consumer);
+    unsigned nops = xed_inst_noperands(xi);
+    bool writes_dest = false;
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) ||
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(&consumer, name)) != dest) {
+            continue;
+        }
+        if (xed_operand_read(op)) {
+            return false;
+        }
+        if (xed_operand_written(op) &&
+            xed_get_register_width_bits64(
+                xed_decoded_inst_get_reg(&consumer, name)) >= 32) {
+            writes_dest = true;
+        }
+    }
+
+    // The producer's flags must be dead: the fold stops setting them.
+    size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
+    if (flags_live_after(inst, len, consumer_offset, flags_written)) {
+        return false;
+    }
+
+    // dest's summed value must be dead too: overwritten by the consumer, or
+    // unread downstream.
+    return writes_dest || !reg_live_after_branch(inst, len, after, dest);
+}
+
 // Multi-instruction peephole. mov reg, imm loads a constant; when the next
 // instruction uses reg as the source operand of an add/sub/adc/sbb/and/or/xor/
 // cmp/test/mov and reg is dead afterward, the constant folds into that
@@ -4342,78 +4606,6 @@ static bool load_foldable_into_extend(const uint8_t *inst, size_t len,
     return xed_get_largest_enclosing_register(
                xed_decoded_inst_get_reg(&ext, XED_OPERAND_REG0)) ==
            xed_get_largest_enclosing_register(dest);
-}
-
-// True when `xedd` reads any sub-register of `reg64` -- an explicit or implicit
-// register operand, or a memory base or index. The read scan reg_live_after
-// runs at each step, factored out for the branch split below.
-static bool inst_reads_reg64(const xed_decoded_inst_t *xedd,
-                             xed_reg_enum_t reg64)
-{
-    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
-    unsigned nops = xed_inst_noperands(xi);
-    for (unsigned i = 0; i < nops; ++i) {
-        const xed_operand_t *op = xed_inst_operand(xi, i);
-        xed_operand_enum_t name = xed_operand_name(op);
-        if (xed_operand_is_register(name) && xed_operand_read(op) &&
-            xed_get_largest_enclosing_register(
-                xed_decoded_inst_get_reg(xedd, name)) == reg64) {
-            return true;
-        }
-    }
-    int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
-    for (int m = 0; m < nmem; ++m) {
-        xed_reg_enum_t b = xed_decoded_inst_get_base_reg(xedd, m);
-        xed_reg_enum_t x = xed_decoded_inst_get_index_reg(xedd, m);
-        if ((b != XED_REG_INVALID &&
-             xed_get_largest_enclosing_register(b) == reg64) ||
-            (x != XED_REG_INVALID &&
-             xed_get_largest_enclosing_register(x) == reg64)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// reg_live_after ends its walk conservatively at any control transfer, and for
-// the compare fold below that transfer is almost always the very next
-// instruction: the point of a compare is the branch that reads its flags.
-// Calling the loaded value live there suppresses nearly the whole population --
-// measured at one finding across glibc against the 370 adjacent sites the
-// corpus sweep counts, a 370x undercount that looked like a working check.
-//
-// A conditional branch reads flags, not GPRs, so it observes nothing of the
-// value; it only splits the paths on which the value could still be read. So
-// split: at a direct Jcc that reads no part of the register, run reg_live_after
-// down both successors and call the value dead only when both agree. This is
-// the register-side twin of the CF/OF both-successors walk in
-// shift_test_redundant, and like it goes exactly one level deep -- a second
-// branch inside either successor ends that walk LIVE on its own.
-//
-// Everything else defers to reg_live_after unchanged and stays LIVE: an
-// indirect or out-of-buffer target, a decode failure, and a conditional branch
-// that does read the register (JRCXZ, the LOOP family).
-static bool reg_live_after_branch(const uint8_t *inst, size_t len,
-                                  size_t offset, xed_reg_enum_t reg64)
-{
-    if (offset < len) {
-        xed_decoded_inst_t jcc;
-        decode_init(&jcc);
-        if (xed_decode(&jcc, inst + offset, len - offset) == XED_ERROR_NONE &&
-            xed_decoded_inst_get_category(&jcc) == XED_CATEGORY_COND_BR &&
-            xed_decoded_inst_get_branch_displacement_width(&jcc) != 0 &&
-            !inst_reads_reg64(&jcc, reg64)) {
-            size_t fall = offset + xed_decoded_inst_get_length(&jcc);
-            int64_t target = (int64_t) fall +
-                xed_decoded_inst_get_branch_displacement(&jcc);
-            if (target < 0 || (uint64_t) target >= (uint64_t) len) {
-                return true;
-            }
-            return reg_live_after(inst, len, fall, reg64) ||
-                   reg_live_after(inst, len, (size_t) target, reg64);
-        }
-    }
-    return reg_live_after(inst, len, offset, reg64);
 }
 
 // The producer the memory-operand folds share: a plain MOV of a GPR from a
@@ -7048,6 +7240,16 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // lea_foldable_into_memop.
         if (lea_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
             emit_finding(&sink, "LEA foldable into memory", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: add/sub/inc/dec reg, addend whose sum
+        // the next instruction uses as a memory base, leaving reg dead and the
+        // flags it set unread. Reported against the add (at `offset`), the
+        // removable instruction. See add_foldable_into_memop.
+        if (add_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
+            emit_finding(&sink, "ADD foldable into memory", offset, &xedd,
                 inst + offset);
             ++errors;
         }

@@ -2868,6 +2868,29 @@ static void check_lea_fold_test(void)
         0x89, 0xD0,              // mov eax, edx
     };
     ASSERT_FINDINGS(jmp_consumer, "LEA foldable into memory", 0);
+
+    // The folded address is very often consumed by a compare the next
+    // instruction branches on, which a straight-line deadness walk gives up at.
+    // Both successors overwrite rdx, so it is dead and the fold stands.
+    static const uint8_t branch_both_dead[] = {
+        0x48, 0x8D, 0x14, 0xD8,  // lea rdx, [rax+rbx*8]
+        0x39, 0x0A,              // cmp [rdx], ecx
+        0x75, 0x03,              // jne +3 (to the mov rdx, rsi below)
+        0x48, 0x89, 0xCA,        // mov rdx, rcx
+        0x48, 0x89, 0xF2,        // mov rdx, rsi
+    };
+    ASSERT_FINDINGS(branch_both_dead, "LEA foldable into memory", 1);
+
+    // The same with the branch target reading rdx: one live successor is enough
+    // to suppress.
+    static const uint8_t branch_one_live[] = {
+        0x48, 0x8D, 0x14, 0xD8,  // lea rdx, [rax+rbx*8]
+        0x39, 0x0A,              // cmp [rdx], ecx
+        0x75, 0x03,              // jne +3 (to the mov rsi, rdx below)
+        0x48, 0x89, 0xCA,        // mov rdx, rcx
+        0x48, 0x89, 0xD6,        // mov rsi, rdx (reads rdx)
+    };
+    ASSERT_FINDINGS(branch_one_live, "LEA foldable into memory", 0);
 }
 
 // Multi-instruction peephole: mov reg, imm followed by an instruction that uses

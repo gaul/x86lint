@@ -212,7 +212,14 @@ argue for or against each, live in [TODO.md](TODO.md).
     one index and a 32-bit displacement (gated by register liveness). The
     consumer need not access memory: a second LEA folds the same way
     (`LEA RAX, [RBX+RAX]; LEA RAX, [RAX+2]` -> `LEA RAX, [RBX+RAX+2]`), which
-    is the shape Go emits, where LLVM output is overwhelmingly the load above
+    is the shape Go emits, where LLVM output is overwhelmingly the load above.
+    Deadness is proved down BOTH successors of a directly following Jcc, since
+    a folded address is very often consumed by a compare the next instruction
+    branches on (`LEA RDI, [RSI+RDI*4]; CMP [RDI], R14D; JE`) and a
+    straight-line walk gives up there. Not folded: a RIP-relative producer,
+    whose displacement is measured from the following instruction, and which
+    in any case feeds an indexed consumer 95% of the time -- and RIP-relative
+    addressing admits no index
 * length-changing prefix stall
   - `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
     immediate's length (imm32 -> imm16) defeats the pre-decoder's length

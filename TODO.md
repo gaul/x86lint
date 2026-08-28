@@ -279,8 +279,40 @@ that closed itself.
 
 | Check | Reports | Population at d1 | Notes |
 | --- | --- | --- | --- |
-| LEA foldable into memory | libxul 1,215; go 153; libc **0** | libxul 14,923; go 658; libc 254 | A 12x gap on libxul and a 254-to-zero gap on libc. Some of the residue is legitimately unfoldable -- a LEA that already carries base+index feeding `[reg]` would need two indices -- but the split has not been measured. Do it armlint's way: lower the check's own gates and count what comes back through its real liveness proof, rather than counting the shape from outside |
+| ~~LEA foldable into memory~~ | libxul **1,326**; go 153; libc 0 | libxul 14,923; go 658; libc 254 | **Investigated and mostly closed.** The 12x figure was the wrong measurement: `defuse`'s `lea->addr` counts a LEA whose sole use is an address and asks nothing about whether the combined address is *encodable* or the register provably dead. See the breakdown below; the check gained 111 findings from one real fix and the rest of the residue is refusals it should be making |
 | redundant TEST after flags | libxul 556; libc 7; go 4 | `cmp0` d1: logic 329, arith 1,637, **test-width 405** | The logic and arith rows are covered (the check searches a window, not just d1, and arith is an upper bound gated on CF/OF deadness, exactly as documented). The test-width row -- 405 sites, 357 of them libxul -- is the check's exact-register match refusing a TEST that names a different width of the producer's register. That refusal is deliberate and sound (`AND EAX, EBX` clears bits 63:32 where `TEST RAX, RAX` reads a sign bit the narrow form never sees); the open question is whether the narrowing direction, where the producer is the *wider* one, is admissible |
+
+**Breaking down the LEA fold's residue.** Classifying every adjacent
+LEA-then-memory-base pair in libc with an independent objdump pass,
+against the 542 the shape count admits:
+
+```
+235  the LEA is RIP-relative        (218 of them feed an indexed consumer)
+111  two indexes between the pair   unfoldable: one addressing mode, one index
+  1  a segment override on the consumer
+195  candidates needing only liveness -- of which 9 are actually dead
+```
+
+So libc's true population is about **10**, not 254, and the check
+reporting 0 was nearly right rather than 254x wrong. One real fix came
+out of the investigation and shipped: the deadness walk used
+`reg_live_after`, which ends at every control transfer, and a folded
+address is very often consumed by a compare or a load the next
+instruction branches on. Switching to `reg_live_after_branch` -- the
+both-successors split written for the compare fold -- took libxul from
+1,215 to **1,326**, 111 gained and none lost, all of them the shape
+`lea rdi, [rsi+rdi*4] ; cmp [rdi], r14d ; je`. It did nothing for libc,
+whose residue is encodability rather than liveness.
+
+The **RIP-relative arm** is the one piece still unimplemented, and it
+is small. `lea rax, [rip+X] ; mov r14, [rax]` is `mov r14, [rip+X']`,
+which the assembler resolves; but RIP-relative addressing admits no
+index, and **95% of the RIP pairs feed an indexed consumer** -- the
+jump-table and global-array shape `lea rax, [rip+X] ; mov ecx,
+[rax+rdx*4]`, which has no one-instruction spelling. What is left is
+**89 sites** (libxul 88, libc 1), and it carries the actionability
+caveat armlint records for `adrp`+`add`: the LEA usually carries a
+relocation, so this is a codegen suggestion rather than a byte patch.
 
 ## Investigated and closed (2026-08 sweep)
 

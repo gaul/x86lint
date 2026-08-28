@@ -3977,6 +3977,78 @@ static bool reg_live_after(const uint8_t *inst, size_t len, size_t offset,
     return true;
 }
 
+// True when `xedd` reads any sub-register of `reg64` -- an explicit or implicit
+// register operand, or a memory base or index. The read scan reg_live_after
+// runs at each step, factored out for the branch split below.
+static bool inst_reads_reg64(const xed_decoded_inst_t *xedd,
+                             xed_reg_enum_t reg64)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (xed_operand_is_register(name) && xed_operand_read(op) &&
+            xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(xedd, name)) == reg64) {
+            return true;
+        }
+    }
+    int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (int m = 0; m < nmem; ++m) {
+        xed_reg_enum_t b = xed_decoded_inst_get_base_reg(xedd, m);
+        xed_reg_enum_t x = xed_decoded_inst_get_index_reg(xedd, m);
+        if ((b != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(b) == reg64) ||
+            (x != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(x) == reg64)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// reg_live_after ends its walk conservatively at any control transfer, and for
+// the compare fold below that transfer is almost always the very next
+// instruction: the point of a compare is the branch that reads its flags.
+// Calling the loaded value live there suppresses nearly the whole population --
+// measured at one finding across glibc against the 370 adjacent sites the
+// corpus sweep counts, a 370x undercount that looked like a working check.
+//
+// A conditional branch reads flags, not GPRs, so it observes nothing of the
+// value; it only splits the paths on which the value could still be read. So
+// split: at a direct Jcc that reads no part of the register, run reg_live_after
+// down both successors and call the value dead only when both agree. This is
+// the register-side twin of the CF/OF both-successors walk in
+// shift_test_redundant, and like it goes exactly one level deep -- a second
+// branch inside either successor ends that walk LIVE on its own.
+//
+// Everything else defers to reg_live_after unchanged and stays LIVE: an
+// indirect or out-of-buffer target, a decode failure, and a conditional branch
+// that does read the register (JRCXZ, the LOOP family).
+static bool reg_live_after_branch(const uint8_t *inst, size_t len,
+                                  size_t offset, xed_reg_enum_t reg64)
+{
+    if (offset < len) {
+        xed_decoded_inst_t jcc;
+        decode_init(&jcc);
+        if (xed_decode(&jcc, inst + offset, len - offset) == XED_ERROR_NONE &&
+            xed_decoded_inst_get_category(&jcc) == XED_CATEGORY_COND_BR &&
+            xed_decoded_inst_get_branch_displacement_width(&jcc) != 0 &&
+            !inst_reads_reg64(&jcc, reg64)) {
+            size_t fall = offset + xed_decoded_inst_get_length(&jcc);
+            int64_t target = (int64_t) fall +
+                xed_decoded_inst_get_branch_displacement(&jcc);
+            if (target < 0 || (uint64_t) target >= (uint64_t) len) {
+                return true;
+            }
+            return reg_live_after(inst, len, fall, reg64) ||
+                   reg_live_after(inst, len, (size_t) target, reg64);
+        }
+    }
+    return reg_live_after(inst, len, offset, reg64);
+}
+
 // Multi-instruction peephole. lea reg, [addr] materializes an address in reg; if
 // the next instruction uses reg as the base of its one memory operand and reg is
 // dead afterward, the address arithmetic folds into that operand's own
@@ -4117,84 +4189,15 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
     }
 
     // dest's address value must be dead after the fold: overwritten by the
-    // consumer, or unread downstream.
+    // consumer, or unread downstream -- through a branch that reads it not at
+    // all, since reg_live_after ends its walk at every control transfer and a
+    // folded address is very often consumed by a load whose result the next
+    // instruction branches on. See reg_live_after_branch.
     if (writes_dest) {
         return true;
     }
     size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
-    return !reg_live_after(inst, len, after, dest);
-}
-
-// True when `xedd` reads any sub-register of `reg64` -- an explicit or implicit
-// register operand, or a memory base or index. The read scan reg_live_after
-// runs at each step, factored out for the branch split below.
-static bool inst_reads_reg64(const xed_decoded_inst_t *xedd,
-                             xed_reg_enum_t reg64)
-{
-    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
-    unsigned nops = xed_inst_noperands(xi);
-    for (unsigned i = 0; i < nops; ++i) {
-        const xed_operand_t *op = xed_inst_operand(xi, i);
-        xed_operand_enum_t name = xed_operand_name(op);
-        if (xed_operand_is_register(name) && xed_operand_read(op) &&
-            xed_get_largest_enclosing_register(
-                xed_decoded_inst_get_reg(xedd, name)) == reg64) {
-            return true;
-        }
-    }
-    int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
-    for (int m = 0; m < nmem; ++m) {
-        xed_reg_enum_t b = xed_decoded_inst_get_base_reg(xedd, m);
-        xed_reg_enum_t x = xed_decoded_inst_get_index_reg(xedd, m);
-        if ((b != XED_REG_INVALID &&
-             xed_get_largest_enclosing_register(b) == reg64) ||
-            (x != XED_REG_INVALID &&
-             xed_get_largest_enclosing_register(x) == reg64)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// reg_live_after ends its walk conservatively at any control transfer, and for
-// the compare fold below that transfer is almost always the very next
-// instruction: the point of a compare is the branch that reads its flags.
-// Calling the loaded value live there suppresses nearly the whole population --
-// measured at one finding across glibc against the 370 adjacent sites the
-// corpus sweep counts, a 370x undercount that looked like a working check.
-//
-// A conditional branch reads flags, not GPRs, so it observes nothing of the
-// value; it only splits the paths on which the value could still be read. So
-// split: at a direct Jcc that reads no part of the register, run reg_live_after
-// down both successors and call the value dead only when both agree. This is
-// the register-side twin of the CF/OF both-successors walk in
-// shift_test_redundant, and like it goes exactly one level deep -- a second
-// branch inside either successor ends that walk LIVE on its own.
-//
-// Everything else defers to reg_live_after unchanged and stays LIVE: an
-// indirect or out-of-buffer target, a decode failure, and a conditional branch
-// that does read the register (JRCXZ, the LOOP family).
-static bool reg_live_after_branch(const uint8_t *inst, size_t len,
-                                  size_t offset, xed_reg_enum_t reg64)
-{
-    if (offset < len) {
-        xed_decoded_inst_t jcc;
-        decode_init(&jcc);
-        if (xed_decode(&jcc, inst + offset, len - offset) == XED_ERROR_NONE &&
-            xed_decoded_inst_get_category(&jcc) == XED_CATEGORY_COND_BR &&
-            xed_decoded_inst_get_branch_displacement_width(&jcc) != 0 &&
-            !inst_reads_reg64(&jcc, reg64)) {
-            size_t fall = offset + xed_decoded_inst_get_length(&jcc);
-            int64_t target = (int64_t) fall +
-                xed_decoded_inst_get_branch_displacement(&jcc);
-            if (target < 0 || (uint64_t) target >= (uint64_t) len) {
-                return true;
-            }
-            return reg_live_after(inst, len, fall, reg64) ||
-                   reg_live_after(inst, len, (size_t) target, reg64);
-        }
-    }
-    return reg_live_after(inst, len, offset, reg64);
+    return !reg_live_after_branch(inst, len, after, dest);
 }
 
 // Multi-instruction peephole, the arithmetic sibling of the LEA fold above. An

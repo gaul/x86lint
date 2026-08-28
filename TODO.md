@@ -258,15 +258,71 @@ than the input's shape.
 
 | Pattern | Rewrite | 2026-08 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
-| `MOV r, imm` of a constant still live in another register | `MOV rD, rS` -- 3 bytes against up to 10 for a `MOVABS`, and eliminated at rename where the immediate form is not | **27,796.** libc 113 (322), libstdc++ 126 (352), bash 90 (354), libcrypto 124 (150), libxul 26,982 (897), go 361 (219) |
+| `MOV r, imm` of a constant still live in another register | `MOV rD, rS` -- 2-3 bytes against the 5-6 the immediate form costs | **27,796** at d1, of 41,108 at all distances. libc 113 (322), libstdc++ 126 (352), bash 90 (354), libcrypto 124 (150), libxul 26,982 (897), go 361 (219) |
 
-The usual counter-argument to un-rematerializing a constant is
-register pressure, and it does not apply: the measurement's
-precondition is that the value is already live in another register, so
-the rewrite frees a register rather than pinning one. armlint has the
-same candidate open from its own pairscan sweep. `defuse`'s
-`remat|movimm` row is the population; a check needs the liveness proof
-that the source register still holds the constant at the use.
+This is the one row in this file whose population may survive contact
+with the rewrite, and the reason is worth stating. Every count that
+collapsed was defined by *shape*: `lea->addr` never asked whether the
+combined address was encodable, `load->addsub` never asked which
+operand the loaded register was. `defuse`'s `remat|movimm` row is
+defined by the rewrite's own precondition -- the constant still being
+live in another register is exactly what makes the copy legal -- so the
+erosion here should be the check's proof being stricter than defuse's
+block-local model, not a condition the count ignored.
+
+Two corrections to an earlier draft of this row, both from measuring
+the sites rather than the shape:
+
+* **The size claim was wrong.** It read "3 bytes against up to 10 for a
+  `MOVABS`". Every constant in the population fits imm32 -- **zero
+  `movabs` sites in libc or libxul** -- so the saving is a uniform 2-3
+  bytes (`mov edi, 0x2` at 5 bytes becomes `mov edi, r10d` at 3), never
+  the 7 a 64-bit immediate would give.
+* **16% of the population is the constant zero** (6,239 of libxul's
+  39,777), and those must be excluded rather than reported. The shipped
+  "suboptimal MOV zero" check already covers them, and its advice --
+  `XOR r, r` -- is strictly better than a copy, since XOR is eliminated
+  at rename *and* breaks the dependency where a copy creates one.
+
+Three costs, in decreasing order of how much they should worry a
+future implementer:
+
+* **It serializes two independent instructions.** The dominant shape is
+  glibc's `mov r10d, 0x2 ; mov edi, 0x2`, two constant materializations
+  with no dependency between them, each 1 cycle, free to issue in
+  parallel. The rewrite makes the second depend on the first. Whether
+  that costs anything turns entirely on **move elimination**, and this
+  is the piece to settle first: a `MOV r64, r64` handled at rename is 0
+  latency and 0 ports, which would make the copy better than the
+  immediate on every axis, but GPR move elimination is reportedly
+  *disabled* from Ice Lake onward. **Unverified here** -- check
+  uops.info before writing any code, because the entire desirability
+  argument rests on it. If elimination is off on current Intel, this is
+  the slow-LEA situation again: sound, tens of thousands of sites, and
+  trading a cycle for two bytes.
+* **Compilers do this deliberately, in reverse.** Rematerialization is
+  a standard register-allocator technique, and LLVM marks `MOV32ri` and
+  `MOV64ri` trivially rematerializable precisely so the allocator can
+  duplicate a constant rather than keep it live; a fresh constant is
+  also the canonical way to break a dependency. So a finding here is
+  often the compiler's choice rather than its oversight, which is not
+  true of anything that shipped this session.
+* **Live-range extension, but only at distance.** The copy needs its
+  source live at the use, which can add register pressure. At d1 the
+  objection is vacuous -- the definition is one instruction away -- and
+  d1 is 68% of the population. It grows with distance, so an
+  adjacency-only v1 mostly escapes it. (An earlier draft of this row
+  claimed the rewrite "frees a register rather than pinning one". It
+  does neither.)
+
+The proof burden is also new in kind. Every shipped check proves a
+register **dead**; this one must prove a register holds a **specific
+value**, which needs a small constant-tracking state that resets at
+branch targets, calls and any write to the source, with width traps
+(`mov ecx, 5` establishes RCX = 5; `mov cl, 5` does not). More
+machinery than any existing check, and more places to be wrong.
+
+armlint has the same candidate open from its own pairscan sweep.
 
 ## Coverage gaps in shipped checks
 

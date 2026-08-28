@@ -4389,6 +4389,228 @@ static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
     return writes_dest || !reg_live_after_branch(inst, len, after, dest);
 }
 
+// Multi-instruction peephole. A LEA already computes base + index*scale + disp,
+// so an ADD immediately after it is a term the same instruction could have
+// carried: the pair collapses into one LEA. The finding is anchored at the LEA,
+// the head of the pair, where the surviving instruction is written.
+//
+//   lea rsi, [rax+6]  ; add rsi, 7    -> lea rsi, [rax+0xd]
+//   lea rax, [rdi-1]  ; add rax, rdx  -> lea rax, [rdi+rdx-1]
+//   lea rdx, [r8+4]   ; add rax, rdx  -> lea rax, [rax+r8+4]
+//
+// `lea` is the already-decoded producer ending at `add_offset`. Three arms,
+// which differ only in where the added term comes from and which register the
+// surviving LEA writes:
+//
+//   imm    add/sub/inc/dec rD, imm  -> the LEA's displacement absorbs it, and
+//                                     rD stays the destination
+//   dest   add rD, rT               -> rT joins the address, rD stays the
+//                                     destination, and nothing has to die
+//   src    add rT, rD               -> rT joins the address AND becomes the
+//                                     destination, so rD must be dead
+//
+// Encodability. The immediate arm needs only that the displacements sum within
+// signed 32 bits. The register arms need a free slot for rT, so the LEA may
+// carry a base or an index but not both, and not neither -- an address with no
+// register at all is a constant, whose fold is an immediate ADD rather than a
+// LEA. RIP-relative producers are refused: their displacement is measured from
+// the following instruction and does not survive being rewritten. When the LEA
+// has a base, rT becomes the scale-1 index, which RSP cannot be; the operands
+// are swapped to rescue that, and only rT = base = RSP has no spelling.
+//
+// Soundness. The two instructions compute one sum, and the rewrite keeps every
+// term of it, so the value is identical. What changes is flags: LEA writes none
+// where ADD/SUB write all of them (INC/DEC all but CF), so every flag the
+// consumer sets must be dead past it -- the same gate the ADD-into-memory fold
+// carries, and for the same reason. The src arm additionally drops rD's
+// definition, so rD must be dead after the pair; the other two arms keep
+// writing the register they wrote, and need no liveness proof at all.
+//
+// Desirability, which here is a narrower condition than soundness and is what
+// bounds the check. An LEA using base, index AND displacement together is the
+// "slow LEA": 3 cycles on port 1 alone from Sandy Bridge onward, where every
+// two-component form is 1 cycle on two ports. Folding a two-component LEA plus
+// an ADD (1 + 1 cycles, two ports) into a three-component one therefore trades
+// a uop and three or four bytes for a cycle of latency and a port -- a real
+// trade rather than an improvement, and not one to make on a dependency chain.
+// So the fold is reported only when the RESULT stays within two components.
+// That is a small minority of the sites: 171 of 39,715 in libxul, the other
+// 99.6% being exactly the base+index LEA that an ADD of a field offset would
+// turn slow. Those are recorded in TODO.md with the measurement rather than
+// reported here, since a finding whose rewrite may cost a cycle is not what
+// this tool emits.
+//
+// Widths must agree between the two instructions, and both arms with a register
+// term are 64-bit only: a 32-bit LEA truncates its sum, and reading the
+// consumer's 32-bit operand as a 64-bit index would need the truncation to
+// commute with the addend in a way only the immediate arm makes obvious.
+//
+// SUB by a register never folds, in either direction: an addressing mode cannot
+// negate a term. That is most of the population -- the corpus is full of
+// lea rdx, [rsp+0xa0] ; sub rdx, rsp -- and none of it is reachable.
+static bool add_foldable_into_lea(const uint8_t *inst, size_t len,
+                                  const uint8_t *branch_targets,
+                                  size_t add_offset,
+                                  const xed_decoded_inst_t *lea)
+{
+    if (xed_decoded_inst_get_iclass(lea) != XED_ICLASS_LEA) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(lea, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    unsigned lea_width = xed_get_register_width_bits64(dest);
+    if (lea_width != 32 && lea_width != 64) {
+        return false;
+    }
+    xed_reg_enum_t base_l = xed_decoded_inst_get_base_reg(lea, 0);
+    xed_reg_enum_t index_l = xed_decoded_inst_get_index_reg(lea, 0);
+    // RIP-relative and 32-bit-address forms do not survive being rewritten.
+    if ((base_l != XED_REG_INVALID &&
+         (xed_reg_class(base_l) != XED_REG_CLASS_GPR ||
+          xed_get_register_width_bits64(base_l) != 64)) ||
+        (index_l != XED_REG_INVALID &&
+         (xed_reg_class(index_l) != XED_REG_CLASS_GPR ||
+          xed_get_register_width_bits64(index_l) != 64))) {
+        return false;
+    }
+
+    // Consumer: an add/sub/inc/dec on a register, same width as the LEA.
+    if (add_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t add;
+    decode_init(&add);
+    if (xed_decode(&add, inst + add_offset, len - add_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&add);
+    uint32_t flags_written;
+    switch (cic) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+        flags_written = FLAG_ARITH;
+        break;
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+        flags_written = FLAG_ARITH & ~FLAG_CF;
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&add) != 0) {
+        return false;
+    }
+    xed_reg_enum_t add_dest = xed_decoded_inst_get_reg(&add, XED_OPERAND_REG0);
+    if (xed_reg_class(add_dest) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(add_dest) != lea_width) {
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the LEA.
+    if (branch_target_in(branch_targets, add_offset,
+            add_offset + xed_decoded_inst_get_length(&add))) {
+        return false;
+    }
+
+    int64_t disp = xed_decoded_inst_get_memory_displacement(lea, 0);
+    bool src_arm = false;
+    bool has_imm = cic == XED_ICLASS_INC || cic == XED_ICLASS_DEC ||
+        xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&add));
+    if (has_imm) {
+        // Immediate arm: the displacement absorbs it and dest stays dest.
+        if (add_dest != dest) {
+            return false;
+        }
+        int64_t imm;
+        if (cic == XED_ICLASS_INC) {
+            imm = 1;
+        } else if (cic == XED_ICLASS_DEC) {
+            imm = -1;
+        } else {
+            imm = xed_decoded_inst_get_signed_immediate(&add);
+            if (imm == 0) {
+                return false;   // the add/sub is check_add_sub_zero's
+            }
+            if (cic == XED_ICLASS_SUB) {
+                imm = -imm;
+            }
+        }
+        disp += imm;
+    } else {
+        // Register arms. SUB cannot be spelled by an addressing mode, and the
+        // LEA needs exactly one free register slot for the addend.
+        if (cic != XED_ICLASS_ADD || lea_width != 64) {
+            return false;
+        }
+        if ((base_l != XED_REG_INVALID) == (index_l != XED_REG_INVALID)) {
+            return false;   // both slots taken, or an address with no register
+        }
+        xed_reg_enum_t other =
+            xed_decoded_inst_get_reg(&add, XED_OPERAND_REG1);
+        if (xed_reg_class(other) != XED_REG_CLASS_GPR ||
+            xed_get_register_width_bits64(other) != 64) {
+            return false;
+        }
+        xed_reg_enum_t addend;
+        if (add_dest == dest) {
+            addend = other;         // dest arm: lea rD, [addr] ; add rD, rT
+        } else if (other == dest) {
+            addend = add_dest;      // src arm:  lea rD, [addr] ; add rT, rD
+            src_arm = true;
+        } else {
+            return false;
+        }
+        if (addend == dest) {
+            return false;           // add rD, rD leaves nothing to fold
+        }
+        // The addend takes the free slot. Where that is the index and the
+        // addend is RSP, swap it with the base; only base = addend = RSP has
+        // no spelling.
+        if (base_l != XED_REG_INVALID && addend == XED_REG_RSP &&
+            base_l == XED_REG_RSP) {
+            return false;
+        }
+    }
+    if (lea_width == 64 && (disp < INT32_MIN || disp > INT32_MAX)) {
+        return false;
+    }
+
+    // Refuse a fold whose result is the three-component slow LEA. The register
+    // arms fill the free slot, so the result has both a base and an index and
+    // is slow unless the displacement is zero; the immediate arm leaves the
+    // register slots alone and is slow only if both were already occupied.
+    bool has_base = base_l != XED_REG_INVALID;
+    bool has_index = index_l != XED_REG_INVALID;
+    if (!has_imm) {
+        has_base = true;
+        has_index = true;
+    }
+    if (has_base && has_index && disp != 0) {
+        return false;
+    }
+
+    // The consumer's flags disappear with it. The walk starts PAST the
+    // consumer, not at it: the consumer is itself the flag writer, so starting
+    // at it would see its own write clear the mask and call every flag dead --
+    // which would fold away the add an adc behind it reads the carry from.
+    size_t after = add_offset + xed_decoded_inst_get_length(&add);
+    if (flags_live_after(inst, len, after, flags_written)) {
+        return false;
+    }
+
+    // Only the src arm drops a definition: the LEA's destination stops being
+    // written, so it must be dead past the pair.
+    if (!src_arm) {
+        return true;
+    }
+    return !reg_live_after_branch(inst, len, after,
+                                  xed_get_largest_enclosing_register(dest));
+}
+
 // Multi-instruction peephole. mov reg, imm loads a constant; when the next
 // instruction uses reg as the source operand of an add/sub/adc/sbb/and/or/xor/
 // cmp/test/mov and reg is dead afterward, the constant folds into that
@@ -7250,6 +7472,16 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // removable instruction. See add_foldable_into_memop.
         if (add_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
             emit_finding(&sink, "ADD foldable into memory", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: lea reg, [addr] followed by an add whose
+        // term the address could have carried -- the pair is one lea. Reported
+        // against the lea (at `offset`), where the surviving instruction is
+        // written. See add_foldable_into_lea.
+        if (add_foldable_into_lea(inst, len, branch_targets, next, &xedd)) {
+            emit_finding(&sink, "ADD foldable into LEA", offset, &xedd,
                 inst + offset);
             ++errors;
         }

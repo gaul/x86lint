@@ -165,7 +165,7 @@ paragraphs below.
 | Pattern | Rewrite | 2026-08 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
 | ~~`ADD`/`SUB`/`INC`/`DEC` whose sole use is as the base of a following access~~ | ~~fold into the addressing mode~~ | **Done: "ADD foldable into memory".** Swept population 219,285; realized **710** (libxul 706, go 2, bash 1, libstdc++ 1, libc 0, libcrypto 0, ld.so 0) -- a 309x overcount, and the reason is the sharpest of the three. See the LEA-displacement note below |
-| `LEA` + `ADD`/`SUB` reading its result | one `LEA`: `LEA RAX, [RBX+8]` ; `ADD RDX, RAX` -> `LEA RDX, [RDX+RBX+8]` | **45,779.** libc 176 (501), libstdc++ 128 (358), bash 36 (142), libcrypto 103 (124), libxul 44,761 (1488), go 575 (348) |
+| ~~`LEA` + `ADD` reading its result~~ | ~~one `LEA`~~ | **Done: "ADD foldable into LEA".** Swept population 45,779; **39,715 sound folds** in libxul alone, of which **2,678** are reported (go 1, everything else 0). The 37,037 excluded are not unsound -- they are not improvements. See the slow-LEA note below. `SUB` reading the result never folds at all |
 
 Both reuse the register-liveness machinery behind "LEA foldable into
 memory", plus the same encodability condition (the combined address
@@ -224,6 +224,35 @@ add r14, rbx  ; movsx eax, byte ptr [r14+0x18]   ->  movsx eax, byte ptr [r14+rb
 
 go's rate (311) is an order of magnitude below the C and C++ binaries;
 this is a clang/gcc shape, and the gc backend largely does not emit it.
+
+**The slow-LEA exclusion.** This is the first row in this file whose
+binding constraint is neither soundness nor shape but *desirability*,
+and it is the one that changed what shipped. All 39,715 libxul folds
+compute the identical value and pass the flag gate. But an LEA using
+base, index and displacement together is the "slow LEA": 3 cycles on
+port 1 alone from Sandy Bridge onward, where every two-component form
+is 1 cycle on two ports. Folding a fast LEA plus an ADD -- 2 cycles
+across two ports -- into a slow one buys a uop and three or four bytes
+for a cycle of latency and a port. That is a trade, not an
+improvement, and **99.6% of the sound folds land on it**: the modal
+site is `lea rcx, [rax+r13] ; add rcx, 8`, a two-component LEA that an
+ADD of a field offset would turn slow.
+
+So the check reports only folds whose result stays within two
+components, which is 2,678 of the 39,715. What survives is a single
+clean shape -- `lea rax, [rdx*8] ; add rax, r13` -> `lea rax, [r13+rdx*8]`
+-- that wins on all three axes at once: one instruction instead of
+two, one uop instead of two, and **one cycle instead of two**, since
+the result has no displacement and stays fast. LLVM emits it
+constantly for `x * 3`, `x * 5` and `x * 9` strength reduction and for
+struct-array indexing, and never rejoins the halves.
+
+Recording the 37,037 here rather than reporting them is the point of
+the row. A sound rewrite that may cost a cycle on a dependency chain
+is not what this tool emits, and the only way to know which side of
+that line a family falls on is to measure the result's encoding rather
+than the input's shape.
+
 
 ## Constants
 

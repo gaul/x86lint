@@ -3049,6 +3049,117 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
 }
 
+// Multi-instruction peephole: a LEA followed by an add whose term the address
+// could have carried is one LEA; check_instructions reports it against the LEA,
+// where the surviving instruction is written. The arithmetic's flags disappear
+// with it, so every fixture ends in test rbx, rbx to kill them, and the fold is
+// refused when the result would be the three-component slow LEA.
+static void check_add_lea_fold_test(void)
+{
+    // lea rax, [rdx*8] ; add rax, r13 -> lea rax, [r13+rdx*8]. The addend takes
+    // the empty base slot; the result has no displacement, so it stays fast.
+    static const uint8_t dest_arm[] = {
+        0x48, 0x8D, 0x04, 0xD5, 0x00, 0x00, 0x00, 0x00,  // lea rax, [rdx*8+0x0]
+        0x4C, 0x01, 0xE8,  // add rax, r13
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS(dest_arm, "ADD foldable into LEA", 1);
+
+    // lea rcx, [rax+6] ; add rcx, 7 -> lea rcx, [rax+0xd]. The displacement
+    // absorbs the immediate and the register slots are untouched.
+    static const uint8_t imm_arm[] = {
+        0x48, 0x8D, 0x48, 0x06,        // lea rcx, [rax+0x6]
+        0x48, 0x83, 0xC1, 0x07,        // add rcx, 7
+        0x48, 0x85, 0xDB,              // test rbx, rbx
+    };
+    ASSERT_FINDINGS(imm_arm, "ADD foldable into LEA", 1);
+
+    // lea rcx, [rax+6] ; inc rcx -> lea rcx, [rax+7].
+    static const uint8_t inc_arm[] = {
+        0x48, 0x8D, 0x48, 0x06,  // lea rcx, [rax+0x6]
+        0x48, 0xFF, 0xC1,        // inc rcx
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS(inc_arm, "ADD foldable into LEA", 1);
+
+    // lea rdx, [rcx*8] ; add rax, rdx -> lea rax, [rax+rcx*8]. The src arm:
+    // the addend becomes the destination too, so the LEA's own register has to
+    // die -- here the mov edx, ebx kills it.
+    static const uint8_t src_arm[] = {
+        0x48, 0x8D, 0x14, 0xCD, 0x00, 0x00, 0x00, 0x00,  // lea rdx, [rcx*8+0x0]
+        0x48, 0x01, 0xD0,  // add rax, rdx
+        0x89, 0xDA,        // mov edx, ebx (kills rdx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS(src_arm, "ADD foldable into LEA", 1);
+
+    // The same with the LEA's register read afterwards: dropping its definition
+    // would lose the value.
+    static const uint8_t src_arm_live[] = {
+        0x48, 0x8D, 0x14, 0xCD, 0x00, 0x00, 0x00, 0x00,  // lea rdx, [rcx*8+0x0]
+        0x48, 0x01, 0xD0,        // add rax, rdx
+        0x48, 0x89, 0xD3,        // mov rbx, rdx (reads rdx)
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS(src_arm_live, "ADD foldable into LEA", 0);
+
+    // lea rcx, [rax+rbx] ; add rcx, 8 -- sound, and refused: the result would
+    // use base, index and displacement together, the three-component LEA that
+    // costs 3 cycles on port 1 alone where the pair costs 2 on two ports.
+    static const uint8_t slow_lea_result[] = {
+        0x48, 0x8D, 0x0C, 0x18,  // lea rcx, [rax+rbx*1]
+        0x48, 0x83, 0xC1, 0x08,  // add rcx, 8
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS(slow_lea_result, "ADD foldable into LEA", 0);
+
+    // lea rax, [rdx*8] ; sub rax, r13 -- an addressing mode cannot negate a
+    // term, so a register subtrahend has no folded spelling.
+    static const uint8_t sub_register[] = {
+        0x48, 0x8D, 0x04, 0xD5, 0x00, 0x00, 0x00, 0x00,  // lea rax, [rdx*8+0x0]
+        0x4C, 0x29, 0xE8,  // sub rax, r13
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS(sub_register, "ADD foldable into LEA", 0);
+
+    // lea rax, [rdx+rbx] ; add rax, r13 -- both register slots are already
+    // taken, so the addend has nowhere to go.
+    static const uint8_t two_terms[] = {
+        0x48, 0x8D, 0x04, 0x1A,  // lea rax, [rdx+rbx*1]
+        0x4C, 0x01, 0xE8,        // add rax, r13
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS(two_terms, "ADD foldable into LEA", 0);
+
+    // lea rax, [rip+0x10] ; add rax, r13 -- a RIP-relative displacement is
+    // measured from the following instruction and does not survive a rewrite.
+    static const uint8_t rip_relative[] = {
+        0x48, 0x8D, 0x05, 0x10, 0x00, 0x00, 0x00,  // lea rax, [rip+0x10]
+        0x4C, 0x01, 0xE8,  // add rax, r13
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS(rip_relative, "ADD foldable into LEA", 0);
+
+    // lea rax, [rdx*8] ; add rax, r13 ; adc rbx, rdx -- the ADC reads the carry
+    // the add set, which a LEA does not produce.
+    static const uint8_t flags_live[] = {
+        0x48, 0x8D, 0x04, 0xD5, 0x00, 0x00, 0x00, 0x00,  // lea rax, [rdx*8+0x0]
+        0x4C, 0x01, 0xE8,  // add rax, r13
+        0x48, 0x13, 0xDA,  // adc rbx, rdx (reads CF)
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS(flags_live, "ADD foldable into LEA", 0);
+
+    // lea ecx, [rax+6] ; add rcx, 7 -- the widths disagree, so the pair does
+    // not compute one sum at one width.
+    static const uint8_t width_mismatch[] = {
+        0x8D, 0x48, 0x06,              // lea ecx, [rax+0x6]
+        0x48, 0x83, 0xC1, 0x07,        // add rcx, 7
+        0x48, 0x85, 0xDB,              // test rbx, rbx
+    };
+    ASSERT_FINDINGS(width_mismatch, "ADD foldable into LEA", 0);
+}
+
 // Multi-instruction peephole: add/sub/inc/dec whose sum the next instruction
 // uses as a memory base folds into that operand's own base+index*scale+disp;
 // check_instructions reports it against the add. Beyond the LEA fold's
@@ -6646,6 +6757,7 @@ int main(int argc, char *argv[])
     check_load_compare_fold_test();
     check_load_alu_fold_test();
     check_add_memop_fold_test();
+    check_add_lea_fold_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();

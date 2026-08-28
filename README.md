@@ -126,6 +126,29 @@ and only for flags -- the ABI guarantees they do not survive it.
 Candidate checks not yet implemented, with the corpus populations that
 argue for or against each, live in [TODO.md](TODO.md).
 
+* ADD foldable into LEA
+  - `488D04D500000000 4C01E8` (LEA RAX, [RDX*8]; ADD RAX, R13) -- a LEA already
+    computes base+index*scale+disp, so an ADD after it is a term the same
+    instruction could have carried: LEA RAX, [R13+RDX*8]. Three arms. An
+    immediate addend (or INC/DEC) is absorbed by the displacement and the
+    destination is unchanged; a register addend takes the LEA's free register
+    slot, either keeping the LEA's destination (ADD rD, rT) or moving to the
+    ADD's (ADD rT, rD), the latter needing rD dead since its definition goes
+    away. The register arms need exactly one free slot, so the LEA may carry a
+    base or an index but not both and not neither, and are 64-bit only. SUB by
+    a register never folds: an addressing mode cannot negate a term. RIP-relative
+    producers are refused, their displacement being measured from the following
+    instruction. LEA writes no flags where the ADD writes all of them (INC/DEC
+    all but CF), so those must be dead past the pair.
+  - Reported only when the RESULT stays within two components. Base, index and
+    displacement together is the "slow LEA": 3 cycles on port 1 alone from Sandy
+    Bridge onward, where each two-component form is 1 cycle on two ports. Folding
+    a fast LEA plus an ADD (2 cycles, two ports) into a slow one trades a uop and
+    three or four bytes for a cycle of latency and a port -- a trade, not an
+    improvement. The gate costs most of the population (2,678 findings of 39,715
+    sound folds in libxul) and keeps every finding a win on all three of size,
+    uops and latency: the reported shape is `LEA rD, [rX*s]` plus `ADD rD, rT`,
+    which becomes a one-cycle two-component LEA where the pair took two
 * ADD foldable into memory
   - `4883C108 488B01` (ADD RCX, 8; MOV RAX, [RCX]) -- an ADD advancing a
     pointer is an address computation spelled as arithmetic, and the consumer's

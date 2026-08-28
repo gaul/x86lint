@@ -3184,6 +3184,132 @@ static void check_load_compare_fold_test(void)
     assert(total == 1);
 }
 
+// Multi-instruction peephole: a load whose sole use is the arithmetic that
+// follows it folds into that instruction, whose two-operand form takes its
+// source from memory; check_instructions reports it against the load. The
+// loaded register must be the consumer's read-only source, named exactly, and
+// dead afterwards.
+static void check_load_alu_fold_test(void)
+{
+    // mov rcx, [rsi] ; add rbx, rcx -> add rbx, [rsi].
+    static const uint8_t add_src[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x01, 0xCB,  // add rbx, rcx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx (kills rcx)
+    };
+    ASSERT_FINDINGS(add_src, "load foldable into ALU", 1);
+
+    // mov ecx, [rsi] ; xor edx, ecx -> xor edx, [rsi]. The logic family folds
+    // exactly as the arithmetic one does.
+    static const uint8_t xor32[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0x31, 0xCA,        // xor edx, ecx
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    ASSERT_FINDINGS(xor32, "load foldable into ALU", 1);
+
+    // mov rcx, [rsi] ; imul rbx, rcx -> imul rbx, [rsi]. The two-operand IMUL
+    // has only the r, r/m direction, which is the one the fold needs.
+    static const uint8_t imul2[] = {
+        0x48, 0x8B, 0x0E,        // mov rcx, [rsi]
+        0x48, 0x0F, 0xAF, 0xD9,  // imul rbx, rcx
+        0x48, 0x89, 0xD1,        // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(imul2, "load foldable into ALU", 1);
+
+    // mov rcx, [rsi] ; mul rcx -> mul qword [rsi]. The one-operand form takes
+    // r/m too; its implicit RDX:RAX result does not collide with RCX.
+    static const uint8_t mul1[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0xF7, 0xE1,  // mul rcx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(mul1, "load foldable into ALU", 1);
+
+    // mov rax, [rsi] ; mul rcx -- MUL writes the loaded register's family
+    // (RDX:RAX) and reads RAX as its other factor, so the load is neither dead
+    // nor foldable: suppress.
+    static const uint8_t mul_rax[] = {
+        0x48, 0x8B, 0x06,  // mov rax, [rsi]
+        0x48, 0xF7, 0xE1,  // mul rcx
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+    };
+    ASSERT_FINDINGS(mul_rax, "load foldable into ALU", 0);
+
+    // mov rcx, [rsi] ; add rcx, rbx -- the loaded register is the consumer's
+    // destination, not its source. It is read and written, so it is not dead,
+    // and the fold with the memory in the other slot would be add [rsi], rbx,
+    // which stores where the original did not.
+    static const uint8_t dst_loaded[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x01, 0xD9,  // add rcx, rbx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(dst_loaded, "load foldable into ALU", 0);
+
+    // mov ecx, [rsi] ; add rbx, rcx -- the consumer reads 64 bits of which the
+    // load wrote 32: folding would read four bytes the original never did.
+    static const uint8_t width_mismatch[] = {
+        0x8B, 0x0E,              // mov ecx, [rsi]
+        0x48, 0x01, 0xCB,        // add rbx, rcx
+        0x48, 0x89, 0xD1,        // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(width_mismatch, "load foldable into ALU", 0);
+
+    // mov rcx, [rsi] ; add [rbx], rcx -- the consumer already carries a memory
+    // operand, and one instruction cannot hold two.
+    static const uint8_t mem_dest[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x01, 0x0B,  // add [rbx], rcx
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+    };
+    ASSERT_FINDINGS(mem_dest, "load foldable into ALU", 0);
+
+    // mov rcx, [rsi] ; add rbx, rcx ; mov rdx, rcx -- the loaded value is read
+    // after the consumer, so the fold would lose it.
+    static const uint8_t still_live[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x01, 0xCB,  // add rbx, rcx
+        0x48, 0x89, 0xCA,  // mov rdx, rcx (reads rcx)
+    };
+    ASSERT_FINDINGS(still_live, "load foldable into ALU", 0);
+
+    // mov ecx, [rsi] ; shl ebx, cl -- a shift's memory operand is its
+    // destination, so a loaded count has nowhere to fold to. (CL also names a
+    // different width of the loaded register than the load wrote.)
+    static const uint8_t shift[] = {
+        0x8B, 0x0E,        // mov ecx, [rsi]
+        0xD3, 0xE3,        // shl ebx, cl
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    ASSERT_FINDINGS(shift, "load foldable into ALU", 0);
+
+    // The consumer's flags feed a Jcc, so the loaded value dies on two paths.
+    // Both successors overwrite rcx.
+    static const uint8_t branch_both_dead[] = {
+        0x48, 0x8B, 0x0E,  // mov rcx, [rsi]
+        0x48, 0x01, 0xCB,  // add rbx, rcx
+        0x75, 0x03,        // jne +3 (to the mov rcx, rbx below)
+        0x48, 0x89, 0xD1,  // mov rcx, rdx
+        0x48, 0x89, 0xD9,  // mov rcx, rbx
+    };
+    ASSERT_FINDINGS(branch_both_dead, "load foldable into ALU", 1);
+
+    // A narrow load feeding the same arithmetic is this finding, not the
+    // merging narrow move its width would otherwise raise.
+    static const uint8_t narrow[] = {
+        0x8A, 0x0E,        // mov cl, [rsi]
+        0x00, 0xCB,        // add bl, cl
+        0x89, 0xD1,        // mov ecx, edx
+    };
+    int total;
+    assert(count_findings(narrow, sizeof(narrow),
+                          "load foldable into ALU", &total, 0) == 1);
+    assert(count_findings(narrow, sizeof(narrow),
+                          "merging narrow move", &total, 0) == 0);
+    assert(total == 1);
+}
+
 // Multi-instruction peephole: mov dest, srcA ; add dest, srcB is the
 // three-operand lea dest, [srcA + srcB]. check_instructions reports it against
 // the mov when the arithmetic flags the add would set are dead.
@@ -6388,6 +6514,7 @@ int main(int argc, char *argv[])
     check_mov_const_fold_test();
     check_load_extend_fold_test();
     check_load_compare_fold_test();
+    check_load_alu_fold_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();

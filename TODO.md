@@ -45,16 +45,23 @@ row and opened the LEA row in "Coverage gaps" below.
 
 x86's two-operand forms take a memory operand directly, so a
 sole-use load feeding an ALU or compare is one instruction the
-encoding already offers to delete. This is the largest and most
-uniform family in the corpus: 229,302 adjacent sites, present at
+encoding already offers to delete. By shape this is the largest and
+most uniform family in the corpus: 229,302 adjacent sites, present at
 3,834-7,214 per Minsn in *every* binary, independent of language.
+
+Both halves have now shipped, and the shape count held for one and not
+the other -- 6,245 realized of 81,510 for the compare fold, 1,631 of
+147,792 for the ALU fold. The two notes below say why, and the second
+is the more useful lesson: the uniformity above is a property of the
+*shape*, and the ALU half loses it entirely once the rewrite's own
+operand condition is applied.
 
 | Pattern | Rewrite | 2026-08 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
 | ~~sole-use load + `CMP`/`TEST` of the loaded register~~ | ~~fold the load into the compare~~ | **Done: "load foldable into compare".** Swept population 81,510; realized **6,245** (libc 73, libstdc++ 69, bash 105, libcrypto 58, libxul 5,854, go 286). See the realized-vs-predicted note below |
-| sole-use load + `ADD`/`SUB`/`ADC`/`SBB` reading it | fold into the ALU: `MOV RAX, [M]` ; `ADD RBX, RAX` -> `ADD RBX, [M]` | **122,714.** libc 1,593 (4534), libstdc++ 1,662 (4649), bash 830 (3267), libcrypto 2,155 (2603), libxul 107,747 (3581), go 8,727 (5286) |
-| sole-use load + `AND`/`OR`/`XOR` reading it | same | **22,326.** libc 294 (837), libstdc++ 296 (828), bash 322 (1267), libcrypto 464 (560), libxul 20,461 (680), go 489 (296) |
-| sole-use load + `IMUL`/`MUL` reading it | same | **2,752**, concentrated in libcrypto (338) and go (260) |
+| ~~sole-use load + `ADD`/`SUB`/`ADC`/`SBB` reading it~~ | ~~fold into the ALU~~ | **Done: "load foldable into ALU"**, with the logic and multiply rows below. Swept population 147,792 across the three rows; realized **1,631** (go 1,150, libxul 470, libcrypto 5, libc 4, bash 2, libstdc++ 0, ld.so 0). The sweep overcounted by 90x, for a reason worth reading: see the operand-role note below |
+| ~~sole-use load + `AND`/`OR`/`XOR` reading it~~ | ~~same~~ | **Done**, same check. 22,326 swept |
+| ~~sole-use load + `IMUL`/`MUL` reading it~~ | ~~same~~ | **Done**, same check, including the one-operand MUL/IMUL forms. 2,752 swept |
 
 The zero-test arm shipped first, and not because it is the largest: it
 is the only one that needs no flag argument at all.
@@ -86,12 +93,45 @@ instructions fusing to two, against two instructions that do not fuse
 -- and strictly positive on code size (7 bytes to 5 in the shape
 above). It belongs in the check's documentation, not in its gate.
 
-This is the generalization of the shipped "load foldable into extend",
+These are the generalization of the shipped "load foldable into extend",
 which fires **49** times on libxul and **0** on libc.
 
+**The operand-role overcount.** `defuse`'s `load->addsub` row counts a
+load whose sole use is an arithmetic instruction. It does not ask WHICH
+operand of that instruction the loaded register is, and only one of the
+two roles folds. When the loaded register is the source
+(`mov rcx, [m] ; add rbx, rcx`) it folds to `add rbx, [m]`. When it is
+the destination (`mov rcx, [m] ; add rcx, rbx`) it is read and written,
+so it is not dead, and the only fold with the memory in the other slot
+is `add [m], rbx`, which stores where the original did not.
+
+An independent objdump pass over libc splits the adjacent pairs
+**634 destination-is-loaded, 122 source-is-loaded** -- the unfoldable
+role is 5x the foldable one, and the C and C++ compilers prefer it
+because accumulating into the loaded register is what their register
+allocators produce. Applying deadness to those 122 leaves **4**, which
+is exactly what the check reports. Two independent counts agreeing on 4
+is the strongest confirmation available that neither is wrong.
+
+So the ALU family's 147,792 swept sites are a 90x overcount of a 1,631
+finding population, where the compare family's 81,510 was a 13x
+overcount of 6,245. Same tools, same corpus, same discipline, and an
+order of magnitude difference in how much the shape overstated the
+rewrite -- because the compare fold's consumer reads its operand and
+the ALU fold's consumer usually writes it. A shape count is an upper
+bound whose tightness is a property of the specific rewrite, and cannot
+be guessed from another rewrite's experience.
+
+The realized population also inverts by language. go supplies 1,150 of
+the 1,631 (697/Minsn against libxul's 15.6), nearly all of it in
+`crypto/internal/fips140`'s field arithmetic, where the gc backend
+spills a bignum limb to the stack and reloads it into an ADC chain
+without ever folding the reload. That is one backend's habit, not a
+cross-language family like the compare fold.
+
 **Realized against predicted, and what the gap is made of.** The shipped
-check reports 6,245 findings where the sweep counted 81,510 adjacent
-sites -- 13x on libxul, 5x on libc. armlint's rule explains the shape
+compare check reports 6,245 findings where the sweep counted 81,510
+adjacent sites -- 13x on libxul, 5x on libc. armlint's rule explains the shape
 of that: a prediction is exact only when it is made by the machinery
 that will realize it, and this one was not. `defuse`'s "sole use" is
 its own region-local dataflow; the check has to *prove* the value dead

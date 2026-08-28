@@ -190,6 +190,30 @@ argue for or against each, live in [TODO.md](TODO.md).
     32-bit operands, needs upper-16 liveness this tool does not track. A
     66-prefixed imm16 whose value fits imm8 is already the
     oversized-immediate finding, whose narrowing removes the LCP by itself
+* load foldable into ALU
+  - `488B0E 4801CB` (MOV RCX, [RSI]; ADD RBX, RCX) -- a load whose only use is
+    the arithmetic right after it is one instruction, since the two-operand ALU
+    forms take their source from memory: ADD RBX, [RSI]. Covers ADD/SUB/ADC/
+    SBB/AND/OR/XOR, the two-operand IMUL (whose only direction is the r, r/m
+    one the fold needs), and the one-operand MUL/IMUL. The rewrite keeps the
+    consumer's opcode, so its result and every flag it writes are unchanged --
+    ADC still reads the same CF -- and the memory is read once at the same
+    address and width, in the same position relative to the consumer's write,
+    so a fault lands where it did. What the fold turns on is which operand may
+    become the memory one: the loaded register must appear exactly once and
+    READ-ONLY, making it the source. When the consumer writes it instead
+    (ADD RCX, RCX-destination under MOV RCX, [M]) the register is not dead and
+    the only other fold is ADD [M], RBX, which stores where the original did
+    not; that shape is the majority of the load-then-arithmetic pairs in C and
+    C++ code. No operand, explicit or implicit, may write the loaded
+    register's family, which drops the MUL whose RDX:RAX result would collide
+    with it; the register must be named exactly, not aliased at another width;
+    and it must be dead after the consumer, proved down both successors of a
+    following Jcc as in load foldable into compare. Not folded: a consumer that
+    already has a memory operand (including every locked and memory-destination
+    form); shifts, whose memory operand is the destination rather than the
+    source; DIV/IDIV. One fused-domain uop where the pair was two, and shorter
+    by the length of the load, with no macro-fusion at stake
 * load foldable into compare
   - `8B0E 85C9` (MOV ECX, [RSI]; TEST ECX, ECX) -- a load whose only use is the
     CMP or TEST that follows it folds into that compare, which takes a memory

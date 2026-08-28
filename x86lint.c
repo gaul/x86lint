@@ -4416,6 +4416,22 @@ static bool reg_live_after_branch(const uint8_t *inst, size_t len,
     return reg_live_after(inst, len, offset, reg64);
 }
 
+// The producer the memory-operand folds share: a plain MOV of a GPR from a
+// single memory read. Returns the loaded register, or XED_REG_INVALID for
+// anything else -- a store, a register-to-register copy, an immediate, or a
+// non-GPR destination.
+static xed_reg_enum_t plain_load_dest(const xed_decoded_inst_t *load)
+{
+    if (xed_decoded_inst_get_iclass(load) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(load) != 1 ||
+        !xed_decoded_inst_mem_read(load, 0) ||
+        xed_decoded_inst_mem_written(load, 0)) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(load, XED_OPERAND_REG0);
+    return xed_reg_class(dest) == XED_REG_CLASS_GPR ? dest : XED_REG_INVALID;
+}
+
 // Multi-instruction peephole. A load whose only use is the CMP or TEST that
 // immediately follows it is one instruction: x86's compare forms take a memory
 // operand directly, so the load folds into the compare and the register write
@@ -4473,14 +4489,8 @@ static bool load_foldable_into_compare(const uint8_t *inst, size_t len,
                                        const xed_decoded_inst_t *load)
 {
     // Producer: mov reg, [mem] -- a GPR loaded from a single memory source.
-    if (xed_decoded_inst_get_iclass(load) != XED_ICLASS_MOV ||
-        xed_decoded_inst_number_of_memory_operands(load) != 1 ||
-        !xed_decoded_inst_mem_read(load, 0) ||
-        xed_decoded_inst_mem_written(load, 0)) {
-        return false;
-    }
-    xed_reg_enum_t dest = xed_decoded_inst_get_reg(load, XED_OPERAND_REG0);
-    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+    xed_reg_enum_t dest = plain_load_dest(load);
+    if (dest == XED_REG_INVALID) {
         return false;
     }
 
@@ -4530,6 +4540,131 @@ static bool load_foldable_into_compare(const uint8_t *inst, size_t len,
     size_t after = cmp_offset + xed_decoded_inst_get_length(&cmp);
     return !reg_live_after_branch(inst, len, after,
                                   xed_get_largest_enclosing_register(dest));
+}
+
+// Multi-instruction peephole, the arithmetic sibling of the compare fold above.
+// x86's two-operand ALU forms take their source from memory, so a load whose
+// only use is the arithmetic immediately after it is one instruction:
+//
+//   mov rax, [rsi] ; add rbx, rax   -> add rbx, [rsi]
+//   mov ecx, [rsi] ; xor edx, ecx   -> xor edx, [rsi]
+//   mov rax, [rsi] ; imul rbx, rax  -> imul rbx, [rsi]
+//   mov rcx, [rsi] ; mul rcx        -> mul qword [rsi]
+//
+// `load` is the already-decoded producer ending at `alu_offset`; on a match the
+// function returns true and the caller reports against the load, the removable
+// instruction. Adjacency only, for the reason the compare fold gives.
+//
+// Soundness is the compare fold's argument with one operand condition added.
+// The rewrite keeps the consumer's opcode, so its result and every flag it
+// writes are unchanged -- ADD is ADD whether its source is a register or
+// memory -- and the memory is read once at the same address and width either
+// way, in the same position relative to the consumer's own write, so a fault
+// lands exactly where it did. What is new is WHICH operand may become the
+// memory one:
+//
+//   * the loaded register must appear exactly once and READ-ONLY. That makes it
+//     the source, the operand the r, r/m form spells from memory. When the
+//     consumer instead writes it -- add rax, rbx under mov rax, [m] -- the
+//     register is not dead, and the only fold with the memory in the other slot
+//     is add [m], rbx, which stores where the original did not;
+//   * no operand of the consumer, explicit or implicit, may write the loaded
+//     register's family, which drops the one-operand MUL/IMUL forms whose
+//     RDX:RAX result would collide with the load;
+//   * the register must be named exactly, not aliased at another width, so
+//     mov eax, [m] ; add rbx, rax does not become an eight-byte read;
+//   * and it must be dead after the consumer (reg_live_after_branch), since
+//     the fold stops writing it.
+//
+// A loaded register that also addresses its own load needs no special case, as
+// in the compare fold: mov rax, [rax] ; add rbx, rax folds to add rbx, [rax],
+// which reads the address the load used.
+//
+// Not folded:
+//   * a consumer that already has a memory operand, including every locked and
+//     memory-destination form: one instruction cannot hold two;
+//   * DIV/IDIV, whose one-operand shape folds identically but whose population
+//     the corpus sweep did not separate from the ALU rows;
+//   * shifts, whose memory operand is the destination rather than the source,
+//     so a loaded shift amount or shifted value has nowhere to fold to.
+//
+// The folded form is one fused-domain uop where the pair was two, and shorter
+// by the length of the load, so the trade is size and frontend width against
+// nothing -- unlike the compare fold, no macro-fusion is at stake.
+static bool load_foldable_into_alu(const uint8_t *inst, size_t len,
+                                   const uint8_t *branch_targets,
+                                   size_t alu_offset,
+                                   const xed_decoded_inst_t *load)
+{
+    xed_reg_enum_t dest = plain_load_dest(load);
+    if (dest == XED_REG_INVALID) {
+        return false;
+    }
+
+    if (alu_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t alu;
+    decode_init(&alu);
+    if (xed_decode(&alu, inst + alu_offset, len - alu_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(&alu)) {
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+    case XED_ICLASS_ADC:
+    case XED_ICLASS_SBB:
+    case XED_ICLASS_AND:
+    case XED_ICLASS_OR:
+    case XED_ICLASS_XOR:
+    case XED_ICLASS_IMUL:
+    case XED_ICLASS_MUL:
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&alu) != 0) {
+        return false;
+    }
+
+    // The loaded register must be the consumer's source: named exactly, read
+    // and not written, and its family untouched by every other operand.
+    xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(dest);
+    const xed_inst_t *xi = xed_decoded_inst_inst(&alu);
+    unsigned nops = xed_inst_noperands(xi);
+    unsigned foldable = 0;
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(&alu, name);
+        if (xed_get_largest_enclosing_register(reg) != dest_enc) {
+            continue;
+        }
+        // Any write to the family -- the destination it would keep, or MUL's
+        // implicit RDX:RAX -- and any read of a different width or in a slot
+        // the memory operand cannot reach, both stop the fold.
+        if (xed_operand_written(op) || reg != dest || !xed_operand_read(op) ||
+            (name != XED_OPERAND_REG0 && name != XED_OPERAND_REG1)) {
+            return false;
+        }
+        ++foldable;
+    }
+    if (foldable != 1) {
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the load.
+    if (branch_target_in(branch_targets, alu_offset,
+            alu_offset + xed_decoded_inst_get_length(&alu))) {
+        return false;
+    }
+
+    size_t after = alu_offset + xed_decoded_inst_get_length(&alu);
+    return !reg_live_after_branch(inst, len, after, dest_enc);
 }
 
 // Window support for the copy folds below -- mov_add_foldable_to_lea and
@@ -6625,8 +6760,9 @@ static bool scalar_move_false_dep(const xed_decoded_inst_t *xedd,
 //   * a narrow load whose next instruction extends the loaded register
 //     in place: that pair is the load-foldable-into-extend finding, whose
 //     one-instruction fix subsumes this one;
-//   * a narrow load whose next instruction compares the loaded register and
-//     lets it die: that pair is the load-foldable-into-compare finding, which
+//   * a narrow load whose next instruction compares or arithmetically consumes
+//     the loaded register and lets it die: that pair is the
+//     load-foldable-into-compare or load-foldable-into-ALU finding, which
 //     deletes the narrow write outright rather than widening it;
 //   * 8/16-bit arithmetic (add al, bl): it merges identically, but no
 //     same-cost full-width spelling preserves its flags and width
@@ -6684,7 +6820,8 @@ static bool narrow_move_merge(const xed_decoded_inst_t *xedd,
         }
     }
     if (load_foldable_into_compare(inst, len, branch_targets, next_offset,
-                                   xedd)) {
+                                   xedd) ||
+        load_foldable_into_alu(inst, len, branch_targets, next_offset, xedd)) {
         return false;
     }
     return !reg_bits_above_live_after(
@@ -6942,6 +7079,16 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (load_foldable_into_compare(inst, len, branch_targets, next,
                                        &xedd)) {
             emit_finding(&sink, "load foldable into compare", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a load whose sole use is the arithmetic
+        // that follows it is one instruction, since the two-operand ALU forms
+        // take their source from memory. Reported against the load (at
+        // `offset`), the removable instruction. See load_foldable_into_alu.
+        if (load_foldable_into_alu(inst, len, branch_targets, next, &xedd)) {
+            emit_finding(&sink, "load foldable into ALU", offset, &xedd,
                 inst + offset);
             ++errors;
         }

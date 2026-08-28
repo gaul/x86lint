@@ -6499,6 +6499,109 @@ static bool mov_op_foldable_to_apx_ndd(const uint8_t *inst, size_t len,
 // Every modrm addressing mode the load can carry -- RIP-relative, SIB,
 // disp32-absolute, segment overrides, r8-r15 -- MOVBE encodes identically.
 //
+// Multi-instruction peephole, only under -m bmi2. One-operand MUL is pinned to
+// fixed registers -- it multiplies RAX by its operand and writes the product to
+// RDX:RAX -- so a widening multiply that wants only the high half spends a
+// second instruction moving it out. MULX has no such pinning: it takes one
+// multiplicand implicitly from RDX, the other from any r/m, names both halves
+// of the product itself, and writes no flags at all. The pair collapses:
+//
+//   mul rdx ; mov rax, rdx   ->   mulx rax, rdx, rax
+//
+// Reading the rewrite: RDX and RAX are the multiplicands either way, the high
+// half goes to RAX (where the MOV was putting it), and the low half -- which
+// the MOV proved dead by overwriting it unread -- is dumped into RDX, whose own
+// value the fold must therefore prove dead too. Six bytes and two instructions
+// become five bytes and one, with the flag write gone.
+//
+// The operand condition is what bounds this check, and it is not the shape's.
+// MULX's implicit multiplicand is RDX where MUL's is RAX, so the fold needs RDX
+// to hold a multiplicand ALREADY -- that is, the instruction must literally be
+// `mul rdx`. A `mul rcx` would need a `mov rdx, rcx` in front and end up back at
+// two instructions. Across the corpus that condition cuts the one-operand MUL
+// population from 415 to 101 sites, the same distance between a shape and a
+// rewrite the rest of TODO.md documents.
+//
+// Three more conditions:
+//
+//   * the consumer must be exactly `mov rax, rdx` at the MUL's width. That both
+//     proves the low half dead (RAX overwritten unread) and names where the
+//     high half wants to be;
+//   * RDX must be dead after the pair. MULX has no discard encoding for the low
+//     half -- it must name a register -- and RDX is the only one available
+//     without register allocation, since the original left the high half there
+//     and the MOV has just copied it away;
+//   * every arithmetic flag must be dead. MUL defines CF and OF (set when the
+//     high half is nonzero) and leaves SF/ZF/PF undefined; MULX writes none. The
+//     corpus's `mul r64 ; setcc` sites are exactly the population that reads
+//     them.
+//
+// IMUL never qualifies: MULX is unsigned-only, and there is no signed spelling,
+// which excludes the 517 one-operand IMUL sites in the same shape -- including
+// the signed magic-number divisions sitting beside these in libxul.
+//
+// A note for whoever applies a finding: the MUL is often preceded by a
+// `mov rax, src` that exists only because MUL demands its multiplicand in RAX.
+// MULX takes that operand from any r/m, so `mov rax, rcx ; mul rdx ;
+// mov rax, rdx` is a single `mulx rax, rdx, rcx` -- three instructions to one.
+// The check anchors on the MUL and does not look back for that MOV, so it
+// reports the two-instruction collapse; the third instruction comes free.
+//
+// `mul` is the already-decoded instruction ending at `consumer_offset`; the
+// caller reports at the MUL, where the pair collapses to the single MULX.
+static bool mul_foldable_to_mulx(const uint8_t *inst, size_t len,
+                                 const uint8_t *branch_targets,
+                                 size_t consumer_offset,
+                                 const xed_decoded_inst_t *mul)
+{
+    // Producer: mul rdx (or mul edx) -- unsigned, register operand, and that
+    // operand RDX, so MULX's implicit multiplicand is already in place.
+    if (xed_decoded_inst_get_iclass(mul) != XED_ICLASS_MUL ||
+        xed_decoded_inst_number_of_memory_operands(mul) != 0) {
+        return false;
+    }
+    xed_reg_enum_t operand = xed_decoded_inst_get_reg(mul, XED_OPERAND_REG0);
+    if (operand != XED_REG_RDX && operand != XED_REG_EDX) {
+        return false;
+    }
+    unsigned width = xed_get_register_width_bits64(operand);
+    xed_reg_enum_t acc = width == 64 ? XED_REG_RAX : XED_REG_EAX;
+
+    // Consumer: mov rax, rdx at the same width. Overwriting RAX unread is the
+    // proof that the low half is dead.
+    if (consumer_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t mov;
+    decode_init(&mov);
+    if (xed_decode(&mov, inst + consumer_offset, len - consumer_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_get_iclass(&mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(&mov) != 0 ||
+        xed_decoded_inst_get_reg(&mov, XED_OPERAND_REG0) != acc ||
+        xed_decoded_inst_get_reg(&mov, XED_OPERAND_REG1) != operand) {
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the MUL.
+    if (branch_target_in(branch_targets, consumer_offset,
+            consumer_offset + xed_decoded_inst_get_length(&mov))) {
+        return false;
+    }
+
+    // The MUL's flags disappear with it. The walk starts at the consumer, past
+    // the flag writer, and the MOV writes none so it does not end there.
+    if (flags_live_after(inst, len, consumer_offset, FLAG_ARITH)) {
+        return false;
+    }
+
+    // RDX must be free to receive the discarded low half.
+    size_t after = consumer_offset + xed_decoded_inst_get_length(&mov);
+    return !reg_live_after_branch(inst, len, after, XED_REG_RDX);
+}
+
 // `mov` is the already-decoded instruction ending at `bswap_offset`; the
 // caller reports at the MOV, where the pair collapses to the single MOVBE.
 // A direct branch onto the BSWAP reaches it without the load, so the fold
@@ -7688,6 +7791,16 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                                        &xedd)) {
             emit_finding(&sink, "missing APX NDD", offset, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, only when the caller enabled BMI2:
+        // mul rdx ; mov rax, rdx collapses to one mulx rax, rdx, rax.
+        // Reported against the MUL (at `offset`), where the replacement
+        // lands. See mul_foldable_to_mulx.
+        if ((extensions & X86LINT_EXT_BMI2) != 0 &&
+            mul_foldable_to_mulx(inst, len, branch_targets, next, &xedd)) {
+            emit_finding(&sink, "missing MULX", offset, &xedd, inst + offset);
             ++errors;
         }
 

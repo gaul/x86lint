@@ -396,6 +396,27 @@ argue for or against each, live in [TODO.md](TODO.md).
     register un-swapped where the original leaves it swapped -- and neither
     is the moffs absolute form, whose 64-bit address the modrm-only MOVBE
     cannot encode
+* missing MULX (only with `-m bmi2`)
+  - `48F7E2 4889D0` (MUL RDX; MOV RAX, RDX) -- one-operand MUL is pinned to
+    fixed registers, multiplying RAX by its operand into RDX:RAX, so a widening
+    multiply that wants only the high half spends a second instruction moving
+    it out. MULX has no such pinning: one multiplicand implicitly from RDX, the
+    other from any r/m, both halves of the product named, and no flags written.
+    The pair is MULX RAX, RDX, RAX -- high half to RAX where the MOV was putting
+    it, the low half (which the MOV proved dead by overwriting it unread) dumped
+    into RDX. Six bytes and two instructions become five and one, with the flag
+    write gone. Fires only for `MUL RDX`/`MUL EDX`: MULX's implicit multiplicand
+    is RDX where MUL's is RAX, so `MUL RCX` would need a MOV into RDX in front
+    and end up back at two instructions -- the condition that takes the corpus
+    population from 415 sites to 101. Also requires RDX dead after the pair
+    (MULX has no discard encoding for the low half, and RDX is the only home
+    available without register allocation) and every arithmetic flag dead (MUL
+    defines CF and OF and leaves SF/ZF/PF undefined; MULX writes none). IMUL
+    never qualifies -- MULX is unsigned-only, which excludes the 517
+    one-operand IMUL sites in the same shape. The MUL is often preceded by a
+    `MOV RAX, src` that exists only because MUL demands its multiplicand in RAX;
+    MULX takes that operand from any r/m, so applying such a finding frequently
+    removes that instruction too, three to one
 * missing POPCNT dependency break
   - `F30FB8C1` (POPCNT EAX, ECX) -- on Sandy Bridge through Cascade Lake the
     destination is a phantom input (uops.info measures 3 cycles of latency

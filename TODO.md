@@ -395,7 +395,56 @@ in the corpus until it was traced to a build flag.
 | sole-use load + shift reading it | fold into the shift | **Not encodable**, 19,729 sites. A shift takes a memory operand only as its destination, and these consume the loaded value as the shifted operand with a register destination |
 | redundant reload of one address (`reload\|same`, `reload\|copy`) | reuse the first value | **7,237** across the corpus (libc 196/Minsn, bash 205, libxul 228, go 108) -- real, and an order of magnitude below every family in the sections above. Worth revisiting only after those ship |
 | `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** See the note below |
+| ~~one-operand `MUL` whose low half is dead~~ | ~~`MULX`~~ | **Done: "missing MULX" (`-m bmi2`).** The row said 415 sites; the operand condition takes it to **101**, and the check reports **94**, all in libxul. See the note below -- this is the second estimate in this file to land, and for the same reason as the first |
 | `XOR r32, r32` + `XOR r32, r32` | -- | **28,516 sites and nothing to fix.** The most frequent flag-coupled pair in the corpus after the compare/branch families, and it is two independent zeroing idioms; the `fdead` tag says only that the first's flag write is dead, which is true of every zeroing idiom |
+
+**MULX: the operand condition the shape count missed.** One-operand
+`MUL` is pinned to fixed registers -- RAX times its operand, product to
+RDX:RAX -- so a widening multiply wanting only the high half spends a
+second instruction moving it out. MULX is not pinned: one multiplicand
+implicitly from RDX, the other from any r/m, both halves named, no flags
+written. `mul rdx ; mov rax, rdx` is `mulx rax, rdx, rax`.
+
+The row originally read "415 `dep,waw` sites", and that number was the
+shape's, not the rewrite's. **MULX's implicit multiplicand is RDX where
+MUL's is RAX**, so the fold needs RDX to hold a multiplicand already --
+the instruction must literally be `mul rdx`. Splitting the corpus by
+that one condition:
+
+```
+mul rdx        182   MULX-eligible; 101 with the `mov rax, rdx` consumer
+mul r64        246   needs a `mov rdx, ...` in front: back to two instructions
+mul rcx        110   same
+memory operand  33   same
+32-bit forms    47   same
+```
+
+The check reports **94 of that 101**, across 80 libxul functions and
+zero everywhere else -- a 93% survival rate against the 1-10% every
+population in this file's earlier rows managed. The difference is not
+the tools. It is that this estimate applied the encodability condition
+before counting, exactly as the RIP-relative arm's did, and those two
+are the only estimates here that landed.
+
+Almost every site is the magic-number division idiom, `movabs rdx,
+0x20c49ba5e353f7cf ; mul rdx ; mov rax, rdx ; shr rax, 4` -- Firefox
+dividing by 1000 and 1000000 for time conversion, 94 times.
+
+Two conditions beyond the operand one: RDX must be dead after the pair,
+since MULX has no discard encoding for the low half and RDX is the only
+home available without register allocation; and every arithmetic flag
+must be dead, since MUL defines CF and OF and MULX writes nothing. IMUL
+never qualifies -- MULX is unsigned-only, which is what excludes the 517
+one-operand `IMUL` sites in the same shape, including the signed magic
+divisions sitting beside these in libxul.
+
+What the check leaves on the table: the MUL is often preceded by a
+`mov rax, src` that exists only because MUL demands its multiplicand in
+RAX, and MULX would take that operand from any r/m -- three instructions
+to one. Only **2 of the 94** have that shape adjacent (the rest reach
+RAX through a shift), so anchoring on the MUL and noting the bonus in
+the check's documentation was the right trade rather than a backward
+window.
 
 **The bit-scan defensive default: right answer, wrong core.** A compiler
 writing `mov r8d, 0x40 ; tzcnt r8, rsi` is providing the zero-source
@@ -466,7 +515,6 @@ earns a row above.
 
 | Item | Notes |
 | --- | --- |
-| one-operand `MUL` whose low half is dead | 415 `dep,waw` sites (`mul rdx ; mov rax, rdx`, the low half in RAX overwritten unread). `MULX` (BMI2) produces the high half without writing RAX/RDX, so this is a `-m bmi2` candidate alongside the shipped SHLX/SHRX/SARX and ANDN checks. MULX is unsigned-only, so the 517 one-operand `IMUL` sites in the same shape do not qualify |
 | `MOV r, r` + shift/ALU (the APX NDD shape) | 270,543 adjacent sites, the second-largest family in the corpus. Already covered by "missing APX NDD" under `-m apx`; recorded here only so the size of the population is not mistaken for an uncovered one |
 | split macro-fusion pairs | Informational, the class armlint files under its `-a` audit idea: a `CMP`/`TEST` separated from its `Jcc` cannot fuse. Needs the per-core fusion tables from the optimization manual, and has no rewrite -- it is a scheduling complaint, not a peephole |
 | constant-condition `Jcc` after a zero test | `TEST r, r` and `CMP r, 0` both clear CF and OF, so `JB`/`JO` are never taken and `JAE`/`JNO` always are. armlint's equivalent row measured empty on AArch64; unmeasured here |

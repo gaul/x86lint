@@ -3115,6 +3115,95 @@ static void check_load_extend_fold_test(void)
     ASSERT_FINDINGS(reg_move, "load foldable into extend", 0);
 }
 
+// Multi-instruction peephole under -m bmi2: mul rdx ; mov rax, rdx collapses to
+// one mulx rax, rdx, rax. check_instructions reports it against the MUL. Every
+// fixture kills RDX (so the discarded low half has a home) and the arithmetic
+// flags (which MULX does not write) after the pair.
+static void check_mulx_fold_test(void)
+{
+    // mul rdx ; mov rax, rdx -> mulx rax, rdx, rax.
+    static const uint8_t basic[] = {
+        0x48, 0xF7, 0xE2,  // mul rdx
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x89, 0xCA,        // mov edx, ecx (kills rdx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS_EXT(basic, "missing MULX", 1, X86LINT_EXT_BMI2);
+    ASSERT_FINDINGS(basic, "missing MULX", 0);   // gated off without -m bmi2
+
+    // The 32-bit pair folds the same way.
+    static const uint8_t width32[] = {
+        0xF7, 0xE2,        // mul edx
+        0x89, 0xD0,        // mov eax, edx
+        0x89, 0xCA,        // mov edx, ecx
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(width32, "missing MULX", 1, X86LINT_EXT_BMI2);
+
+    // imul rdx ; mov rax, rdx -- MULX is unsigned-only and has no signed
+    // spelling, so the signed widening multiply never qualifies.
+    static const uint8_t signed_mul[] = {
+        0x48, 0xF7, 0xEA,  // imul rdx
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x89, 0xCA,        // mov edx, ecx
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(signed_mul, "missing MULX", 0, X86LINT_EXT_BMI2);
+
+    // mul rcx ; mov rax, rdx -- MULX's implicit multiplicand is RDX, and here
+    // neither multiplicand is in it, so the fold would need a mov rdx, rcx in
+    // front and end up back at two instructions. This is the condition that
+    // takes the corpus population from 415 sites to 101.
+    static const uint8_t operand_not_rdx[] = {
+        0x48, 0xF7, 0xE1,  // mul rcx
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x89, 0xCA,        // mov edx, ecx
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(operand_not_rdx, "missing MULX", 0, X86LINT_EXT_BMI2);
+
+    // mul QWORD PTR [rbx] -- a memory multiplicand cannot be RDX either.
+    static const uint8_t memory_operand[] = {
+        0x48, 0xF7, 0x23,  // mul QWORD PTR [rbx]
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x89, 0xCA,        // mov edx, ecx
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(memory_operand, "missing MULX", 0, X86LINT_EXT_BMI2);
+
+    // mul rdx ; mov rbx, rdx -- the high half goes somewhere else, so RAX still
+    // holds the low half and nothing proves it dead. MULX would need a scratch
+    // register for the discard, which is register allocation.
+    static const uint8_t high_half_elsewhere[] = {
+        0x48, 0xF7, 0xE2,  // mul rdx
+        0x48, 0x89, 0xD3,  // mov rbx, rdx
+        0x89, 0xCA,        // mov edx, ecx
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(high_half_elsewhere, "missing MULX", 0, X86LINT_EXT_BMI2);
+
+    // mul rdx ; mov rax, rdx ; mov rbx, rdx -- RDX is read after the pair, so
+    // it is not free to receive the discarded low half.
+    static const uint8_t rdx_live[] = {
+        0x48, 0xF7, 0xE2,  // mul rdx
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x48, 0x89, 0xD3,  // mov rbx, rdx (reads rdx)
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(rdx_live, "missing MULX", 0, X86LINT_EXT_BMI2);
+
+    // mul rdx ; mov rax, rdx ; setb cl -- the SETcc reads the carry MUL set to
+    // report a nonzero high half, and MULX writes no flags at all.
+    static const uint8_t flags_live[] = {
+        0x48, 0xF7, 0xE2,  // mul rdx
+        0x48, 0x89, 0xD0,  // mov rax, rdx
+        0x0F, 0x92, 0xC1,  // setb cl (reads CF)
+        0x89, 0xCA,        // mov edx, ecx
+        0x48, 0x85, 0xDB,  // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(flags_live, "missing MULX", 0, X86LINT_EXT_BMI2);
+}
+
 // Multi-instruction peephole: a LEA followed by an add whose term the address
 // could have carried is one LEA; check_instructions reports it against the LEA,
 // where the surviving instruction is written. The arithmetic's flags disappear
@@ -6824,6 +6913,7 @@ int main(int argc, char *argv[])
     check_load_alu_fold_test();
     check_add_memop_fold_test();
     check_add_lea_fold_test();
+    check_mulx_fold_test();
     check_mov_add_lea_test();
     check_shift_pair_extend_test();
     check_cmp_one_branch_test();

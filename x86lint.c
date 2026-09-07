@@ -1294,10 +1294,16 @@ bool check_shift_zero(const xed_decoded_inst_t *xedd)
 // selector into the prefix's pp field, so vmovaps saves nothing over
 // vmovdqa (and the EVEX forms add masking semantics besides).
 //
-// Bypass-delay caveat (cf. check_sub_self's uarch note): Nehalem-era cores
-// charged a penalty when *computation* ops crossed the int/FP domains, but
-// plain moves and loads/stores are domain-agnostic on every relevant core;
-// clang canonicalizes all of these to movaps/movups unconditionally.
+// Bypass-delay caveat (cf. check_sub_self's uarch note): the int/FP domain
+// penalty is a property of the computation units that forward to one
+// another -- Nehalem-era cores charged it when *compute* ops crossed the
+// domains. A load, a store, or a rename-eliminated register copy never
+// routes its data through an execution-domain unit, so the domain tag
+// ExecutionDomainFix hangs on these moves is cosmetic and the encoding need
+// not honor it -- the rewrite is free on every relevant core. It is also
+// real work rather than something the compiler already does: LLVM keeps the
+// byte-larger movdqa/movdqu for integer-domain data (a load feeding paddd,
+// say) and does not shorten it even at -Osize, which is why they show up.
 bool check_sse_mov_opcode(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {

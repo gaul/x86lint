@@ -368,10 +368,15 @@ gets the high-byte names right while it is there: AH covers bits 15:8,
 so `mov al, 5 ; test ah, ah` proves nothing. A gate that looks like a
 detail is worth measuring before it is believed.
 
-The same refusal in the zeroing arm costs nothing, which is why it
-stays: a census of narrow zeroing idioms (`xor cl, cl` and the like)
-followed by a same-width `TEST` and a consumer finds **0 sites in both
-libxul and uutils**. Compilers zero with `xor r32, r32`.
+The zeroing arm now carries the same model, for symmetry rather than for
+yield. It costs nothing and gains nothing on real code: a census of
+narrow zeroing idioms (`xor cl, cl` and the like) followed by a
+same-width `TEST` and a consumer finds **0 sites in both libxul and
+uutils**, since compilers zero with `xor r32, r32`, and the corpus
+output is byte-identical across all ten binaries before and after. What
+it buys is that one rule now decides both arms, stated as bits rather
+than as widths, and that the high-byte names are right in both:
+`xor al, al` proves nothing about `test ah, ah`.
 
 **Realized above predicted, for once, and why.** Every other row in this
 file overstated its rewrite by between 5x and 300x. The zeroing arm

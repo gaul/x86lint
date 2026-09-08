@@ -2637,14 +2637,41 @@ static void check_zeroed_condition_test(void)
     ASSERT_FINDINGS(xor_not_zeroing, "constant condition after zeroing", 0);
 
     // xor cl, cl ; test rcx, rcx ; je -- the 8-bit idiom zeroes eight bits,
-    // and the test reads 56 more that it never touched: no match. (The 16-bit
-    // form is excluded for the same reason.)
+    // and the test reads 56 more that it never touched: no match.
     static const uint8_t xor_narrow[] = {
         0x30, 0xC9,              // xor cl, cl
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x00,              // je +0
     };
     ASSERT_FINDINGS(xor_narrow, "constant condition after zeroing", 0);
+
+    // xor cl, cl ; test cl, cl ; jne -- the same narrow idiom tested at the
+    // width it zeroed is proven, and the branch is never taken. Compilers do
+    // not write this, but the width rule is about which bits are known, not
+    // about how common the spelling is.
+    static const uint8_t xor_narrow_same[] = {
+        0x30, 0xC9,              // xor cl, cl
+        0x84, 0xC9,              // test cl, cl
+        0x75, 0x00,              // jne +0
+    };
+    ASSERT_FINDINGS(xor_narrow_same, "constant condition after zeroing", 1);
+
+    // xor ah, ah ; test ah, ah ; jne -- the high-byte names cover bits 15:8.
+    static const uint8_t xor_high_byte[] = {
+        0x30, 0xE4,              // xor ah, ah
+        0x84, 0xE4,              // test ah, ah
+        0x75, 0x00,              // jne +0
+    };
+    ASSERT_FINDINGS(xor_high_byte, "constant condition after zeroing", 1);
+
+    // xor al, al ; test ah, ah ; jne -- same enclosing register, disjoint
+    // bits: no match.
+    static const uint8_t xor_low_test_high[] = {
+        0x30, 0xC0,              // xor al, al
+        0x84, 0xE4,              // test ah, ah
+        0x75, 0x00,              // jne +0
+    };
+    ASSERT_FINDINGS(xor_low_test_high, "constant condition after zeroing", 0);
 
     // xor ecx, ecx ; test rdx, rdx ; je -- a test of another register reads
     // flags this producer says nothing about.

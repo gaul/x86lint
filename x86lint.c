@@ -3973,6 +3973,36 @@ static bool constant_condition_consumed(const uint8_t *inst, size_t len,
     return false;
 }
 
+// The bits of the enclosing 64-bit register a GPR name covers, as the
+// half-open range [lo, hi). AL is [0, 8), AH is [8, 16), AX [0, 16), EAX
+// [0, 32) and RAX [0, 64). Callers writing a 32-bit name widen the result to
+// [0, 64) themselves, since such a write zero-extends. False for anything that
+// is not a GPR.
+static bool gpr_bit_range(xed_reg_enum_t reg, unsigned *lo, unsigned *hi)
+{
+    if (xed_reg_class(reg) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    switch (reg) {
+    case XED_REG_AH:
+    case XED_REG_CH:
+    case XED_REG_DH:
+    case XED_REG_BH:
+        *lo = 8;
+        *hi = 16;
+        return true;
+    default:
+        break;
+    }
+    unsigned int width = xed_get_register_width_bits64(reg);
+    if (width != 8 && width != 16 && width != 32 && width != 64) {
+        return false;
+    }
+    *lo = 0;
+    *hi = width;
+    return true;
+}
+
 // The other half shared by the two checks below: whether an instruction
 // between the producer and the compare leaves the producer's claim standing.
 // Only a write of `dest_enc` (in any width) breaks it, plus any control
@@ -4043,16 +4073,18 @@ static bool known_reg_gap_transparent(const xed_decoded_inst_t *gap,
 // flags_gap_transparent must reject that) and only a write of the tested
 // register breaks the chain.
 //
-// Zeroing idioms accepted are the 32- and 64-bit register-register XOR and
-// SUB forms with both operands naming one register. The 8- and 16-bit forms
-// are left out on purpose: xor cl, cl zeroes eight bits, and a wider TEST of
-// RCX would read bits it never touched. The 32-bit form needs no such care,
-// since a 32-bit write zero-extends the whole register. Unlike the immediate
-// arm below, which carries a bit-range model because narrow loads compared at
-// their own width are most of its population, this arm loses nothing to the
-// refusal: a census of narrow zeroing idioms followed by a same-width TEST and
-// a consumer finds no site at all in either libxul or uutils, since compilers
-// zero with xor r32, r32.
+// Zeroing idioms accepted are the register-register XOR and SUB forms with
+// both operands naming one register, at any width. What the width decides is
+// not whether the site counts but which TESTs it proves: the idiom zeroes its
+// own bit range, widened to [0, 64) for a 32-bit name (which zero-extends), and
+// the TEST must read inside it. So xor ecx, ecx proves test rcx, rcx and
+// test cl, cl alike, xor cl, cl proves only the narrow one, and xor al, al
+// proves nothing about test ah, ah, since the high-byte names cover bits 15:8.
+// gpr_bit_range spells all of that, and is shared with the immediate arm below.
+// Narrow idioms are admitted for symmetry rather than for yield: a census finds
+// no narrow site at all in libxul or uutils, since compilers zero with
+// xor r32, r32. The immediate arm, where the same model is worth 323 of 455
+// libxul sites, is what made the case for having it.
 //
 // The consumer search and the side-entry gate are constant_condition_consumed
 // above. Getting that gate wrong is expensive in both directions: a sweep of
@@ -4082,21 +4114,23 @@ static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
         return false;
     }
 
-    // Both operands must name one GPR at 32 or 64 bits: xor eax, eax rather
-    // than xor eax, ebx (not zero) or xor al, al (only eight bits zeroed).
+    // Both operands must name one GPR: xor eax, eax rather than xor eax, ebx,
+    // whose result is not a constant. The zeroed bits are that register's
+    // range, widened to [0, 64) for a 32-bit name, which zero-extends.
     xed_reg_enum_t zeroed = xed_decoded_inst_get_reg(producer, XED_OPERAND_REG0);
+    unsigned int zeroed_lo;
+    unsigned int zeroed_hi;
     if (zeroed == XED_REG_INVALID ||
         zeroed != xed_decoded_inst_get_reg(producer, XED_OPERAND_REG1) ||
-        xed_reg_class(zeroed) != XED_REG_CLASS_GPR) {
+        !gpr_bit_range(zeroed, &zeroed_lo, &zeroed_hi)) {
         return false;
     }
-    unsigned int zeroed_width = xed_get_register_width_bits64(zeroed);
-    if (zeroed_width != 32 && zeroed_width != 64) {
-        return false;
+    if (zeroed_hi == 32) {
+        zeroed_hi = 64;
     }
     xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(zeroed);
 
-    // test reg, reg on any width of the zeroed register, within the shared
+    // test reg, reg reading only bits the idiom zeroed, within the shared
     // window, past instructions that leave that register alone.
     size_t cur = after_producer;
     for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
@@ -4111,11 +4145,15 @@ static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
 
         xed_reg_enum_t tested =
             xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG0);
+        unsigned int tested_lo = 0;
+        unsigned int tested_hi = 0;
         if (xed_decoded_inst_get_iclass(test_out) != XED_ICLASS_TEST ||
             xed_decoded_inst_number_of_memory_operands(test_out) > 0 ||
             tested == XED_REG_INVALID ||
             tested != xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) ||
-            xed_get_largest_enclosing_register(tested) != dest_enc) {
+            !gpr_bit_range(tested, &tested_lo, &tested_hi) ||
+            xed_get_largest_enclosing_register(tested) != dest_enc ||
+            tested_lo < zeroed_lo || tested_hi > zeroed_hi) {
             if (!known_reg_gap_transparent(test_out, dest_enc)) {
                 return false;
             }
@@ -4133,35 +4171,6 @@ static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
     return false;
 }
 
-// The bits of the enclosing 64-bit register a GPR name covers, as the
-// half-open range [lo, hi). AL is [0, 8), AH is [8, 16), AX [0, 16), EAX
-// [0, 32) and RAX [0, 64). Callers writing a 32-bit name widen the result to
-// [0, 64) themselves, since such a write zero-extends. False for anything that
-// is not a GPR.
-static bool gpr_bit_range(xed_reg_enum_t reg, unsigned *lo, unsigned *hi)
-{
-    if (xed_reg_class(reg) != XED_REG_CLASS_GPR) {
-        return false;
-    }
-    switch (reg) {
-    case XED_REG_AH:
-    case XED_REG_CH:
-    case XED_REG_DH:
-    case XED_REG_BH:
-        *lo = 8;
-        *hi = 16;
-        return true;
-    default:
-        break;
-    }
-    unsigned int width = xed_get_register_width_bits64(reg);
-    if (width != 8 && width != 16 && width != 32 && width != 64) {
-        return false;
-    }
-    *lo = 0;
-    *hi = width;
-    return true;
-}
 
 // Multi-instruction peephole: the second arm of the same family. A register
 // loaded with an immediate is compared against a second constant, so the

@@ -230,11 +230,17 @@ argue for or against each, live in [TODO.md](TODO.md).
     reported alone. Note what the proof does not use: the producer's own
     flags. The TEST redefines every flag the consumer reads, from a value
     proven zero, so an intervening instruction may write flags freely and only
-    a write of the tested register breaks the chain. Accepts the 32- and
-    64-bit register-register XOR and SUB idioms (`XOR CL, CL` zeroes eight
-    bits, which a wider TEST would read past); the TEST is searched for
-    through `APX_NDD_WINDOW`, and a consumer is required, since without one
-    the site is a dead TEST rather than a decided condition. The side-entry
+    a write of the tested register breaks the chain. Accepts the
+    register-register XOR and SUB idioms at any width, and shares the immediate
+    arm's bit-range model to say which TESTs each one proves: the idiom zeroes
+    its own range of the enclosing register, widened to the full 64 bits for a
+    32-bit name, and the TEST must read inside it. `XOR ECX, ECX` proves
+    `TEST RCX, RCX` and `TEST CL, CL` alike; `XOR CL, CL` proves only the
+    narrow one, since a wider TEST reads 56 bits it never touched; and
+    `XOR AL, AL` proves nothing about `TEST AH, AH`, the high-byte names
+    covering bits 15:8. The TEST is searched for through `APX_NDD_WINDOW`, and
+    a consumer is required, since without one the site is a dead TEST rather
+    than a decided condition. The side-entry
     gate is stricter than the redundant-TEST checks': a direct edge onto the
     TEST, onto anything between it and the consumer, or onto the consumer
     itself suppresses the finding, because that path's register need not be

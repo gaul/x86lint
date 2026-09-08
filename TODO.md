@@ -333,7 +333,7 @@ machinery than any existing check, and more places to be wrong.
 
 armlint has the same candidate open from its own pairscan sweep.
 
-## Constant conditions
+## Constant conditions (both arms shipped, 2026-09)
 
 A flag producer whose result is known at assembly time makes its
 consumer's condition a constant, so the `Jcc`, `CMOVcc` or `SETcc`
@@ -341,7 +341,16 @@ reading it has one outcome and the compare feeding it is pure waste.
 Two arms, both found by the 2026-09 Rust sweep, both counted with the
 side-entry gate described below. Site counts come from an independent
 whole-binary disassembly pass, quoted against the symbol-restricted
-instruction counts the rest of this file uses:
+instruction counts the rest of this file uses.
+
+**This family is done.** Both arms ship as checks -- "constant condition
+after zeroing" and "constant condition after immediate" -- for **1,543
+findings** across the corpus against the sweep's predicted 1,330, sharing
+a consumer search (`constant_condition_consumed`), a gap rule
+(`known_reg_gap_transparent`) and a bit-range model (`gpr_bit_range`).
+Nothing here is left open. What follows is kept for the measurements,
+and for the ways the counting went wrong on the way to them -- the
+transferable part:
 
 | Pattern | Rewrite | 2026-09 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
@@ -458,16 +467,19 @@ instructions, but it answers whether the flags are read, not by which
 condition, and these checks have to name the consumer and see that it
 reads one.
 
-The shipped "redundant TEST after flags" reports 28 on uutils and 9 on
-geckodriver, so this is a gap rather than a re-count of covered ground.
+The shipped "redundant TEST after flags" reported 28 on uutils and 9 on
+geckodriver, so this was a gap rather than a re-count of covered ground.
+It stayed one: on libxul the zeroing arm took over 16 sites that check
+had been reporting (556 to 540) and added 322 it could not see.
 
-Two cautions for an implementer. The rewrite deletes instructions, so
-as a byte patch it is a `NOP` fill plus a `Jcc`-to-`JMP` opcode swap
-(same length for both rel8 and rel32); as a codegen report it is one
-finding per site. And a never-taken branch means the code it guards is
-unreachable, which is a stronger statement about the compiler's output
-than any other row in this file makes -- worth stating in the finding's
-wording rather than implying.
+Two cautions were written here for an implementer, and both survived
+into the shipped checks. The rewrite deletes instructions, so as a byte
+patch it would be a `NOP` fill plus a `Jcc`-to-`JMP` opcode swap (same
+length for both rel8 and rel32); as a codegen report it is one finding
+per site, which is what both checks emit. And a never-taken branch means
+the code it guards is unreachable, a stronger statement about the
+compiler's output than any other row in this file makes -- said outright
+in both README entries rather than implied.
 
 ## Coverage gaps in shipped checks
 
@@ -481,7 +493,7 @@ that closed itself.
 | Check | Reports | Population at d1 | Notes |
 | --- | --- | --- | --- |
 | ~~LEA foldable into memory~~ | libxul **1,359**; go **184**; libc **2** | libxul 14,923; go 658; libc 254 | **Investigated and mostly closed.** The 12x figure was the wrong measurement: `defuse`'s `lea->addr` counts a LEA whose sole use is an address and asks nothing about whether the combined address is *encodable* or the register provably dead. See the breakdown below; the check gained 111 findings from a liveness fix and 87 more from the RIP-relative arm, and the rest of the residue is refusals it should be making |
-| redundant TEST after flags | libxul 556; libc 7; go 4 | `cmp0` d1: logic 329, arith 1,637, **test-width 405** | The logic and arith rows are covered (the check searches a window, not just d1, and arith is an upper bound gated on CF/OF deadness, exactly as documented). The test-width row -- 405 sites, 357 of them libxul -- is the check's exact-register match refusing a TEST that names a different width of the producer's register. That refusal is deliberate and sound (`AND EAX, EBX` clears bits 63:32 where `TEST RAX, RAX` reads a sign bit the narrow form never sees); the question this row left open -- whether the narrowing direction, with the producer the *wider* one, is admissible -- is now answered, and not in the terms it was asked: **the test-width row is almost entirely the zeroing idiom**, where every width agrees because the register is zero. See "Constant conditions" above, which supersedes this row -- the sites it names are not a widening puzzle but a decided condition |
+| redundant TEST after flags | libxul 556; libc 7; go 4 | `cmp0` d1: logic 329, arith 1,637, **test-width 405** | The logic and arith rows are covered (the check searches a window, not just d1, and arith is an upper bound gated on CF/OF deadness, exactly as documented). The test-width row -- 405 sites, 357 of them libxul -- is the check's exact-register match refusing a TEST that names a different width of the producer's register. That refusal is deliberate and sound (`AND EAX, EBX` clears bits 63:32 where `TEST RAX, RAX` reads a sign bit the narrow form never sees); the question this row left open -- whether the narrowing direction, with the producer the *wider* one, is admissible -- is now answered, and not in the terms it was asked: **the test-width row is almost entirely the zeroing idiom**, where every width agrees because the register is zero. See "Constant conditions" above, which supersedes this row -- the sites it names are not a widening puzzle but a decided condition, and are now reported as one by "constant condition after zeroing" (338 findings on libxul) |
 
 **Breaking down the LEA fold's residue.** Classifying every adjacent
 LEA-then-memory-base pair in libc with an independent objdump pass,
@@ -662,4 +674,4 @@ earns a row above.
 | --- | --- |
 | `MOV r, r` + shift/ALU (the APX NDD shape) | 270,543 adjacent sites, the second-largest family in the corpus. Already covered by "missing APX NDD" under `-m apx`; recorded here only so the size of the population is not mistaken for an uncovered one |
 | split macro-fusion pairs | Informational, the class armlint files under its `-a` audit idea: a `CMP`/`TEST` separated from its `Jcc` cannot fuse. Needs the per-core fusion tables from the optimization manual, and has no rewrite -- it is a scheduling complaint, not a peephole |
-| ~~constant-condition `Jcc` after a zero test~~ | **Measured; moved to "Constant conditions" above.** The CF/OF half this row described (`JB`/`JO` after a zero test) is a subset of the general case, which is worth 1,330 sites across the corpus |
+| ~~constant-condition `Jcc` after a zero test~~ | **Done.** Measured, moved to "Constant conditions" above, and shipped there as both arms: 1,543 findings against the 1,330 the sweep predicted. The CF/OF half this row described (`JB`/`JO` after a zero test) is a subset of the general case |

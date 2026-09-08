@@ -19,6 +19,15 @@ not the sum -- three of the rows below look large only because libxul
 is large, and one of them (the dead `mov rbp, rsp` row) is a property
 of libxul's build flags rather than of any compiler.
 
+Figures marked **2026-09 Rust sweep** add three binaries totalling
+3.2M instructions, mined for what a Rust-heavy corpus shows that a C
+and C++ one does not: `geckodriver` (rustc, 715k) and `http3server`
+(rustc, 549k) from the Firefox tree, and uutils `coreutils` 0.11.0
+(1.98M), the only one of the three built outside this tree. uutils
+ships stripped, so it was swept with `-a`; treat its absolute numbers
+as upper bounds, though `geckodriver`'s symbol-restricted run
+reproduces the same ranking.
+
 Both tools restrict the scan to the symbol table's function ranges, so
 no pair or def-use distance spans two functions or is mined from the
 non-code that executable sections interleave. Only libxul, go and libc
@@ -324,6 +333,93 @@ machinery than any existing check, and more places to be wrong.
 
 armlint has the same candidate open from its own pairscan sweep.
 
+## Constant conditions
+
+A flag producer whose result is known at assembly time makes its
+consumer's condition a constant, so the `Jcc`, `CMOVcc` or `SETcc`
+reading it has one outcome and the compare feeding it is pure waste.
+Two arms, both found by the 2026-09 Rust sweep, both counted with the
+side-entry gate described below. Site counts come from an independent
+whole-binary disassembly pass, quoted against the symbol-restricted
+instruction counts the rest of this file uses:
+
+| Pattern | Rewrite | 2026-09 sweep (d1, rate/Minsn) |
+| --- | --- | --- |
+| zeroing idiom (`XOR r, r` / `SUB r, r`) + `TEST r, r` of any width of that register | delete the `TEST`; `CMOVE` -> `MOV`, `JE` -> `JMP`, `JNE`/`CMOVNE` deleted | **809.** uutils 521 (263), libxul 276 (9.2), geckodriver 7 (9.8), http3server 5 (9.7), go 0, libc 0, bash 0, ld.so 0, libcrypto 0, libstdc++ 0 |
+| `MOV r, imm` + `TEST r, r` or `CMP r, imm2` | same, with the outcome decided by the two immediates | **521.** libxul 457 (15.2), uutils 52 (26), geckodriver 6 (8.4), go 0, and 0 in every C binary |
+
+The first arm is `defuse`'s `cmp0|test-width` row, which the
+"Coverage gaps" table below had recorded as an open question about
+whether the narrowing direction is admissible. Dumping the sites
+answers it by dissolving it: **559 of 559 uutils sites at d1 are a
+zeroing idiom**, and the width mismatch is not a width problem at all.
+
+```
+xor   ecx, ecx
+test  rcx, rcx        <- tests a register just proven zero
+cmove rbx, rax        <- ZF is 1, so this always moves
+```
+
+A zeroed register is zero in every width, so every flag is a constant
+-- ZF=1, SF=0, CF=OF=0, PF=1 -- independent of the `TEST`'s operand
+size. That is why the width mismatch that makes "redundant TEST after
+flags" refuse the site is exactly what hides it, and why the claim
+available here is stronger than that check's: the condition is decided,
+not merely recomputed, which also covers the `CMOVcc` and `SETcc`
+consumers that a redundant-compare framing cannot reach. uutils'
+consumers are 328 `CMOVE`, 135 `JE`, 44 `JNE` and 11 `CMOVNE`;
+libxul's are 168 `JNE`, 95 `JE`, 5 `CMOVNE` and 4 `SETcc`.
+
+Real sites, from libxul and from uutils:
+
+```
+xor edx, edx  ; test dl, dl   ; jne  +0xf     (never taken; cdef_filter_block_c)
+mov r10d, 0x3f; test r10d,r10d; jg   -0x70    (always taken; VP8EnterCritical)
+mov ecx, 0x10 ; cmp  rcx,0x28 ; ja   +0x79    (never taken; wasm2c bounds check)
+```
+
+**The side-entry gate is the whole check.** Raw adjacency counts the
+first arm at 1,096 on uutils, 1,381 on libxul and 704 on go. Most of
+those are unsound: the `TEST` is a branch target reached from paths
+where the register is not zero, the shape being a block that falls into
+a shared join. **All 704 of go's are side entries**, so go's true
+population is zero, and the arm is absent from every C binary in the
+corpus. The gate has a second edge that is easy to get backwards: a
+site where the *zeroing instruction* is the branch target is still
+sound, since every entry there executes it, and rejecting those drops
+uutils from 521 to 189. Between the two errors this family can be
+counted as anything from 189 to 1,096.
+
+Neither arm is concentrated in one file: 250 libxul functions for the
+zeroing arm, 242 for the immediate arm -- though wasm2c's generated
+dispatcher supplies 93 of that arm's 457, so the row carries a smaller
+version of the `mov rbp, rsp` caveat.
+
+Distance is not needed: uutils' histogram is 559 at d1 against 32 at
+d2 and 13 beyond, so adjacency plus the existing flag-producer walk
+covers the population.
+
+The proof burden is the lightest of any open row. The first arm needs
+no constant model at all -- a zeroing idiom is recognized by its two
+operands naming one register -- and the second needs a single
+immediate, where the `remat|movimm` row above needs a tracked constant
+per register. What both need beyond the shipped machinery is a flag
+*consumer* search: `flags_live_after` already walks forward sixteen
+instructions, but it answers whether the flags are read, not by which
+condition, and this check has to name the consumer and read its
+condition code to say which way the outcome falls.
+
+The shipped "redundant TEST after flags" reports 28 on uutils and 9 on
+geckodriver, so this is a gap rather than a re-count of covered ground.
+
+Two cautions for an implementer. The rewrite deletes instructions, so
+as a byte patch it is a `NOP` fill plus a `Jcc`-to-`JMP` opcode swap
+(same length for both rel8 and rel32); as a codegen report it is one
+finding per site. And a never-taken branch means the code it guards is
+unreachable, which is a stronger statement about the compiler's output
+than any other row in this file makes -- worth stating in the finding's
+wording rather than implying.
+
 ## Coverage gaps in shipped checks
 
 A population counted independently says nothing about which spellings
@@ -336,7 +432,7 @@ that closed itself.
 | Check | Reports | Population at d1 | Notes |
 | --- | --- | --- | --- |
 | ~~LEA foldable into memory~~ | libxul **1,359**; go **184**; libc **2** | libxul 14,923; go 658; libc 254 | **Investigated and mostly closed.** The 12x figure was the wrong measurement: `defuse`'s `lea->addr` counts a LEA whose sole use is an address and asks nothing about whether the combined address is *encodable* or the register provably dead. See the breakdown below; the check gained 111 findings from a liveness fix and 87 more from the RIP-relative arm, and the rest of the residue is refusals it should be making |
-| redundant TEST after flags | libxul 556; libc 7; go 4 | `cmp0` d1: logic 329, arith 1,637, **test-width 405** | The logic and arith rows are covered (the check searches a window, not just d1, and arith is an upper bound gated on CF/OF deadness, exactly as documented). The test-width row -- 405 sites, 357 of them libxul -- is the check's exact-register match refusing a TEST that names a different width of the producer's register. That refusal is deliberate and sound (`AND EAX, EBX` clears bits 63:32 where `TEST RAX, RAX` reads a sign bit the narrow form never sees); the open question is whether the narrowing direction, where the producer is the *wider* one, is admissible |
+| redundant TEST after flags | libxul 556; libc 7; go 4 | `cmp0` d1: logic 329, arith 1,637, **test-width 405** | The logic and arith rows are covered (the check searches a window, not just d1, and arith is an upper bound gated on CF/OF deadness, exactly as documented). The test-width row -- 405 sites, 357 of them libxul -- is the check's exact-register match refusing a TEST that names a different width of the producer's register. That refusal is deliberate and sound (`AND EAX, EBX` clears bits 63:32 where `TEST RAX, RAX` reads a sign bit the narrow form never sees); the question this row left open -- whether the narrowing direction, with the producer the *wider* one, is admissible -- is now answered, and not in the terms it was asked: **the test-width row is almost entirely the zeroing idiom**, where every width agrees because the register is zero. See "Constant conditions" above, which supersedes this row -- the sites it names are not a widening puzzle but a decided condition |
 
 **Breaking down the LEA fold's residue.** Classifying every adjacent
 LEA-then-memory-base pair in libc with an independent objdump pass,
@@ -517,4 +613,4 @@ earns a row above.
 | --- | --- |
 | `MOV r, r` + shift/ALU (the APX NDD shape) | 270,543 adjacent sites, the second-largest family in the corpus. Already covered by "missing APX NDD" under `-m apx`; recorded here only so the size of the population is not mistaken for an uncovered one |
 | split macro-fusion pairs | Informational, the class armlint files under its `-a` audit idea: a `CMP`/`TEST` separated from its `Jcc` cannot fuse. Needs the per-core fusion tables from the optimization manual, and has no rewrite -- it is a scheduling complaint, not a peephole |
-| constant-condition `Jcc` after a zero test | `TEST r, r` and `CMP r, 0` both clear CF and OF, so `JB`/`JO` are never taken and `JAE`/`JNO` always are. armlint's equivalent row measured empty on AArch64; unmeasured here |
+| ~~constant-condition `Jcc` after a zero test~~ | **Measured; moved to "Constant conditions" above.** The CF/OF half this row described (`JB`/`JO` after a zero test) is a subset of the general case, which is worth 1,330 sites across the corpus |

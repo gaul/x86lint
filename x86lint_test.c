@@ -2570,6 +2570,163 @@ static void check_redundant_flags_test(void)
     ASSERT_FINDINGS(gap_add_jb, "redundant TEST after flags", 0);
 }
 
+// Multi-instruction peephole: a TEST of a register a zeroing idiom just
+// cleared. The tested value is provably zero, so every flag the test writes is
+// a constant (ZF=1, SF=0, PF=1, CF=OF=0) and the Jcc, CMOVcc or SETcc reading
+// them has a decided outcome. Any width of the zeroed register may be tested,
+// which is what separates this from the redundant-TEST check next door;
+// where both apply, the dispatcher reports this one alone.
+static void check_zeroed_condition_test(void)
+{
+    // xor ecx, ecx ; test rcx, rcx ; je -- the branch is always taken. The
+    // test names a wider register than the producer, which is exactly the
+    // spelling flags_test_redundant refuses and this check accepts.
+    static const uint8_t xor_test_je[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(xor_test_je, "constant condition after zeroing", 1);
+
+    // The same site is not also reported as a redundant TEST: one site, one
+    // finding, and the stronger claim. (Asserted directly rather than through
+    // ASSERT_FINDINGS, which additionally requires the fixture to produce no
+    // other finding at all -- here it produces exactly the one above.)
+    int suppressed_total;
+    assert(count_findings(xor_test_je, sizeof(xor_test_je),
+                          "redundant TEST after flags", &suppressed_total,
+                          0) == 0);
+    assert(suppressed_total == 1);
+
+    // xor ecx, ecx ; test cl, cl ; cmove rbx, rax -- a narrower test of the
+    // same register, and a CMOVcc consumer, which the redundant-compare
+    // framing cannot reach at all. The move always happens.
+    static const uint8_t xor_test_cmove[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x84, 0xC9,              // test cl, cl
+        0x48, 0x0F, 0x44, 0xD8,  // cmove rbx, rax
+    };
+    ASSERT_FINDINGS(xor_test_cmove, "constant condition after zeroing", 1);
+
+    // sub rcx, rcx ; test rcx, rcx ; jne -- SUB of a register from itself is
+    // the same idiom, and the branch is never taken. Same width here, so the
+    // suppression of the weaker finding is what keeps the total at one.
+    static const uint8_t sub_test_jne[] = {
+        0x48, 0x29, 0xC9,        // sub rcx, rcx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x75, 0x00,              // jne +0
+    };
+    int sub_total;
+    assert(count_findings(sub_test_jne, sizeof(sub_test_jne),
+                          "constant condition after zeroing", &sub_total,
+                          0) == 1);
+    // Two findings, not one: check_sub_self independently reports the SUB
+    // itself, since xor reg, reg is the portable zeroing idiom. What matters
+    // here is that the redundant-TEST finding is not the second one.
+    assert(sub_total == 2);
+    assert(count_findings(sub_test_jne, sizeof(sub_test_jne),
+                          "redundant TEST after flags", &sub_total, 0) == 0);
+
+    // xor ecx, ebx ; test rcx, rcx ; je -- the operands name different
+    // registers, so the result is not a constant: no match.
+    static const uint8_t xor_not_zeroing[] = {
+        0x31, 0xD9,              // xor ecx, ebx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(xor_not_zeroing, "constant condition after zeroing", 0);
+
+    // xor cl, cl ; test rcx, rcx ; je -- the 8-bit idiom zeroes eight bits,
+    // and the test reads 56 more that it never touched: no match. (The 16-bit
+    // form is excluded for the same reason.)
+    static const uint8_t xor_narrow[] = {
+        0x30, 0xC9,              // xor cl, cl
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(xor_narrow, "constant condition after zeroing", 0);
+
+    // xor ecx, ecx ; test rdx, rdx ; je -- a test of another register reads
+    // flags this producer says nothing about.
+    static const uint8_t xor_test_other[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xD2,        // test rdx, rdx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(xor_test_other, "constant condition after zeroing", 0);
+
+    // xor ecx, ecx ; test rcx, rcx ; ret -- no consumer, so the flags are
+    // unread and the site is a dead test rather than a decided condition.
+    static const uint8_t xor_test_ret[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(xor_test_ret, "constant condition after zeroing", 0);
+
+    // xor ecx, ecx ; test rcx, rcx ; adc eax, ebx -- ADC reads CF, which is
+    // constant here too, but rewriting it is a different fold: left alone.
+    static const uint8_t xor_test_adc[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x11, 0xD8,              // adc eax, ebx
+    };
+    ASSERT_FINDINGS(xor_test_adc, "constant condition after zeroing", 0);
+
+    // xor ecx, ecx ; cmp eax, ebx ; test rcx, rcx ; je -- a gap that writes
+    // the flags is fine, since the test redefines every flag the branch
+    // reads. flags_gap_transparent rejects exactly this, which is why the
+    // check carries its own gap rule.
+    static const uint8_t xor_flag_gap[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x39, 0xD8,              // cmp eax, ebx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(xor_flag_gap, "constant condition after zeroing",
+                    APX_NDD_WINDOW >= 3 ? 1 : 0);
+
+    // xor ecx, ecx ; mov ecx, ebx ; test rcx, rcx ; je -- a gap that writes
+    // the tested register destroys the zero: no match.
+    static const uint8_t xor_reg_gap[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x89, 0xD9,              // mov ecx, ebx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(xor_reg_gap, "constant condition after zeroing", 0);
+
+    // An incoming direct edge onto the test arrives without the zeroing.
+    static const uint8_t edge_on_test[] = {
+        0x31, 0xC9,              // 0: xor ecx, ecx
+        0x48, 0x85, 0xC9,        // 2: test rcx, rcx  <- branch target
+        0x74, 0x00,              // 5: je +0
+        0xEB, 0xF9,              // 7: jmp 2
+    };
+    ASSERT_FINDINGS(edge_on_test, "constant condition after zeroing", 0);
+
+    // An edge onto the consumer likewise: that path's flags are whatever it
+    // brings. This gate is stricter than the redundant-TEST check's, whose
+    // rewrite does not touch the consumer.
+    static const uint8_t edge_on_consumer[] = {
+        0x31, 0xC9,              // 0: xor ecx, ecx
+        0x48, 0x85, 0xC9,        // 2: test rcx, rcx
+        0x74, 0x00,              // 5: je +0        <- branch target
+        0xEB, 0xFC,              // 7: jmp 5
+    };
+    ASSERT_FINDINGS(edge_on_consumer, "constant condition after zeroing", 0);
+
+    // An edge onto the zeroing instruction executes it, so the register is
+    // zero on that path too: fires.
+    static const uint8_t edge_on_head[] = {
+        0x31, 0xC9,              // 0: xor ecx, ecx  <- branch target
+        0x48, 0x85, 0xC9,        // 2: test rcx, rcx
+        0x74, 0x00,              // 5: je +0
+        0xEB, 0xF7,              // 7: jmp 0
+    };
+    ASSERT_FINDINGS(edge_on_head, "constant condition after zeroing", 1);
+}
+
 // Multi-instruction peephole: a SHL/SHR/SAR of a register by a statically
 // nonzero count -- a nonzero masked immediate, or the by-one D0/D1 forms --
 // sets SF/ZF/PF exactly as test reg, reg would, so a following test on the
@@ -7015,6 +7172,7 @@ int main(int argc, char *argv[])
     check_redundant_reextension_test();
     check_upper32_identity_gate_test();
     check_redundant_flags_test();
+    check_zeroed_condition_test();
     check_redundant_shift_test();
     check_lea_fold_test();
     check_mov_const_fold_test();

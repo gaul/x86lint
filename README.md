@@ -190,6 +190,34 @@ argue for or against each, live in [TODO.md](TODO.md).
     bits, so it neither sets nor clears the state. An unseen indirect
     edge could only reach a flagged site with clean uppers, where both
     fixes stay harmless
+* constant condition after zeroing
+  - `31C9 4885C9 74xx` (XOR ECX, ECX; TEST RCX, RCX; JE) -- the register is
+    provably zero, so the TEST computes no condition: it sets ZF=1, SF=0, PF=1
+    and clears CF and OF, whatever its width. Every Jcc, CMOVcc and SETcc
+    condition is a function of exactly those flags, so the consumer's outcome
+    is decided at assembly time -- the JE above is always taken, `CMOVE` is a
+    `MOV`, `CMOVNE` and `JNE` are dead -- and the TEST goes with it. The
+    stronger sibling of "redundant TEST after flags", which refuses these
+    sites because it requires the TEST to name the producer's register at its
+    exact width; a zeroed register is zero in every width, so any
+    sub-register may be tested, and where both checks apply this one is
+    reported alone. Note what the proof does not use: the producer's own
+    flags. The TEST redefines every flag the consumer reads, from a value
+    proven zero, so an intervening instruction may write flags freely and only
+    a write of the tested register breaks the chain. Accepts the 32- and
+    64-bit register-register XOR and SUB idioms (`XOR CL, CL` zeroes eight
+    bits, which a wider TEST would read past); the TEST is searched for
+    through `APX_NDD_WINDOW`, and a consumer is required, since without one
+    the site is a dead TEST rather than a decided condition. The side-entry
+    gate is stricter than the redundant-TEST checks': a direct edge onto the
+    TEST, onto anything between it and the consumer, or onto the consumer
+    itself suppresses the finding, because that path's register need not be
+    zero. Reported at the TEST. A never-taken branch also says the code it
+    guards is unreachable from here, which is worth reading as a codegen
+    report rather than a byte patch. Almost entirely a Rust and C++ shape:
+    562 findings in uutils coreutils and 338 in libxul, 9 in geckodriver and
+    5 in http3server, against 0 in glibc, ld.so, bash, libstdc++, libcrypto
+    and go
 * IBT-bypassing NOTRACK call
   - `3E FFD0` (NOTRACK CALL RAX) -- the 3E prefix exempts this one indirect
     call from CET indirect-branch tracking: the CPU will not require an

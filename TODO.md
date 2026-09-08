@@ -345,8 +345,27 @@ instruction counts the rest of this file uses:
 
 | Pattern | Rewrite | 2026-09 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
-| zeroing idiom (`XOR r, r` / `SUB r, r`) + `TEST r, r` of any width of that register | delete the `TEST`; `CMOVE` -> `MOV`, `JE` -> `JMP`, `JNE`/`CMOVNE` deleted | **809.** uutils 521 (263), libxul 276 (9.2), geckodriver 7 (9.8), http3server 5 (9.7), go 0, libc 0, bash 0, ld.so 0, libcrypto 0, libstdc++ 0 |
+| ~~zeroing idiom (`XOR r, r` / `SUB r, r`) + `TEST r, r` of any width of that register~~ | ~~delete the `TEST`; `CMOVE` -> `MOV`, `JE` -> `JMP`, `JNE`/`CMOVNE` deleted~~ | **Done: "constant condition after zeroing".** Swept population 809 (uutils 521, libxul 276, geckodriver 7, http3server 5, and 0 in go, libc, bash, ld.so, libcrypto and libstdc++); realized **914** (uutils 562, libxul 338, geckodriver 9, http3server 5, 0 everywhere else). The first row in this file to realize *more* than its sweep predicted -- see the note below |
 | `MOV r, imm` + `TEST r, r` or `CMP r, imm2` | same, with the outcome decided by the two immediates | **521.** libxul 457 (15.2), uutils 52 (26), geckodriver 6 (8.4), go 0, and 0 in every C binary |
+
+**Realized above predicted, for once, and why.** Every other row in this
+file overstated its rewrite by between 5x and 300x. This one understated
+it, by 13%: 914 findings against 809 swept sites, with no site the sweep
+found and the check misses. The sweep was an objdump pass that matched
+the `TEST` **immediately** after the zeroing instruction, because that is
+what a quick census can express; the check searches `APX_NDD_WINDOW` past
+instructions that leave the tested register alone. Classifying libxul's
+338: 287 adjacent, 44 with one intervening instruction, 7 with more. The
+gaps are exactly what the shape suggests -- a second zeroing
+(`xor r8d, r8d ; xor eax, eax ; test r8d, r8d`), a spill of the zero, an
+alignment NOP. So the discipline that every other row demonstrates in one
+direction holds in the other too: a shape count is not the rewrite's
+count, and the sign of the error is not predictable either.
+
+The 16 libxul sites where a zeroing producer met a same-width `TEST` were
+already reported as "redundant TEST after flags" (556 there before, 540
+after); they now carry the stronger claim instead. All six C and Go
+binaries are byte-identical to the previous build's output.
 
 The first arm is `defuse`'s `cmp0|test-width` row, which the
 "Coverage gaps" table below had recorded as an open question about

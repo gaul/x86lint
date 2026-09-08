@@ -3445,6 +3445,116 @@ static void check_add_memop_fold_test(void)
     ASSERT_FINDINGS(rsp_addend, "ADD foldable into memory", 0);
 }
 
+// The V8 arm of the memory fold: `mov r32, [..]; or r64, r14; mov .., [r64+d]`
+// folds to `[r14+r64*1+d]` because r14 (the 4 GB-aligned cage base) and the
+// zero-extended 32-bit value share no set bits, so the OR is an ADD. Only with
+// X86LINT_EXT_V8; the same bytes report nothing without it. The fixtures end
+// as the ADD fold's do: mov ecx, edx kills rcx, test rbx, rbx kills the flags.
+static void check_or_memop_fold_test(void)
+{
+    // mov ecx, [rsi+0x6b] ; or rcx, r14 ; mov r8d, [rcx+0x4f]
+    //                                  -> mov r8d, [r14+rcx*1+0x4f]
+    static const uint8_t decompress[] = {
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b] (zero-extends rcx)
+        0x4C, 0x09, 0xF1,        // or rcx, r14
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x89, 0xD1,              // mov ecx, edx (kills rcx)
+        0x48, 0x85, 0xDB,        // test rbx, rbx (kills the flags)
+    };
+    ASSERT_FINDINGS_EXT(decompress, "OR foldable into memory", 1,
+                        X86LINT_EXT_V8);
+    ASSERT_FINDINGS(decompress, "OR foldable into memory", 0);
+    ASSERT_FINDINGS(decompress, "ADD foldable into memory", 0);
+
+    // The consumer overwrites the destination: no liveness walk needed.
+    static const uint8_t consumer_overwrites[] = {
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b]
+        0x4C, 0x09, 0xF1,        // or rcx, r14
+        0x8B, 0x49, 0x4F,        // mov ecx, [rcx+0x4f]
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(consumer_overwrites, "OR foldable into memory", 1,
+                        X86LINT_EXT_V8);
+
+    // A 64-bit load precedes the OR: nothing proves the upper half zero, so
+    // disjunction and sum may differ. Silent.
+    static const uint8_t load64[] = {
+        0x48, 0x8B, 0x0E,        // mov rcx, [rsi]
+        0x4C, 0x09, 0xF1,        // or rcx, r14
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x89, 0xD1,              // mov ecx, edx
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(load64, "OR foldable into memory", 0, X86LINT_EXT_V8);
+
+    // The merged register is not the cage base (r13): the invariant says
+    // nothing about it. Silent.
+    static const uint8_t not_cage[] = {
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b]
+        0x4C, 0x09, 0xE9,        // or rcx, r13
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x89, 0xD1,              // mov ecx, edx
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(not_cage, "OR foldable into memory", 0, X86LINT_EXT_V8);
+
+    // 32-bit OR: the fold is a 64-bit address computation. Silent.
+    static const uint8_t or32[] = {
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b]
+        0x44, 0x09, 0xF1,        // or ecx, r14d
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x89, 0xD1,              // mov ecx, edx
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(or32, "OR foldable into memory", 0, X86LINT_EXT_V8);
+
+    // The consumer already has an index: r14 has nowhere to go. Silent.
+    static const uint8_t two_indexes[] = {
+        0x8B, 0x4E, 0x6B,              // mov ecx, [rsi+0x6b]
+        0x4C, 0x09, 0xF1,              // or rcx, r14
+        0x44, 0x8B, 0x44, 0x11, 0x4F,  // mov r8d, [rcx+rdx*1+0x4f]
+        0x89, 0xD1,                    // mov ecx, edx
+        0x48, 0x85, 0xDB,              // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(two_indexes, "OR foldable into memory", 0,
+                        X86LINT_EXT_V8);
+
+    // The decompressed pointer stays live past the consumer. Silent.
+    static const uint8_t dest_live[] = {
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b]
+        0x4C, 0x09, 0xF1,        // or rcx, r14
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x48, 0x89, 0xC8,        // mov rax, rcx (reads rcx)
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(dest_live, "OR foldable into memory", 0,
+                        X86LINT_EXT_V8);
+
+    // The OR's flags are read after the consumer. Silent.
+    static const uint8_t flags_live[] = {
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b]
+        0x4C, 0x09, 0xF1,        // or rcx, r14
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x89, 0xD1,              // mov ecx, edx
+        0x74, 0x00,              // jz +0 (reads ZF)
+    };
+    ASSERT_FINDINGS_EXT(flags_live, "OR foldable into memory", 0,
+                        X86LINT_EXT_V8);
+
+    // A direct edge lands on the OR, bypassing the zero-extending load: the
+    // upper half is unknown on that path. Silent.
+    static const uint8_t edge_onto_or[] = {
+        0xEB, 0x03,              // jmp +3 (over the load, onto the or)
+        0x8B, 0x4E, 0x6B,        // mov ecx, [rsi+0x6b]
+        0x4C, 0x09, 0xF1,        // or rcx, r14
+        0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
+        0x89, 0xD1,              // mov ecx, edx
+        0x48, 0x85, 0xDB,        // test rbx, rbx
+    };
+    ASSERT_FINDINGS_EXT(edge_onto_or, "OR foldable into memory", 0,
+                        X86LINT_EXT_V8);
+}
+
 // Multi-instruction peephole: a load whose sole use is the CMP or TEST that
 // follows it folds into that compare, which takes the memory operand directly;
 // check_instructions reports it against the load. The compare must name the
@@ -6912,6 +7022,7 @@ int main(int argc, char *argv[])
     check_load_compare_fold_test();
     check_load_alu_fold_test();
     check_add_memop_fold_test();
+    check_or_memop_fold_test();
     check_add_lea_fold_test();
     check_mulx_fold_test();
     check_mov_add_lea_test();

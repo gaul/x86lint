@@ -1739,10 +1739,14 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_MOVBE;
             } else if (strcmp(argv[i], "apx") == 0) {
                 extensions |= X86LINT_EXT_APX;
+            } else if (strcmp(argv[i], "v8") == 0) {
+                // Not an ISA extension: asserts that R14 holds V8's 4 GB-aligned
+                // pointer-compression cage base (see X86LINT_EXT_V8).
+                extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
                     "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
-                "[-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "[-m bmi1|bmi2|movbe|apx|v8] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -1751,7 +1755,7 @@ int main(int argc, char **argv)
         } else {
             fprintf(stderr,
                 "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
-                "[-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "[-m bmi1|bmi2|movbe|apx|v8] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
@@ -1759,7 +1763,7 @@ int main(int argc, char **argv)
     if (path == NULL) {
         fprintf(stderr,
             "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
-                "[-m bmi1|bmi2|movbe|apx] <ELF_FILE>\n",
+                "[-m bmi1|bmi2|movbe|apx|v8] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }

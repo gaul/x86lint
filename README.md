@@ -555,6 +555,28 @@ argue for or against each, live in [TODO.md](TODO.md).
     the addend's read above anything between them -- in `MOV RCX, R12;
     MOV RBX, [RSP+0x70]; ADD RCX, RBX` (a Go site) it would read RBX
     before the load
+* OR foldable into memory (only with `-m v8`)
+  - `8B4E6B 4C09F1 448B414F` (MOV ECX, [RSI+0x6B]; OR RCX, R14; MOV R8D,
+    [RCX+0x4F]) -- V8's pointer decompression: a 32-bit compressed field is
+    loaded (zero-extending) and merged with the cage base in R14, then used as
+    a base. The OR is an ADD in disguise, because the cage base is 4 GB aligned
+    and the loaded value fits in 32 bits, so the two share no set bits; the
+    consumer's addressing mode carries the sum for free: MOV R8D,
+    [R14+RCX*1+0x4F]. This is the ADD-foldable-into-memory check with a
+    different producer, and it inherits every gate of that check (adjacency,
+    a single index, dead flags, a dead destination, no incoming edge onto the
+    consumer). What it adds is the disjointness proof: the merged register
+    must be R14, the immediately preceding instruction must write the
+    destination as a 32-bit register (which zero-extends), and no direct edge
+    may land on the OR to bypass that write. The alignment of R14 is the one
+    thing the bytes cannot prove, which is why the check is off without `-m
+    v8`. V8 switched this sequence from ADD to OR in 2026-08 (commit
+    2cdd6c55d1a); against JetStream 3 the ADD form had been the second most
+    frequent finding of all. Measured on V8 15.5's JIT output for JetStream
+    3's Kotlin compose benchmark, 6,851 of the 15,457 cage ORs in Liftoff code
+    fold; of the rest, all but 61 fail the adjacency gate (the pointer is
+    consumed later than the next instruction, or compared or stored rather
+    than dereferenced), not the zero-extension proof.
 * oversized ADD/SUB 128
   - `05 80000000` instead of `83E8 80` (ADD EAX, 128 -> SUB EAX, -128)
   - `2D 80000000` instead of `83C0 80` (SUB EAX, 128 -> ADD EAX, -128)
@@ -983,6 +1005,14 @@ surrounding bytes is unsound for binaries like glibc that keep baseline code
 and CPU-dispatched BMI-rich variants in the same section. The flags are
 independent, matching their CPUID feature bits: `-m bmi2` does not imply
 `-m bmi1`.
+
+`-m v8` is a knowledge bit rather than an ISA bit, and is armlint's flag
+of the same name: it asserts a runtime invariant of the scanned code,
+that R14 holds V8's pointer-compression cage base, which is 4 GB aligned
+so its low 32 bits are zero. It enables OR foldable into memory, which is
+unsound for arbitrary code and stays silent without it. Pass it when
+scanning V8's JIT output or its embedded builtins; never for an ordinary
+binary.
 
 Pass `--json` to replace the human report with the findings as a JSON
 document, one object per line inside a `findings` array:

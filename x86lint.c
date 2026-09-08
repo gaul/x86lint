@@ -4275,15 +4275,36 @@ static bool lea_foldable_into_memop(const uint8_t *inst, size_t len,
 // A 32-bit ADD is excluded: it truncates the sum to 32 bits and zero-extends,
 // where the folded 64-bit addressing mode would not, so the two disagree
 // whenever the sum exceeds 32 bits.
+//
+// V8 arm (X86LINT_EXT_V8 / -m v8 only). V8 decompresses a tagged field as
+//
+//   mov ecx, [rsi+0x6b] ; or rcx, r14 ; mov r8d, [rcx+0x4f]
+//                                     -> mov r8d, [r14+rcx*1+0x4f]
+//
+// where R14 is the pointer-compression cage base. The OR is an ADD in
+// disguise: the cage base is 4 GB aligned (low 32 bits zero) and the loaded
+// value is a zero-extended 32-bit compressed pointer, so the operands share no
+// set bits and disjunction equals sum. Nothing in the encoding proves either
+// half. The alignment is the invariant the feature bit asserts; the
+// zero-extension is proved here, by requiring the immediately preceding
+// instruction (`prev`) to write the destination as a 32-bit register (which
+// zero-extends) with no incoming direct edge landing on the OR to bypass it.
+// OR writes every arithmetic flag, so the flag gate is ADD's. Reported under
+// its own name, "OR foldable into memory", returned through `name_out`.
 static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
                                     const uint8_t *branch_targets,
                                     size_t consumer_offset,
-                                    const xed_decoded_inst_t *add)
+                                    const xed_decoded_inst_t *add,
+                                    size_t producer_offset,
+                                    const xed_decoded_inst_t *prev,
+                                    uint32_t extensions,
+                                    const char **name_out)
 {
     // Producer: a register-destination add/sub/inc/dec at 64 bits. A memory
     // destination (including every locked form) computes no register address.
     xed_iclass_enum_t pic = xed_decoded_inst_get_iclass(add);
     uint32_t flags_written;
+    *name_out = "ADD foldable into memory";
     switch (pic) {
     case XED_ICLASS_ADD:
     case XED_ICLASS_SUB:
@@ -4293,6 +4314,13 @@ static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
     case XED_ICLASS_DEC:
         // inc/dec leave CF untouched, so only the flags they write can be lost.
         flags_written = FLAG_ARITH & ~FLAG_CF;
+        break;
+    case XED_ICLASS_OR:
+        if ((extensions & X86LINT_EXT_V8) == 0) {
+            return false;
+        }
+        flags_written = FLAG_ARITH;
+        *name_out = "OR foldable into memory";
         break;
     default:
         return false;
@@ -4315,6 +4343,9 @@ static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
         disp_p = -1;
     } else if (xed_operand_values_has_immediate(
                    xed_decoded_inst_operands_const(add))) {
+        if (pic == XED_ICLASS_OR) {
+            return false;   // the V8 arm merges the cage register only
+        }
         int64_t imm = xed_decoded_inst_get_signed_immediate(add);
         if (imm == 0) {
             return false;   // the add/sub is check_add_sub_zero's
@@ -4334,6 +4365,20 @@ static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
             return false;
         }
         disp_p = 0;
+        if (pic == XED_ICLASS_OR) {
+            // The V8 arm: the merged register must be the cage base, and the
+            // destination must provably hold a zero-extended 32-bit value --
+            // written by the immediately preceding instruction as a 32-bit
+            // register, on a path no direct edge can enter after that write.
+            if (index_p != XED_REG_R14 || dest == XED_REG_R14) {
+                return false;
+            }
+            if (prev == NULL || !writes_zero_extended_32(prev, dest) ||
+                branch_target_in(branch_targets, producer_offset,
+                                 producer_offset + 1)) {
+                return false;
+            }
+        }
     }
 
     // Consumer: one memory operand based on dest, dest not also its index, no
@@ -7604,8 +7649,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // the next instruction uses as a memory base, leaving reg dead and the
         // flags it set unread. Reported against the add (at `offset`), the
         // removable instruction. See add_foldable_into_memop.
-        if (add_foldable_into_memop(inst, len, branch_targets, next, &xedd)) {
-            emit_finding(&sink, "ADD foldable into memory", offset, &xedd,
+        const char *memop_fold_name;
+        if (add_foldable_into_memop(inst, len, branch_targets, next, &xedd,
+                                    offset, have_prev ? &prev : NULL,
+                                    extensions, &memop_fold_name)) {
+            emit_finding(&sink, memop_fold_name, offset, &xedd,
                 inst + offset);
             ++errors;
         }

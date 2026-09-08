@@ -427,6 +427,16 @@ enum x86lint_extensions {
     X86LINT_EXT_BMI2 = 1u << 1,  // BZHI, MULX, PDEP, PEXT, RORX, SHLX, ...
     X86LINT_EXT_MOVBE = 1u << 2, // MOVBE (byte-swapping load/store)
     X86LINT_EXT_APX = 1u << 3,   // EVEX-promoted NDD three-operand forms, ...
+    // V8 differs in kind from the ISA bits above: it asserts a runtime
+    // invariant of the scanned code rather than a hardware capability -- that
+    // R14 holds V8's pointer-compression cage base (kPtrComprCageBaseRegister),
+    // which is 4 GB aligned so its low 32 bits are zero. V8 decompresses a
+    // tagged field with `mov r32, [obj+off]; or r64, r14`, and the OR equals an
+    // ADD only because the two operands share no set bits. The checks it gates
+    // (OR foldable into memory) are unsound for arbitrary code and stay silent
+    // without it. The armlint twin is -m v8 (ARMLINT_FEATURE_V8, whose cage
+    // half is ARMLINT_FEATURE_V8CAGE).
+    X86LINT_EXT_V8 = 1u << 4,
 };
 
 // How many instructions the copy folds -- missing APX NDD and MOV+ADD

@@ -346,12 +346,37 @@ instruction counts the rest of this file uses:
 | Pattern | Rewrite | 2026-09 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
 | ~~zeroing idiom (`XOR r, r` / `SUB r, r`) + `TEST r, r` of any width of that register~~ | ~~delete the `TEST`; `CMOVE` -> `MOV`, `JE` -> `JMP`, `JNE`/`CMOVNE` deleted~~ | **Done: "constant condition after zeroing".** Swept population 809 (uutils 521, libxul 276, geckodriver 7, http3server 5, and 0 in go, libc, bash, ld.so, libcrypto and libstdc++); realized **914** (uutils 562, libxul 338, geckodriver 9, http3server 5, 0 everywhere else). The first row in this file to realize *more* than its sweep predicted -- see the note below |
-| `MOV r, imm` + `TEST r, r` or `CMP r, imm2` | same, with the outcome decided by the two immediates | **521.** libxul 457 (15.2), uutils 52 (26), geckodriver 6 (8.4), go 0, and 0 in every C binary |
+| ~~`MOV r, imm` + `TEST r, r` or `CMP r, imm2`~~ | ~~same, with the outcome decided by the two immediates~~ | **Done: "constant condition after immediate".** Swept population 521 (libxul 457, uutils 52, geckodriver 6, and 0 in every C binary); realized **629** (libxul 520, uutils 79, geckodriver 20, http3server 9, libcrypto 1, 0 everywhere else) -- see the note below on what the sweep got wrong in both directions |
+
+**What the immediate arm's sweep got wrong, in both directions.** Its raw
+count was 457 libxul sites, its realized count 520, and the two numbers
+agree by accident: three separate errors, two of them large and pulling
+opposite ways. The census took *any* third instruction as the consumer,
+which cost nothing here (455 of the 457 do read the condition) but was
+luck, not method. Against that, it counted only an adjacent compare,
+where the check searches `APX_NDD_WINDOW`: 65 of libxul's 520 have a gap
+instruction between the load and the compare, and the site sets agree
+exactly otherwise (census-only 0). The third error was the interesting
+one, and it was mine rather than the census's. The first draft of the
+check copied the zeroing arm's rule and refused 8- and 16-bit producers,
+on the argument that `mov cl, 5` leaves bits 63:8 unknown -- true of a
+wider compare, and irrelevant to `test cl, cl`, which reads exactly the
+bits the load wrote. That draft found 172. Splitting the census showed
+the refusal was throwing away **323 of 455** libxul sites, so the check
+carries a bit-range model (`gpr_bit_range`) instead of a width test, and
+gets the high-byte names right while it is there: AH covers bits 15:8,
+so `mov al, 5 ; test ah, ah` proves nothing. A gate that looks like a
+detail is worth measuring before it is believed.
+
+The same refusal in the zeroing arm costs nothing, which is why it
+stays: a census of narrow zeroing idioms (`xor cl, cl` and the like)
+followed by a same-width `TEST` and a consumer finds **0 sites in both
+libxul and uutils**. Compilers zero with `xor r32, r32`.
 
 **Realized above predicted, for once, and why.** Every other row in this
-file overstated its rewrite by between 5x and 300x. This one understated
-it, by 13%: 914 findings against 809 swept sites, with no site the sweep
-found and the check misses. The sweep was an objdump pass that matched
+file overstated its rewrite by between 5x and 300x. The zeroing arm
+understated it, by 13%: 914 findings against 809 swept sites, with no
+site the sweep found and the check misses. The sweep was an objdump pass that matched
 the `TEST` **immediately** after the zeroing instruction, because that is
 what a quick census can express; the check searches `APX_NDD_WINDOW` past
 instructions that leave the tested register alone. Classifying libxul's
@@ -418,15 +443,15 @@ Distance is not needed: uutils' histogram is 559 at d1 against 32 at
 d2 and 13 beyond, so adjacency plus the existing flag-producer walk
 covers the population.
 
-The proof burden is the lightest of any open row. The first arm needs
+The proof burden was the lightest of any row in this file. The first arm needs
 no constant model at all -- a zeroing idiom is recognized by its two
 operands naming one register -- and the second needs a single
 immediate, where the `remat|movimm` row above needs a tracked constant
-per register. What both need beyond the shipped machinery is a flag
+per register. What both needed beyond the shipped machinery was a flag
 *consumer* search: `flags_live_after` already walks forward sixteen
 instructions, but it answers whether the flags are read, not by which
-condition, and this check has to name the consumer and read its
-condition code to say which way the outcome falls.
+condition, and these checks have to name the consumer and see that it
+reads one.
 
 The shipped "redundant TEST after flags" reports 28 on uutils and 9 on
 geckodriver, so this is a gap rather than a re-count of covered ground.

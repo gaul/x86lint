@@ -2727,6 +2727,161 @@ static void check_zeroed_condition_test(void)
     ASSERT_FINDINGS(edge_on_head, "constant condition after zeroing", 1);
 }
 
+// Multi-instruction peephole: the second arm of the same family. A register
+// loaded with an immediate and then compared against a constant -- test reg,
+// reg, or cmp reg, imm -- leaves every flag decided at assembly time, so the
+// Jcc, CMOVcc or SETcc below has one outcome. Reported at the compare.
+static void check_movimm_condition_test(void)
+{
+    // mov r10d, 0x3f ; test r10d, r10d ; jg -- the value is nonzero and
+    // positive, so the branch is always taken.
+    static const uint8_t mov_test_jg[] = {
+        0x41, 0xBA, 0x3F, 0x00, 0x00, 0x00,  // mov r10d, 0x3f
+        0x45, 0x85, 0xD2,                    // test r10d, r10d
+        0x7F, 0x00,                          // jg +0
+    };
+    ASSERT_FINDINGS(mov_test_jg, "constant condition after immediate", 1);
+
+    // mov ecx, 0x10 ; cmp rcx, 0x28 ; ja -- both operands of the compare are
+    // constants, and a 32-bit mov zero-extends, so the 64-bit compare reads no
+    // unknown bit. The branch is never taken, which also says the code it
+    // guards is unreachable from here.
+    static const uint8_t mov_cmp_ja[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x48, 0x83, 0xF9, 0x28,        // cmp rcx, 0x28
+        0x77, 0x00,                    // ja +0
+    };
+    ASSERT_FINDINGS(mov_cmp_ja, "constant condition after immediate", 1);
+
+    // A CMOVcc consumer, which the redundant-compare framing cannot reach.
+    static const uint8_t mov_cmp_cmove[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x83, 0xF9, 0x10,              // cmp ecx, 0x10
+        0x48, 0x0F, 0x44, 0xD8,        // cmove rbx, rax
+    };
+    ASSERT_FINDINGS(mov_cmp_cmove, "constant condition after immediate", 1);
+
+    // mov cl, 5 ; test rcx, rcx ; je -- the 8-bit load leaves bits 63:8
+    // unknown, which the wider test reads: no match.
+    static const uint8_t mov_narrow[] = {
+        0xB1, 0x05,              // mov cl, 5
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(mov_narrow, "constant condition after immediate", 0);
+
+    // mov cl, 5 ; test cl, cl ; jne -- the same narrow load, compared at the
+    // width it wrote, is proven: the branch is always taken. This shape, not
+    // the wide one, is most of the population.
+    static const uint8_t mov_narrow_same[] = {
+        0xB1, 0x05,              // mov cl, 5
+        0x84, 0xC9,              // test cl, cl
+        0x75, 0x00,              // jne +0
+    };
+    ASSERT_FINDINGS(mov_narrow_same, "constant condition after immediate", 1);
+
+    // mov ah, 5 ; test ah, ah ; jne -- the high-byte names cover bits 15:8,
+    // not 7:0, and the range model has to say so rather than assume every
+    // 8-bit name starts at zero.
+    static const uint8_t mov_high_byte[] = {
+        0xB4, 0x05,              // mov ah, 5
+        0x84, 0xE4,              // test ah, ah
+        0x75, 0x00,              // jne +0
+    };
+    ASSERT_FINDINGS(mov_high_byte, "constant condition after immediate", 1);
+
+    // mov al, 5 ; test ah, ah ; jne -- same enclosing register, disjoint bits:
+    // no match.
+    static const uint8_t mov_low_test_high[] = {
+        0xB0, 0x05,              // mov al, 5
+        0x84, 0xE4,              // test ah, ah
+        0x75, 0x00,              // jne +0
+    };
+    ASSERT_FINDINGS(mov_low_test_high, "constant condition after immediate", 0);
+
+    // mov ecx, ebx ; test rcx, rcx ; je -- a register move carries no known
+    // value.
+    static const uint8_t mov_reg[] = {
+        0x89, 0xD9,              // mov ecx, ebx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x00,              // je +0
+    };
+    ASSERT_FINDINGS(mov_reg, "constant condition after immediate", 0);
+
+    // mov ecx, 0x10 ; cmp rcx, rdx ; je -- the second operand is a register,
+    // so the comparison has an unknown in it.
+    static const uint8_t cmp_reg[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x48, 0x39, 0xD1,              // cmp rcx, rdx
+        0x74, 0x00,                    // je +0
+    };
+    ASSERT_FINDINGS(cmp_reg, "constant condition after immediate", 0);
+
+    // The same with a memory operand: also unknown.
+    static const uint8_t cmp_mem[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x48, 0x3B, 0x08,              // cmp rcx, [rax]
+        0x74, 0x00,                    // je +0
+    };
+    ASSERT_FINDINGS(cmp_mem, "constant condition after immediate", 0);
+
+    // A test of another register says nothing about this one.
+    static const uint8_t test_other[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x85, 0xD2,                    // test edx, edx
+        0x74, 0x00,                    // je +0
+    };
+    ASSERT_FINDINGS(test_other, "constant condition after immediate", 0);
+
+    // No consumer: the flags are unread, so the site is a dead compare rather
+    // than a decided condition.
+    static const uint8_t no_consumer[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x85, 0xC9,                    // test ecx, ecx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(no_consumer, "constant condition after immediate", 0);
+
+    // A gap that writes the flags is fine -- the compare redefines every flag
+    // the branch reads.
+    static const uint8_t flag_gap[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x39, 0xD8,                    // cmp eax, ebx
+        0x85, 0xC9,                    // test ecx, ecx
+        0x74, 0x00,                    // je +0
+    };
+    ASSERT_FINDINGS(flag_gap, "constant condition after immediate",
+                    APX_NDD_WINDOW >= 3 ? 1 : 0);
+
+    // A gap that writes the loaded register destroys the known value.
+    static const uint8_t reg_gap[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x89, 0xD9,                    // mov ecx, ebx
+        0x85, 0xC9,                    // test ecx, ecx
+        0x74, 0x00,                    // je +0
+    };
+    ASSERT_FINDINGS(reg_gap, "constant condition after immediate", 0);
+
+    // An incoming direct edge onto the compare arrives without the load.
+    static const uint8_t edge_on_cmp[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // 0: mov ecx, 0x10
+        0x85, 0xC9,                    // 5: test ecx, ecx  <- branch target
+        0x74, 0x00,                    // 7: je +0
+        0xEB, 0xFA,                    // 9: jmp 5
+    };
+    ASSERT_FINDINGS(edge_on_cmp, "constant condition after immediate", 0);
+
+    // An edge onto the load executes it, so the value is known on that path
+    // too: fires.
+    static const uint8_t edge_on_head[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // 0: mov ecx, 0x10  <- branch target
+        0x85, 0xC9,                    // 5: test ecx, ecx
+        0x74, 0x00,                    // 7: je +0
+        0xEB, 0xF5,                    // 9: jmp 0
+    };
+    ASSERT_FINDINGS(edge_on_head, "constant condition after immediate", 1);
+}
+
 // Multi-instruction peephole: a SHL/SHR/SAR of a register by a statically
 // nonzero count -- a nonzero masked immediate, or the by-one D0/D1 forms --
 // sets SF/ZF/PF exactly as test reg, reg would, so a following test on the
@@ -7173,6 +7328,7 @@ int main(int argc, char *argv[])
     check_upper32_identity_gate_test();
     check_redundant_flags_test();
     check_zeroed_condition_test();
+    check_movimm_condition_test();
     check_redundant_shift_test();
     check_lea_fold_test();
     check_mov_const_fold_test();

@@ -3898,6 +3898,121 @@ static bool shift_test_redundant(const uint8_t *inst, size_t len,
     return false;
 }
 
+// The shared tail of the two constant-condition checks below: from
+// `after_compare`, find the first instruction that reads a flag and decide
+// whether it is a consumer this rewrite reaches. The compare above it has set
+// every flag from operands known at assembly time, so any Jcc, CMOVcc or SETcc
+// found here has an outcome decided at assembly time. Anything that writes a
+// flag first leaves the consumer reading something other than those constants,
+// and anything that transfers control ends the straight-line path.
+//
+// The side-entry gate spans the whole site, from `after_producer` through the
+// consumer: a direct edge onto the compare, onto anything between, or onto the
+// consumer itself arrives without having executed the producer, so the value
+// the compare reads on that path is not the known one. This is stricter than
+// the redundant-TEST checks', which gate only the producer-to-compare span on
+// the argument that a path jumping to the consumer sees the flags unchanged --
+// true when the rewrite merely deletes a compare, false when the whole claim
+// is about the consumer.
+static bool constant_condition_consumed(const uint8_t *inst, size_t len,
+                                        const uint8_t *branch_targets,
+                                        size_t after_producer,
+                                        size_t after_compare)
+{
+    size_t consumer = after_compare;
+    for (int step = 0; step < APX_NDD_WINDOW - 1; ++step) {
+        if (consumer >= len) {
+            return false;
+        }
+        xed_decoded_inst_t user;
+        decode_init(&user);
+        if (xed_decode(&user, inst + consumer, len - consumer) !=
+            XED_ERROR_NONE) {
+            return false;
+        }
+        size_t after_consumer = consumer + xed_decoded_inst_get_length(&user);
+
+        if (branch_target_in(branch_targets, after_producer, after_consumer)) {
+            return false;
+        }
+
+        const xed_simple_flag_t *fi = xed_decoded_inst_get_rflags_info(&user);
+        uint32_t read = fi == NULL ? 0 :
+            flag_set_to_mask(xed_simple_flag_get_read_flag_set(fi));
+        uint32_t written = fi == NULL ? 0 :
+            (flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
+             flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi)));
+        xed_category_enum_t category = xed_decoded_inst_get_category(&user);
+
+        if (read != 0) {
+            // Only the three condition-consuming families are rewritten by a
+            // decided condition. Others that read a flag (ADC and SBB read CF,
+            // which is likewise constant here) would need their own rewrite
+            // and are left alone.
+            return category == XED_CATEGORY_COND_BR ||
+                   category == XED_CATEGORY_CMOV ||
+                   category == XED_CATEGORY_SETCC;
+        }
+        if (written != 0) {
+            return false;
+        }
+        switch (category) {
+        case XED_CATEGORY_CALL:
+        case XED_CATEGORY_RET:
+        case XED_CATEGORY_UNCOND_BR:
+        case XED_CATEGORY_COND_BR:      // JRCXZ and LOOP read no flag
+        case XED_CATEGORY_SYSCALL:
+        case XED_CATEGORY_SYSRET:
+        case XED_CATEGORY_INTERRUPT:
+            return false;
+        default:
+            break;
+        }
+        consumer = after_consumer;
+    }
+    return false;
+}
+
+// The other half shared by the two checks below: whether an instruction
+// between the producer and the compare leaves the producer's claim standing.
+// Only a write of `dest_enc` (in any width) breaks it, plus any control
+// transfer, which ends the straight-line path. Unlike flags_gap_transparent
+// this permits flag writes: the compare below redefines every flag the
+// consumer reads, so what the gap did to them does not matter.
+static bool known_reg_gap_transparent(const xed_decoded_inst_t *gap,
+                                      xed_reg_enum_t dest_enc)
+{
+    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
+    if (category == XED_CATEGORY_CALL ||
+        category == XED_CATEGORY_RET ||
+        category == XED_CATEGORY_UNCOND_BR ||
+        category == XED_CATEGORY_COND_BR ||
+        category == XED_CATEGORY_SYSCALL ||
+        category == XED_CATEGORY_SYSRET ||
+        category == XED_CATEGORY_INTERRUPT) {
+        return false;
+    }
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *operand = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(operand);
+        // As in flags_gap_transparent, the memory-addressing names carry the
+        // stack-pointer updates XED reports nowhere else.
+        if ((!xed_operand_is_register(name) &&
+             !xed_operand_is_memory_addressing_register(name)) ||
+            !xed_operand_written(operand)) {
+            continue;
+        }
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(gap, name)) == dest_enc) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Multi-instruction peephole: a TEST of a register a zeroing idiom just
 // cleared. The register is provably zero, so the TEST does not compute a
 // condition -- it restates one, setting ZF=1, SF=0, PF=1 and clearing CF and
@@ -3932,59 +4047,23 @@ static bool shift_test_redundant(const uint8_t *inst, size_t len,
 // SUB forms with both operands naming one register. The 8- and 16-bit forms
 // are left out on purpose: xor cl, cl zeroes eight bits, and a wider TEST of
 // RCX would read bits it never touched. The 32-bit form needs no such care,
-// since a 32-bit write zero-extends the whole register.
+// since a 32-bit write zero-extends the whole register. Unlike the immediate
+// arm below, which carries a bit-range model because narrow loads compared at
+// their own width are most of its population, this arm loses nothing to the
+// refusal: a census of narrow zeroing idioms followed by a same-width TEST and
+// a consumer finds no site at all in either libxul or uutils, since compilers
+// zero with xor r32, r32.
 //
-// The side-entry discipline is stricter here than in the two siblings, and
-// deliberately so. They gate only the span from producer to test, on the
-// argument that a path jumping straight to the consumer never executed the
-// test and so sees its flags unchanged. That argument holds for deleting a
-// redundant TEST; it fails for this rewrite, whose whole claim is about the
-// consumer. So a direct edge onto the test, onto anything between the
-// producer and the consumer, or onto the consumer itself suppresses the
-// finding: the register that path arrives with need not be zero. Getting
-// this backwards is expensive in both directions -- a sweep of uutils
-// coreutils counts the shape 1,096 times raw, 521 with this gate, and 189 if
-// the gate wrongly also rejects an edge onto the zeroing instruction (an
-// entry there still executes it, so those sites are sound).
+// The consumer search and the side-entry gate are constant_condition_consumed
+// above. Getting that gate wrong is expensive in both directions: a sweep of
+// uutils coreutils counts this shape 1,096 times raw, 521 with the gate, and
+// 189 if the gate wrongly also rejects an edge onto the zeroing instruction
+// (an entry there still executes it, so those sites are sound).
 //
 // Reported at the TEST, the first removable instruction, as the siblings are.
 // The consumer is required: without one the flags are unread and the site is
 // a dead TEST rather than a decided condition, which is a different claim
 // than this check's name makes.
-static bool zeroed_test_gap_transparent(const xed_decoded_inst_t *gap,
-                                        xed_reg_enum_t dest_enc)
-{
-    xed_category_enum_t category = xed_decoded_inst_get_category(gap);
-    if (category == XED_CATEGORY_CALL ||
-        category == XED_CATEGORY_RET ||
-        category == XED_CATEGORY_UNCOND_BR ||
-        category == XED_CATEGORY_COND_BR ||
-        category == XED_CATEGORY_SYSCALL ||
-        category == XED_CATEGORY_SYSRET ||
-        category == XED_CATEGORY_INTERRUPT) {
-        return false;
-    }
-
-    const xed_inst_t *xi = xed_decoded_inst_inst(gap);
-    unsigned nops = xed_inst_noperands(xi);
-    for (unsigned i = 0; i < nops; ++i) {
-        const xed_operand_t *operand = xed_inst_operand(xi, i);
-        xed_operand_enum_t name = xed_operand_name(operand);
-        // As in flags_gap_transparent, the memory-addressing names carry the
-        // stack-pointer updates XED reports nowhere else.
-        if ((!xed_operand_is_register(name) &&
-             !xed_operand_is_memory_addressing_register(name)) ||
-            !xed_operand_written(operand)) {
-            continue;
-        }
-        if (xed_get_largest_enclosing_register(
-                xed_decoded_inst_get_reg(gap, name)) == dest_enc) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
                                            const uint8_t *branch_targets,
                                            size_t after_producer,
@@ -4037,78 +4116,168 @@ static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
             tested == XED_REG_INVALID ||
             tested != xed_decoded_inst_get_reg(test_out, XED_OPERAND_REG1) ||
             xed_get_largest_enclosing_register(tested) != dest_enc) {
-            if (!zeroed_test_gap_transparent(test_out, dest_enc)) {
+            if (!known_reg_gap_transparent(test_out, dest_enc)) {
                 return false;
             }
             cur = after;
             continue;
         }
 
-        // The condition consumer: the first instruction past the test that
-        // reads any flag. Anything that writes a flag first leaves the
-        // consumer reading something other than the test's constants, and
-        // anything that transfers control ends the straight-line path.
-        size_t consumer = after;
-        for (int step = 0; step < APX_NDD_WINDOW - 1; ++step) {
-            if (consumer >= len) {
-                return false;
-            }
-            xed_decoded_inst_t user;
-            decode_init(&user);
-            if (xed_decode(&user, inst + consumer, len - consumer) !=
-                XED_ERROR_NONE) {
-                return false;
-            }
-            size_t after_consumer =
-                consumer + xed_decoded_inst_get_length(&user);
-
-            // An incoming direct edge anywhere from the test through the
-            // consumer arrives without the zeroing, so the condition it reads
-            // is not constant on that path.
-            if (branch_target_in(branch_targets, after_producer,
-                                 after_consumer)) {
-                return false;
-            }
-
-            const xed_simple_flag_t *fi = xed_decoded_inst_get_rflags_info(&user);
-            uint32_t read = fi == NULL ? 0 :
-                flag_set_to_mask(xed_simple_flag_get_read_flag_set(fi));
-            uint32_t written = fi == NULL ? 0 :
-                (flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
-                 flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi)));
-            xed_category_enum_t category = xed_decoded_inst_get_category(&user);
-
-            if (read != 0) {
-                // Only the three condition-consuming families are rewritten
-                // by a decided condition. Others that read a flag (ADC and
-                // SBB read CF, which is likewise constant here) would need
-                // their own rewrite and are left alone.
-                if (category != XED_CATEGORY_COND_BR &&
-                    category != XED_CATEGORY_CMOV &&
-                    category != XED_CATEGORY_SETCC) {
-                    return false;
-                }
-                *test_offset_out = cur;
-                return true;
-            }
-            if (written != 0) {
-                return false;
-            }
-            switch (category) {
-            case XED_CATEGORY_CALL:
-            case XED_CATEGORY_RET:
-            case XED_CATEGORY_UNCOND_BR:
-            case XED_CATEGORY_COND_BR:      // JRCXZ and LOOP read no flag
-            case XED_CATEGORY_SYSCALL:
-            case XED_CATEGORY_SYSRET:
-            case XED_CATEGORY_INTERRUPT:
-                return false;
-            default:
-                break;
-            }
-            consumer = after_consumer;
+        if (!constant_condition_consumed(inst, len, branch_targets,
+                                         after_producer, after)) {
+            return false;
         }
+        *test_offset_out = cur;
+        return true;
+    }
+    return false;
+}
+
+// The bits of the enclosing 64-bit register a GPR name covers, as the
+// half-open range [lo, hi). AL is [0, 8), AH is [8, 16), AX [0, 16), EAX
+// [0, 32) and RAX [0, 64). Callers writing a 32-bit name widen the result to
+// [0, 64) themselves, since such a write zero-extends. False for anything that
+// is not a GPR.
+static bool gpr_bit_range(xed_reg_enum_t reg, unsigned *lo, unsigned *hi)
+{
+    if (xed_reg_class(reg) != XED_REG_CLASS_GPR) {
         return false;
+    }
+    switch (reg) {
+    case XED_REG_AH:
+    case XED_REG_CH:
+    case XED_REG_DH:
+    case XED_REG_BH:
+        *lo = 8;
+        *hi = 16;
+        return true;
+    default:
+        break;
+    }
+    unsigned int width = xed_get_register_width_bits64(reg);
+    if (width != 8 && width != 16 && width != 32 && width != 64) {
+        return false;
+    }
+    *lo = 0;
+    *hi = width;
+    return true;
+}
+
+// Multi-instruction peephole: the second arm of the same family. A register
+// loaded with an immediate is compared against a second constant, so the
+// compare's flags -- and the condition its consumer reads -- are decided at
+// assembly time:
+//
+//   mov r10d, 0x3f ; test r10d, r10d ; jg  L  ->  jmp L   (always taken)
+//   mov ecx, 0x10  ; cmp rcx, 0x28   ; ja  L  ->  (dead; L is unreachable
+//                                                  from here)
+//
+// Where the zeroing arm recognizes its constant from the shape of the
+// producer's operands, this one reads it from the encoding, which is the only
+// difference in the proof: both leave every flag the consumer reads a function
+// of values fixed at assembly time, so neither needs to evaluate the condition
+// to know it has one outcome. The consumer search, the side-entry gate and the
+// gap rule are shared with the zeroing arm; see constant_condition_consumed
+// and known_reg_gap_transparent.
+//
+// Where the zeroing arm accepts a compare at any width, because a zeroed
+// register is zero in all of them, this one has to say which bits it knows.
+// The producer is a register MOV of an immediate at any width, and the compare
+// must read only bits that MOV wrote: gpr_bit_range spells both as ranges of
+// the enclosing register, widened to [0, 64) for a 32-bit destination, which
+// zero-extends. So mov cl, 5 ; test cl, cl is admitted and mov cl, 5 ;
+// test rcx, rcx is not, the latter reading 56 bits this check knows nothing
+// about. That distinction is most of the population rather than an edge case:
+// of 455 candidate sites in libxul, 323 load 8 or 16 bits and compare exactly
+// those.
+//
+// The compare is TEST reg, reg on the loaded register, or CMP of it against an
+// immediate -- in both cases every bit either operand contributes is known. A
+// memory operand on either instruction, or a CMP against a second register,
+// leaves an unknown in the comparison and is refused. (XED spells the second
+// operand of the immediate forms as RFLAGS rather than as no register, so that
+// refusal is written as a register-class test.)
+//
+// Reported at the compare, the first instruction the rewrite removes, as the
+// zeroing arm is. This shape is common in generated code that specializes a
+// bound or a mode flag and then re-checks it: 457 findings in libxul, of which
+// wasm2c's generated dispatcher supplies 93, against 0 in every C binary in
+// the corpus.
+static bool movimm_condition_constant(const uint8_t *inst, size_t len,
+                                      const uint8_t *branch_targets,
+                                      size_t after_producer,
+                                      const xed_decoded_inst_t *producer,
+                                      xed_decoded_inst_t *cmp_out,
+                                      size_t *cmp_offset_out)
+{
+    if (xed_decoded_inst_get_iclass(producer) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(producer) > 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(producer))) {
+        return false;
+    }
+    xed_reg_enum_t loaded = xed_decoded_inst_get_reg(producer, XED_OPERAND_REG0);
+    if (loaded == XED_REG_INVALID ||
+        xed_reg_class(loaded) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    unsigned int known_lo;
+    unsigned int known_hi;
+    if (!gpr_bit_range(loaded, &known_lo, &known_hi)) {
+        return false;
+    }
+    if (known_hi == 32) {
+        known_hi = 64;          // a 32-bit write zero-extends
+    }
+    xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(loaded);
+
+    size_t cur = after_producer;
+    for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
+        if (cur >= len) {
+            return false;
+        }
+        decode_init(cmp_out);
+        if (xed_decode(cmp_out, inst + cur, len - cur) != XED_ERROR_NONE) {
+            return false;
+        }
+        size_t after = cur + xed_decoded_inst_get_length(cmp_out);
+
+        xed_reg_enum_t reg0 =
+            xed_decoded_inst_get_reg(cmp_out, XED_OPERAND_REG0);
+        xed_reg_enum_t reg1 =
+            xed_decoded_inst_get_reg(cmp_out, XED_OPERAND_REG1);
+        // TEST reg, reg on the loaded register, or CMP of it against an
+        // immediate, reading no bit outside the range the MOV wrote. XED
+        // spells the second operand of the immediate forms as RFLAGS rather
+        // than as no register, so the GPR check is by class.
+        unsigned int read_lo = 0;
+        unsigned int read_hi = 0;
+        bool compares_constant =
+            xed_decoded_inst_number_of_memory_operands(cmp_out) == 0 &&
+            reg0 != XED_REG_INVALID &&
+            gpr_bit_range(reg0, &read_lo, &read_hi) &&
+            xed_get_largest_enclosing_register(reg0) == dest_enc &&
+            read_lo >= known_lo && read_hi <= known_hi &&
+            ((xed_decoded_inst_get_iclass(cmp_out) == XED_ICLASS_TEST &&
+              reg1 == reg0) ||
+             (xed_decoded_inst_get_iclass(cmp_out) == XED_ICLASS_CMP &&
+              xed_reg_class(reg1) != XED_REG_CLASS_GPR &&
+              xed_operand_values_has_immediate(
+                  xed_decoded_inst_operands_const(cmp_out))));
+        if (!compares_constant) {
+            if (!known_reg_gap_transparent(cmp_out, dest_enc)) {
+                return false;
+            }
+            cur = after;
+            continue;
+        }
+
+        if (!constant_condition_consumed(inst, len, branch_targets,
+                                         after_producer, after)) {
+            return false;
+        }
+        *cmp_offset_out = cur;
+        return true;
     }
     return false;
 }
@@ -7844,6 +8013,19 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (zeroed_condition) {
             emit_finding(&sink, "constant condition after zeroing",
                 zeroed_test_offset, &zeroed_test, inst + zeroed_test_offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole, the second arm of the same family: a
+        // register loaded with an immediate and then compared against another
+        // constant, leaving the Jcc, CMOVcc or SETcc below it decided.
+        // Reported at the compare. See movimm_condition_constant.
+        xed_decoded_inst_t const_cmp;
+        size_t const_cmp_offset;
+        if (movimm_condition_constant(inst, len, branch_targets, next, &xedd,
+                                      &const_cmp, &const_cmp_offset)) {
+            emit_finding(&sink, "constant condition after immediate",
+                const_cmp_offset, &const_cmp, inst + const_cmp_offset);
             ++errors;
         }
 

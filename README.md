@@ -190,6 +190,32 @@ argue for or against each, live in [TODO.md](TODO.md).
     bits, so it neither sets nor clears the state. An unseen indirect
     edge could only reach a flagged site with clean uppers, where both
     fixes stay harmless
+* constant condition after immediate
+  - `B910000000 4883F928 77xx` (MOV ECX, 0x10; CMP RCX, 0x28; JA) -- the
+    register holds a constant and the compare's other operand is a second
+    constant, so every flag is decided at assembly time and the Jcc, CMOVcc or
+    SETcc reading them has one outcome: 0x10 is not above 0x28, so the JA above
+    is never taken. The immediate sibling of "constant condition after
+    zeroing", sharing its consumer search and its side-entry gate; the
+    difference is only where the constant comes from, read here from the
+    encoding rather than from a producer whose two operands name one register.
+    Neither arm evaluates the condition -- knowing that both operands are fixed
+    is enough to know the outcome is.
+    The compare must read only bits the MOV wrote, which is a real constraint
+    rather than a formality: `MOV CL, 5; TEST CL, CL` is admitted and
+    `MOV CL, 5; TEST RCX, RCX` is not, the latter reading 56 bits the MOV left
+    alone, and the high-byte names (AH, CH, DH, BH) cover bits 15:8 rather than
+    7:0. Narrow loads compared at their own width are most of the population,
+    not an edge case: 323 of libxul's 455 adjacent sites. Accepts `TEST reg,
+    reg` on the loaded register and `CMP reg, imm`; a memory operand on either
+    instruction, or a CMP against a second register, leaves an unknown in the
+    comparison. The compare is searched for through `APX_NDD_WINDOW` past
+    instructions that leave the register alone, and a consumer is required.
+    As with the zeroing arm, a never-taken branch says the code it guards is
+    unreachable from here. Again a Rust and C++ shape: 520 findings in libxul,
+    79 in uutils coreutils, 20 in geckodriver and 9 in http3server, against a
+    single site in libcrypto (an inlined constant-size copy in
+    `WHIRLPOOL_Final`) and 0 in glibc, ld.so, bash, libstdc++ and go
 * constant condition after zeroing
   - `31C9 4885C9 74xx` (XOR ECX, ECX; TEST RCX, RCX; JE) -- the register is
     provably zero, so the TEST computes no condition: it sets ZF=1, SF=0, PF=1

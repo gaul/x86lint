@@ -262,6 +262,15 @@ is not what this tool emits, and the only way to know which side of
 that line a family falls on is to measure the result's encoding rather
 than the input's shape.
 
+The line is drawn per core, which turns the exclusion into a
+target-axis question rather than a closed one. Agner Fog's instruction
+tables (read 2026-09) give the three-component form 3 cycles on port 1
+on Skylake, no separate row at all on Ice Lake and Tiger Lake -- their
+"with index" form is 1 cycle on p15, the same as two components -- and
+2 cycles as 2 ops on Zen 3 through Zen 5. On Ice Lake and later the
+37,037 win on every axis the check measures. Filed as [#28](https://github.com/gaul/x86lint/issues/28),
+together with the other per-core caveats a `-t` knob would gate.
+
 
 ## Constants
 
@@ -304,11 +313,16 @@ future implementer:
   is the piece to settle first: a `MOV r64, r64` handled at rename is 0
   latency and 0 ports, which would make the copy better than the
   immediate on every axis, but GPR move elimination is reportedly
-  *disabled* from Ice Lake onward. **Unverified here** -- check
-  uops.info before writing any code, because the entire desirability
-  argument rests on it. If elimination is off on current Intel, this is
-  the slow-LEA situation again: sound, tens of thousands of sites, and
-  trading a cycle for two bytes.
+  *disabled* from Ice Lake onward. Agner Fog's tables (read 2026-09)
+  settle it per core: `MOV r32/64, r32/64` is latency 0 by renaming on
+  Zen 1 through Zen 5, 0-1 and "may be eliminated" on Ivy Bridge
+  through Coffee Lake, and a full cycle on p0156 with no elimination on
+  Ice Lake and Tiger Lake, as on Sandy Bridge. The tables have no Alder
+  Lake section, so Golden Cove and later stay unverified. On Ice Lake,
+  then, this is the slow-LEA situation: sound, tens of thousands of
+  sites, and trading a cycle for two bytes -- which makes the row a
+  client of the target axis in [#28](https://github.com/gaul/x86lint/issues/28),
+  reportable where the copy is free and refused where it is not.
 * **Compilers do this deliberately, in reverse.** Rematerialization is
   a standard register-allocator technique, and LLVM marks `MOV32ri` and
   `MOV64ri` trivially rematerializable precisely so the allocator can
@@ -550,8 +564,8 @@ in the corpus until it was traced to a build flag.
 | `ADD r, imm` + `ADD r, imm` chain (armlint ships this as `check_add_sub_imm_chain`) | one `ADD` | **0 real.** 16,002 pairscan hits, every dumped one on *different* registers (`add r10, 0x4 ; add r9, 0x3`) -- interleaved JIT-style sequences, which the shape key cannot separate from a chain because it collapses register identity. The coupled spelling (`dep,fdead`) is empty |
 | `LEA` + `CMOVcc` reading its result | fold the address into the CMOV's memory operand | **Unsound**, 10,679 sites. `CMOVcc r, m` loads unconditionally regardless of the condition; the LEA does not load at all. Any site where the address is only conditionally valid would fault |
 | sole-use load + shift reading it | fold into the shift | **Not encodable**, 19,729 sites. A shift takes a memory operand only as its destination, and these consume the loaded value as the shifted operand with a register destination |
-| redundant reload of one address (`reload\|same`, `reload\|copy`) | reuse the first value | **7,237** across the corpus (libc 196/Minsn, bash 205, libxul 228, go 108) -- real, and an order of magnitude below every family in the sections above. Worth revisiting only after those ship |
-| `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** See the note below |
+| redundant reload of one address (`reload\|same`, `reload\|copy`) | reuse the first value | **7,237** across the 2026-08 corpus (libc 196/Minsn, bash 205, libxul 228, go 108), about 7,700 with the Rust sweep. **Dissected 2026-09 and filed as [#29](https://github.com/gaul/x86lint/issues/29).** The heap, global and TLS sites are atomics, `volatile` signal flags and wasm2c sandbox memory: a plain load that survives -O2 CSE with no store between is one the source forbade merging, so for those addresses the shape selects for the unsound case. The stack sites are spill reloads -- **2,666** in libxul, 365 in uutils, 65 in libc, 2 in go -- and sound as thread-private memory, about 2,900 of them within the check window. Blocked on the tool's standard that no finding changes the set of memory accesses; see the note below |
+| `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** See the note below; the knob is filed as [#28](https://github.com/gaul/x86lint/issues/28) |
 | ~~one-operand `MUL` whose low half is dead~~ | ~~`MULX`~~ | **Done: "missing MULX" (`-m bmi2`).** The row said 415 sites; the operand condition takes it to **101**, and the check reports **94**, all in libxul. See the note below -- this is the second estimate in this file to land, and for the same reason as the first |
 | `XOR r32, r32` + `XOR r32, r32` | -- | **28,516 sites and nothing to fix.** The most frequent flag-coupled pair in the corpus after the compare/branch families, and it is two independent zeroing idioms; the `fdead` tag says only that the first's flag write is dead, which is true of every zeroing idiom |
 
@@ -662,7 +676,60 @@ and the **37,037 slow-LEA folds excluded from "ADD foldable into LEA"**
 all carry per-core caveats that currently live in prose. A `-t` knob
 would turn several of them into gates at once, and would make this row
 and the slow-LEA folds reportable on the same day. That is the argument
-for building the axis rather than the check.
+for building the axis rather than the check. Filed as [#28](https://github.com/gaul/x86lint/issues/28),
+with Agner's per-core LEA and `MOV r,r` rows attached: the slow-LEA
+exclusion is Skylake-class only, and the constants row's
+move-elimination question is the same axis.
+
+**The reload row, dissected.** `defuse` records a reload when a `MOV`
+loads an address the same block already loaded -- same base, index,
+scale, displacement, width and segment -- with no store, call or `LOCK`
+between and no write to the base or index, and it resets at every
+branch target, so its counts already carry the side-entry gate. It
+splits sites by what the first load left behind: *same* (the value is
+still in the register this load targets, so the load is a duplicate),
+*copy* (still in another register, so the load becomes a register
+copy) and *clobbered* (gone, which is register allocation rather than a
+peephole). libxul's 6,867 same-and-copy sites, by where the address
+lives:
+
+```
+3,111  heap, dword, same register    atomic loads, 14 of 14 sampled: Glean's EventMetric
+                                     re-reading a flags word in hundreds of monomorphized
+                                     copies, HarfBuzz refcounts read twice before lock decl,
+                                     an nsHttpChannel load before lock cmpxchg
+2,666  stack slots                   spill reloads: jpeg_idct_11x11 reloading its loop
+                                     index before each of eleven indexed accesses, dav1d's
+                                     sgr_5x5_c, libwebp's NearLossless; 2,661 through rbp
+  408  gs: segment                   wasm2c RLBox sandbox memory
+  211  RIP-relative globals          unsampled in libxul; bash's are terminating_signal
+                                     and _rl_caught_signal, volatile signal flags
+  471  heap, other widths and copy   unsampled
+```
+
+The heap and global halves are unsound by construction: a plain load
+that survives -O2 CSE with no store between it and its twin is one the
+source told the compiler not to merge, and the binary cannot show the
+atomic, the `volatile` or the compiler fence that did it. armlint
+reached the same conclusion for its twin row. The stack half is spill
+code, created after IR-level optimization and never merged afterwards,
+and its rate is ordinary compiled code's: 89/Minsn in libxul, 184 in
+uutils, 185 in glibc, 147 in geckodriver, 1 in go. That rules out a
+frame-pointer artifact -- libxul, built with frame pointers, has the
+lowest rate of the LLVM binaries -- and one backend's habit, though gc
+does not produce it. 2,346 of libxul's 2,666 and 315 of uutils' 365 sit
+within eight instructions. Two things the check would need beyond the
+shipped machinery: a gap rule that permits conditional branches, since
+the rewrite lives on the fall-through path and most uutils sites have a
+`Jcc` between the loads, where `known_reg_gap_transparent` refuses
+every control transfer and permits the memory writes this check must
+refuse; and a decision on `rbp`, which is a frame slot only in
+functions whose prologue makes it one. What blocks it is not proof but
+the standard `check_shift_zero` records -- no finding changes the set
+of memory accesses -- and [#29](https://github.com/gaul/x86lint/issues/29)
+leaves the choice between a carve-out for thread-private frame slots
+and an informational class open. It needs no target axis: deleting a
+reload wins bytes, a load-port uop and the cache latency on every core.
 
 ## Not yet measured
 
@@ -673,5 +740,5 @@ earns a row above.
 | Item | Notes |
 | --- | --- |
 | `MOV r, r` + shift/ALU (the APX NDD shape) | 270,543 adjacent sites, the second-largest family in the corpus. Already covered by "missing APX NDD" under `-m apx`; recorded here only so the size of the population is not mistaken for an uncovered one |
-| split macro-fusion pairs | Informational, the class armlint files under its `-a` audit idea: a `CMP`/`TEST` separated from its `Jcc` cannot fuse. Needs the per-core fusion tables from the optimization manual, and has no rewrite -- it is a scheduling complaint, not a peephole |
+| split macro-fusion pairs | Informational, the class armlint files under its `-a` audit idea: a `CMP`/`TEST` separated from its `Jcc` cannot fuse. Needs the per-core fusion tables from the optimization manual, and has no rewrite -- it is a scheduling complaint, not a peephole. The tables are the target axis of [#28](https://github.com/gaul/x86lint/issues/28) |
 | ~~constant-condition `Jcc` after a zero test~~ | **Done.** Measured, moved to "Constant conditions" above, and shipped there as both arms: 1,543 findings against the 1,330 the sweep predicted. The CF/OF half this row described (`JB`/`JO` after a zero test) is a subset of the general case |

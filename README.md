@@ -45,8 +45,12 @@ appears in bash and git), where folding the pair into `lea rbx, [rax + 1]`
 would turn the loop increment into a per-iteration reset. Each
 multi-instruction finding is therefore suppressed when a collected target
 lands inside its window; a target on the window's head is fine, since that
-edge executes the whole pattern. Edges the sweep cannot see -- indirect
-branches, jump tables, entries from another section -- remain a residual risk
+edge executes the whole pattern. An `ENDBR64` is marked as a target too:
+under IBT it is the only place an indirect branch may land, so it is the
+binary's own declaration of an incoming edge -- the one indirect edge the
+sweep can see -- and a window it sits inside is suppressed like any other.
+Edges the sweep cannot see -- indirect branches in code without landing pads,
+`notrack` jump tables, entries from another section -- remain a residual risk
 of judging raw bytes, accepted and documented here.
 
 **Soundness over recall.** For a tool that suggests code changes, a false

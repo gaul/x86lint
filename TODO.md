@@ -551,7 +551,7 @@ than a byte patch.
 ## Investigated and closed (2026-08 sweep)
 
 Candidates measured and set aside, recorded so they are not
-re-investigated. Most are rejected outright; the last is sound and
+re-investigated. Most are rejected outright; one is sound and
 merely blocked on a knob the tool does not have. The first two are the
 sharper warnings: one looked like a 20x coverage gap until the sites
 were dumped, and the other looked like the largest dead-code population
@@ -568,6 +568,8 @@ in the corpus until it was traced to a build flag.
 | `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** See the note below; the knob is filed as [#28](https://github.com/gaul/x86lint/issues/28) |
 | ~~one-operand `MUL` whose low half is dead~~ | ~~`MULX`~~ | **Done: "missing MULX" (`-m bmi2`).** The row said 415 sites; the operand condition takes it to **101**, and the check reports **94**, all in libxul. See the note below -- this is the second estimate in this file to land, and for the same reason as the first |
 | `XOR r32, r32` + `XOR r32, r32` | -- | **28,516 sites and nothing to fix.** The most frequent flag-coupled pair in the corpus after the compare/branch families, and it is two independent zeroing idioms; the `fdead` tag says only that the first's flag write is dead, which is true of every zeroing idiom |
+| `PUSH r` + `POP r` of one register (an [#24](https://github.com/gaul/x86lint/issues/24) candidate) | delete the pair | **Rejected: the shape is a stack-clash probe.** 0 sites in compiled code across eight binaries (libxul, geckodriver, uutils, go, bash, libc, libcrypto) except **89** in libstdc++, every one GCC's `-fstack-clash-protection` probe in a function whose only frame activity is a call to a `noreturn` function -- `endbr64 ; push rax ; pop rax ; mov edi, 8 ; sub rsp, 8 ; call g`, reproduced with gcc 16 at `-O2 -fstack-clash-protection` and gone under `-fno-stack-clash-protection`. The push touches the page below the return address so a guard page faults before the callee runs; deleting the pair removes the protection. The shape selects for the intentional case, as the reload row's heap half does |
+| adjacent `ADD`/`SUB rsp, imm` pairs (an [#24](https://github.com/gaul/x86lint/issues/24) candidate) | one adjustment | **Rejected: 3 real sites.** 38 adjacent pairs across the same eight binaries: **29** have a direct branch onto the second, a join point the incoming-edge gate refuses anyway; **6** are crti/crtn's empty `.fini` (`sub rsp, 8 ; add rsp, 8` with nothing between); and 3 are LLVM's post-call argument-area pop ahead of the epilogue's own adjustment, in Rust `Debug::fmt` (geckodriver 2, libxul 1) |
 
 **MULX: the operand condition the shape count missed.** One-operand
 `MUL` is pinned to fixed registers -- RAX times its operand, product to
@@ -730,6 +732,20 @@ of memory accesses -- and [#29](https://github.com/gaul/x86lint/issues/29)
 leaves the choice between a carve-out for thread-private frame slots
 and an informational class open. It needs no target axis: deleting a
 reload wins bytes, a load-port uop and the cache latency on every core.
+
+The store-to-load form of the same row -- a `MOV` store followed at once
+by a `MOV` load of the identical operand, another #24 candidate -- is
+outside `defuse`'s census, whose reload category is load-after-load. An
+adjacent, exact-operand count over the objdump dumps (a lower bound)
+gives **3,328** sites: libxul 2,732 (1,842 frame slots; 813 `gs:` wasm2c
+sandbox words; 77 heap; no RIP-relative), libstdc++ 261, uutils 94,
+geckodriver 60, libcrypto 60, go 58, libc 33, bash 30, with nine in ten
+of the non-libxul, non-go sites on frame slots. The value is still in the
+store's source register, so the rewrite is a register copy, or a deletion
+when the load targets that register, and the adjacency leaves no gap to
+rule on. It is the same spill phenomenon behind the same policy line,
+and is recorded on [#29](https://github.com/gaul/x86lint/issues/29) as a
+sibling shape.
 
 ## Not yet measured
 

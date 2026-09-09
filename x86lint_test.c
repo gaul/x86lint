@@ -2551,6 +2551,16 @@ static void check_redundant_flags_test(void)
     };
     ASSERT_FINDINGS(gap_edge_on_head, "redundant TEST after flags", one_gap);
 
+    // An ENDBR64 in the gap is an indirect-branch landing pad, the one
+    // incoming edge the binary announces, and counts as the direct edge onto
+    // the gap above does: suppress.
+    static const uint8_t gap_endbr[] = {
+        0x21, 0xD8,              // and eax, ebx
+        0xF3, 0x0F, 0x1E, 0xFA,  // endbr64        <- landing pad
+        0x85, 0xC0,              // test eax, eax
+    };
+    ASSERT_FINDINGS(gap_endbr, "redundant TEST after flags", 0);
+
     // The divergence gate evaluates at the test wherever the window found it:
     // an arithmetic producer fires through a gap when CF/OF die at the RET,
     // and stays suppressed when a later reader keeps them live.
@@ -4380,6 +4390,33 @@ static void check_mov_add_lea_test(void)
         0xC3,              // ret
     };
     ASSERT_FINDINGS(gap_fold_imm, "MOV+ADD foldable to LEA", one_gap);
+
+    // An ENDBR64 in the gap is an indirect-branch landing pad -- the one
+    // incoming edge the binary announces -- so control can reach the add
+    // without the mov, exactly as a direct edge onto the gap could: suppress.
+    // The same gap filled by a NOP fires (subject to the window), and a pad
+    // ahead of the pair executes the whole pattern, so that fires too.
+    static const uint8_t gap_endbr[] = {
+        0x48, 0x89, 0xD8,        // mov rax, rbx
+        0xF3, 0x0F, 0x1E, 0xFA,  // endbr64        <- landing pad
+        0x48, 0x01, 0xC8,        // add rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(gap_endbr, "MOV+ADD foldable to LEA", 0);
+    static const uint8_t gap_nop_control[] = {
+        0x48, 0x89, 0xD8,        // mov rax, rbx
+        0x90,                    // nop
+        0x48, 0x01, 0xC8,        // add rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(gap_nop_control, "MOV+ADD foldable to LEA", one_gap);
+    static const uint8_t endbr_ahead[] = {
+        0xF3, 0x0F, 0x1E, 0xFA,  // endbr64        <- landing pad
+        0x48, 0x89, 0xD8,        // mov rax, rbx
+        0x48, 0x01, 0xC8,        // add rax, rcx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(endbr_ahead, "MOV+ADD foldable to LEA", 1);
 
     // Reading the copy stops the scan; so does writing srcA, whose value
     // the lea reads later than the mov captured it.

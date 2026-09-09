@@ -3513,9 +3513,10 @@ static const struct check_entry checks[] = {
 // rotates are excluded from the producer set (a masked or CL count of zero
 // leaves the flags untouched, so the test would not be redundant), as are IMUL,
 // MUL, and the bit-scan ops, which leave SF/ZF/PF undefined.
-// Bitmap of direct branch targets, one bit per byte offset of the scanned
-// buffer: the target of every decoded jmp/jcc/call/loop with a relative
-// displacement that lands inside the buffer. Built by a first pass walking the
+// Bitmap of incoming edges, one bit per byte offset of the scanned buffer:
+// the target of every decoded jmp/jcc/call/loop with a relative displacement
+// that lands inside the buffer, and every ENDBR64 (see below). Built by a
+// first pass walking the
 // same decode-and-resync sweep as the scan proper (so it sees the identical
 // instruction boundaries) and consulted by the multi-instruction peepholes:
 // their rewrite replaces a WINDOW of instructions, which is sound only if
@@ -3528,10 +3529,21 @@ static const struct check_entry checks[] = {
 // a per-iteration reset (observed in /usr/bin/bash and /usr/bin/git; four of
 // the first five real-binary mov+add-imm findings were this shape). An edge to
 // the window HEAD is harmless -- it executes the whole pattern, which the
-// rewrite reproduces -- so only interior offsets suppress. Edges the sweep
-// cannot see -- indirect branches, jump tables, entries from another section --
-// remain a documented residual risk of operating on raw bytes (README,
-// "Linear sweep with resync").
+// rewrite reproduces -- so only interior offsets suppress.
+//
+// One indirect edge is announced: under IBT an indirect branch may land only
+// on an ENDBR64, so every ENDBR64 is the binary's own declaration of an entry
+// and is marked as one. Before it was, a synthetic mov rax, rbx ; endbr64 ;
+// add rax, rcx folded to LEA -- XED files ENDBR64 under category CET, which no
+// gap predicate refuses. The corpus never paid: marking the pads changed none
+// of the 35,333 findings on bash, libc, libcrypto, libstdc++ and ld.so
+// (2026-09), since their mid-function pads follow a call (a setjmp return) or
+// a jmp (glibc printf's jump-table labels), where the gap rules already stop.
+// ENDBR32 is not a landing pad in 64-bit mode (cf. check_endbr64_target) and
+// is left alone. Edges the sweep cannot see -- indirect branches onto unpadded
+// code, notrack jump tables, entries from another section -- remain a
+// documented residual risk of operating on raw bytes (README, "Linear sweep
+// with resync").
 static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len)
 {
     uint8_t *targets = calloc((len + 7) / 8, 1);
@@ -3547,6 +3559,11 @@ static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len)
             continue;
         }
         size_t next = offset + xed_decoded_inst_get_length(&xedd);
+        // An ENDBR64 is an indirect-branch landing pad: the one incoming edge
+        // the binary announces. Mark it as an entry of its own.
+        if (xed_decoded_inst_get_iclass(&xedd) == XED_ICLASS_ENDBR64) {
+            targets[offset >> 3] |= (uint8_t) (1u << (offset & 7));
+        }
         // A nonzero branch-displacement width marks every direct relative
         // transfer (jmp/jcc rel8/rel32, call rel32, loop/jrcxz); indirect
         // forms carry none.

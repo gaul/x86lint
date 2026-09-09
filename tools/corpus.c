@@ -46,12 +46,14 @@ bool corpus_conditional_write(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_category(xedd) == XED_CATEGORY_CMOV;
 }
 
-// One bit per byte of the section, set where a direct relative transfer lands.
+// One bit per byte of the section, set where a direct relative transfer lands
+// and at every ENDBR64, the landing pad an indirect branch is allowed to reach.
 // Mirrors x86lint.c's collect_branch_targets, including its resync: the
 // prepass must walk the bytes exactly as the scan does or the two disagree on
-// instruction boundaries. Indirect branches and jump tables leave no mark
-// here, so a range's straight-line assumption remains a documented residual
-// risk, the same one x86lint's multi-instruction windows carry.
+// instruction boundaries. Indirect branches onto unpadded code and jump tables
+// leave no mark here, so a range's straight-line assumption remains a
+// documented residual risk, the same one x86lint's multi-instruction windows
+// carry.
 static uint8_t *collect_branch_targets(const uint8_t *code, size_t size)
 {
     uint8_t *targets = calloc((size + 7) / 8, 1);
@@ -67,6 +69,9 @@ static uint8_t *collect_branch_targets(const uint8_t *code, size_t size)
             continue;
         }
         size_t next = offset + xed_decoded_inst_get_length(&xedd);
+        if (xed_decoded_inst_get_iclass(&xedd) == XED_ICLASS_ENDBR64) {
+            targets[offset >> 3] |= (uint8_t) (1u << (offset & 7));
+        }
         if (xed_decoded_inst_get_branch_displacement_width_bits(&xedd) != 0) {
             int64_t target = (int64_t) next +
                 xed_decoded_inst_get_branch_displacement(&xedd);

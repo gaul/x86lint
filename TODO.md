@@ -570,6 +570,7 @@ in the corpus until it was traced to a build flag.
 | `XOR r32, r32` + `XOR r32, r32` | -- | **28,516 sites and nothing to fix.** The most frequent flag-coupled pair in the corpus after the compare/branch families, and it is two independent zeroing idioms; the `fdead` tag says only that the first's flag write is dead, which is true of every zeroing idiom |
 | `PUSH r` + `POP r` of one register (an [#24](https://github.com/gaul/x86lint/issues/24) candidate) | delete the pair | **Rejected: the shape is a stack-clash probe.** 0 sites in compiled code across eight binaries (libxul, geckodriver, uutils, go, bash, libc, libcrypto) except **89** in libstdc++, every one GCC's `-fstack-clash-protection` probe in a function whose only frame activity is a call to a `noreturn` function -- `endbr64 ; push rax ; pop rax ; mov edi, 8 ; sub rsp, 8 ; call g`, reproduced with gcc 16 at `-O2 -fstack-clash-protection` and gone under `-fno-stack-clash-protection`. The push touches the page below the return address so a guard page faults before the callee runs; deleting the pair removes the protection. The shape selects for the intentional case, as the reload row's heap half does |
 | adjacent `ADD`/`SUB rsp, imm` pairs (an [#24](https://github.com/gaul/x86lint/issues/24) candidate) | one adjustment | **Rejected: 3 real sites.** 38 adjacent pairs across the same eight binaries: **29** have a direct branch onto the second, a join point the incoming-edge gate refuses anyway; **6** are crti/crtn's empty `.fini` (`sub rsp, 8 ; add rsp, 8` with nothing between); and 3 are LLVM's post-call argument-area pop ahead of the epilogue's own adjustment, in Rust `Debug::fmt` (geckodriver 2, libxul 1) |
+| armlint's immediate-misfit audit (`-a imm`), the implied-zero / flag-reorder idea from Mozilla [D325572](https://phabricator.services.mozilla.com/D325572) | renumber a constant or a flag bit so it materializes in a cheaper/shorter form | **Rejected: no x86 analog, measured across four corpora.** The audit's premise is AArch64's restrictive immediate encoding; x86's imm32 on every ALU/CMP/TEST/logical op absorbs it. See the note below |
 
 **MULX: the operand condition the shape count missed.** One-operand
 `MUL` is pinned to fixed registers -- RAX times its operand, product to
@@ -746,6 +747,59 @@ when the load targets that register, and the adjacency leaves no gap to
 rule on. It is the same spill phenomenon behind the same policy line,
 and is recorded on [#29](https://github.com/gaul/x86lint/issues/29) as a
 sibling shape.
+
+**The immediate-misfit and flag-reorder audits: no x86 analog (measured
+2026-09-14 over four corpora).** armlint's `-a imm` finds constants that miss
+AArch64's immediate encoding and so must be materialized in a register, tallied
+by value to surface near-misses a source change fixes wholesale (its V8 win was
+a 16 MiB bound one step past `0xfff000`, fixed at 92,109 sites). Mozilla's
+[D325572](https://phabricator.services.mozilla.com/D325572) is the sibling idea:
+make a NaN-boxed magic value's payload 0 so the ARM64 `movz/movk` chain shortens
+and the compare folds. Neither ports to x86, and the reason is the ISA, not the
+corpus: x86 takes a full imm32 on every ALU/CMP/TEST/logical op, so an ordinary
+constant is never materialized to satisfy an immediate field, and `movabs` is
+bit-pattern-flat -- 10 bytes for any true-64-bit value regardless of which bits
+are set.
+
+Corpora and method: libxul (objdump), V8 TurboFan (`--print-opt-code`),
+SpiderMonkey Ion (`IONFLAGS=codegen` on the `obj-js-x86lint-opt` shell), and
+`librustc_driver.so`; ARES-6 was the JIT workload since no shell-runnable
+JetStream 3 harness is in-tree.
+
+* **movabs misfit: zero, everywhere.** imm32-fitting 10-byte movabs was libxul
+  0/206,123, V8 0/21,977, rustc 0/134,607, SpiderMonkey 0 (excluding patch
+  placeholders). Every wide movabs is a genuine 64-bit value -- NaN-box tags,
+  heap pointers, division magics (`0xaaaa...ab`, `0xcccc...cd`), hash constants.
+  D325572's `0xfff9800000000000` is materialized 15,046x in libxul and 19,091x
+  in SpiderMonkey as a flat movabs whatever the payload; the compare is
+  `movabs tmp,..;cmp` either way (x86 has no `movn` fold). D325572 saves 0 bytes
+  on x86.
+* **A SpiderMonkey false positive worth remembering.** Ion's 10-byte
+  `movabsq $-1` (13,575x) and `$0` (864x) look like same-value waste but are
+  patchable placeholders (`movWithPatch`/`pushArgWithPatch` for IC offsets,
+  jump-table bases, wasm `SymbolicAddress`) that require the full width; the
+  integrated disassembler prints every imm->reg move as `movabsq`, masking the
+  encoding. The genuine paths (`mov(ImmWord)`) already use xor for 0 and the
+  compact form otherwise.
+* **Flag-reorder into the low-7-bit `test al, imm8` form** (the sound subset,
+  already shipped as `check_oversized_test_immediate`): single-bit TEST masks at
+  bit>=8 that a source reorder could demote number libxul ~14,021 and rustc
+  12,366, but ~0 in the hand-tuned JITs (V8 0, SpiderMonkey 51). They cluster in
+  **upstream** code -- Rust std `core::fmt`, LLVM CC/feature tablegen tables,
+  `regex_automata` -- and where the flag is project-owned and hot it is stranded
+  high **on purpose**: `JSString::LATIN1_CHARS_BIT` is bit 10 because bits 0-2
+  are GC-reserved and 3-6 are the four type bits (7-9 already double-booked);
+  `core::fmt`'s flags sit in the high byte of a `u32` because the low 21 bits
+  hold the fill `char`. Moving the hot flag down means evicting an equally hot
+  one -- zero-sum. The only residue is a `test32`->`test8` memory-operand
+  lowering worth ~2 bytes, which the checker deliberately skips (narrowing a
+  memory access is unsound on MMIO). Nothing here is a sound binary rewrite the
+  tool can emit.
+
+The encoding-waste subset that IS sound already ships:
+`check_oversized_test_immediate` (low-7-bit TEST masks -> byte form) and
+`check_oversized_immediate` (same-value shorter encodings, including a `movabs`
+whose value fits imm32).
 
 ## Not yet measured
 

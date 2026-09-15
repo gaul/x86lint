@@ -495,6 +495,134 @@ the code it guards is unreachable, a stronger statement about the
 compiler's output than any other row in this file makes -- said outright
 in both README entries rather than implied.
 
+## Ported from armlint (2026-09 cross-project audit)
+
+armlint's shipped check table was walked against x86lint's and every
+member with an x86 spelling was counted, in the other direction from
+the rest of this file: the candidates here are things armlint already
+*ships*, so the question is not whether the rewrite is sound but
+whether the shape exists on x86 and survives its own conditions.
+
+Figures marked **2026-09 port sweep** are whole-binary `objdump`
+adjacency counts over libxul (32.1M decoded instructions, against the
+30.08M x86lint's symbol-restricted scan reports), go 1.92M, libcrypto
+828k, libstdc++ 358k, libc 356k and bash 254k. The sweep applies no
+liveness proof and no side-entry gate and is not symbol-restricted, so
+every figure is an upper bound admitting data-in-text -- the same
+standing this file gives its `-a`-swept binaries.
+
+| Pattern | Rewrite | 2026-09 port sweep |
+| --- | --- | --- |
+| ~~`LOCK CMPXCHG` retry loop whose body is one bitwise op~~ | ~~`LOCK OR`/`AND`/`XOR`~~ | **Done: "CAS loop foldable into LOCK op".** Shape 614 in libxul (466 OR, 132 AND, 16 XOR), 3 libc, 0 elsewhere; realized **19**, all libxul. See the note below -- a 32x collapse with a single cause |
+| aligned vector load whose sole use is the next vector op's source | fold into that operand | Shape **9,298** in libxul, of which **541** survive a deadness proof; 158 libc, 10 libcrypto, 2 go. The VEX-unaligned arm adds 141 / 40 / 48 / 1. Two scalar siblings: `mov r, [m] ; movd/movq xmm, r` (370 libxul, 34 go) and `mov r, [m] ; cvtsi2sd xmm, r` (100 libxul). See the note below -- the 17x gap is the register allocator being right, not the proof being timid |
+| adjacent immediate-zero stores at consecutive addresses | one wider store | libxul **3,722** byte / 933 dword / 1,297 qword; libcrypto 250 qword, libstdc++ 341 qword, libc 66, go 56, bash 43. Blocked on a policy question, not on proof -- see below |
+
+**The CAS fold, and why its shape overstated it 32x.** The check
+ships, and the collapse from 5,192 `LOCK CMPXCHG` + `JNE` pairs to 614
+fetch-op-shaped loops to **19 findings** has one cause worth recording:
+LLVM already lowers an `atomic_fetch_or` whose result is *discarded*
+straight to `LOCK OR`, so a CAS loop that survives to the binary is
+usually the value-returning form, which no single x86 instruction
+spells. dav1d's two dominant tails say it outright -- `jne L ; test
+eax, eax` and `jne L ; or eax, ecx` both read the old value the fold
+would discard. That also explains the **zero ADD and SUB loops
+anywhere in the corpus**: `LOCK XADD` is the one value-returning locked
+form, so the compiler reaches for it directly and the CAS spelling
+never appears. The 19 that remain are real and concentrated:
+`HttpBaseChannel`'s constructor sets eight bitfield flags in a row,
+each its own five-instruction CAS loop, each old value killed by the
+next loop's reload. This is the fourth row in this file whose
+population is a property of what the compiler *already* optimizes, and
+the first where measuring the tail of the loop rather than its head was
+what showed it.
+
+**The vector fold, and the 17x its shape overstated.** It is the shipped
+"load foldable into ALU" family with the consumer set widened past the
+GPR ALU. The alignment condition is unusually clean for x86: a
+`movaps`/`movdqa` producer *proves* its address 16-byte aligned,
+because the instruction faults otherwise, so folding into a legacy-SSE
+memory operand inherits that proof -- the instruction the fold deletes
+is the one carrying the evidence for the instruction that survives. A
+`movups`/`movdqu` producer proves nothing and may fold only into a VEX
+consumer, which carries no alignment requirement, which is why the two
+arms are counted separately above.
+
+The first draft of this row read "9,279 libxul sites, several times the
+1,631 the scalar arm realized", and that was a shape count with the
+rewrite's own deadness condition not applied -- the mistake this file
+exists to stop. Applying it:
+
+```
+reuse    6,670  (72%)  the loaded register is read again
+window   1,889  (20%)  the 12-instruction scan reached no verdict
+xfer       198  ( 2%)  a control transfer ended the scan
+dead       541  ( 6%)  foldable
+```
+
+**The 72% is the register allocator being right, not the proof being
+timid.** A vector constant is loaded into a register precisely because
+it is used more than once, and folding would turn one load into N; the
+unrolled-accumulator shape, one mask applied to four or eight
+accumulators, is most of that mass. Only the window and transfer rows
+are recoverable by a sharper proof, so the ceiling is under 800. What
+survives is concentrated -- `mulps` is 350 of the 541, and **539 of the
+541 are RIP-relative constant-pool loads**, so this is "a constant used
+once", not pointer traffic. The modal site is a vectorized polynomial
+kernel reloading its coefficients one at a time through one scratch,
+where the next constant's load is itself what proves the previous one
+dead:
+
+```
+movaps xmm2, [rip+A] ; mulps xmm8, xmm2 ; divps xmm8, xmm10
+movaps xmm2, [rip+B] ; addps xmm8, xmm2
+```
+
+Everything else is the existing family's machinery: sole use, register
+deadness, the both-successors split.
+
+**The zero-store merge needs a policy decision before it needs code.**
+The rewrite is armlint's (`check_ldp_stp_coalesce`'s zero arm and
+`check_stp_wzr_to_str_xzr`), and the dword pair is the clean case --
+`C7 /0 imm32` twice is 14 bytes against one `48 C7 /0 imm32` at 8, a
+store uop saved as well. But it changes the *granularity* of a memory
+access, which the standing rule behind `check_shift_zero` and
+[#29](https://github.com/gaul/x86lint/issues/29) -- no finding changes
+the set of memory accesses -- was written to forbid. Merging is not
+deleting, and every compiler's store-merging pass does it, so the rule
+may simply be about deletion; that is the call to make. Two x86-only
+wrinkles if it proceeds: the byte pair must merge four at a time rather
+than two, since a `66`-prefixed `imm16` store is this tool's own
+length-changing-prefix finding, and the qword pair merges only into a
+16-byte vector store, which needs a zeroed XMM the surrounding code may
+not have.
+
+**Measured and near-dead.** Every remaining armlint check with an x86
+spelling, counted the same way. Recorded so the table is not walked
+again:
+
+| armlint check | x86 spelling | 2026-09 port sweep |
+| --- | --- | --- |
+| compare whose flags are overwritten unread | delete the `CMP`/`TEST` | **291 of 2,118,109** register-only candidates in libxul (0.014%), 38 go, 1 libc, 0 in bash, libcrypto and libstdc++ -- measured with a 16-instruction forward window, not adjacency. armlint reports 315 on `/bin/ls` alone. The difference is structural: x86 pairs a compare with its branch by design for macro-fusion, where AArch64 schedules them apart and leaves `ccmp`/`cset` chains behind. Memory-operand compares are excluded outright and are 683,613 of libxul's sites -- go's `test BYTE PTR [rax], al` is the nil-check idiom, and deleting it removes the fault that *is* the check |
+| `csel Rd, Rn, Rn` | same-register `CMOVcc` | 3 libxul, 0 elsewhere |
+| vector self-op identity | `pand`/`por`/`psub` with one source | 3 libxul, 0 elsewhere. x86's canonical zero and all-ones idioms (`pxor`, `pcmpeqd`) are already the shipped SSE zero-idiom check's business |
+| `umov` of lane 0 | `pextrd/q ..., 0` -> `movd/movq` | **0** everywhere. `vextractps m32, xmm, 0` -> `vmovss` appears 10 times in libxul, the only member of the family with any population |
+| `and xd, xn, #0xffffffff` | `and r64, 0xffffffff` -> `mov r32, r32` | **0** everywhere |
+| branch to the next instruction | `jmp`/`jcc` to the next instruction | **0** everywhere |
+| `neg` + `add`/`sub` | `neg r ; add r2, r` -> `sub r2, r` | 60 libxul, 0 elsewhere |
+| `mov #C` + variable shift | `mov ecx, imm ; shl r, cl` -> `shl r, imm` | 6 libxul, 0 elsewhere. The shipped "MOV constant foldable" covers the ALU consumers and not this one |
+| shift foldable into shifted-register form | `shl r, k<=3 ; add r2, r` -> `lea` | 8 libxul, 4 libcrypto, 2 libc, 2 libstdc++, 1 bash |
+| widening extend + `scvtf` | `movsxd` + `cvtsi2sd` -> 32-bit convert | **0** everywhere |
+| redundant zero-extension by producer threshold | generalized past extension-after-extension | `setcc` + `and 1` 13 libxul; `shr >= 24` + `movzx` 3 libxul, 5 go. The shipped "redundant re-extension" already owns the extension-after-extension case, and the generalization buys these |
+
+## Tooling and test-suite gaps (armlint cross-check)
+
+| Item | Notes |
+| --- | --- |
+| Snapshot/integration suite | armlint assembles 95 `.s` fixtures with clang and diffs the output against checked-in `.expected` files, with a regen target; x86lint has one 717-line `driver_test.sh` smoke test. The snapshot suite is what covers the ELF parser and the report formatting that unit tests bypass, and it is the larger half of the gap: unit tests are 16,086 lines against x86lint's 7,496 |
+| JIT-dump → ELF converters | armlint ships `v8dump2elf.py`, `jscdump2elf.py` and `smdump2elf.py`, plus a SpiderMonkey `jit::Linker` hook, so its whole check table applies to JIT output. x86lint has none, which is why the 2026-09 SpiderMonkey and V8 work in this file was done with ad-hoc awk over `IONFLAGS=codegen` text rather than by running the tool |
+| Differential against the decoder's own model | `ARMLINT_LIVENESS_SWEEP=1` sweeps all 2^32 A64 encodings asserting that anything Capstone reports as read is never classified dead, and found four real defects on its first run. x86 has no enumerable encoding space, but the same differential is available over XED's iform table: check `flag_concerns` and `reg_kill_iclass` against XED's flag and operand records. The `CMOVcc` mis-model is already known and corrected by hand; nothing has looked for the rest |
+| Doc split | armlint keeps a 554-line README plus a 3,795-line `analyses.md`; x86lint carries everything in a 1,411-line README. This file's own header already says it mirrors armlint's pair, so half the split is intended |
+
 ## Coverage gaps in shipped checks
 
 A population counted independently says nothing about which spellings

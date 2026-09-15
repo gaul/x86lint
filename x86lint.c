@@ -7884,6 +7884,204 @@ static bool writes_wide_vector(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// A LOCK CMPXCHG retry loop whose body recomputes the new value with one
+// bitwise op is an atomic fetch-op spelled the long way:
+//
+//         mov  eax, [m]              seed, outside the window
+//   L:    mov  ecx, eax              copy the old value
+//         or   ecx, 0x1              new = old | src
+//         lock cmpxchg [m], ecx
+//         jne  L
+//
+// The loop's net effect is one atomic read-modify-write of [m] at the
+// successful iteration, which is exactly what LOCK OR DWORD PTR [m], 0x1
+// performs -- four instructions and two scratch registers become one
+// instruction, and the contended path stops issuing a locked write per
+// failed attempt (LOCK CMPXCHG writes its destination whether or not the
+// comparison succeeds, so the loop costs N locked writes where the fold
+// costs one; the direction is strictly toward less bus traffic, and N is
+// contention-dependent, so no correct program can observe the difference).
+//
+// This is armlint's -m lse fetch-op arm with the feature gate removed:
+// LOCK OR/AND/XOR to a memory destination is 386 baseline, so unlike
+// ldset/ldclr/ldeor the rewrite asserts nothing about the target.
+//
+// Nothing has to be proved about the seed load, which is why it is not
+// matched: the loop converges from any starting RAX, since a mismatch
+// reloads it and retries. What must be proved is that the two values the
+// loop leaves behind and the fold does not are dead, plus the flags:
+//
+//   * RAX, the pre-op value. CMPXCHG leaves it there; LOCK OR discards
+//     it, and x86 has no value-returning locked OR/AND/XOR. (XADD is the
+//     one value-returning form, and covers only addition -- which is why
+//     no ADD or SUB loop appears in the corpus at all: LLVM already
+//     lowers fetch_add straight to LOCK XADD. The 614 sites measured in
+//     libxul are 466 OR, 132 AND and 16 XOR, every one a fetch-op whose
+//     result the source discarded.)
+//   * the scratch holding the new value.
+//   * every arithmetic flag: the loop falls out of its JNE with ZF set,
+//     where LOCK OR writes SF/ZF/PF from the result and clears CF and OF.
+//
+// The op's source may be an immediate or a register, but neither RAX nor
+// the scratch: either would make the merged value depend on the iteration
+// rather than be a constant folded into memory. The address may not be
+// built from RAX or the scratch for the same reason -- both change inside
+// the loop, so the accesses would not all name one location.
+//
+// Only the interior of the window is side-entry gated. A direct edge onto
+// the head is exactly what the loop's own back edge is, and any other
+// entry there runs the whole pattern, which is the same thing the fold
+// does.
+static bool cas_fetch_op_loop(const uint8_t *inst, size_t len,
+                              const uint8_t *branch_targets, size_t head,
+                              size_t next, const xed_decoded_inst_t *mov)
+{
+    // Head: a register-to-register copy of the accumulator into a scratch.
+    if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov) > 0 ||
+        xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(mov))) {
+        return false;
+    }
+    xed_reg_enum_t scratch = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
+    switch (xed_decoded_inst_get_reg(mov, XED_OPERAND_REG1)) {
+    case XED_REG_AL:
+    case XED_REG_AX:
+    case XED_REG_EAX:
+    case XED_REG_RAX:
+        break;
+    default:
+        // AH names bits 15:8, where CMPXCHG's implicit operand at byte
+        // width is AL; no other register is the accumulator at all.
+        return false;
+    }
+    if (xed_reg_class(scratch) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    xed_reg_enum_t scratch64 = xed_get_largest_enclosing_register(scratch);
+    if (scratch64 == XED_REG_RAX) {
+        return false;   // mov rax, rax leaves no scratch and no loop
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(mov);
+
+    // Body: or/and/xor scratch, (imm | reg), at the copy's width.
+    xed_decoded_inst_t op;
+    decode_init(&op);
+    if (next >= len ||
+        xed_decode(&op, inst + next, len - next) != XED_ERROR_NONE) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(&op)) {
+    case XED_ICLASS_OR:
+    case XED_ICLASS_AND:
+    case XED_ICLASS_XOR:
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&op) > 0 ||
+        xed_decoded_inst_get_operand_width(&op) != width ||
+        xed_decoded_inst_get_reg(&op, XED_OPERAND_REG0) != scratch) {
+        return false;
+    }
+    if (!xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&op))) {
+        xed_reg_enum_t src = xed_decoded_inst_get_reg(&op, XED_OPERAND_REG1);
+        if (xed_reg_class(src) != XED_REG_CLASS_GPR) {
+            return false;
+        }
+        xed_reg_enum_t src64 = xed_get_largest_enclosing_register(src);
+        if (src64 == XED_REG_RAX || src64 == scratch64) {
+            return false;
+        }
+    }
+
+    // The locked compare-exchange itself, storing the scratch.
+    size_t cas_offset = next + xed_decoded_inst_get_length(&op);
+    xed_decoded_inst_t cas;
+    decode_init(&cas);
+    if (cas_offset >= len ||
+        xed_decode(&cas, inst + cas_offset, len - cas_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    // XED gives the locked form its own iclass; the prefix is also asserted
+    // directly, since only a locked exchange makes the loop atomic and only
+    // an atomic loop is what LOCK OR replaces.
+    switch (xed_decoded_inst_get_iclass(&cas)) {
+    case XED_ICLASS_CMPXCHG:
+    case XED_ICLASS_CMPXCHG_LOCK:
+        break;
+    default:
+        return false;
+    }
+    if (!xed_operand_values_has_lock_prefix(
+            xed_decoded_inst_operands_const(&cas)) ||
+        xed_decoded_inst_number_of_memory_operands(&cas) != 1 ||
+        xed_decoded_inst_get_operand_width(&cas) != width) {
+        return false;
+    }
+    // CMPXCHG's explicit register source, RAX being suppressed. Found by
+    // visibility rather than by operand position, which differs between the
+    // memory- and register-destination forms.
+    xed_reg_enum_t cas_src = XED_REG_INVALID;
+    const xed_inst_t *cxi = xed_decoded_inst_inst(&cas);
+    unsigned cnops = xed_inst_noperands(cxi);
+    for (unsigned i = 0; i < cnops; ++i) {
+        const xed_operand_t *o = xed_inst_operand(cxi, i);
+        xed_operand_enum_t nm = xed_operand_name(o);
+        if (xed_operand_operand_visibility(o) == XED_OPVIS_EXPLICIT &&
+            xed_operand_is_register(nm)) {
+            cas_src = xed_decoded_inst_get_reg(&cas, nm);
+            break;
+        }
+    }
+    if (cas_src != scratch) {
+        return false;
+    }
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&cas, 0);
+    xed_reg_enum_t index = xed_decoded_inst_get_index_reg(&cas, 0);
+    for (int i = 0; i < 2; ++i) {
+        xed_reg_enum_t r = (i == 0) ? base : index;
+        if (r == XED_REG_INVALID) {
+            continue;
+        }
+        xed_reg_enum_t r64 = xed_get_largest_enclosing_register(r);
+        if (r64 == XED_REG_RAX || r64 == scratch64) {
+            return false;   // the address would move between iterations
+        }
+    }
+
+    // The back edge, which must land on the head for this to be the loop.
+    size_t jne_offset = cas_offset + xed_decoded_inst_get_length(&cas);
+    xed_decoded_inst_t jne;
+    decode_init(&jne);
+    if (jne_offset >= len ||
+        xed_decode(&jne, inst + jne_offset, len - jne_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed_decoded_inst_get_iclass(&jne) != XED_ICLASS_JNZ ||
+        xed_decoded_inst_get_branch_displacement_width_bits(&jne) == 0) {
+        return false;
+    }
+    size_t after = jne_offset + xed_decoded_inst_get_length(&jne);
+    int64_t target = (int64_t) after +
+        xed_decoded_inst_get_branch_displacement(&jne);
+    if (target < 0 || (uint64_t) target != (uint64_t) head) {
+        return false;
+    }
+
+    if (branch_target_in(branch_targets, next, after)) {
+        return false;
+    }
+    if (flags_live_after(inst, len, after, FLAG_ARITH)) {
+        return false;
+    }
+    return !reg_live_after(inst, len, after, XED_REG_RAX) &&
+           !reg_live_after(inst, len, after, scratch64);
+}
+
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
                        uint32_t extensions, x86lint_finding_fn on_finding,
@@ -8117,6 +8315,18 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (mov_const_foldable(inst, len, branch_targets, next, &xedd)) {
             emit_finding(&sink, "MOV constant foldable", offset, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a LOCK CMPXCHG retry loop whose body is
+        // one bitwise op is an atomic fetch-op, which LOCK OR/AND/XOR performs
+        // in a single instruction. Reported against the loop head (at
+        // `offset`), the first of the three instructions the fold removes.
+        // See cas_fetch_op_loop.
+        if (cas_fetch_op_loop(inst, len, branch_targets, offset, next,
+                              &xedd)) {
+            emit_finding(&sink, "CAS loop foldable into LOCK op", offset,
+                &xedd, inst + offset);
             ++errors;
         }
 

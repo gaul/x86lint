@@ -194,6 +194,44 @@ argue for or against each, live in [TODO.md](TODO.md).
     bits, so it neither sets nor clears the state. An unseen indirect
     edge could only reach a flagged site with clean uppers, where both
     fixes stay harmless
+* CAS loop foldable into LOCK op
+  - `8B07 89C1 83C901 F00FB10F 75F5` (MOV EAX, [RDI]; L: MOV ECX, EAX; OR ECX,
+    1; LOCK CMPXCHG [RDI], ECX; JNE L) -- a locked compare-exchange retry loop
+    whose body recomputes the new value with one bitwise op is an atomic
+    fetch-op spelled the long way, and its net effect is what a single
+    instruction performs: LOCK OR DWORD PTR [RDI], 1. Four instructions and two
+    scratch registers become one, and the contended path stops issuing a locked
+    write per failed attempt -- LOCK CMPXCHG writes its destination whether or
+    not the comparison succeeds, so the loop costs one locked write per
+    iteration where the fold costs one in total. The iteration count is
+    contention-dependent, so no correct program observes the difference.
+    This is armlint's `-m lse` fetch-op arm with the feature gate removed:
+    LOCK OR/AND/XOR to memory is 386 baseline, so unlike `ldset`/`ldclr` the
+    rewrite asserts nothing about the target.
+  - Nothing is proved about the seed load, which is why it is not matched: the
+    loop converges from any starting RAX, a mismatch reloading it and retrying.
+    What must be proved dead past the loop is everything the fold does not
+    produce -- RAX, which CMPXCHG leaves holding the pre-op value and LOCK OR
+    discards; the scratch holding the new value; and every arithmetic flag,
+    since the loop falls out of its JNE with ZF set where LOCK OR writes SF/ZF/PF
+    from the result and clears CF/OF. The op's source may be an immediate or a
+    register but neither RAX nor the scratch, and the address may be built from
+    neither, since both change inside the loop. Only the window's interior is
+    side-entry gated: an edge onto the head is what the loop's own back edge is,
+    and any other entry there runs the whole pattern
+  - **The deadness gate is the whole check, and it removes 97% of the shape.**
+    5,192 `LOCK CMPXCHG` + `JNE` pairs in libxul reduce to 614 that are
+    structurally fetch-op loops (466 OR, 132 AND, 16 XOR), and those to **19
+    findings**; glibc has 3 of the shape and 0 findings. The reason is that
+    LLVM already lowers an `atomic_fetch_or` whose result is *discarded*
+    straight to `LOCK OR`, so a surviving CAS loop is usually the
+    value-returning form -- `jne L ; test eax, eax` and `jne L ; or eax, ecx`
+    are the two dominant tails in dav1d -- which no single instruction spells.
+    What is left is real: `HttpBaseChannel`'s constructor sets eight bitfield
+    flags in a row, each a separate five-instruction CAS loop whose old value
+    the next loop's own reload immediately kills. **Zero ADD or SUB loops occur
+    anywhere in the corpus**, since `LOCK XADD` is the one value-returning
+    locked form and LLVM reaches for it directly
 * constant condition after immediate
   - `B910000000 4883F928 77xx` (MOV ECX, 0x10; CMP RCX, 0x28; JA) -- the
     register holds a constant and the compare's other operand is a second

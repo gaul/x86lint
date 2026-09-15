@@ -3092,6 +3092,98 @@ static void check_redundant_shift_test(void)
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
 }
 
+// Multi-instruction peephole: a LOCK CMPXCHG retry loop whose body is a single
+// bitwise op is an atomic fetch-op, which LOCK OR/AND/XOR performs outright.
+// check_instructions reports it against the loop head when the old value, the
+// scratch and the flags are all dead past the loop. See cas_fetch_op_loop.
+static void check_cas_fetch_op_test(void)
+{
+    // mov eax, [rdi] ; L: mov ecx, eax ; or ecx, 1 ; lock cmpxchg [rdi], ecx ;
+    // jne L -- an atomic OR of 1 into [rdi]: lock or dword ptr [rdi], 1. Both
+    // scratch values are overwritten after the loop and the flags die at the
+    // ret, so every gate passes.
+    static const uint8_t or_imm[] = {
+        0x8B, 0x07,                    // mov eax, [rdi]
+        0x89, 0xC1,                    // L: mov ecx, eax
+        0x83, 0xC9, 0x01,              // or ecx, 1
+        0xF0, 0x0F, 0xB1, 0x0F,        // lock cmpxchg [rdi], ecx
+        0x75, 0xF5,                    // jne L
+        0x89, 0xD0,                    // mov eax, edx (kills rax)
+        0x89, 0xD1,                    // mov ecx, edx (kills rcx)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(or_imm, "CAS loop foldable into LOCK op", 1);
+
+    // The 64-bit AND form with a register source: lock and qword ptr [rdi], rsi.
+    static const uint8_t and_reg[] = {
+        0x48, 0x8B, 0x07,              // mov rax, [rdi]
+        0x48, 0x89, 0xC1,              // L: mov rcx, rax
+        0x48, 0x21, 0xF1,              // and rcx, rsi
+        0xF0, 0x48, 0x0F, 0xB1, 0x0F,  // lock cmpxchg [rdi], rcx
+        0x75, 0xF3,                    // jne L
+        0x48, 0x89, 0xD0,              // mov rax, rdx (kills rax)
+        0x48, 0x89, 0xD1,              // mov rcx, rdx (kills rcx)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(and_reg, "CAS loop foldable into LOCK op", 1);
+
+    // The same loop with nothing after it: rax carries the pre-op value out
+    // across the ret, where lock or would have discarded it. Registers are
+    // conservatively live at a return, so the fold is refused.
+    static const uint8_t old_value_live[] = {
+        0x8B, 0x07,                    // mov eax, [rdi]
+        0x89, 0xC1,                    // L: mov ecx, eax
+        0x83, 0xC9, 0x01,              // or ecx, 1
+        0xF0, 0x0F, 0xB1, 0x0F,        // lock cmpxchg [rdi], ecx
+        0x75, 0xF5,                    // jne L
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(old_value_live, "CAS loop foldable into LOCK op", 0);
+
+    // A back edge onto the op rather than the head: control can re-enter the
+    // window past the copy, so the scratch is not the accumulator's value on
+    // every iteration and the window is not this loop.
+    static const uint8_t edge_into_body[] = {
+        0x8B, 0x07,                    // mov eax, [rdi]
+        0x89, 0xC1,                    // L: mov ecx, eax
+        0x83, 0xC9, 0x01,              // or ecx, 1
+        0xF0, 0x0F, 0xB1, 0x0F,        // lock cmpxchg [rdi], ecx
+        0x75, 0xF7,                    // jne (into the or, not L)
+        0x89, 0xD0,                    // mov eax, edx
+        0x89, 0xD1,                    // mov ecx, edx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(edge_into_body, "CAS loop foldable into LOCK op", 0);
+
+    // or ecx, eax merges the old value into itself rather than a constant, so
+    // there is no single-instruction atomic form.
+    static const uint8_t src_is_accumulator[] = {
+        0x8B, 0x07,                    // mov eax, [rdi]
+        0x89, 0xC1,                    // L: mov ecx, eax
+        0x09, 0xC1,                    // or ecx, eax
+        0xF0, 0x0F, 0xB1, 0x0F,        // lock cmpxchg [rdi], ecx
+        0x75, 0xF6,                    // jne L
+        0x89, 0xD0,                    // mov eax, edx
+        0x89, 0xD1,                    // mov ecx, edx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(src_is_accumulator, "CAS loop foldable into LOCK op", 0);
+
+    // The address is built from the scratch, which the loop rewrites every
+    // iteration, so the accesses do not all name one location.
+    static const uint8_t address_moves[] = {
+        0x8B, 0x01,                    // mov eax, [rcx]
+        0x89, 0xC1,                    // L: mov ecx, eax
+        0x83, 0xC9, 0x01,              // or ecx, 1
+        0xF0, 0x0F, 0xB1, 0x09,        // lock cmpxchg [rcx], ecx
+        0x75, 0xF5,                    // jne L
+        0x89, 0xD0,                    // mov eax, edx
+        0x89, 0xD1,                    // mov ecx, edx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(address_moves, "CAS loop foldable into LOCK op", 0);
+}
+
 // Multi-instruction peephole: lea reg, [addr] whose address the next
 // instruction consumes as its memory base folds into that operand, so the lea
 // disappears. check_instructions reports it against the lea when reg is dead
@@ -7394,6 +7486,7 @@ int main(int argc, char *argv[])
     check_zeroed_condition_test();
     check_movimm_condition_test();
     check_redundant_shift_test();
+    check_cas_fetch_op_test();
     check_lea_fold_test();
     check_mov_const_fold_test();
     check_load_extend_fold_test();

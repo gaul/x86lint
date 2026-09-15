@@ -7884,6 +7884,351 @@ static bool writes_wide_vector(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// A full-register vector load. Split by whether the spelling itself proves
+// its address 16- or 32-byte aligned, which is the whole soundness argument
+// of the fold below: these forms #GP on a misaligned address, so a program
+// that executes one has already established the alignment that a legacy-SSE
+// memory operand needs.
+static bool vec_load_proves_alignment(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_MOVAPS:
+    case XED_ICLASS_MOVAPD:
+    case XED_ICLASS_MOVDQA:
+    case XED_ICLASS_VMOVAPS:
+    case XED_ICLASS_VMOVAPD:
+    case XED_ICLASS_VMOVDQA:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The unaligned spellings, which prove nothing about the address and so may
+// only fold into a VEX consumer.
+static bool vec_load_iclass(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_MOVUPS:
+    case XED_ICLASS_MOVUPD:
+    case XED_ICLASS_MOVDQU:
+    case XED_ICLASS_VMOVUPS:
+    case XED_ICLASS_VMOVUPD:
+    case XED_ICLASS_VMOVDQU:
+    case XED_ICLASS_LDDQU:
+    case XED_ICLASS_VLDDQU:
+        return true;
+    default:
+        return vec_load_proves_alignment(iclass);
+    }
+}
+
+// A vector register-to-register copy. Excluded as a consumer: folding a load
+// into a move produces another move, which is a redundant-copy finding rather
+// than an operation absorbing its operand, and no compiler emits the pair.
+static bool vec_move_iclass(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_MOVSS:
+    case XED_ICLASS_MOVSD_XMM:
+    case XED_ICLASS_MOVD:
+    case XED_ICLASS_MOVQ:
+    case XED_ICLASS_VMOVSS:
+    case XED_ICLASS_VMOVSD:
+    case XED_ICLASS_VMOVD:
+    case XED_ICLASS_VMOVQ:
+        return true;
+    default:
+        return vec_load_iclass(iclass);
+    }
+}
+
+// Vector-register liveness, the counterpart of reg_live_after for the SIMD
+// file. The read scan is shared -- inst_reads_reg64 compares largest-enclosing
+// registers and is register-class agnostic -- but the kill rule cannot be:
+// reg_kill_iclass enumerates GPR writers, and a vector write is instead
+// recognized structurally, as an operand that is written, not read, and at
+// least as wide as the value in question. That width test is what keeps a
+// legacy 128-bit write from being read as a kill of a 256-bit value, since
+// SSE leaves bits 255:128 standing where a VEX write zeroes them.
+//
+// Same bias as every other walk here: reads count inclusively and kills
+// exclusively, so a decode error, a control transfer, or the end of the
+// window all resolve toward LIVE and suppress the finding.
+static bool vec_live_after(const uint8_t *inst, size_t len, size_t offset,
+                           xed_reg_enum_t parent, unsigned value_bits)
+{
+    const int MAX_LOOKAHEAD = 16;
+
+    for (int step = 0; step < MAX_LOOKAHEAD && offset < len; ++step) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
+            return true;
+        }
+        if (inst_reads_reg64(&xedd, parent)) {
+            return true;
+        }
+
+        xed_category_enum_t category = xed_decoded_inst_get_category(&xedd);
+        if (category == XED_CATEGORY_CALL ||
+            category == XED_CATEGORY_RET ||
+            category == XED_CATEGORY_UNCOND_BR ||
+            category == XED_CATEGORY_COND_BR ||
+            category == XED_CATEGORY_SYSCALL ||
+            category == XED_CATEGORY_SYSRET ||
+            category == XED_CATEGORY_INTERRUPT) {
+            return true;
+        }
+
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned nops = xed_inst_noperands(xi);
+        for (unsigned i = 0; i < nops; ++i) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t name = xed_operand_name(op);
+            if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+                continue;
+            }
+            xed_reg_enum_t wr = xed_decoded_inst_get_reg(&xedd, name);
+            if (xed_get_largest_enclosing_register(wr) == parent &&
+                xed_get_register_width_bits64(wr) >= value_bits) {
+                return false;
+            }
+        }
+
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+
+    return true;
+}
+
+// True when the consumer still encodes with `src_name` replaced by the load's
+// memory operand -- that is, when the memory form of this instruction exists
+// and takes its operand in that slot. Asking XED to build it is what keeps the
+// check from carrying a hand-written table of which SIMD iclasses have an
+// xmm/m128 form, and it answers the operand-position question for free: a
+// VEX source that is not the last one produces no encoding, so the wrong slot
+// refuses itself. The result is decoded back and required to be the same
+// operation reading exactly one memory operand, so an encoder that reached a
+// different iform cannot be mistaken for success.
+static bool vecop_takes_memory_source(const xed_decoded_inst_t *consumer,
+                                      const xed_decoded_inst_t *load,
+                                      xed_operand_enum_t src_name)
+{
+    xed_state_t dstate;
+    dstate.mmode = XED_MACHINE_MODE_LONG_64;
+    dstate.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+
+    xed_encoder_operand_t ops[4];
+    unsigned nops = 0;
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(consumer);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (xed_operand_operand_visibility(op) != XED_OPVIS_EXPLICIT) {
+            continue;
+        }
+        if (nops >= sizeof(ops) / sizeof(ops[0])) {
+            return false;
+        }
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (name == src_name) {
+            xed_int64_t disp =
+                xed_decoded_inst_get_memory_displacement(load, 0);
+            xed_reg_enum_t base = xed_decoded_inst_get_base_reg(load, 0);
+            unsigned disp_bits;
+            if (base == XED_REG_RIP || base == XED_REG_EIP) {
+                disp_bits = 32;
+            } else if (disp == 0 &&
+                       base != XED_REG_RBP && base != XED_REG_R13 &&
+                       base != XED_REG_EBP && base != XED_REG_R13D) {
+                disp_bits = 0;
+            } else if (disp >= INT8_MIN && disp <= INT8_MAX) {
+                disp_bits = 8;
+            } else {
+                disp_bits = 32;
+            }
+            ops[nops++] = xed_mem_bisd(base,
+                xed_decoded_inst_get_index_reg(load, 0),
+                xed_decoded_inst_get_scale(load, 0),
+                xed_disp(disp, disp_bits),
+                xed_decoded_inst_get_memory_operand_length(load, 0) * 8);
+            continue;
+        }
+        switch (name) {
+        case XED_OPERAND_REG0:
+        case XED_OPERAND_REG1:
+        case XED_OPERAND_REG2:
+        case XED_OPERAND_REG3:
+            ops[nops++] = xed_reg(xed_decoded_inst_get_reg(consumer, name));
+            break;
+        case XED_OPERAND_IMM0:
+            ops[nops++] = xed_imm0(
+                xed_decoded_inst_get_unsigned_immediate(consumer),
+                xed_decoded_inst_get_immediate_width_bits(consumer));
+            break;
+        default:
+            return false;
+        }
+    }
+
+    xed_encoder_instruction_t enc;
+    xed_inst(&enc, dstate, xed_decoded_inst_get_iclass(consumer), 0, nops, ops);
+
+    xed_encoder_request_t req;
+    xed_encoder_request_zero_set_mode(&req, &dstate);
+    if (!xed_convert_to_encoder_request(&req, &enc)) {
+        return false;
+    }
+    uint8_t out[XED_MAX_INSTRUCTION_BYTES];
+    unsigned int olen = 0;
+    if (xed_encode(&req, out, sizeof(out), &olen) != XED_ERROR_NONE) {
+        return false;
+    }
+    xed_decoded_inst_t reenc;
+    decode_init(&reenc);
+    if (xed_decode(&reenc, out, olen) != XED_ERROR_NONE) {
+        return false;
+    }
+    return xed_decoded_inst_get_iclass(&reenc) ==
+               xed_decoded_inst_get_iclass(consumer) &&
+           xed_decoded_inst_number_of_memory_operands(&reenc) == 1;
+}
+
+// A vector load whose only use is the next vector instruction's source operand
+// is one instruction, since the SIMD two- and three-operand forms take that
+// operand from memory directly:
+//
+//   movaps xmm2, [rip+A] ; mulps xmm8, xmm2   ->   mulps xmm8, [rip+A]
+//
+// This is "load foldable into ALU" with the consumer set widened past the
+// general-purpose ALU, and it inherits that check's dataflow argument intact:
+// the memory is read once at the same address and width, in the same position
+// relative to the consumer's write, so a fault lands where it did; the loaded
+// register must appear in the consumer exactly once and READ-ONLY, making it
+// the operand that becomes memory; and it must be dead afterward.
+//
+// What is new is alignment, and it resolves unusually cleanly. A legacy SSE
+// instruction with a memory operand requires 16-byte alignment and #GPs
+// otherwise, which looks like a blocker until one notices which instruction
+// the fold deletes: MOVAPS/MOVAPD/MOVDQA carry the same requirement, so the
+// original already faults on a misaligned address and folding introduces no
+// new fault. The instruction being removed is the one that proved the
+// precondition of the instruction that survives. MOVUPS/MOVDQU/LDDQU prove
+// nothing, so those may fold only into a VEX consumer, whose memory operands
+// carry no alignment requirement at all -- that asymmetry is the one gate
+// here without a counterpart in the scalar check.
+//
+// EVEX is skipped on both sides, as elsewhere, rather than reasoning about
+// masking and broadcast. A vector move consumer is excluded: folding a load
+// into a move yields another move. The consumer may not write a
+// general-purpose register the load's address is built from, which drops the
+// extraction instructions that would otherwise reach the encodability test.
+//
+// The deadness gate is what sizes this check, and it removes 94% of the
+// shape: 9,298 adjacent libxul sites yield 541, because 6,670 of them read
+// the loaded register again. That is the register allocator being right
+// rather than the proof being timid -- a vector constant is held in a
+// register precisely because it is used more than once, and folding would
+// turn one load into N. What survives is the single-use constant: 539 of the
+// 541 are RIP-relative constant-pool loads, and the modal site is a
+// vectorized polynomial kernel cycling coefficients through one scratch,
+// where the next coefficient's load is itself what proves the previous one
+// dead.
+static bool load_foldable_into_vecop(const uint8_t *inst, size_t len,
+                                     const uint8_t *branch_targets,
+                                     size_t consumer_offset,
+                                     const xed_decoded_inst_t *load)
+{
+    if (!vec_load_iclass(xed_decoded_inst_get_iclass(load)) ||
+        xed3_operand_get_vexvalid(load) == 2 ||
+        xed_decoded_inst_number_of_memory_operands(load) != 1 ||
+        xed_decoded_inst_mem_written(load, 0)) {
+        return false;   // a store, or a masked EVEX form
+    }
+    xed_reg_enum_t loaded = xed_decoded_inst_get_reg(load, XED_OPERAND_REG0);
+    xed_reg_class_enum_t loaded_class = xed_reg_class(loaded);
+    if (loaded_class != XED_REG_CLASS_XMM &&
+        loaded_class != XED_REG_CLASS_YMM) {
+        return false;
+    }
+
+    if (consumer_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t consumer;
+    decode_init(&consumer);
+    if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (xed3_operand_get_vexvalid(&consumer) == 2 ||
+        xed_decoded_inst_number_of_memory_operands(&consumer) != 0 ||
+        vec_move_iclass(xed_decoded_inst_get_iclass(&consumer))) {
+        return false;
+    }
+
+    // An unaligned load proves nothing, so its consumer must be an encoding
+    // that asks nothing: VEX. An aligned load's proof carries to either.
+    if (!vec_load_proves_alignment(xed_decoded_inst_get_iclass(load)) &&
+        xed3_operand_get_vexvalid(&consumer) != 1) {
+        return false;
+    }
+
+    // The loaded register must appear exactly once in the consumer and be
+    // read-only there, which is what makes it the operand memory replaces and
+    // what leaves it dead; and the consumer must not write a register the
+    // load's address is built from.
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(load, 0);
+    xed_reg_enum_t index = xed_decoded_inst_get_index_reg(load, 0);
+    xed_operand_enum_t src_name = XED_OPERAND_INVALID;
+    unsigned uses = 0;
+    const xed_inst_t *xi = xed_decoded_inst_inst(&consumer);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        xed_reg_enum_t r = xed_decoded_inst_get_reg(&consumer, name);
+        if (r == loaded) {
+            if (xed_operand_written(op) ||
+                xed_operand_operand_visibility(op) != XED_OPVIS_EXPLICIT) {
+                return false;
+            }
+            ++uses;
+            src_name = name;
+        } else if (xed_operand_written(op) &&
+                   xed_reg_class(r) == XED_REG_CLASS_GPR) {
+            xed_reg_enum_t w = xed_get_largest_enclosing_register(r);
+            if ((base != XED_REG_INVALID &&
+                 xed_get_largest_enclosing_register(base) == w) ||
+                (index != XED_REG_INVALID &&
+                 xed_get_largest_enclosing_register(index) == w)) {
+                return false;
+            }
+        }
+    }
+    if (uses != 1) {
+        return false;
+    }
+
+    if (!vecop_takes_memory_source(&consumer, load, src_name)) {
+        return false;
+    }
+
+    // An incoming direct edge onto the consumer reaches it without the load.
+    size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
+    if (branch_target_in(branch_targets, consumer_offset, after)) {
+        return false;
+    }
+
+    return !vec_live_after(inst, len, after,
+                           xed_get_largest_enclosing_register(loaded),
+                           xed_get_register_width_bits64(loaded));
+}
+
 // A LOCK CMPXCHG retry loop whose body recomputes the new value with one
 // bitwise op is an atomic fetch-op spelled the long way:
 //
@@ -8314,6 +8659,17 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // mov (at `offset`), the removable instruction. See mov_const_foldable.
         if (mov_const_foldable(inst, len, branch_targets, next, &xedd)) {
             emit_finding(&sink, "MOV constant foldable", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a vector load whose sole use is the next
+        // vector instruction's source operand folds into that operand, since
+        // the SIMD forms take it from memory directly. Reported against the
+        // load (at `offset`), the removable instruction. See
+        // load_foldable_into_vecop.
+        if (load_foldable_into_vecop(inst, len, branch_targets, next, &xedd)) {
+            emit_finding(&sink, "load foldable into vector op", offset, &xedd,
                 inst + offset);
             ++errors;
         }

@@ -3092,6 +3092,83 @@ static void check_redundant_shift_test(void)
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
 }
 
+// Multi-instruction peephole: a vector load whose sole use is the next vector
+// instruction's source operand folds into that operand. check_instructions
+// reports it against the load when the loaded register is dead after the
+// consumer and the load's spelling licenses the consumer's alignment
+// requirement. See load_foldable_into_vecop.
+static void check_vecop_fold_test(void)
+{
+    // movaps xmm2, [rdi] ; mulps xmm0, xmm2 ; movaps xmm2, xmm3 -- the aligned
+    // load proves the address 16-byte aligned, which is exactly what the
+    // legacy-SSE memory operand needs, and the copy kills xmm2:
+    // mulps xmm0, [rdi].
+    static const uint8_t aligned_legacy[] = {
+        0x0F, 0x28, 0x17,  // movaps xmm2, [rdi]
+        0x0F, 0x59, 0xC2,  // mulps xmm0, xmm2
+        0x0F, 0x28, 0xD3,  // movaps xmm2, xmm3 (kills xmm2)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(aligned_legacy, "load foldable into vector op", 1);
+
+    // vmovdqu xmm1, [rdi] ; vpxor xmm0, xmm2, xmm1 -- an unaligned load proves
+    // nothing about the address, but a VEX consumer requires nothing either:
+    // vpxor xmm0, xmm2, [rdi].
+    static const uint8_t unaligned_vex[] = {
+        0xC5, 0xFA, 0x6F, 0x0F,  // vmovdqu xmm1, [rdi]
+        0xC5, 0xE9, 0xEF, 0xC1,  // vpxor xmm0, xmm2, xmm1
+        0xC5, 0xF8, 0x28, 0xCB,  // vmovaps xmm1, xmm3 (kills xmm1)
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(unaligned_vex, "load foldable into vector op", 1);
+
+    // movups xmm2, [rdi] ; mulps xmm0, xmm2 -- the same pair with the
+    // alignment proof removed. mulps with a memory operand #GPs on a
+    // misaligned address where the movups form does not, so the fold would
+    // introduce a fault the original cannot take.
+    static const uint8_t unaligned_legacy[] = {
+        0x0F, 0x10, 0x17,  // movups xmm2, [rdi]
+        0x0F, 0x59, 0xC2,  // mulps xmm0, xmm2
+        0x0F, 0x28, 0xD3,  // movaps xmm2, xmm3
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(unaligned_legacy, "load foldable into vector op", 0);
+
+    // movaps xmm2, [rdi] ; mulps xmm0, xmm2 ; addps xmm1, xmm2 -- the loaded
+    // register is read a second time, so it is not dead and folding would
+    // turn one load into two. This is the dominant refusal on real code.
+    static const uint8_t reused[] = {
+        0x0F, 0x28, 0x17,  // movaps xmm2, [rdi]
+        0x0F, 0x59, 0xC2,  // mulps xmm0, xmm2
+        0x0F, 0x58, 0xCA,  // addps xmm1, xmm2
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(reused, "load foldable into vector op", 0);
+
+    // movaps xmm2, [rdi] ; mulps xmm2, xmm0 -- the consumer writes the loaded
+    // register rather than only reading it, so the register is not the operand
+    // memory replaces and the only fold with memory in the other slot would
+    // store where the original did not.
+    static const uint8_t consumer_writes[] = {
+        0x0F, 0x28, 0x17,  // movaps xmm2, [rdi]
+        0x0F, 0x59, 0xD0,  // mulps xmm2, xmm0
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(consumer_writes, "load foldable into vector op", 0);
+
+    // vmovaps xmm1, [rdi] ; vaddps xmm0, xmm1, xmm2 -- the loaded register is
+    // the VEX non-destructive source, not the last operand, and no encoding
+    // puts a memory operand in that slot. The encodability test refuses it
+    // without the check having to know operand positions.
+    static const uint8_t wrong_operand_slot[] = {
+        0xC5, 0xF8, 0x28, 0x0F,  // vmovaps xmm1, [rdi]
+        0xC5, 0xF0, 0x58, 0xC2,  // vaddps xmm0, xmm1, xmm2
+        0xC5, 0xF8, 0x28, 0xCB,  // vmovaps xmm1, xmm3
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(wrong_operand_slot, "load foldable into vector op", 0);
+}
+
 // Multi-instruction peephole: a LOCK CMPXCHG retry loop whose body is a single
 // bitwise op is an atomic fetch-op, which LOCK OR/AND/XOR performs outright.
 // check_instructions reports it against the loop head when the old value, the
@@ -7486,6 +7563,7 @@ int main(int argc, char *argv[])
     check_zeroed_condition_test();
     check_movimm_condition_test();
     check_redundant_shift_test();
+    check_vecop_fold_test();
     check_cas_fetch_op_test();
     check_lea_fold_test();
     check_mov_const_fold_test();

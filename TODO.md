@@ -514,7 +514,7 @@ standing this file gives its `-a`-swept binaries.
 | Pattern | Rewrite | 2026-09 port sweep |
 | --- | --- | --- |
 | ~~`LOCK CMPXCHG` retry loop whose body is one bitwise op~~ | ~~`LOCK OR`/`AND`/`XOR`~~ | **Done: "CAS loop foldable into LOCK op".** Shape 614 in libxul (466 OR, 132 AND, 16 XOR), 3 libc, 0 elsewhere; realized **19**, all libxul. See the note below -- a 32x collapse with a single cause |
-| aligned vector load whose sole use is the next vector op's source | fold into that operand | Shape **9,298** in libxul, of which **541** survive a deadness proof; 158 libc, 10 libcrypto, 2 go. The VEX-unaligned arm adds 141 / 40 / 48 / 1. Two scalar siblings: `mov r, [m] ; movd/movq xmm, r` (370 libxul, 34 go) and `mov r, [m] ; cvtsi2sd xmm, r` (100 libxul). See the note below -- the 17x gap is the register allocator being right, not the proof being timid |
+| ~~vector load whose sole use is the next vector op's source~~ | ~~fold into that operand~~ | **Done: "load foldable into vector op".** Shape 9,298 in libxul, of which 541 were predicted to survive a deadness proof; realized **583** (libcrypto 176, and 0 in libc, libstdc++, go and bash). See the note below -- the 17x gap between shape and finding is the register allocator being right, not the proof being timid. Two scalar siblings remain unbuilt: `mov r, [m] ; movd/movq xmm, r` (370 libxul, 34 go) and `mov r, [m] ; cvtsi2sd xmm, r` (100 libxul) |
 | adjacent immediate-zero stores at consecutive addresses | one wider store | libxul **3,722** byte / 933 dword / 1,297 qword; libcrypto 250 qword, libstdc++ 341 qword, libc 66, go 56, bash 43. Blocked on a policy question, not on proof -- see below |
 
 **The CAS fold, and why its shape overstated it 32x.** The check
@@ -536,7 +536,7 @@ population is a property of what the compiler *already* optimizes, and
 the first where measuring the tail of the loop rather than its head was
 what showed it.
 
-**The vector fold, and the 17x its shape overstated.** It is the shipped
+**The vector fold, and the 17x its shape overstated.** It now ships. It is the
 "load foldable into ALU" family with the consumer set widened past the
 GPR ALU. The alignment condition is unusually clean for x86: a
 `movaps`/`movdqa` producer *proves* its address 16-byte aligned,
@@ -577,8 +577,22 @@ movaps xmm2, [rip+A] ; mulps xmm8, xmm2 ; divps xmm8, xmm10
 movaps xmm2, [rip+B] ; addps xmm8, xmm2
 ```
 
+libcrypto's 176 are a different population with the same cause: OpenSSL's
+hand-written AES-NI perlasm loads a round key per round and uses it once,
+which is what a fold the compiler already performs leaves behind.
+
 Everything else is the existing family's machinery: sole use, register
-deadness, the both-successors split.
+deadness, adjacency. **Realized 583 against the 541 predicted**, the
+closest estimate in this file and the second to land high rather than
+low. The overshoot is understood and has the same shape as the zeroing
+arm's: the estimate counted a fixed list of consumers and only the
+alignment-proving producers, where the check asks XED whether the
+consumer has a memory form at all and carries the unaligned-into-VEX arm
+besides. Against that it scans only symbol ranges where the estimate read
+whole sections. Two conditions the estimate never applied, both pushing
+the same way. The both-successors split is deliberately not used: 198 of
+the 9,298 end at a control transfer, so it would buy under 2% for the
+machinery it costs.
 
 **The zero-store merge needs a policy decision before it needs code.**
 The rewrite is armlint's (`check_ldp_stp_coalesce`'s zero arm and

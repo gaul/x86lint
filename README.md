@@ -401,6 +401,46 @@ argue for or against each, live in [TODO.md](TODO.md).
     in-place sign/zero-extension is a single extending load: MOVZX EAX, byte
     [RSI]. Removes the load and its partial-register write; also MOVSX and the
     MOVSXD (32->64) form
+* load foldable into vector op
+  - `0F2817 0F59C2` (MOVAPS XMM2, [RDI]; MULPS XMM0, XMM2) -- a vector load
+    whose only use is the next SIMD instruction's source operand is one
+    instruction, since the two- and three-operand forms take that operand from
+    memory directly: MULPS XMM0, [RDI]. The general-purpose family's argument
+    carries over intact -- the memory is read once at the same address and
+    width, in the same position relative to the consumer's write, so a fault
+    lands where it did; the loaded register must appear in the consumer exactly
+    once and READ-ONLY, which is what makes it the operand memory replaces; and
+    it must be dead afterward, proved by a vector-register liveness walk whose
+    kill rule is structural (an operand written, not read, and at least as wide
+    as the value) rather than an iclass list, since a legacy 128-bit write
+    leaves bits 255:128 standing where a VEX write zeroes them
+  - **Alignment is the one gate with no scalar counterpart, and it resolves
+    through the instruction being deleted.** A legacy SSE instruction with a
+    memory operand requires 16-byte alignment and #GPs otherwise, which looks
+    like a blocker until one notices that MOVAPS/MOVAPD/MOVDQA carry the same
+    requirement: a program that executed the load has already established the
+    alignment, so folding introduces no fault the original could not take. The
+    producer proves the precondition of the instruction that outlives it.
+    MOVUPS/MOVDQU/LDDQU prove nothing and may fold only into a VEX consumer,
+    whose memory operands require no alignment at all. Whether the consumer has
+    a memory form, and in that operand slot, is answered by re-encoding it
+    through XED rather than by a table of SIMD iclasses -- a VEX
+    non-destructive source that is not the last operand produces no encoding
+    and so refuses itself. EVEX is skipped on both sides, as elsewhere, rather
+    than reasoning about masking and broadcast, and a vector move consumer is
+    excluded since folding a load into a move yields another move
+  - The deadness gate removes 94% of the shape: 9,298 adjacent libxul sites
+    yield **583 findings** (libcrypto 176, and 0 in libc, libstdc++, go and
+    bash), because 6,670 read the loaded register again. That is the register
+    allocator being right rather than the proof being timid -- a vector
+    constant is held in a register precisely because it is used more than once,
+    and folding would turn one load into N. What survives is the single-use
+    constant: 539 of libxul's are RIP-relative constant-pool loads, the modal
+    site being a vectorized polynomial kernel cycling coefficients through one
+    scratch, where the next coefficient's load is what proves the previous one
+    dead. libcrypto's are OpenSSL's hand-written AES-NI perlasm loading a round
+    key per round (`vmovups xmm14, [r15+0x60]; vaesenc xmm12, xmm12, xmm14`),
+    the population a fold the compiler already performs leaves behind
 * missing ANDN (only with `-m bmi1`)
   - `F7D0 21C8` (NOT EAX; AND EAX, ECX) -- one ANDN EAX, EAX, ECX (BMI1)
     computes ~x & y directly. An exact fold: both forms write only the

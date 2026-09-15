@@ -515,7 +515,7 @@ standing this file gives its `-a`-swept binaries.
 | --- | --- | --- |
 | ~~`LOCK CMPXCHG` retry loop whose body is one bitwise op~~ | ~~`LOCK OR`/`AND`/`XOR`~~ | **Done: "CAS loop foldable into LOCK op".** Shape 614 in libxul (466 OR, 132 AND, 16 XOR), 3 libc, 0 elsewhere; realized **19**, all libxul. See the note below -- a 32x collapse with a single cause |
 | ~~vector load whose sole use is the next vector op's source~~ | ~~fold into that operand~~ | **Done: "load foldable into vector op".** Shape 9,298 in libxul, of which 541 were predicted to survive a deadness proof; realized **583** (libcrypto 176, and 0 in libc, libstdc++, go and bash). See the note below -- the 17x gap between shape and finding is the register allocator being right, not the proof being timid. Two scalar siblings remain unbuilt: `mov r, [m] ; movd/movq xmm, r` (370 libxul, 34 go) and `mov r, [m] ; cvtsi2sd xmm, r` (100 libxul) |
-| adjacent immediate-zero stores at consecutive addresses | one wider store | libxul **3,722** byte / 933 dword / 1,297 qword; libcrypto 250 qword, libstdc++ 341 qword, libc 66, go 56, bash 43. Blocked on a policy question, not on proof -- see below |
+| adjacent immediate-zero stores at consecutive addresses | one wider store | **Filed as [#30](https://github.com/gaul/x86lint/issues/30).** Re-counted by maximal run rather than by pair: libxul **20,870** runs covering 45,626 stores, of which **11,788** are removable with no new register; libstdc++ 396 runs, libcrypto 339, go 331, libc 91, bash 78. Blocked on a policy question, not on proof -- see below |
 
 **The CAS fold, and why its shape overstated it 32x.** The check
 ships, and the collapse from 5,192 `LOCK CMPXCHG` + `JNE` pairs to 614
@@ -594,21 +594,41 @@ the same way. The both-successors split is deliberately not used: 198 of
 the 9,298 end at a control transfer, so it would buy under 2% for the
 machinery it costs.
 
-**The zero-store merge needs a policy decision before it needs code.**
-The rewrite is armlint's (`check_ldp_stp_coalesce`'s zero arm and
-`check_stp_wzr_to_str_xzr`), and the dword pair is the clean case --
-`C7 /0 imm32` twice is 14 bytes against one `48 C7 /0 imm32` at 8, a
-store uop saved as well. But it changes the *granularity* of a memory
-access, which the standing rule behind `check_shift_zero` and
+**The zero-store merge needs a policy decision before it needs code**, and
+is filed as [#30](https://github.com/gaul/x86lint/issues/30) with the
+measurement and the argument. The rewrite is armlint's
+(`check_ldp_stp_coalesce`'s zero arm and `check_stp_wzr_to_str_xzr`), and
+the dword run is the clean case -- `C7 /0 imm32` twice is 14 bytes against
+one `48 C7 /0 imm32` at 8, a store uop saved as well, and `MOV r/m64,
+imm32` sign-extends so zero costs the same immediate at either width. But
+it changes the *granularity* of a memory access, which the standing rule
+behind `check_shift_zero` and
 [#29](https://github.com/gaul/x86lint/issues/29) -- no finding changes
 the set of memory accesses -- was written to forbid. Merging is not
-deleting, and every compiler's store-merging pass does it, so the rule
-may simply be about deletion; that is the call to make. Two x86-only
-wrinkles if it proceeds: the byte pair must merge four at a time rather
-than two, since a `66`-prefixed `imm16` store is this tool's own
-length-changing-prefix finding, and the qword pair merges only into a
-16-byte vector store, which needs a zeroed XMM the surrounding code may
-not have.
+deleting, nothing stops being written, and every compiler's store-merging
+pass does exactly this, so the rule may simply be about deletion; that is
+the call to make.
+
+**Counting by run rather than by pair is what made the row honest.** An
+eight-store run is one opportunity, not seven, and the pair count also
+missed every mixed-width run: libxul's ~6,000 same-width pairs are really
+20,870 maximal runs covering 45,626 stores. Bucketing those by the bytes
+they span says what each would merge into -- 284 at 2 bytes, 1,057 at 4,
+6,927 at 8, and 12,602 above 8 -- so about 8,000 collapse to a single
+store outright and the rest collapse partially. The small binaries look
+empty (21 in libstdc++, 28 in libcrypto) for a reason worth keeping:
+their runs are overwhelmingly *pairs of qword stores* spanning 16 bytes,
+which the no-new-register model cannot improve at all. That is not the
+shape being absent, it is the cheap half of the rewrite not applying.
+
+Two x86-only wrinkles if it proceeds: a 2-byte span must not be merged,
+since a `66`-prefixed `imm16` store is this tool's own
+length-changing-prefix finding and its fix would create another, so byte
+stores merge four at a time rather than two; and above 8 bytes the merge
+wants a zeroed XMM the surrounding code may not have, spelled `MOVUPS`
+rather than `MOVAPS` since byte and dword stores prove nothing about
+alignment. That register is the whole difference from armlint, where
+`xzr` exists and the wider store needs nothing allocated.
 
 **Measured and near-dead.** Every remaining armlint check with an x86
 spelling, counted the same way. Recorded so the table is not walked

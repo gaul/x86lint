@@ -183,6 +183,7 @@ with the corpus populations that argue for or against each, live in
 | [redundant CMOVcc reg, reg](analyses.md#redundant-cmovcc-reg-reg) | remove; a conditional move onto itself |
 | [redundant AND immediate](analyses.md#redundant-and-immediate) | `TEST reg, reg` |
 | [redundant bit-scan default](analyses.md#redundant-bit-scan-default) | delete the MOV; needs `-t skylake` or later |
+| [redundant MOV constant](analyses.md#redundant-mov-constant) | delete; the destination already holds it |
 | [redundant MOV reg, reg](analyses.md#redundant-mov-reg-reg) | remove |
 | [redundant OR/XOR zero](analyses.md#redundant-orxor-zero) | `TEST`, or remove |
 | [redundant zero-extension](analyses.md#redundant-zero-extension) | drop it; the producer already zeroed those bits |
@@ -193,6 +194,7 @@ with the corpus populations that argue for or against each, live in
 | [redundant TEST after shift](analyses.md#redundant-test-after-shift) | branch on the shift's flags directly |
 | [redundant TEST immediate](analyses.md#redundant-test-immediate) | `TEST reg, reg` |
 | [shift pair foldable into extend](analyses.md#shift-pair-foldable-into-extend) | `MOVSX`/`MOVZX` |
+| [rematerialized constant](analyses.md#rematerialized-constant) | `MOV rD, rS`; needs `-t skylake` or `-t zen` |
 | [suboptimal AND immediate](analyses.md#suboptimal-and-immediate) | `MOVZX` |
 | [suboptimal AND zero](analyses.md#suboptimal-and-zero) | `XOR reg, reg` |
 | [suboptimal CMP zero](analyses.md#suboptimal-cmp-zero) | `TEST reg, reg` |

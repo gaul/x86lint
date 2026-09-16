@@ -3635,6 +3635,20 @@ enum {
     // target_requires can only ask for bits that are set. An unmeasured core
     // leaves it clear, which withholds the finding.
     TARGET_BITSCAN_DEP_FIXED = 1u << 4,
+    // `MOV r32, r32` and `MOV r64, r64` are handled at rename, so a register
+    // copy costs no latency and no port. Agner Fog's tables (read 2026-09)
+    // give latency 0 by renaming on Zen 1 through Zen 5 and 0-1 with "may be
+    // eliminated" on Ivy Bridge through Coffee Lake, against a full cycle on
+    // p0156 with no elimination on Sandy Bridge, Ice Lake and Tiger Lake.
+    // The rewrite that needs this replaces an independent immediate with a
+    // dependent copy, so without elimination it trades a cycle for bytes --
+    // the slow-LEA situation again, one instruction over.
+    //
+    // SANDYBRIDGE spans cores that disagree here, Sandy Bridge lacking the
+    // elimination that Ivy Bridge onward has, and takes the conservative
+    // member. The tables have no Alder Lake section, so Golden Cove and later
+    // are unverified and no target claims them.
+    TARGET_MOVE_ELIM = 1u << 5,
 };
 
 static uint32_t target_properties(enum x86lint_target target)
@@ -3646,11 +3660,11 @@ static uint32_t target_properties(enum x86lint_target target)
         // Where the two differ: the bit-scan false dependency ends at
         // Broadwell, while POPCNT's runs on to Cascade Lake.
         return TARGET_SLOW_LEA3 | TARGET_POPCNT_FALSE_DEP |
-               TARGET_BITSCAN_DEP_FIXED;
+               TARGET_BITSCAN_DEP_FIXED | TARGET_MOVE_ELIM;
     case X86LINT_TARGET_ICELAKE:
         return TARGET_LCP_ON_MOV | TARGET_BITSCAN_DEP_FIXED;
     case X86LINT_TARGET_ZEN:
-        return TARGET_BITSCAN_DEP_FIXED;
+        return TARGET_BITSCAN_DEP_FIXED | TARGET_MOVE_ELIM;
     case X86LINT_TARGET_SILVERMONT:
         // No LCP stall at all, and the one core where the SUB zeroing idiom
         // is worth rewriting. The LEA row is left set: Agner's tables give
@@ -8473,6 +8487,172 @@ static bool vecop_takes_memory_source(const xed_decoded_inst_t *consumer,
 #define REFUSE(why_) \
     do { if (why != NULL) { *why = (why_); } return false; } while (0)
 
+// A constant materialized into a register that another register provably
+// still holds: `mov r10d, 0x2 ; mov edi, 0x2` is `mov edi, r10d`, three
+// bytes against five, and against ten where the immediate needed a movabs.
+// The copy is shorter at every width, there being no imm8 form of MOV.
+//
+// This is the one check here that carries state across the scan, because
+// the rewrite's precondition is about a value rather than a pattern. The map
+// is deliberately small and loses toward not-a-finding:
+//
+//   * only the 32- and 64-bit `mov r, imm` forms are recorded, as the full
+//     64-bit contents the write leaves behind -- a 32-bit write zero-extends,
+//     so `mov eax, 5` really does establish RAX = 5, where `mov al, 5` says
+//     nothing about the other 56 bits and is not tracked at all;
+//   * every register an instruction writes is cleared;
+//   * the whole map is cleared at a call, at any control transfer, at a
+//     branch target and at a decode error, since a register's contents
+//     cannot be carried across an edge this scan cannot see.
+//
+// What survives is therefore a value provably present on every path that
+// reaches the site, which is also why the copy needs no liveness argument:
+// nothing has written the source since it was set.
+//
+// Two findings come out of one walk. When the register still holding the
+// value is the *destination*, the MOV writes what is already there and is
+// dead outright -- reported unconditionally, since deleting it raises no
+// question about anything. Otherwise the rewrite is a copy, and that one is
+// target-gated: it replaces an independent immediate with a dependent move,
+// so it wants a core that eliminates register copies at rename. Without
+// that, `mov r10d, 2 ; mov edi, 2` is two one-cycle instructions free to
+// issue together and the rewrite serializes them, trading a cycle for two
+// bytes.
+//
+// Measured: 33,248 copy sites and 246 dead ones across the corpus, libxul
+// supplying 32,177 and 189. Unusually for this tool the conditions cost
+// almost nothing -- 97% of the shape survives -- because the population was
+// defined by the precondition rather than by a pattern.
+#define CONST_SLOTS 16
+
+struct const_map {
+    bool known[CONST_SLOTS];
+    uint64_t value[CONST_SLOTS];
+};
+
+// The 16 architectural GPRs, or -1 for anything else.
+static int const_slot(xed_reg_enum_t r)
+{
+    xed_reg_enum_t p = xed_get_largest_enclosing_register(r);
+    if (p < XED_REG_RAX || p > XED_REG_R15) {
+        return -1;
+    }
+    return (int) (p - XED_REG_RAX);
+}
+
+// The 64-bit contents a `mov r, imm` leaves in its destination, or false if
+// this is not one of the forms worth tracking.
+static bool const_mov_value(const xed_decoded_inst_t *d, int *slot,
+                            uint64_t *value)
+{
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d))) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(d, XED_OPERAND_REG0);
+    unsigned w = xed_decoded_inst_get_operand_width(d);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR || (w != 32 && w != 64)) {
+        return false;
+    }
+    *slot = const_slot(dest);
+    if (*slot < 0) {
+        return false;
+    }
+    // The three forms leave three different values behind, and conflating
+    // them is a false positive rather than a missed finding: `mov edx,
+    // 0xffffffff` leaves 0x00000000ffffffff because a 32-bit write
+    // zero-extends, while `mov rdx, -1` is an imm32 the instruction
+    // sign-extends to 0xffffffffffffffff. Reading the raw immediate for both
+    // makes them compare equal, which is glibc's `mov edx, 0xffffffff ; ...
+    // ; mov rdx, -1` reported as a redundant move of a value the register
+    // does not hold.
+    uint64_t raw = xed_decoded_inst_get_unsigned_immediate(d);
+    if (w == 32) {
+        *value = raw & 0xffffffffu;
+    } else if (xed_decoded_inst_get_immediate_width_bits(d) == 64) {
+        *value = raw;                               // movabs
+    } else {
+        *value = (uint64_t) (int64_t) (int32_t) raw;    // imm32, sign-extended
+    }
+    return true;
+}
+
+enum const_verdict {
+    CONST_NONE,
+    CONST_DEAD,         // the destination already holds it: delete the MOV
+    CONST_COPYABLE,     // another register holds it: MOV rD, rS
+};
+
+// One step of the walk: judge the instruction at `offset`, then fold it into
+// the map. Called once per decoded instruction, in order, by the dispatcher
+// and by tools/shapescan alike.
+static enum const_verdict const_remat_step(struct const_map *map,
+                                           const uint8_t *branch_targets,
+                                           size_t offset, size_t next,
+                                           const xed_decoded_inst_t *d)
+{
+    if (branch_target_in(branch_targets, offset, next)) {
+        memset(map, 0, sizeof(*map));   // another path reaches here
+    }
+
+    enum const_verdict verdict = CONST_NONE;
+    int slot = -1;
+    uint64_t value = 0;
+    if (const_mov_value(d, &slot, &value)) {
+        for (int i = 0; i < CONST_SLOTS; ++i) {
+            if (!map->known[i] || map->value[i] != value) {
+                continue;
+            }
+            if (i == slot) {
+                verdict = CONST_DEAD;   // the stronger claim wins outright
+                break;
+            }
+            // Zero is the shipped "suboptimal MOV zero" finding, whose XOR
+            // is strictly better than a copy: two bytes rather than three,
+            // and it breaks the dependency chain where the copy creates one.
+            // A zero the destination already holds is still dead, so only
+            // the copy arm defers.
+            if (value != 0) {
+                verdict = CONST_COPYABLE;
+            }
+        }
+    }
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(d);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t nm = xed_operand_name(op);
+        if (!xed_operand_is_register(nm) || !xed_operand_written(op)) {
+            continue;
+        }
+        int w = const_slot(xed_decoded_inst_get_reg(d, nm));
+        if (w >= 0) {
+            map->known[w] = false;
+        }
+    }
+    if (slot >= 0) {
+        map->known[slot] = true;
+        map->value[slot] = value;
+    }
+
+    switch (xed_decoded_inst_get_category(d)) {
+    case XED_CATEGORY_CALL:
+    case XED_CATEGORY_RET:
+    case XED_CATEGORY_UNCOND_BR:
+    case XED_CATEGORY_COND_BR:
+    case XED_CATEGORY_INTERRUPT:
+    case XED_CATEGORY_SYSCALL:
+        memset(map, 0, sizeof(*map));
+        break;
+    default:
+        break;
+    }
+    return verdict;
+}
+
+
 // NEG then an ADD of the negated value is a SUB of the original, and the
 // mirror: `neg edx ; add r14d, edx` is `sub r14d, edx`, one instruction and
 // one scratch register fewer.
@@ -9163,6 +9343,12 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
     // AVX-SSE transition block below.
     bool ymm_upper_dirty = false;
 
+    // Per-register constant contents, for the rematerialization check. Reset
+    // by const_remat_step itself at every edge it cannot see through, and
+    // here on a decode resync. See const_remat_step.
+    struct const_map const_map;
+    memset(&const_map, 0, sizeof(const_map));
+
     // Direct branch targets for the multi-instruction windows (see
     // collect_branch_targets). NULL on allocation failure, which
     // branch_target_in treats as every-offset-targeted: the multi-instruction
@@ -9189,6 +9375,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             have_prev = false;
             dep_history_reset(&dep_history);
             ymm_upper_dirty = false;
+            memset(&const_map, 0, sizeof(const_map));
             offset += 1;
             continue;
         }
@@ -9372,6 +9559,27 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             emit_finding(&sink, "load foldable into vector op", offset, &xedd,
                 inst + offset);
             ++errors;
+        }
+
+        // Stateful check: a constant this register, or another, already
+        // holds. Reported against the mov, which the rewrite either deletes
+        // or turns into a copy. See const_remat_step.
+        switch (const_remat_step(&const_map, branch_targets, offset, next,
+                                 &xedd)) {
+        case CONST_DEAD:
+            emit_finding(&sink, "redundant MOV constant", offset, &xedd,
+                inst + offset);
+            ++errors;
+            break;
+        case CONST_COPYABLE:
+            if ((tprops & TARGET_MOVE_ELIM) != 0) {
+                emit_finding(&sink, "rematerialized constant", offset, &xedd,
+                    inst + offset);
+                ++errors;
+            }
+            break;
+        case CONST_NONE:
+            break;
         }
 
         // Multi-instruction peephole: neg then an add of the negated value

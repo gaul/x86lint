@@ -277,7 +277,7 @@ together with the other per-core caveats a `-t` knob would gate.
 
 | Pattern | Rewrite | 2026-08 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
-| `MOV r, imm` of a constant still live in another register | `MOV rD, rS` -- 2-3 bytes against the 5-6 the immediate form costs | **Measured 2026-09-15 by `tools/shapescan`: 33,248 realized of a 34,155 shape** (libxul 32,177, go 417, libcrypto 197, libc 168, libstdc++ 153, bash 136); 30,753 of those are adjacent. defuse's d1 estimate was 27,796. Sound and unblocked; what remains is desirability, not proof |
+| ~~`MOV r, imm` of a constant still live in another register~~ | ~~`MOV rD, rS`~~ | **Done, 2026-09-15: "rematerialized constant", gated on move elimination (`-t skylake`, `-t zen`).** 33,218 findings of a 33,456 shape, libxul 32,168. A second, ungated finding came out of the same walk: "redundant MOV constant", 238 sites where the register already holding the value is the destination, so the move is dead rather than replaceable |
 
 **This is the one row in this file whose population survived contact with
 the rewrite**, and it was predicted to, for the right reason. Every count that
@@ -309,15 +309,27 @@ independent corroboration.
 
 Two things the measurement found that the row did not say:
 
-* **246 sites are a stronger finding than this row describes.** The register
+* **238 sites are a stronger finding than this row describes.** The register
   that already holds the value is the destination itself, so the `mov` is not
-  a copy opportunity but dead outright -- libxul 189, libstdc++ 31, go 18.
-  Those want deleting, not rewriting, and no target question arises.
-* **The zero fraction is 1.7%, not the 16% recorded below.** 661 of 34,155,
-  and 0 in libc and bash. The 16% came from counting a population that
-  included the XOR zeroing idiom; the rewrite here needs a `mov r, imm` to
-  replace, and compilers do not spell zero that way. The zeros that do occur
-  are already the shipped "suboptimal MOV zero" finding.
+  a copy opportunity but dead outright -- libxul 188, libstdc++ 31, go 18.
+  Those want deleting, not rewriting, and no target question arises, so they
+  ship ungated.
+* **The zero fraction is about 2%, not the 16% recorded below**, and those
+  sites now defer to the shipped "suboptimal MOV zero" rather than being
+  counted here at all: its XOR is two bytes against the copy's three and
+  breaks the dependency the copy would create. The 16% came from counting a
+  population that included the XOR zeroing idiom, where this rewrite needs a
+  `mov r, imm` to replace and compilers do not spell zero that way.
+* **The first measurement of this row was 2% high, from a false positive the
+  check itself then reproduced.** The three MOV-immediate forms leave three
+  different values behind: a 32-bit write zero-extends, so `mov edx,
+  0xffffffff` leaves `0x00000000ffffffff`, where the 64-bit imm32 form
+  sign-extends and `mov rdx, -1` leaves all ones. Reading the raw immediate
+  for both made them compare equal, and glibc's `__isoc23_strtoul` clamp --
+  which uses exactly that pair -- was reported as a redundant move of a value
+  the register does not hold. Every one of libc's 7 "already holds it" sites
+  was that bug. It was caught by disassembling a finding rather than by any
+  count looking wrong, which is the second time this file has needed that.
 
 Two corrections to an earlier draft of this row, both from measuring
 the sites rather than the shape:

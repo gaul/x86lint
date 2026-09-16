@@ -574,79 +574,22 @@ static bool c_stack_reload(const uint8_t *inst, size_t len,
 
 // === run candidate: a constant already live in another register ===
 //
-// TODO.md's "Constants" row: `mov edi, 2` where some other register
-// provably still holds 2 is `mov edi, r10d`, three bytes against five (and
-// against ten for a movabs). It is the largest population in that file never
-// measured with the rewrite's own precondition applied, and the precondition
-// is the interesting part: the constant has to still be *there*, which needs
-// a tracked value per register rather than a pattern over two instructions.
-// That is why this is a run candidate -- the window API is stateless by
-// construction.
-//
-// The model is deliberately small and loses toward not-a-finding. A value is
-// recorded only for the 32- and 64-bit `mov r, imm` forms, as the full
-// 64-bit contents the write leaves behind: a 32-bit move zero-extends, so
-// `mov eax, 5` records RAX = 5 and a later `mov edx, 5` matches it, where
-// `mov al, 5` records nothing because the other 56 bits are unknown. Every
-// register an instruction writes is cleared, and the whole map is cleared at
-// a call, at any control transfer, at a branch target, and at a decode
-// error -- a register's contents cannot be carried across an edge this scan
-// cannot see.
-#define NCONST 16
-
-struct const_map {
-    bool known[NCONST];
-    uint64_t value[NCONST];
-    size_t set_at[NCONST];      // instruction index, for the distance test
-};
-
-// The 16 architectural GPRs, or -1 for anything else.
-static int gpr_slot(xed_reg_enum_t r)
-{
-    xed_reg_enum_t p = xed_get_largest_enclosing_register(r);
-    if (p < XED_REG_RAX || p > XED_REG_R15) {
-        return -1;
-    }
-    return (int) (p - XED_REG_RAX);
-}
-
-// The 64-bit contents a `mov r, imm` leaves in its destination, or false if
-// this is not one of the forms worth tracking.
-static bool mov_const_value(const xed_decoded_inst_t *d, int *slot,
-                            uint64_t *value)
-{
-    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
-        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
-        !xed_operand_values_has_immediate(
-            xed_decoded_inst_operands_const(d))) {
-        return false;
-    }
-    xed_reg_enum_t dest = xed_decoded_inst_get_reg(d, XED_OPERAND_REG0);
-    unsigned w = xed_decoded_inst_get_operand_width(d);
-    if (xed_reg_class(dest) != XED_REG_CLASS_GPR || (w != 32 && w != 64)) {
-        return false;
-    }
-    *slot = gpr_slot(dest);
-    if (*slot < 0) {
-        return false;
-    }
-    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(d);
-    // A 32-bit write zero-extends; the 64-bit imm32 form sign-extends, which
-    // XED has already applied to the value it reports.
-    *value = w == 32 ? (imm & 0xffffffffu) : imm;
-    return true;
-}
-
-static void remat_constant(const uint8_t *inst, size_t len,
-                           const uint8_t *targets, struct tally *t,
-                           const char *path, uint64_t vaddr,
-                           const char *example, long *left, bool adjacent_only)
+// Now shipped as two findings, and driven here through the very same state
+// machine: const_remat_step judges one instruction and folds it into the
+// map, so the tool and the linter cannot disagree about what a register
+// holds. A duplicate of this walk is exactly what produced a false positive
+// on glibc -- `mov edx, 0xffffffff` leaves 0x00000000ffffffff where
+// `mov rdx, -1` leaves all ones, and reading the raw immediate for both made
+// them compare equal.
+static void remat_constant_any(const uint8_t *inst, size_t len,
+                               const uint8_t *targets, struct tally *t,
+                               const char *path, uint64_t vaddr,
+                               const char *example, long *left)
 {
     struct const_map map;
     memset(&map, 0, sizeof(map));
-    size_t index = 0;
 
-    for (size_t offset = 0; offset < len; ++index) {
+    for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
         decode_init(&xedd);
         if (xed_decode(&xedd, inst + offset, len - offset) != XED_ERROR_NONE) {
@@ -655,94 +598,28 @@ static void remat_constant(const uint8_t *inst, size_t len,
             continue;
         }
         size_t next = offset + xed_decoded_inst_get_length(&xedd);
-        if (branch_target_in(targets, offset, next)) {
-            memset(&map, 0, sizeof(map));   // another path reaches here
-        }
-
-        int slot = -1;
-        uint64_t value = 0;
-        if (mov_const_value(&xedd, &slot, &value)) {
-            // Is the value already somewhere? The destination first: if it
-            // holds it, the move is not a copy opportunity but dead.
-            int src = -1;
-            for (int i = 0; i < NCONST; ++i) {
-                if (map.known[i] && map.value[i] == value &&
-                    (!adjacent_only || map.set_at[i] + 1 == index)) {
-                    if (i == slot) {
-                        src = i;
-                        break;          // the destination itself wins
-                    }
-                    if (src < 0) {
-                        src = i;
-                    }
-                }
+        switch (const_remat_step(&map, targets, offset, next, &xedd)) {
+        case CONST_DEAD:
+            ++t->shape;
+            tally_refusal(t, "the destination already holds it");
+            break;
+        case CONST_COPYABLE:
+            ++t->shape;
+            ++t->realized;
+            if (example != NULL && *left > 0) {
+                char text[128];
+                xed_format_context(XED_SYNTAX_INTEL, &xedd, text,
+                    sizeof(text), vaddr + offset, NULL, NULL);
+                printf("  %s+0x%" PRIx64 ": %s\n", path, vaddr + offset,
+                    text);
+                --*left;
             }
-            if (src >= 0) {
-                ++t->shape;
-                if (src == slot) {
-                    tally_refusal(t, "the destination already holds it");
-                } else if (value == 0) {
-                    tally_refusal(t, "zero: XOR is shorter and breaks the chain");
-                } else {
-                    ++t->realized;
-                    if (example != NULL && *left > 0) {
-                        char text[128];
-                        xed_format_context(XED_SYNTAX_INTEL, &xedd, text,
-                            sizeof(text), vaddr + offset, NULL, NULL);
-                        printf("  %s+0x%" PRIx64 ": %s  (held since %zu"
-                            " instruction%s back)\n", path, vaddr + offset,
-                            text, index - map.set_at[src],
-                            index - map.set_at[src] == 1 ? "" : "s");
-                        --*left;
-                    }
-                }
-            }
-        }
-
-        // Clear every register this instruction writes, then record the one
-        // it sets to a constant.
-        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
-        for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
-            const xed_operand_t *op = xed_inst_operand(xi, i);
-            xed_operand_enum_t nm = xed_operand_name(op);
-            if (!xed_operand_is_register(nm) || !xed_operand_written(op)) {
-                continue;
-            }
-            int w = gpr_slot(xed_decoded_inst_get_reg(&xedd, nm));
-            if (w >= 0) {
-                map.known[w] = false;
-            }
-        }
-        if (slot >= 0) {
-            map.known[slot] = true;
-            map.value[slot] = value;
-            map.set_at[slot] = index;
-        }
-
-        xed_category_enum_t cat = xed_decoded_inst_get_category(&xedd);
-        if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_RET ||
-            cat == XED_CATEGORY_UNCOND_BR || cat == XED_CATEGORY_COND_BR ||
-            cat == XED_CATEGORY_INTERRUPT || cat == XED_CATEGORY_SYSCALL) {
-            memset(&map, 0, sizeof(map));
+            break;
+        case CONST_NONE:
+            break;
         }
         offset = next;
     }
-}
-
-static void remat_constant_any(const uint8_t *inst, size_t len,
-                               const uint8_t *targets, struct tally *t,
-                               const char *path, uint64_t vaddr,
-                               const char *example, long *left)
-{
-    remat_constant(inst, len, targets, t, path, vaddr, example, left, false);
-}
-
-static void remat_constant_adjacent(const uint8_t *inst, size_t len,
-                                    const uint8_t *targets, struct tally *t,
-                                    const char *path, uint64_t vaddr,
-                                    const char *example, long *left)
-{
-    remat_constant(inst, len, targets, t, path, vaddr, example, left, true);
 }
 
 // === run candidate: adjacent immediate-zero stores (issue #30) ===
@@ -866,8 +743,6 @@ static const struct candidate candidates[] = {
       NULL, zero_store_runs },
     { "constant already in a register", "MOV rD, rS",
       NULL, remat_constant_any },
-    { "constant already in a register (adjacent)", "MOV rD, rS",
-      NULL, remat_constant_adjacent },
 
     // TODO rows, not yet shipped. The figure in the comment on each
     // predicate is what an earlier throwaway script reported, where there

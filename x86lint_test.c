@@ -3191,6 +3191,82 @@ static void check_redundant_shift_test(void)
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
 }
 
+// A constant another register still holds, and one the destination already
+// holds. The only check here that carries state across the scan. See
+// const_remat_step.
+static void check_const_remat_test(void)
+{
+    int total;
+
+    // mov r10d, 2 ; mov edi, 2 -- the second is `mov edi, r10d`, three bytes
+    // against five, but only worth it where a register copy is eliminated at
+    // rename.
+    static const uint8_t remat[] = {
+        0x41, 0xBA, 0x02, 0x00, 0x00, 0x00,  // mov r10d, 2
+        0xBF, 0x02, 0x00, 0x00, 0x00,        // mov edi, 2
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS_TARGET(remat, "rematerialized constant", 1,
+                           X86LINT_TARGET_SKYLAKE);
+    ASSERT_FINDINGS_TARGET(remat, "rematerialized constant", 1,
+                           X86LINT_TARGET_ZEN);
+    // Without elimination the copy serializes two independent instructions,
+    // trading a cycle for two bytes.
+    ASSERT_FINDINGS_TARGET(remat, "rematerialized constant", 0,
+                           X86LINT_TARGET_ICELAKE);
+    ASSERT_FINDINGS_TARGET(remat, "rematerialized constant", 0,
+                           X86LINT_TARGET_GENERIC);
+
+    // The destination itself already holds the value, so the move is dead
+    // rather than replaceable: reported at every target.
+    static const uint8_t already[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1
+        0x89, 0xD1,                    // mov ecx, edx
+        0xB8, 0x01, 0x00, 0x00, 0x00,  // mov eax, 1 (dead)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(already, "redundant MOV constant", 1,
+                           X86LINT_TARGET_GENERIC);
+
+    // Regression: the three MOV-immediate forms leave three different values
+    // behind. A 32-bit write zero-extends, where the 64-bit imm32 form
+    // sign-extends, so these two registers do NOT agree and neither finding
+    // applies. Reading the raw immediate for both made them compare equal,
+    // which reported glibc's __isoc23_strtoul clamp as a redundant move.
+    static const uint8_t widths_differ[] = {
+        0xBA, 0xFF, 0xFF, 0xFF, 0xFF,              // mov edx, 0xffffffff
+        0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF,  // mov rdx, -1
+        0xC3,                                      // ret
+    };
+    ASSERT_FINDINGS_TARGET(widths_differ, "redundant MOV constant", 0,
+                           X86LINT_TARGET_SKYLAKE);
+    assert(count_findings_target(widths_differ, sizeof(widths_differ),
+        "rematerialized constant", &total, 0, X86LINT_TARGET_SKYLAKE) == 0);
+
+    // A call clears the map: the callee may write any caller-saved register,
+    // and this scan does not follow it.
+    static const uint8_t across_call[] = {
+        0x41, 0xBA, 0x02, 0x00, 0x00, 0x00,  // mov r10d, 2
+        0xE8, 0x00, 0x00, 0x00, 0x00,        // call +0
+        0xBF, 0x02, 0x00, 0x00, 0x00,        // mov edi, 2
+        0xC3,                                // ret
+    };
+    assert(count_findings_target(across_call, sizeof(across_call),
+        "rematerialized constant", &total, 0, X86LINT_TARGET_SKYLAKE) == 0);
+
+    // Zero defers to "suboptimal MOV zero", whose XOR is two bytes rather
+    // than three and breaks the dependency the copy would create.
+    static const uint8_t zeros[] = {
+        0x41, 0xBA, 0x00, 0x00, 0x00, 0x00,  // mov r10d, 0
+        0xBF, 0x00, 0x00, 0x00, 0x00,        // mov edi, 0
+        0xC3,                                // ret
+    };
+    assert(count_findings_target(zeros, sizeof(zeros),
+        "rematerialized constant", &total, 0, X86LINT_TARGET_SKYLAKE) == 0);
+    assert(count_findings_target(zeros, sizeof(zeros), "suboptimal MOV zero",
+        &total, 0, X86LINT_TARGET_SKYLAKE) == 2);
+}
+
 // The four small sound checks promoted from tools/shapescan: a conditional
 // move onto itself, a lane-0 extract, a NEG folded into the arithmetic that
 // consumes it, and a zero-extension of bits a producer already zeroed.
@@ -7936,6 +8012,7 @@ int main(int argc, char *argv[])
     check_zeroed_condition_test();
     check_movimm_condition_test();
     check_redundant_shift_test();
+    check_const_remat_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

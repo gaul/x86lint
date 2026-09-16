@@ -899,6 +899,62 @@ argue for or against each, live in [TODO.md](TODO.md).
   register, and it loads unconditionally, so it is not a no-op at all.
 * 3 sites in libxul and none elsewhere in the corpus
 
+## redundant MOV constant
+
+* `B801000000 ... B801000000` (MOV EAX, 1; ...; MOV EAX, 1) -- the second
+  move writes a value the register already holds, so it is dead. MOV writes
+  no flags, so deleting it is unconditional, and no target question arises:
+  this is the strong half of the constant tracking described under
+  [rematerialized constant](#rematerialized-constant), where the register
+  still holding the value is the destination itself
+* 238 sites: libxul 188, libstdc++ 31, go 18, and none in libcrypto, glibc
+  or bash
+
+## rematerialized constant
+
+* `41BA02000000 BF02000000` (MOV R10D, 2; MOV EDI, 2) -- a constant
+  materialized into a register that another register provably still holds is
+  a copy: MOV EDI, R10D, three bytes against five, and against ten where the
+  immediate needed a MOVABS. There is no imm8 form of MOV, so the copy is
+  shorter at every width
+* **This is the only check here that carries state across the scan**, because
+  the rewrite's precondition is about a value rather than a pattern. The map
+  is deliberately small and loses toward not-a-finding: only the 32- and
+  64-bit `MOV r, imm` forms are recorded, as the full 64-bit contents the
+  write leaves behind; every register an instruction writes is cleared; and
+  the whole map is cleared at a call, at any control transfer, at a branch
+  target and at a decode error, since a register's contents cannot be carried
+  across an edge the scan cannot see. What survives is a value provably
+  present on every path reaching the site, which is also why the copy needs
+  no liveness argument -- nothing has written the source since it was set.
+* **The three MOV-immediate forms leave three different values behind**, and
+  conflating them is a false positive rather than a missed finding. A 32-bit
+  write zero-extends, so `MOV EDX, 0xffffffff` leaves `0x00000000ffffffff`,
+  where the 64-bit imm32 form sign-extends and `MOV RDX, -1` leaves all ones.
+  Reading the raw immediate for both makes them compare equal, which reported
+  glibc's `__isoc23_strtoul` clamp as a redundant move of a value the
+  register does not hold. A fixture pins it
+* Target-gated on move elimination, so `-t skylake` and `-t zen` only. The
+  rewrite replaces an independent immediate with a dependent copy:
+  `mov r10d, 2 ; mov edi, 2` is two one-cycle instructions free to issue
+  together, and the copy serializes them. Agner Fog's tables give `MOV r,r`
+  latency 0 by renaming on Zen 1 through Zen 5 and 0-1 on Ivy Bridge through
+  Coffee Lake, against a full cycle with no elimination on Sandy Bridge, Ice
+  Lake and Tiger Lake. Zero defers to "suboptimal MOV zero", whose XOR is two
+  bytes rather than three and breaks the dependency the copy would create
+* **Unusually for this tool the conditions cost almost nothing**: 33,218
+  findings of a 33,456 shape, 99%, where the CAS loop went 614 to 19 and the
+  vector fold 18,236 to 583. TODO.md predicted that and gave the reason --
+  the population was defined by the rewrite's own precondition rather than by
+  a pattern the conditions would later cut down. libxul supplies 32,168,
+  then go 403, libcrypto 195, libstdc++ 152, glibc 165 and bash 135
+* What it does not settle is whether a compiler wants the advice.
+  Rematerialization is a deliberate register-allocator technique, and LLVM
+  marks `MOV32ri` trivially rematerializable precisely so the allocator can
+  duplicate a constant rather than keep it live. A finding here is often the
+  compiler's choice rather than its oversight, which is not true of anything
+  else in this file
+
 ## redundant MOV reg, reg
 
 * `4889C0` (MOV RAX, RAX)

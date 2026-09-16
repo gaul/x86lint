@@ -2087,6 +2087,72 @@ bool check_oversized_branch(const xed_decoded_inst_t *xedd)
     return new_disp < INT8_MIN || new_disp > INT8_MAX;
 }
 
+// A direct branch whose displacement is zero transfers control to the
+// instruction after it, which is exactly where falling through arrives:
+// taken or not taken, execution continues at the same place. JMP and Jcc
+// write no register and no flag, so the instruction is a pure no-op whatever
+// the condition evaluates to -- deletable with no liveness argument at all,
+// and with no condition to reason about -- while it still costs fetch
+// bandwidth, a branch-predictor entry, and for the conditional forms a
+// possible misprediction.
+//
+// Only the rel8 forms are matched, and the reason is relocations rather than
+// size. In a relocatable object an unresolved `jmp foo` stores a zero rel32
+// and keeps the real target in an R_X86_64_PC32 entry the instruction stream
+// cannot see, so matching rel32 would call every unlinked branch a no-op.
+// No toolchain emits an 8-bit branch relocation, so a zero rel8 is always a
+// genuine self-relative zero. Nothing is lost by the restriction: a linked
+// rel32 branch to the next instruction is already an oversized branch
+// displacement, and narrowing it to rel8 lands it here.
+//
+// CALL is excluded even at zero displacement, since it pushes a return
+// address and `call .+0` is the classic get-the-PC idiom of older
+// position-independent code. LOOP, LOOPE and LOOPNE are excluded for the
+// same class of reason: they decrement RCX, so deleting one changes a
+// register. JRCXZ writes nothing and is matched.
+//
+// Deleting a branch that is itself a branch target is sound, so no
+// incoming-edge gate is needed: the entering path falls through to the same
+// successor the deleted branch would have reached.
+//
+// The population is hand-written assembly and JIT output rather than
+// compiler codegen, exactly as for armlint's version of this check: 909 in
+// libxul, 47 in libcrypto's perlasm, 8 in go, and none at all in glibc,
+// libstdc++ or bash. Most of libxul's are libjpeg-turbo's AVX2 colour
+// conversion, whose NASM macro chain jumps to a label that lands on the very
+// next instruction (`jsimd_ycc_rgb_convert_avx2.column_st31` and its
+// siblings). A further 40 libxul sites and 5 in glibc are the rel32 spelling
+// and are deliberately not counted here; where they are genuine the
+// oversized-branch-displacement finding reaches them first.
+bool check_branch_to_next(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_JMP:
+    case XED_ICLASS_JRCXZ:
+    case XED_ICLASS_JB:
+    case XED_ICLASS_JBE:
+    case XED_ICLASS_JL:
+    case XED_ICLASS_JLE:
+    case XED_ICLASS_JNB:
+    case XED_ICLASS_JNBE:
+    case XED_ICLASS_JNL:
+    case XED_ICLASS_JNLE:
+    case XED_ICLASS_JNO:
+    case XED_ICLASS_JNP:
+    case XED_ICLASS_JNS:
+    case XED_ICLASS_JNZ:
+    case XED_ICLASS_JO:
+    case XED_ICLASS_JP:
+    case XED_ICLASS_JS:
+    case XED_ICLASS_JZ:
+        break;
+    default:
+        return true;
+    }
+    return xed_decoded_inst_get_branch_displacement_width_bits(xedd) != 8 ||
+           xed_decoded_inst_get_branch_displacement(xedd) != 0;
+}
+
 // Bitmask of x86 arithmetic status flags. Aliased to the bit names in
 // xed_flag_set_t.s; the higher-order EFLAGS bits (DF, IF, etc.) aren't
 // tracked here because none of the optimizations below change them.
@@ -3450,6 +3516,7 @@ static const struct check_entry checks[] = {
     {check_notrack_call,               "IBT-bypassing NOTRACK call",      0},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
+    {check_branch_to_next,             "branch to the next instruction",  0},
     {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern, true},
     {check_add_sub_zero,               "redundant ADD/SUB zero",          0, reg0_upper32_concern, true},
     {check_or_xor_zero,                "redundant OR/XOR zero",           0, reg0_upper32_concern, true},

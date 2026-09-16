@@ -98,6 +98,10 @@ bool check_xchg_accumulator(const xed_decoded_inst_t *xedd);
 // return false if a JMP or Jcc uses rel32 when rel8 would reach the target
 bool check_oversized_branch(const xed_decoded_inst_t *xedd);
 
+// A direct rel8 branch whose displacement is zero: control arrives at the
+// same instruction taken or not, so it is a pure no-op. See x86lint.c.
+bool check_branch_to_next(const xed_decoded_inst_t *xedd);
+
 // return false if instruction is a no-op mov reg, reg. The 8/16/64-bit forms
 // are pure no-ops; the mov r32, r32 form is a no-op only when its incidental
 // zero-extension into the upper 32 bits is dead, which the dispatcher gates on

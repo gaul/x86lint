@@ -316,22 +316,15 @@ static bool c_and_lo32(const uint8_t *inst, size_t len,
     return true;
 }
 
-// A direct branch to the instruction after it transfers control exactly
-// where falling through would: deletable whatever the condition, and with no
-// liveness to prove since neither form writes a register. CALL is excluded,
-// its return-address push being the point of `call .+0`.
+// Now shipped; measured through the check itself like the three above.
 static bool c_branch_to_next(const uint8_t *inst, size_t len,
                              const uint8_t *targets, size_t offset,
                              size_t next, const xed_decoded_inst_t *d,
                              const char **why)
 {
-    (void) inst; (void) len; (void) targets; (void) offset; (void) why;
-    xed_category_enum_t cat = xed_decoded_inst_get_category(d);
-    if ((cat != XED_CATEGORY_COND_BR && cat != XED_CATEGORY_UNCOND_BR) ||
-        xed_decoded_inst_get_branch_displacement_width_bits(d) == 0) {
-        return false;
-    }
-    return xed_decoded_inst_get_branch_displacement(d) == 0 && next != 0;
+    (void) inst; (void) len; (void) targets; (void) offset; (void) next;
+    (void) why;
+    return !check_branch_to_next(d);
 }
 
 // NEG then an ADD of the negated value is a SUB of the original, and the

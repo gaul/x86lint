@@ -78,6 +78,44 @@ argue for or against each, live in [TODO.md](TODO.md).
   edge could only reach a flagged site with clean uppers, where both
   fixes stay harmless
 
+## branch to the next instruction
+
+* `EB00` (JMP .+0) -- a direct branch whose displacement is zero transfers
+  control to the instruction after it, which is exactly where falling
+  through arrives: taken or not taken, execution continues at the same
+  place. JMP and Jcc write no register and no flag, so the instruction is a
+  pure no-op whatever the condition evaluates to. It is deletable with no
+  liveness argument and no condition to reason about, while it still costs
+  fetch bandwidth, a branch-predictor entry, and for the conditional forms a
+  possible misprediction.
+* **Only the rel8 forms are matched, and the reason is relocations rather
+  than size.** In a relocatable object an unresolved `jmp foo` stores a zero
+  rel32 and keeps the real target in an `R_X86_64_PC32` entry the
+  instruction stream cannot see, so matching rel32 would call every unlinked
+  branch a no-op. No toolchain emits an 8-bit branch relocation, so a zero
+  rel8 is always a genuine self-relative zero. Nothing is lost by the
+  restriction: a linked rel32 branch to the next instruction is already an
+  oversized branch displacement, and narrowing it to rel8 lands it here.
+* `CALL` is excluded even at zero displacement, since it pushes a return
+  address and `call .+0` is the classic get-the-PC idiom of older
+  position-independent code. `LOOP`, `LOOPE` and `LOOPNE` are excluded for
+  the same class of reason: they decrement RCX, so deleting one changes a
+  register. `JRCXZ` writes nothing and is matched.
+* Deleting a branch that is itself a branch target is sound, so unlike the
+  multi-instruction folds this needs no incoming-edge gate: the entering
+  path falls through to the same successor the deleted branch would have
+  reached.
+* The population is hand-written assembly and JIT output rather than
+  compiler codegen, exactly as for armlint's version of this check: **909**
+  in libxul, 47 in libcrypto's perlasm, 8 in go, and none at all in glibc,
+  libstdc++ or bash. Most of libxul's are libjpeg-turbo's AVX2 colour
+  conversion, whose NASM macro chain jumps to a label that lands on the very
+  next instruction (`jsimd_ycc_rgb_convert_avx2.column_st31` and its
+  siblings). A further 40 libxul sites and 5 in glibc carry the rel32
+  spelling and are deliberately not counted; where those are genuine rather
+  than unresolved relocations, the oversized-branch-displacement finding
+  reaches them first.
+
 ## CAS loop foldable into LOCK op
 
 * `8B07 89C1 83C901 F00FB10F 75F5` (MOV EAX, [RDI]; L: MOV ECX, EAX; OR ECX,

@@ -140,10 +140,15 @@ static int count_findings(const uint8_t *inst, size_t len,
 // the category count. Use it only where the co-firing finding is correct and
 // named in a comment; a surprise finding should fail the stricter macro.
 #define ASSERT_FINDINGS_AMONG(bytes_arr, category, expected, total_expected) \
+    ASSERT_FINDINGS_AMONG_EXT(bytes_arr, category, expected, total_expected, 0)
+
+// ASSERT_FINDINGS_AMONG with an enabled-extensions mask, for the -m fixtures.
+#define ASSERT_FINDINGS_AMONG_EXT(bytes_arr, category, expected, \
+                                  total_expected, ext) \
 do { \
     int _total; \
     int _cat = count_findings(bytes_arr, sizeof(bytes_arr), category, &_total, \
-                              0); \
+                              (ext)); \
     if (_cat != (expected) || _total != (total_expected)) { \
         fprintf(stderr, \
                 "%s:%d: expected %d \"%s\" finding(s) of %d total; " \
@@ -655,7 +660,8 @@ static void check_xor_to_not_test(void)
     // A downstream ZF reader keeps the XOR's flags live: suppress.
     static const uint8_t xornot_jz[] = {
         0x83, 0xF0, 0xFF,  // xor eax, -1
-        0x74, 0x00,        // jz +0
+        0x74, 0x01,        // jz +1
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xornot_jz, "suboptimal XOR immediate", 0);
 }
@@ -965,7 +971,8 @@ static void check_shl_one_test(void)
     // a CF reader, since add reg, reg produces the identical CF (and OF).
     static const uint8_t shl_jc[] = {
         0xD1, 0xE3,        // shl ebx, 1
-        0x72, 0x00,        // jc +0 (reads CF; add ebx, ebx sets the same one)
+        0x72, 0x01,        // jc +1 (reads CF; add ebx, ebx sets the same one)
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(shl_jc, "suboptimal SHL one", 1);
 }
@@ -1069,7 +1076,8 @@ static void check_imul_to_lea_test(void)
     // conservative here.
     static const uint8_t zero_jc[] = {
         0x6B, 0xD9, 0x00,        // imul ebx, ecx, 0
-        0x72, 0x00,              // jc +0
+        0x72, 0x01,              // jc +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(zero_jc, "suboptimal IMUL constant", 0);
 
@@ -1148,7 +1156,8 @@ static void check_lea_to_add_test(void)
 
     static const uint8_t flags_live[] = {
         0x48, 0x8d, 0x04, 0x08,  // lea rax, [rax+rcx]
-        0x74, 0x00,              // jz +0 (reads ZF)
+        0x74, 0x01,              // jz +1 (reads ZF)
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(flags_live, "suboptimal LEA", 0);
 }
@@ -1614,7 +1623,8 @@ static void check_flag_liveness_test(void)
     // mov eax, 0 ; je +0 -- JE reads ZF which xor would clobber, suppress.
     static const uint8_t mov_je[] = {
         0xB8, 0x00, 0x00, 0x00, 0x00,
-        0x74, 0x00,
+        0x74, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_je, "suboptimal MOV zero", 0);
 
@@ -1641,7 +1651,8 @@ static void check_flag_liveness_test(void)
     // the same OF, suppress.
     static const uint8_t imul_jo[] = {
         0x6B, 0xC0, 0x04,
-        0x70, 0x00,
+        0x70, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(imul_jo, "suboptimal IMUL constant", 0);
 
@@ -1660,7 +1671,8 @@ static void check_flag_liveness_test(void)
     // check_and_minus_one handles flag-exactly and so does not gate.)
     static const uint8_t and_jz[] = {
         0x25, 0xFF, 0x00, 0x00, 0x00,
-        0x74, 0x00,
+        0x74, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(and_jz, "suboptimal AND immediate", 0);
 
@@ -1706,7 +1718,8 @@ static void check_flag_liveness_test(void)
     static const uint8_t addzero_je[] = {
         0x89, 0xCB,        // mov ebx, ecx (already zero-extends rbx)
         0x83, 0xC3, 0x00,  // add ebx, 0
-        0x74, 0x00,        // je +0 (reads the flags; upper-32 walk blocked)
+        0x74, 0x01,        // je +1 (reads the flags; upper-32 walk blocked)
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(addzero_je, "redundant ADD/SUB zero", 1);
 
@@ -1745,7 +1758,8 @@ static void check_flag_liveness_test(void)
     // add eax, 1 ; jc +0 -- JC reads CF, which inc would not set, suppress.
     static const uint8_t addone_jc[] = {
         0x83, 0xC0, 0x01,
-        0x72, 0x00,
+        0x72, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(addone_jc, "oversized ADD/SUB one", 0);
 
@@ -1769,7 +1783,8 @@ static void check_flag_liveness_test(void)
     // sub dword [rbx+0x10], 1 ; jc +0 -- CF may be read, suppress.
     static const uint8_t subonemem_jc[] = {
         0x83, 0x6B, 0x10, 0x01,
-        0x72, 0x00,
+        0x72, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(subonemem_jc, "oversized ADD/SUB one", 0);
 
@@ -1781,7 +1796,7 @@ static void check_flag_liveness_test(void)
         0x75, 0x00,                          // jne +0
         0xC3,                                // ret
     };
-    ASSERT_FINDINGS(testnarrow_jne, "oversized TEST immediate", 1);
+    ASSERT_FINDINGS_AMONG(testnarrow_jne, "oversized TEST immediate", 1, 2);
 
     // test ebx, 0x80 ; jne +0 ; ret -- bit 7 in the mask would change how
     // SF is computed; not flagged at all.
@@ -1790,7 +1805,7 @@ static void check_flag_liveness_test(void)
         0x75, 0x00,                          // jne +0
         0xC3,                                // ret
     };
-    ASSERT_FINDINGS(testbit7_jne, "oversized TEST immediate", 0);
+    ASSERT_FINDINGS_AMONG(testbit7_jne, "oversized TEST immediate", 0, 1);
 }
 
 // Instruction-flavor corners for flag liveness: pin the analyzer's handling
@@ -1894,7 +1909,8 @@ static void check_flag_liveness_corners_test(void)
     static const uint8_t add128_shlcl_jc[] = {
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0xD3, 0xE3,                    // shl ebx, cl (conditional flag write)
-        0x72, 0x00,                    // jc +0 (reads CF)
+        0x72, 0x01,                    // jc +1 (reads CF)
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(add128_shlcl_jc, "oversized ADD/SUB 128", 0);
 
@@ -1903,7 +1919,8 @@ static void check_flag_liveness_corners_test(void)
     static const uint8_t add128_shlimm_jc[] = {
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0xC1, 0xE3, 0x02,              // shl ebx, 2 (unconditional flag write)
-        0x72, 0x00,                    // jc +0
+        0x72, 0x01,                    // jc +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(add128_shlimm_jc, "oversized ADD/SUB 128", 1);
 
@@ -1912,7 +1929,8 @@ static void check_flag_liveness_corners_test(void)
     static const uint8_t add128_repecmps_jc[] = {
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80
         0xF3, 0xA6,                    // repe cmpsb (conditional flag write)
-        0x72, 0x00,                    // jc +0
+        0x72, 0x01,                    // jc +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(add128_repecmps_jc, "oversized ADD/SUB 128", 0);
 
@@ -1991,7 +2009,8 @@ static void check_reg_liveness_test(void)
     // upper bits conservatively live, suppress.
     static const uint8_t moveax_je[] = {
         0x89, 0xC0,
-        0x74, 0x00,
+        0x74, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(moveax_je, "redundant MOV reg, reg", 0);
 
@@ -2015,14 +2034,16 @@ static void check_reg_liveness_test(void)
     // concern, flagged regardless of a downstream reader: mov rax, rax ; je +0.
     static const uint8_t movrax_je[] = {
         0x48, 0x89, 0xC0,       // mov rax, rax
-        0x74, 0x00,
+        0x74, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(movrax_je, "redundant MOV reg, reg", 1);
 
     // mov al, al ; je +0 -- 8-bit no-op, likewise unconditional.
     static const uint8_t moval_je[] = {
         0x88, 0xC0,             // mov al, al
-        0x74, 0x00,
+        0x74, 0x01,
+        0x90,  // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(moval_je, "redundant MOV reg, reg", 1);
 }
@@ -2131,7 +2152,8 @@ static void check_upper32_identity_gate_test(void)
     static const uint8_t or_self_after_load[] = {
         0x8B, 0x1E,              // mov ebx, [rsi]
         0x09, 0xDB,              // or ebx, ebx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(or_self_after_load, "suboptimal OR/AND reg, reg", 1);
 
@@ -2139,7 +2161,8 @@ static void check_upper32_identity_gate_test(void)
     // already zero, so the 32-bit form is suppressed.
     static const uint8_t or_self_cold[] = {
         0x09, 0xDB,              // or ebx, ebx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(or_self_cold, "suboptimal OR/AND reg, reg", 0);
 
@@ -2147,7 +2170,8 @@ static void check_upper32_identity_gate_test(void)
     // the rewrite drops nothing: fires.
     static const uint8_t or_self_64[] = {
         0x48, 0x09, 0xDB,        // or rbx, rbx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(or_self_64, "suboptimal OR/AND reg, reg", 1);
 
@@ -2397,7 +2421,8 @@ static void check_redundant_flags_test(void)
     static const uint8_t and_test_jb[] = {
         0x21, 0xD8,        // and eax, ebx
         0x85, 0xC0,        // test eax, eax
-        0x72, 0x00,        // jb +0
+        0x72, 0x01,        // jb +1
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(and_test_jb, "redundant TEST after flags", 1);
 
@@ -2426,7 +2451,8 @@ static void check_redundant_flags_test(void)
     static const uint8_t add_test_jz[] = {
         0x01, 0xD8,        // add eax, ebx
         0x85, 0xC0,        // test eax, eax
-        0x74, 0x00,        // jz +0
+        0x74, 0x01,        // jz +1
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(add_test_jz, "redundant TEST after flags", 0);
 
@@ -2550,7 +2576,7 @@ static void check_redundant_flags_test(void)
         0x74, 0x00,        // jz +0
         0x85, 0xC0,        // test eax, eax
     };
-    ASSERT_FINDINGS(gap_branches, "redundant TEST after flags", 0);
+    ASSERT_FINDINGS_AMONG(gap_branches, "redundant TEST after flags", 0, 1);
 
     // An incoming edge onto a looked-through instruction reaches the test
     // without the producer, exactly as an edge onto the test itself does.
@@ -2595,7 +2621,8 @@ static void check_redundant_flags_test(void)
         0x01, 0xD8,        // add eax, ebx
         0x90,              // nop
         0x85, 0xC0,        // test eax, eax
-        0x72, 0x00,        // jb +0
+        0x72, 0x01,        // jb +1
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(gap_add_jb, "redundant TEST after flags", 0);
 }
@@ -2614,7 +2641,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_test_je[] = {
         0x31, 0xC9,              // xor ecx, ecx
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_test_je, "constant condition after zeroing", 1);
 
@@ -2644,7 +2672,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t sub_test_jne[] = {
         0x48, 0x29, 0xC9,        // sub rcx, rcx
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     int sub_total;
     assert(count_findings(sub_test_jne, sizeof(sub_test_jne),
@@ -2662,7 +2691,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_not_zeroing[] = {
         0x31, 0xD9,              // xor ecx, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_not_zeroing, "constant condition after zeroing", 0);
 
@@ -2671,7 +2701,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_narrow[] = {
         0x30, 0xC9,              // xor cl, cl
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_narrow, "constant condition after zeroing", 0);
 
@@ -2682,7 +2713,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_narrow_same[] = {
         0x30, 0xC9,              // xor cl, cl
         0x84, 0xC9,              // test cl, cl
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_narrow_same, "constant condition after zeroing", 1);
 
@@ -2690,7 +2722,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_high_byte[] = {
         0x30, 0xE4,              // xor ah, ah
         0x84, 0xE4,              // test ah, ah
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_high_byte, "constant condition after zeroing", 1);
 
@@ -2699,7 +2732,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_low_test_high[] = {
         0x30, 0xC0,              // xor al, al
         0x84, 0xE4,              // test ah, ah
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_low_test_high, "constant condition after zeroing", 0);
 
@@ -2708,7 +2742,8 @@ static void check_zeroed_condition_test(void)
     static const uint8_t xor_test_other[] = {
         0x31, 0xC9,              // xor ecx, ecx
         0x48, 0x85, 0xD2,        // test rdx, rdx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_test_other, "constant condition after zeroing", 0);
 
@@ -2738,7 +2773,8 @@ static void check_zeroed_condition_test(void)
         0x31, 0xC9,              // xor ecx, ecx
         0x39, 0xD8,              // cmp eax, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_flag_gap, "constant condition after zeroing",
                     APX_NDD_WINDOW >= 3 ? 1 : 0);
@@ -2749,7 +2785,8 @@ static void check_zeroed_condition_test(void)
         0x31, 0xC9,              // xor ecx, ecx
         0x89, 0xD9,              // mov ecx, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(xor_reg_gap, "constant condition after zeroing", 0);
 
@@ -2760,7 +2797,7 @@ static void check_zeroed_condition_test(void)
         0x74, 0x00,              // 5: je +0
         0xEB, 0xF9,              // 7: jmp 2
     };
-    ASSERT_FINDINGS(edge_on_test, "constant condition after zeroing", 0);
+    ASSERT_FINDINGS_AMONG(edge_on_test, "constant condition after zeroing", 0, 1);
 
     // An edge onto the consumer likewise: that path's flags are whatever it
     // brings. This gate is stricter than the redundant-TEST check's, whose
@@ -2771,7 +2808,7 @@ static void check_zeroed_condition_test(void)
         0x74, 0x00,              // 5: je +0        <- branch target
         0xEB, 0xFC,              // 7: jmp 5
     };
-    ASSERT_FINDINGS(edge_on_consumer, "constant condition after zeroing", 0);
+    ASSERT_FINDINGS_AMONG(edge_on_consumer, "constant condition after zeroing", 0, 1);
 
     // An edge onto the zeroing instruction executes it, so the register is
     // zero on that path too: fires.
@@ -2781,7 +2818,7 @@ static void check_zeroed_condition_test(void)
         0x74, 0x00,              // 5: je +0
         0xEB, 0xF7,              // 7: jmp 0
     };
-    ASSERT_FINDINGS(edge_on_head, "constant condition after zeroing", 1);
+    ASSERT_FINDINGS_AMONG(edge_on_head, "constant condition after zeroing", 1, 2);
 }
 
 // Multi-instruction peephole: the second arm of the same family. A register
@@ -2795,7 +2832,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_test_jg[] = {
         0x41, 0xBA, 0x3F, 0x00, 0x00, 0x00,  // mov r10d, 0x3f
         0x45, 0x85, 0xD2,                    // test r10d, r10d
-        0x7F, 0x00,                          // jg +0
+        0x7F, 0x01,                          // jg +1
+        0x90,                          // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_test_jg, "constant condition after immediate", 1);
 
@@ -2806,7 +2844,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_cmp_ja[] = {
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x48, 0x83, 0xF9, 0x28,        // cmp rcx, 0x28
-        0x77, 0x00,                    // ja +0
+        0x77, 0x01,                    // ja +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_cmp_ja, "constant condition after immediate", 1);
 
@@ -2823,7 +2862,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_narrow[] = {
         0xB1, 0x05,              // mov cl, 5
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_narrow, "constant condition after immediate", 0);
 
@@ -2833,7 +2873,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_narrow_same[] = {
         0xB1, 0x05,              // mov cl, 5
         0x84, 0xC9,              // test cl, cl
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_narrow_same, "constant condition after immediate", 1);
 
@@ -2843,7 +2884,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_high_byte[] = {
         0xB4, 0x05,              // mov ah, 5
         0x84, 0xE4,              // test ah, ah
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_high_byte, "constant condition after immediate", 1);
 
@@ -2852,7 +2894,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_low_test_high[] = {
         0xB0, 0x05,              // mov al, 5
         0x84, 0xE4,              // test ah, ah
-        0x75, 0x00,              // jne +0
+        0x75, 0x01,              // jne +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_low_test_high, "constant condition after immediate", 0);
 
@@ -2861,7 +2904,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t mov_reg[] = {
         0x89, 0xD9,              // mov ecx, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
-        0x74, 0x00,              // je +0
+        0x74, 0x01,              // je +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(mov_reg, "constant condition after immediate", 0);
 
@@ -2870,7 +2914,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t cmp_reg[] = {
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x48, 0x39, 0xD1,              // cmp rcx, rdx
-        0x74, 0x00,                    // je +0
+        0x74, 0x01,                    // je +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(cmp_reg, "constant condition after immediate", 0);
 
@@ -2878,7 +2923,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t cmp_mem[] = {
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x48, 0x3B, 0x08,              // cmp rcx, [rax]
-        0x74, 0x00,                    // je +0
+        0x74, 0x01,                    // je +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(cmp_mem, "constant condition after immediate", 0);
 
@@ -2886,7 +2932,8 @@ static void check_movimm_condition_test(void)
     static const uint8_t test_other[] = {
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x85, 0xD2,                    // test edx, edx
-        0x74, 0x00,                    // je +0
+        0x74, 0x01,                    // je +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(test_other, "constant condition after immediate", 0);
 
@@ -2905,7 +2952,8 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x39, 0xD8,                    // cmp eax, ebx
         0x85, 0xC9,                    // test ecx, ecx
-        0x74, 0x00,                    // je +0
+        0x74, 0x01,                    // je +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(flag_gap, "constant condition after immediate",
                     APX_NDD_WINDOW >= 3 ? 1 : 0);
@@ -2915,7 +2963,8 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x89, 0xD9,                    // mov ecx, ebx
         0x85, 0xC9,                    // test ecx, ecx
-        0x74, 0x00,                    // je +0
+        0x74, 0x01,                    // je +1
+        0x90,                    // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(reg_gap, "constant condition after immediate", 0);
 
@@ -2926,7 +2975,7 @@ static void check_movimm_condition_test(void)
         0x74, 0x00,                    // 7: je +0
         0xEB, 0xFA,                    // 9: jmp 5
     };
-    ASSERT_FINDINGS(edge_on_cmp, "constant condition after immediate", 0);
+    ASSERT_FINDINGS_AMONG(edge_on_cmp, "constant condition after immediate", 0, 1);
 
     // An edge onto the load executes it, so the value is known on that path
     // too: fires.
@@ -2936,7 +2985,7 @@ static void check_movimm_condition_test(void)
         0x74, 0x00,                    // 7: je +0
         0xEB, 0xF5,                    // 9: jmp 0
     };
-    ASSERT_FINDINGS(edge_on_head, "constant condition after immediate", 1);
+    ASSERT_FINDINGS_AMONG(edge_on_head, "constant condition after immediate", 1, 2);
 }
 
 // Multi-instruction peephole: a SHL/SHR/SAR of a register by a statically
@@ -3043,7 +3092,7 @@ static void check_redundant_shift_test(void)
         0x72, 0x00,              // jb +0
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(shl_test_jb, "redundant TEST after shift", 0);
+    ASSERT_FINDINGS_AMONG(shl_test_jb, "redundant TEST after shift", 0, 1);
 
     // shl rax, 2 ; test ; jne ; adc -- the fall-through successor reads CF:
     // suppress despite the ZF-only branch.
@@ -3110,6 +3159,56 @@ static void check_redundant_shift_test(void)
         0xC3,                          // ret
     };
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
+}
+
+// A direct rel8 branch whose displacement is zero arrives where falling
+// through arrives, so it is a pure no-op whatever the condition holds. See
+// check_branch_to_next.
+static void check_branch_to_next_test(void)
+{
+    static const uint8_t jmp_next[] = {
+        0xEB, 0x00,  // jmp .+0
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(jmp_next, "branch to the next instruction", 1);
+
+    static const uint8_t jcc_next[] = {
+        0x74, 0x00,  // jz .+0
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(jcc_next, "branch to the next instruction", 1);
+
+    // A branch that skips an instruction is not this finding.
+    static const uint8_t jmp_over[] = {
+        0xEB, 0x01,  // jmp .+1
+        0x90,        // nop
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(jmp_over, "branch to the next instruction", 0);
+
+    // rel32 is excluded: in a relocatable object a zero displacement is an
+    // unresolved R_X86_64_PC32 rather than a self-relative zero. The linked
+    // form is reported as an oversized branch displacement, which is the
+    // other finding this fixture carries.
+    static const uint8_t jmp_rel32[] = {
+        0xE9, 0x00, 0x00, 0x00, 0x00,  // jmp .+0 (rel32)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_AMONG(jmp_rel32, "branch to the next instruction", 0, 1);
+
+    // CALL pushes a return address; call .+0 is the get-the-PC idiom.
+    static const uint8_t call_next[] = {
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call .+0
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(call_next, "branch to the next instruction", 0);
+
+    // LOOP decrements RCX, so deleting it would change a register.
+    static const uint8_t loop_next[] = {
+        0xE2, 0x00,  // loop .+0
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(loop_next, "branch to the next instruction", 0);
 }
 
 // Multi-instruction peephole: a vector load whose sole use is the next vector
@@ -4146,7 +4245,8 @@ static void check_or_memop_fold_test(void)
         0x4C, 0x09, 0xF1,        // or rcx, r14
         0x44, 0x8B, 0x41, 0x4F,  // mov r8d, [rcx+0x4f]
         0x89, 0xD1,              // mov ecx, edx
-        0x74, 0x00,              // jz +0 (reads ZF)
+        0x74, 0x01,              // jz +1 (reads ZF)
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS_EXT(flags_live, "OR foldable into memory", 0,
                         X86LINT_EXT_V8);
@@ -4601,7 +4701,8 @@ static void check_mov_add_lea_test(void)
     static const uint8_t flags_live[] = {
         0x89, 0xF2,        // mov edx, esi
         0x01, 0xFA,        // add edx, edi
-        0x74, 0x00,        // jz +0
+        0x74, 0x01,        // jz +1
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(flags_live, "MOV+ADD foldable to LEA", 0);
 
@@ -4716,7 +4817,7 @@ static void check_mov_add_lea_test(void)
         0x70, 0x00,        // jo +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS(gap_flags_live, "MOV+ADD foldable to LEA", 0);
+    ASSERT_FINDINGS_AMONG(gap_flags_live, "MOV+ADD foldable to LEA", 0, 1);
     int total;
     assert(count_findings(gap_flags_live, sizeof(gap_flags_live),
                           "missing APX NDD", &total,
@@ -4810,7 +4911,8 @@ static void check_shift_pair_extend_test(void)
     static const uint8_t flags_live[] = {
         0xC1, 0xE0, 0x18,        // shl eax, 24
         0xC1, 0xF8, 0x18,        // sar eax, 24
-        0x74, 0x00,              // jz +0
+        0x74, 0x01,              // jz +1
+        0x90,              // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(flags_live, "shift pair foldable into extend", 0);
 
@@ -4848,7 +4950,7 @@ static void check_cmp_one_branch_test(void)
         0x72, 0x00,              // jb +0
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(jb_ret, "suboptimal CMP one", 1);
+    ASSERT_FINDINGS_AMONG(jb_ret, "suboptimal CMP one", 1, 2);
 
     // The jae twin (-> jnz).
     static const uint8_t jae_ret[] = {
@@ -4856,7 +4958,7 @@ static void check_cmp_one_branch_test(void)
         0x73, 0x00,              // jae +0
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(jae_ret, "suboptimal CMP one", 1);
+    ASSERT_FINDINGS_AMONG(jae_ret, "suboptimal CMP one", 1, 2);
 
     // 64- and 16-bit widths fold alike.
     static const uint8_t jb_ret64[] = {
@@ -4864,13 +4966,13 @@ static void check_cmp_one_branch_test(void)
         0x72, 0x00,              // jb +0
         0xC3,
     };
-    ASSERT_FINDINGS(jb_ret64, "suboptimal CMP one", 1);
+    ASSERT_FINDINGS_AMONG(jb_ret64, "suboptimal CMP one", 1, 2);
     static const uint8_t jb_ret16[] = {
         0x66, 0x83, 0xF9, 0x01,  // cmp cx, 1
         0x72, 0x00,              // jb +0
         0xC3,
     };
-    ASSERT_FINDINGS(jb_ret16, "suboptimal CMP one", 1);
+    ASSERT_FINDINGS_AMONG(jb_ret16, "suboptimal CMP one", 1, 2);
 
     // je reads ZF = (reg == 1), a condition test cannot answer: suppress.
     static const uint8_t je_wrong_cc[] = {
@@ -4878,7 +4980,7 @@ static void check_cmp_one_branch_test(void)
         0x74, 0x00,              // je +0
         0xC3,
     };
-    ASSERT_FINDINGS(je_wrong_cc, "suboptimal CMP one", 0);
+    ASSERT_FINDINGS_AMONG(je_wrong_cc, "suboptimal CMP one", 0, 1);
 
     // cmp ebx, 2 ; jb is "< 2", not "== 0": suppress.
     static const uint8_t imm_two[] = {
@@ -4886,7 +4988,7 @@ static void check_cmp_one_branch_test(void)
         0x72, 0x00,              // jb +0
         0xC3,
     };
-    ASSERT_FINDINGS(imm_two, "suboptimal CMP one", 0);
+    ASSERT_FINDINGS_AMONG(imm_two, "suboptimal CMP one", 0, 1);
 
     // The adc at the shared successor reads CF, which the rewrite replaces
     // with test's 0: suppress.
@@ -4896,7 +4998,7 @@ static void check_cmp_one_branch_test(void)
         0x11, 0xD8,              // adc eax, ebx (reads CF)
         0xC3,
     };
-    ASSERT_FINDINGS(flags_live_fall, "suboptimal CMP one", 0);
+    ASSERT_FINDINGS_AMONG(flags_live_fall, "suboptimal CMP one", 0, 1);
 
     // Flags dead on the fall-through (ret) but read on the taken target
     // (lahf): the taken-side scan suppresses.
@@ -4918,7 +5020,7 @@ static void check_cmp_one_branch_test(void)
         0xC3,                    // 5: ret
         0xEB, 0xFB,              // 6: jmp 3
     };
-    ASSERT_FINDINGS(edge_on_branch, "suboptimal CMP one", 0);
+    ASSERT_FINDINGS_AMONG(edge_on_branch, "suboptimal CMP one", 0, 1);
 
     // An edge onto the cmp (the window head) executes the whole rewritten
     // pair: fires.
@@ -4928,7 +5030,7 @@ static void check_cmp_one_branch_test(void)
         0xC3,                    // 5: ret
         0xEB, 0xF8,              // 6: jmp 0
     };
-    ASSERT_FINDINGS(edge_on_cmp, "suboptimal CMP one", 1);
+    ASSERT_FINDINGS_AMONG(edge_on_cmp, "suboptimal CMP one", 1, 2);
 
     // cmp al, 1 via the accumulator opcode is 2 bytes, tying test al, al:
     // suppress.
@@ -4937,7 +5039,7 @@ static void check_cmp_one_branch_test(void)
         0x72, 0x00,              // jb +0
         0xC3,
     };
-    ASSERT_FINDINGS(al_tie, "suboptimal CMP one", 0);
+    ASSERT_FINDINGS_AMONG(al_tie, "suboptimal CMP one", 0, 1);
 
     // Memory operands have no test [mem], [mem] to shrink to: suppress.
     static const uint8_t mem_cmp[] = {
@@ -4945,7 +5047,7 @@ static void check_cmp_one_branch_test(void)
         0x72, 0x00,              // jb +0
         0xC3,
     };
-    ASSERT_FINDINGS(mem_cmp, "suboptimal CMP one", 0);
+    ASSERT_FINDINGS_AMONG(mem_cmp, "suboptimal CMP one", 0, 1);
 }
 
 // Multi-instruction peephole: setcc X ; test X, X ; je/jne branches on a
@@ -5125,7 +5227,7 @@ static void check_setcc_movzx_test(void)
         0x0F, 0x94, 0xC0,  // 2: setz al  <- branch target
         0x0F, 0xB6, 0xC0,  // 5: movzx eax, al
     };
-    ASSERT_FINDINGS(edge_on_head, "suboptimal SETcc zero-extension", 1);
+    ASSERT_FINDINGS_AMONG(edge_on_head, "suboptimal SETcc zero-extension", 1, 2);
 }
 
 // Multi-instruction peephole: setcc X ; xor X, 1 inverts the boolean the
@@ -5181,7 +5283,8 @@ static void check_setcc_invert_test(void)
     static const uint8_t flags_live[] = {
         0x0F, 0x94, 0xC0,  // setz al
         0x34, 0x01,        // xor al, 1
-        0x74, 0x00,        // jz +0
+        0x74, 0x01,        // jz +1
+        0x90,        // skipped: a zero displacement is its own finding
     };
     ASSERT_FINDINGS(flags_live, "suboptimal SETcc inversion", 0);
 
@@ -5939,7 +6042,7 @@ static void check_avx_sse_transition_test(void)
         0x74, 0x00,              // je +0 (next instruction is a target)
         0x0F, 0x28, 0xDC,        // movaps xmm3, xmm4
     };
-    ASSERT_FINDINGS(branch_target, "AVX-SSE transition", 0);
+    ASSERT_FINDINGS_AMONG(branch_target, "AVX-SSE transition", 0, 1);
 
     // A callee may clean the state: a control transfer drops the claim.
     static const uint8_t call_between[] = {
@@ -6090,7 +6193,7 @@ static void check_missing_andn_test(void)
         0x7A, 0x00,        // jp +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(pf_live, "missing ANDN", 0, X86LINT_EXT_BMI1);
+    ASSERT_FINDINGS_AMONG_EXT(pf_live, "missing ANDN", 0, 1, X86LINT_EXT_BMI1);
 
     // A direct branch onto the AND reaches it without the NOT.
     static const uint8_t edge_on_and[] = {
@@ -6168,7 +6271,7 @@ static void check_missing_blsr_test(void)
         0x72, 0x00,              // jb +0
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS_EXT(cf_live, "missing BLSR", 0, X86LINT_EXT_BMI1);
+    ASSERT_FINDINGS_AMONG_EXT(cf_live, "missing BLSR", 0, 1, X86LINT_EXT_BMI1);
 
     // RIP-relative is not a register decrement.
     static const uint8_t rip_base[] = {
@@ -6255,7 +6358,7 @@ static void check_missing_blsmsk_test(void)
         0x72, 0x00,              // jb +0
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS_EXT(cf_live, "missing BLSMSK", 0, X86LINT_EXT_BMI1);
+    ASSERT_FINDINGS_AMONG_EXT(cf_live, "missing BLSMSK", 0, 1, X86LINT_EXT_BMI1);
 
     // RIP-relative is not a register decrement.
     static const uint8_t rip_base[] = {
@@ -6409,7 +6512,7 @@ static void check_missing_blsi_test(void)
         0x72, 0x00,        // jb +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(cf_live, "missing BLSI", 0, X86LINT_EXT_BMI1);
+    ASSERT_FINDINGS_AMONG_EXT(cf_live, "missing BLSI", 0, 1, X86LINT_EXT_BMI1);
 
     // A direct branch onto the NEG reaches a partial idiom.
     static const uint8_t edge_on_neg[] = {
@@ -6480,7 +6583,7 @@ static void check_missing_shlx_test(void)
         0x72, 0x00,        // jb +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(cf_live, "missing SHLX/SHRX/SARX", 0, X86LINT_EXT_BMI2);
+    ASSERT_FINDINGS_AMONG_EXT(cf_live, "missing SHLX/SHRX/SARX", 0, 1, X86LINT_EXT_BMI2);
 }
 
 // mov rX, [mem] ; bswap rX folds to movbe rX, [mem] -- but only when the
@@ -6767,7 +6870,7 @@ static void check_missing_apx_ndd_test(void)
                           &total, X86LINT_EXT_BMI1 | X86LINT_EXT_APX) == 0);
     assert(count_findings(blsi_gated, sizeof(blsi_gated), "missing APX NDD",
                           &total, X86LINT_EXT_BMI1 | X86LINT_EXT_APX) == 1);
-    assert(total == 1);
+    assert(total == 2);
 
     // Memory sources are pure loads the NDD forms take directly.
     static const uint8_t mem_sub[] = {
@@ -6914,24 +7017,24 @@ static void check_missing_apx_ndd_test(void)
     assert(count_findings(live_add_reg, sizeof(live_add_reg),
                           "MOV+ADD foldable to LEA", &total,
                           X86LINT_EXT_APX) == 0);
-    assert(total == 1);
-    ASSERT_FINDINGS(live_add_reg, "missing APX NDD", 0);
+    assert(total == 2);
+    ASSERT_FINDINGS_AMONG(live_add_reg, "missing APX NDD", 0, 1);
     static const uint8_t live_add_imm[] = {
         0x89, 0xF2,        // mov edx, esi
         0x83, 0xC2, 0x05,  // add edx, 5
         0x70, 0x00,        // jo +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(live_add_imm, "missing APX NDD", 1,
-                        X86LINT_EXT_APX);
+    ASSERT_FINDINGS_AMONG_EXT(live_add_imm, "missing APX NDD", 1, 2,
+                          X86LINT_EXT_APX);
     static const uint8_t live_sub_imm[] = {
         0x89, 0xC8,        // mov eax, ecx
         0x83, 0xE8, 0x03,  // sub eax, 3
         0x70, 0x00,        // jo +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(live_sub_imm, "missing APX NDD", 1,
-                        X86LINT_EXT_APX);
+    ASSERT_FINDINGS_AMONG_EXT(live_sub_imm, "missing APX NDD", 1, 2,
+                          X86LINT_EXT_APX);
     // INC divides by the flags it writes -- CF, which it and lea alike
     // leave untouched, plays no part.
     static const uint8_t live_inc[] = {
@@ -6940,7 +7043,7 @@ static void check_missing_apx_ndd_test(void)
         0x70, 0x00,        // jo +0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(live_inc, "missing APX NDD", 1, X86LINT_EXT_APX);
+    ASSERT_FINDINGS_AMONG_EXT(live_inc, "missing APX NDD", 1, 2, X86LINT_EXT_APX);
 
     // A direct branch onto the op reaches it without the copy.
     static const uint8_t edge_on_op[] = {
@@ -7655,6 +7758,7 @@ int main(int argc, char *argv[])
     check_zeroed_condition_test();
     check_movimm_condition_test();
     check_redundant_shift_test();
+    check_branch_to_next_test();
     check_vecop_fold_test();
     check_vec_transfer_fold_test();
     check_cas_fetch_op_test();

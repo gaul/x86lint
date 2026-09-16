@@ -138,6 +138,7 @@ with the corpus populations that argue for or against each, live in
 | [ADD foldable into LEA](analyses.md#add-foldable-into-lea) | one `LEA` carrying the ADD's term, where the result stays within two components |
 | [ADD foldable into memory](analyses.md#add-foldable-into-memory) | fold the pointer arithmetic into the consumer's `base+index*scale+disp` |
 | [AVX-SSE transition](analyses.md#avx-sse-transition) | `VZEROUPPER` after the last 256-bit use, or the VEX spelling of the SSE code |
+| [branch to the next instruction](analyses.md#branch-to-the-next-instruction) | delete; control arrives there either way |
 | [CAS loop foldable into LOCK op](analyses.md#cas-loop-foldable-into-lock-op) | `LOCK OR`/`AND`/`XOR` |
 | [constant condition after immediate](analyses.md#constant-condition-after-immediate) | delete the compare; the `Jcc`/`CMOVcc`/`SETcc` reading it has one outcome |
 | [constant condition after zeroing](analyses.md#constant-condition-after-zeroing) | same, the tested register being provably zero at any width |

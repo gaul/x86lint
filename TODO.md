@@ -687,7 +687,6 @@ bash:
 
 | armlint check | x86 spelling | shape | realized |
 | --- | --- | --- | --- |
-| branch to the next instruction | `jmp`/`jcc` to the next instruction | **1,009** | **1,009** |
 | compare whose flags are overwritten unread | delete the `CMP`/`TEST` | 2,327,914 | 396 |
 | `neg` + `add`/`sub` | `neg r ; add r2, r` -> `sub r2, r` | 61 | 16 |
 | redundant zero-extension by producer threshold | generalized past extension-after-extension | 39 | 37 |
@@ -699,22 +698,26 @@ bash:
 | `and xd, xn, #0xffffffff` | `and r64, 0xffffffff` -> `mov r32, r32` | 0 | 0 |
 | widening extend + `scvtf` | `movsxd` + `cvtsi2sd` -> 32-bit convert | 0 | 0 |
 
-**The branch-to-next row was recorded here as zero and is not.** It is
-**1,009** sites, every one realized -- there is nothing to gate, since
-neither form writes a register and both outcomes fall through. The earlier
-census parsed each instruction's address out of `objdump` with its trailing
-colon still attached, so `strtonum` returned 0 and every "is the target the
-next instruction" test compared against zero. It reported a plausible number
--- none -- and nothing looked wrong, which is the silent-failure mode
-armlint's `--selftest` was built for and the reason a candidate belongs in a
-tool rather than in a shell pipeline.
+**The branch-to-next row was recorded here as zero, and it shipped
+instead.** It is **964** findings -- libxul 909, libcrypto 47, go 8 -- every
+one realized, since neither form writes a register and both outcomes fall
+through so there is nothing to gate. The earlier census parsed each
+instruction's address out of `objdump` with its trailing colon still
+attached, so `strtonum` returned 0 and every "is the target the next
+instruction" test compared against zero. It reported a plausible number --
+none -- and nothing looked wrong, which is the silent-failure mode armlint's
+`--selftest` was built for and the reason a candidate belongs in a tool
+rather than in a shell pipeline.
 
 What the sites are is worth keeping too: hand-written SIMD, not compiler
 output. libjpeg-turbo's `jsimd_ycc_rgb_convert_avx2` emits `jmp` to a NASM
-macro label that lands on the very next instruction, 949 times across libxul,
+macro label that lands on the very next instruction, most of libxul's 909,
 with 47 more in libcrypto's perlasm. That is exactly the population armlint
 documents for its own version -- compilers emit none, and the catch is
-assembly and JIT emitters.
+assembly and JIT emitters. See
+[analyses.md](analyses.md#branch-to-the-next-instruction) for why only the
+rel8 spelling is matched, which is a relocation argument rather than a size
+one and costs 40 libxul sites and 5 in glibc.
 
 Two rows shifted on better gates rather than on a bug. The dead compare rose
 from 291 to 396 because `flags_live_after` reads a `RET` as flag death where

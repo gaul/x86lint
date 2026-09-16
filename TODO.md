@@ -277,10 +277,10 @@ together with the other per-core caveats a `-t` knob would gate.
 
 | Pattern | Rewrite | 2026-08 sweep (d1, rate/Minsn) |
 | --- | --- | --- |
-| `MOV r, imm` of a constant still live in another register | `MOV rD, rS` -- 2-3 bytes against the 5-6 the immediate form costs | **27,796** at d1, of 41,108 at all distances. libc 113 (322), libstdc++ 126 (352), bash 90 (354), libcrypto 124 (150), libxul 26,982 (897), go 361 (219) |
+| `MOV r, imm` of a constant still live in another register | `MOV rD, rS` -- 2-3 bytes against the 5-6 the immediate form costs | **Measured 2026-09-15 by `tools/shapescan`: 33,248 realized of a 34,155 shape** (libxul 32,177, go 417, libcrypto 197, libc 168, libstdc++ 153, bash 136); 30,753 of those are adjacent. defuse's d1 estimate was 27,796. Sound and unblocked; what remains is desirability, not proof |
 
-This is the one row in this file whose population may survive contact
-with the rewrite, and the reason is worth stating. Every count that
+**This is the one row in this file whose population survived contact with
+the rewrite**, and it was predicted to, for the right reason. Every count that
 collapsed was defined by *shape*: `lea->addr` never asked whether the
 combined address was encodable, `load->addsub` never asked which
 operand the loaded register was. `defuse`'s `remat|movimm` row is
@@ -288,6 +288,36 @@ defined by the rewrite's own precondition -- the constant still being
 live in another register is exactly what makes the copy legal -- so the
 erosion here should be the check's proof being stricter than defuse's
 block-local model, not a condition the count ignored.
+
+**Measured, and it held.** Every other candidate this session collapsed
+under its own conditions -- the CAS loop 614 to 19, the vector fold 18,236 to
+583, the scalar siblings 470 to 12. This one goes 34,155 to **33,248**, which
+is 97%, and its adjacent half comes in 11% *above* defuse's d1 estimate rather
+than below it. The reason is the one the paragraph above gives: the row's
+population was defined by the rewrite's own precondition -- the constant still
+being live in another register -- and not by a shape that the conditions would
+later cut down. A count defined that way is the count.
+
+The shipped-check machinery is what makes the figure trustworthy rather than
+another estimate: the candidate tracks a value per register, records only the
+32- and 64-bit `mov r, imm` forms (a 32-bit write zero-extends, so `mov eax,
+5` really does establish RAX = 5, where `mov al, 5` establishes nothing about
+the other 56 bits), clears every register an instruction writes, and clears
+the whole map at a call, at any control transfer, at a branch target and at a
+decode error. libc's 116 adjacent sites against defuse's 113 is the
+independent corroboration.
+
+Two things the measurement found that the row did not say:
+
+* **246 sites are a stronger finding than this row describes.** The register
+  that already holds the value is the destination itself, so the `mov` is not
+  a copy opportunity but dead outright -- libxul 189, libstdc++ 31, go 18.
+  Those want deleting, not rewriting, and no target question arises.
+* **The zero fraction is 1.7%, not the 16% recorded below.** 661 of 34,155,
+  and 0 in libc and bash. The 16% came from counting a population that
+  included the XOR zeroing idiom; the rewrite here needs a `mov r, imm` to
+  replace, and compilers do not spell zero that way. The zeros that do occur
+  are already the shipped "suboptimal MOV zero" finding.
 
 Two corrections to an earlier draft of this row, both from measuring
 the sites rather than the shape:

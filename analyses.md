@@ -23,15 +23,25 @@ argue for or against each, live in [TODO.md](TODO.md).
   producers are refused, their displacement being measured from the following
   instruction. LEA writes no flags where the ADD writes all of them (INC/DEC
   all but CF), so those must be dead past the pair.
-* Reported only when the RESULT stays within two components. Base, index and
-  displacement together is the "slow LEA": 3 cycles on port 1 alone from Sandy
-  Bridge onward, where each two-component form is 1 cycle on two ports. Folding
-  a fast LEA plus an ADD (2 cycles, two ports) into a slow one trades a uop and
-  three or four bytes for a cycle of latency and a port -- a trade, not an
-  improvement. The gate costs most of the population (2,678 findings of 39,715
-  sound folds in libxul) and keeps every finding a win on all three of size,
-  uops and latency: the reported shape is `LEA rD, [rX*s]` plus `ADD rD, rT`,
-  which becomes a one-cycle two-component LEA where the pair took two
+* Reported only when the RESULT stays within two components, **unless the
+  target says otherwise**. Base, index and displacement together is the "slow
+  LEA": 3 cycles on port 1 alone from Sandy Bridge through Cascade Lake, where
+  each two-component form is 1 cycle on two ports. Folding a fast LEA plus an
+  ADD (2 cycles, two ports) into a slow one trades a uop and three or four
+  bytes for a cycle of latency and a port -- a trade, not an improvement. The
+  gate costs most of the population and keeps every finding a win on all three
+  of size, uops and latency: the reported shape is `LEA rD, [rX*s]` plus
+  `ADD rD, rT`, which becomes a one-cycle two-component LEA where the pair
+  took two.
+* The gate is `TARGET_SLOW_LEA3`, so `-t icelake` and `-t zen` lift it:
+  Agner Fog's tables give Ice Lake and Tiger Lake no separate row for the
+  three-component form -- their "with index" form is 1 cycle on p15, the same
+  as two components -- and Zen 3 through Zen 5 two cycles as two ops, which
+  is what the pair being folded already costs. On libxul the difference is
+  **2,678 findings against 28,064**, so 25,386 sound folds are withheld from
+  the conservative default and reported for a core that does not pay. TODO.md
+  had recorded that residue as 37,037 from a measurement that did not apply
+  every gate; the figure here is the check's own
 
 ## ADD foldable into memory
 

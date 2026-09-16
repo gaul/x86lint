@@ -398,6 +398,47 @@ unsound for arbitrary code and stays silent without it. Pass it when
 scanning V8's JIT output or its embedded builtins; never for an ordinary
 binary.
 
+Pass `-t generic|sandybridge|skylake|icelake|zen|silvermont` to name the
+microarchitecture the code is tuned for. This is a different axis from `-m`:
+that says whether an encoding *exists* on the target, where `-t` says whether
+a rewrite is *worth making* there, and several of x86lint's are not worth it
+everywhere. The default, `generic`, assumes every documented penalty applies
+at once, so it reports the rewrites that pay on every core and withholds the
+ones that only sometimes do.
+
+Four behaviours move with it, and they move in both directions:
+
+* A **three-component LEA** costs 3 cycles on port 1 alone from Sandy Bridge
+  through Cascade Lake, where each two-component form is 1 cycle on two
+  ports, so folding a fast LEA and an ADD into a slow one trades a cycle for
+  three or four bytes. Agner Fog's tables give Ice Lake and Tiger Lake no
+  separate row for the three-component form, and Zen 3 through Zen 5 two
+  cycles as two ops, which is what the pair already costs. On libxul,
+  `-t icelake` takes "ADD foldable into LEA" from **2,678 findings to
+  28,064**: 25,386 sound folds that the default is right to withhold and a
+  modern target is right to want.
+* **POPCNT's destination is a phantom input** from Sandy Bridge through
+  Cascade Lake and not after, so on `icelake` and `zen` the dependency-break
+  check goes silent rather than advising an XOR that is pure cost. That is
+  6,431 findings on libxul the default reports and Ice Lake does not.
+* The **length-changing prefix stall** applies to MOV on the Pentium 4
+  through Nehalem, not on Sandy Bridge through Skylake, and again from Ice
+  Lake. MOV is most of what that check fires on -- 92% of the findings on
+  librustc_driver -- so on a Sandy-Bridge-through-Skylake target the bulk of
+  its output was reporting a cost that is not paid. The arithmetic and logic
+  forms pay on every Intel big core and are never gated.
+* **SUB r, r is recognized as a zeroing idiom** independent of its input
+  everywhere except the low-power line, where "SUB, SBB and CMP instructions
+  are not recognized in this way" (Agner Fog). The rewrite to XOR therefore
+  fires under `generic` and `silvermont` and nowhere else.
+
+`sandybridge` and `skylake` currently differ in no gated behaviour and are
+named separately because they differ on an axis no check reads yet: the
+bit-scan false dependency ends at Broadwell where POPCNT's runs to Cascade
+Lake. An unknown name is a usage error rather than a silent fallback to the
+default, since a typo that quietly changed which findings appear would be
+worse than a refusal.
+
 Pass `--json` to replace the human report with the findings as a JSON
 document, one object per line inside a `findings` array:
 

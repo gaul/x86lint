@@ -91,7 +91,7 @@ static int count_findings(const uint8_t *inst, size_t len,
     // verbose=true so each finding prints its "<name> at offset:" line into
     // the captured buffer for the per-category count below.
     int total = check_instructions(inst, len, 0, true, NULL, extensions,
-        NULL, NULL);
+        X86LINT_TARGET_GENERIC, NULL, NULL);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -400,7 +400,12 @@ static void check_lcp_imm16_test(void)
     // imm16 under a 66 prefix: the length-changing shape, register and
     // memory destinations alike.
     CHECK_BYTES_ASM(!check_lcp_imm16, "add cx, 0x1234", 0x66, 0x81, 0xC1, 0x34, 0x12);
-    CHECK_BYTES_ASM(!check_lcp_imm16, "mov cx, 0x1234", 0x66, 0xB9, 0x34, 0x12);
+    // MOV belongs to the per-core half, which is a row of its own gated on
+    // the target: the arithmetic check does not claim it.
+    CHECK_BYTES_ASM(check_lcp_imm16, "mov cx, 0x1234", 0x66, 0xB9, 0x34, 0x12);
+    CHECK_BYTES_ASM(!check_lcp_imm16_mov, "mov cx, 0x1234", 0x66, 0xB9, 0x34, 0x12);
+    CHECK_BYTES_ASM(check_lcp_imm16_mov, "add cx, 0x1234", 0x66, 0x81, 0xC1, 0x34, 0x12);
+    CHECK_BYTES_ASM(check_lcp_imm16_mov, "mov ecx, 0x12345678", 0xB9, 0x78, 0x56, 0x34, 0x12);
     CHECK_BYTES_ASM(!check_lcp_imm16, "test ax, 0x1234", 0x66, 0xA9, 0x34, 0x12);
     CHECK_BYTES_ASM(!check_lcp_imm16, "imul cx, ax, 0x1234", 0x66, 0x69, 0xC8, 0x34, 0x12);
     CHECK_BYTES_ASM(!check_lcp_imm16, "push 0x1234", 0x66, 0x68, 0x34, 0x12);
@@ -7488,7 +7493,7 @@ static void check_decode_resync_test(void)
     x86lint_summary *summary = x86lint_summary_create();
     assert(summary != NULL);
     int findings = check_instructions(inst, sizeof(inst), 0, false, summary,
-        0, NULL, NULL);
+        0, X86LINT_TARGET_GENERIC, NULL, NULL);
     assert(findings == 1);                              // not -1; scan continued
     assert(x86lint_summary_skipped(summary) == 1);      // the one bad byte
     assert(x86lint_summary_instructions(summary) == 2); // nop + push, not the byte
@@ -7514,7 +7519,7 @@ static void summary_functions_test(void)
     assert(summary != NULL);
     x86lint_summary_set_functions(summary, funcs, 2);
     int findings = check_instructions(inst, sizeof(inst), 0x1000, false,
-        summary, 0, NULL, NULL);
+        summary, 0, X86LINT_TARGET_GENERIC, NULL, NULL);
     assert(findings == 3);
     assert(x86lint_summary_function_findings(summary, 0) == 1);
     assert(x86lint_summary_function_findings(summary, 1) == 1);
@@ -7525,13 +7530,13 @@ static void summary_functions_test(void)
     summary = x86lint_summary_create();
     assert(summary != NULL);
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary,
-        0, NULL, NULL) == 3);
+        0, X86LINT_TARGET_GENERIC, NULL, NULL) == 3);
     assert(x86lint_summary_function_findings(summary, 0) == 0);
     x86lint_summary_destroy(summary);
 
     // NULL summary still tolerated with attribution in the code path.
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
-        0, NULL, NULL) == 3);
+        0, X86LINT_TARGET_GENERIC, NULL, NULL) == 3);
 }
 
 // Records the per-finding callback's arguments so the test can assert on
@@ -7571,7 +7576,7 @@ static void finding_callback_test(void)
     // report.
     struct finding_log log = {0};
     int findings = check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
-        0, finding_log_cb, &log);
+        0, X86LINT_TARGET_GENERIC, finding_log_cb, &log);
     assert(findings == 3);
     assert(log.count == 3);
 
@@ -7598,13 +7603,13 @@ static void finding_callback_test(void)
     assert(summary != NULL);
     struct finding_log both = {0};
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary, 0,
-        finding_log_cb, &both) == 3);
+        X86LINT_TARGET_GENERIC, finding_log_cb, &both) == 3);
     assert(both.count == 3);
     x86lint_summary_destroy(summary);
 
     // A NULL callback leaves the scan exactly as it was.
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL, 0,
-        NULL, NULL) == 3);
+        X86LINT_TARGET_GENERIC, NULL, NULL) == 3);
 }
 
 static void census_test(void)

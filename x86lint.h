@@ -47,6 +47,9 @@ bool check_oversized_add_sub_128(const xed_decoded_inst_t *xedd);
 // liveness here tracks
 bool check_lcp_imm16(const xed_decoded_inst_t *xedd);
 
+// The MOV half of the same stall, whose cost is per-core. See x86lint.c.
+bool check_lcp_imm16_mov(const xed_decoded_inst_t *xedd);
+
 // return false if instruction has an unneeded rex prefix
 bool check_unneeded_rex(const xed_decoded_inst_t *xedd);
 
@@ -443,6 +446,42 @@ enum x86lint_extensions {
     X86LINT_EXT_V8 = 1u << 4,
 };
 
+// The microarchitecture the scanned code is tuned for. This is a different
+// axis from the extensions above: those say whether an encoding *exists* on
+// the target, where this says whether a rewrite is *worth making* there, and
+// several of x86lint's are not worth it everywhere.
+//
+// A three-component LEA costs 3 cycles on port 1 alone from Sandy Bridge
+// through Cascade Lake, where each two-component form is 1 cycle on two
+// ports, so folding a fast LEA and an ADD into a slow one trades a cycle for
+// three or four bytes. Ice Lake and later drop the penalty and Zen never had
+// it, and on those the same fold wins on size, uops and latency at once.
+// POPCNT treats its destination as a phantom input from Sandy Bridge through
+// Cascade Lake and not after. The length-changing prefix stall applies to MOV
+// on the Pentium 4 through Nehalem, not on Sandy Bridge through Skylake, and
+// again from Ice Lake -- non-monotonic, which is why this is a set of named
+// cores rather than a version number. And SUB r, r is recognized as a
+// zeroing idiom independent of its input everywhere except the low-power
+// line, so the rewrite to XOR buys nothing on a big core.
+//
+// GENERIC is the default and assumes every penalty applies at once, which is
+// the conservative reading: it reports the rewrites that are safe everywhere
+// and withholds the ones that are only sometimes worth it.
+enum x86lint_target {
+    X86LINT_TARGET_GENERIC = 0,
+    X86LINT_TARGET_SANDYBRIDGE,   // Sandy Bridge, Ivy Bridge, Haswell, Broadwell
+    X86LINT_TARGET_SKYLAKE,       // Skylake, Cascade Lake
+    X86LINT_TARGET_ICELAKE,       // Ice Lake, Tiger Lake and later
+    X86LINT_TARGET_ZEN,           // Zen 1 through Zen 5
+    X86LINT_TARGET_SILVERMONT,    // the low-power line
+};
+
+// The name accepted by the driver's -t, or NULL for an unknown target.
+const char *x86lint_target_name(enum x86lint_target target);
+
+// Parse a -t name; returns false and leaves *out alone if it is not one.
+bool x86lint_target_parse(const char *name, enum x86lint_target *out);
+
 // How many instructions the copy folds -- missing APX NDD and MOV+ADD
 // foldable to LEA, which divide the same pairs by flag liveness -- may
 // examine, counting the copy and its consumer: 2 matches only adjacent
@@ -473,13 +512,15 @@ enum x86lint_extensions {
 // type and function and the decoded-instruction and skipped-byte counts
 // are accumulated. extensions is a bitwise OR of
 // enum x86lint_extensions values; 0 restricts the scan to baseline x86-64
-// checks. If on_finding is non-NULL it is invoked once per finding with ctx
+// checks. target names the microarchitecture being tuned for, which decides
+// the rewrites whose worth is per-core rather than universal;
+// X86LINT_TARGET_GENERIC assumes every documented penalty applies. If on_finding is non-NULL it is invoked once per finding with ctx
 // as its first argument; it is independent of both summary and verbose, so a
 // consumer wanting only the per-finding stream passes NULL for the summary
 // and false for verbose.
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
-                       uint32_t extensions, x86lint_finding_fn on_finding,
-                       void *ctx);
+                       uint32_t extensions, enum x86lint_target target,
+                       x86lint_finding_fn on_finding, void *ctx);
 
 #endif

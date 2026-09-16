@@ -95,6 +95,25 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# The target axis: a fold whose worth is per-core. lea rax, [rbx+rcx] ; add
+# rax, 8 makes a three-component LEA, which is 3 cycles on port 1 from Sandy
+# Bridge through Cascade Lake and 1 cycle on Ice Lake, so the same fold is a
+# trade there and a win here. A zeroing SUB moves the other way: rewriting it
+# to XOR buys nothing outside the low-power line.
+cat >"$dir/target.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x48, 0x8D, 0x04, 0x0B        # lea rax, [rbx+rcx]
+    .byte 0x48, 0x83, 0xC0, 0x08        # add rax, 8
+    .byte 0x48, 0x8B, 0x00              # mov rax, [rax]
+    .byte 0x29, 0xC9                    # sub ecx, ecx
+    .byte 0xC3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # The dynamic linker's import glue is not compiler output, so the scan skips
 # it by section name. Linked stripped so no symbol restriction is in play:
 # that is the configuration the exclusion exists for, and it is also the one
@@ -434,7 +453,7 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi notrack census isanote perfunc; do
+for f in finding clean bmi notrack census isanote perfunc target; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -614,6 +633,22 @@ expect '^1 optimization opportunities in 3 instructions$'
 # output: one finding from .text by default, all three under -a. The
 # instruction counts pin that the glue was not merely unreported but
 # unscanned.
+# -t decides the rewrites whose worth is per-core, and nothing else: the
+# slow-LEA fold appears only where a three-component LEA is not slower, and
+# the SUB zeroing idiom only where SUB is not recognized as independent.
+run 1 -t generic "$dir/target"
+reject 'ADD foldable into LEA' "slow-LEA fold under the conservative default"
+expect '^ +1 +suboptimal SUB reg, reg$' "SUB rewrite under the default"
+run 1 -t icelake "$dir/target"
+expect '^ +1 +ADD foldable into LEA$' "slow-LEA fold on a core without the penalty"
+reject 'suboptimal SUB reg, reg' "SUB rewrite on a big core"
+run 1 -t skylake "$dir/target"
+reject 'ADD foldable into LEA' "slow-LEA fold on a core with the penalty"
+run 1 -t silvermont "$dir/target"
+expect '^ +1 +suboptimal SUB reg, reg$' "SUB rewrite on the low-power line"
+# An unknown target is a usage error, not a silent default.
+run 2 -t nehalem "$dir/target"
+
 run 1 "$dir/pltskip"
 expect '^ +1 +oversized XCHG encoding$' "count of 1 with the glue skipped"
 expect '^1 optimization opportunities in 2 instructions$'

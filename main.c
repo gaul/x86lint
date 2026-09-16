@@ -1742,6 +1742,7 @@ int main(int argc, char **argv)
     bool census = false;
     bool json = false;
     uint32_t extensions = 0;
+    enum x86lint_target target = X86LINT_TARGET_GENERIC;
     const char *path = NULL;
     const char *fname = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -1757,6 +1758,17 @@ int main(int argc, char **argv)
             census = true;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = true;
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            // The microarchitecture being tuned for. A different axis from
+            // -m: that says an encoding exists on the target, this says a
+            // rewrite is worth making there. The default assumes every
+            // documented penalty applies, so it reports only what pays on
+            // every core.
+            if (!x86lint_target_parse(argv[++i], &target)) {
+                fprintf(stderr, "%s: unknown -t target '%s'\n",
+                    argv[0], argv[i]);
+                return 2;
+            }
         } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             ++i;
             if (strcmp(argv[i], "bmi1") == 0) {
@@ -1774,7 +1786,9 @@ int main(int argc, char **argv)
             } else {
                 fprintf(stderr,
                     "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
-                "[-m bmi1|bmi2|movbe|apx|v8] <ELF_FILE>\n",
+                "[-m bmi1|bmi2|movbe|apx|v8] "
+                "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
+                "<ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -1783,7 +1797,9 @@ int main(int argc, char **argv)
         } else {
             fprintf(stderr,
                 "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
-                "[-m bmi1|bmi2|movbe|apx|v8] <ELF_FILE>\n",
+                "[-m bmi1|bmi2|movbe|apx|v8] "
+                "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
+                "<ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
@@ -1791,7 +1807,9 @@ int main(int argc, char **argv)
     if (path == NULL) {
         fprintf(stderr,
             "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
-                "[-m bmi1|bmi2|movbe|apx|v8] <ELF_FILE>\n",
+                "[-m bmi1|bmi2|movbe|apx|v8] "
+                "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
+                "<ELF_FILE>\n",
             argv[0]);
         return 2;
     }
@@ -2348,7 +2366,7 @@ int main(int argc, char **argv)
         jctx.section = sec_name;
 
         int n = check_instructions(buf, shdr.sh_size, shdr.sh_addr, verbose,
-            summary, extensions, json ? json_finding : NULL,
+            summary, extensions, target, json ? json_finding : NULL,
             json ? &jctx : NULL);
         if (n < 0) {
             goto out;

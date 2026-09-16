@@ -334,7 +334,6 @@ bool check_lcp_imm16(const xed_decoded_inst_t *xedd)
     case XED_ICLASS_AND:
     case XED_ICLASS_CMP:
     case XED_ICLASS_IMUL:
-    case XED_ICLASS_MOV:
     case XED_ICLASS_OR:
     case XED_ICLASS_PUSH:
     case XED_ICLASS_SBB:
@@ -350,6 +349,27 @@ bool check_lcp_imm16(const xed_decoded_inst_t *xedd)
     }
     // The whitelisted iclasses reach an imm16 only through the prefix, but
     // keep the direct test so a decode surprise fails toward no finding.
+    return !xed_operand_values_has_operand_size_prefix(
+        xed_decoded_inst_operands_const(xedd));
+}
+
+// The MOV half of the same stall, split out because it is the half that is
+// not universal. MOV pays on the Pentium 4 through Nehalem, then does not on
+// Sandy Bridge through Skylake -- where "mov ax,1234 has no penalty", Haswell
+// and Skylake both inheriting Sandy Bridge's behaviour -- and pays again from
+// Ice Lake onward (Agner Fog, microarchitecture.pdf). The Atom line has never
+// paid it. It is also most of what this check fires on: 92% of the findings
+// on librustc_driver, so against a Sandy-Bridge-through-Skylake target the
+// bulk of the check's output was costing nothing.
+//
+// Reported under the same name as the arithmetic half, so the two rows tally
+// as one finding type and only the target decides how many there are.
+bool check_lcp_imm16_mov(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_MOV ||
+        xed_decoded_inst_get_immediate_width_bits(xedd) != 16) {
+        return true;
+    }
     return !xed_operand_values_has_operand_size_prefix(
         xed_decoded_inst_operands_const(xedd));
 }
@@ -3460,6 +3480,98 @@ static void emit_finding(const struct finding_sink *sink, const char *name,
     }
 }
 
+// What a target costs, one bit per rewrite whose worth is per-core. A check
+// declares the bits its rewrite needs in `target_requires`, and the
+// dispatcher skips the row unless the selected target has them all -- the
+// same shape as ext_required, and for a parallel reason: an ISA bit says the
+// replacement can be encoded, these say it is worth encoding.
+enum {
+    // A three-component LEA is materially slower than a two-component one,
+    // so folding an ADD into a fast LEA to make a slow one trades a cycle
+    // for bytes. Sandy Bridge through Cascade Lake: 3 cycles on port 1
+    // alone against 1 cycle on two ports. Agner Fog's tables give Ice Lake
+    // and Tiger Lake no separate row for the three-component form, and Zen 3
+    // through Zen 5 two cycles as two ops, which is what the pair it
+    // replaces already costs.
+    TARGET_SLOW_LEA3 = 1u << 0,
+    // POPCNT's destination is a phantom input, so an unrelated writer
+    // serializes the count behind it. Sandy Bridge through Cascade Lake,
+    // measured by uops.info at 3 cycles of latency from the destination.
+    TARGET_POPCNT_FALSE_DEP = 1u << 1,
+    // A 66-prefixed imm16 MOV pays the length-changing prefix stall. The
+    // Pentium 4 through Nehalem do, Sandy Bridge through Skylake do not
+    // ("mov ax,1234 has no penalty"), and Ice Lake onward do again. The
+    // arithmetic and logic forms pay on every Intel big core and carry no
+    // bit here. The Atom line has never paid it at all.
+    TARGET_LCP_ON_MOV = 1u << 2,
+    // SUB r, r is NOT recognized as independent of its input, so it carries
+    // a false dependency the XOR idiom breaks. True only on the low-power
+    // line: "SUB, SBB and CMP instructions are not recognized in this way"
+    // (Agner Fog, microarchitecture.pdf, Silvermont). Intel's big cores and
+    // AMD list XOR and SUB together, where the rewrite buys nothing.
+    TARGET_SUB_FALSE_DEP = 1u << 3,
+};
+
+static uint32_t target_properties(enum x86lint_target target)
+{
+    switch (target) {
+    case X86LINT_TARGET_SANDYBRIDGE:
+    case X86LINT_TARGET_SKYLAKE:
+        // These differ on axes no check reads yet -- the bit-scan false
+        // dependency ends at Broadwell where POPCNT's runs to Cascade Lake --
+        // and are named separately so that stays expressible.
+        return TARGET_SLOW_LEA3 | TARGET_POPCNT_FALSE_DEP;
+    case X86LINT_TARGET_ICELAKE:
+        return TARGET_LCP_ON_MOV;
+    case X86LINT_TARGET_ZEN:
+        return 0;
+    case X86LINT_TARGET_SILVERMONT:
+        // No LCP stall at all, and the one core where the SUB zeroing idiom
+        // is worth rewriting. The LEA row is left set: Agner's tables give
+        // the low-power line no three-component figure, and an unmeasured
+        // core keeps the conservative answer.
+        return TARGET_SLOW_LEA3 | TARGET_SUB_FALSE_DEP;
+    case X86LINT_TARGET_GENERIC:
+    default:
+        // Every penalty at once: report only what is worth doing everywhere.
+        return TARGET_SLOW_LEA3 | TARGET_POPCNT_FALSE_DEP |
+               TARGET_LCP_ON_MOV | TARGET_SUB_FALSE_DEP;
+    }
+}
+
+static const struct {
+    const char *name;
+    enum x86lint_target target;
+} target_names[] = {
+    {"generic",     X86LINT_TARGET_GENERIC},
+    {"sandybridge", X86LINT_TARGET_SANDYBRIDGE},
+    {"skylake",     X86LINT_TARGET_SKYLAKE},
+    {"icelake",     X86LINT_TARGET_ICELAKE},
+    {"zen",         X86LINT_TARGET_ZEN},
+    {"silvermont",  X86LINT_TARGET_SILVERMONT},
+};
+
+const char *x86lint_target_name(enum x86lint_target target)
+{
+    for (size_t i = 0; i < sizeof(target_names) / sizeof(target_names[0]); ++i) {
+        if (target_names[i].target == target) {
+            return target_names[i].name;
+        }
+    }
+    return NULL;
+}
+
+bool x86lint_target_parse(const char *name, enum x86lint_target *out)
+{
+    for (size_t i = 0; i < sizeof(target_names) / sizeof(target_names[0]); ++i) {
+        if (strcmp(name, target_names[i].name) == 0) {
+            *out = target_names[i].target;
+            return true;
+        }
+    }
+    return false;
+}
+
 struct check_entry {
     bool (*fn)(const xed_decoded_inst_t *);
     const char *name;
@@ -3492,6 +3604,12 @@ struct check_entry {
     // extension the finding would not be actionable. 0 (the default) for the
     // baseline checks, whose replacements any x86-64 CPU executes.
     uint32_t ext_required;
+    // Target properties (TARGET_* bits) the suggested replacement needs to be
+    // worth making. The dispatcher skips the row unless the selected target
+    // has them all; 0 (the default) for a rewrite that pays on every core.
+    // Declared last so the table's positional initializers keep their
+    // meaning.
+    uint32_t target_requires;
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
@@ -3502,6 +3620,8 @@ static const struct check_entry checks[] = {
     {check_test_minus_one,             "redundant TEST immediate",        0},
     {check_oversized_add_sub_128,      "oversized ADD/SUB 128",           FLAG_CF},
     {check_lcp_imm16,                  "length-changing prefix stall",    0},
+    {check_lcp_imm16_mov,              "length-changing prefix stall",    0,
+                                       NULL, false, 0, TARGET_LCP_ON_MOV},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},
     {check_mov_zero,                   "suboptimal MOV zero",             FLAG_ARITH},
@@ -3527,7 +3647,8 @@ static const struct check_entry checks[] = {
     {check_oversized_displacement,     "oversized displacement",          0},
     {check_unneeded_movsxd,            "unneeded MOVSXD",                 0},
     {check_unneeded_movsx,             "unneeded MOVSX",                  0},
-    {check_sub_self,                   "suboptimal SUB reg, reg",         0},
+    {check_sub_self,                   "suboptimal SUB reg, reg",         0,
+                                       NULL, false, 0, TARGET_SUB_FALSE_DEP},
     {check_or_and_self,                "suboptimal OR/AND reg, reg",      0, reg0_upper32_concern, true},
     {check_imul_to_lea,                "suboptimal IMUL constant",        FLAG_CF | FLAG_OF, imul_identity_upper_concern, true},
     {check_lea_to_mov,                 "suboptimal LEA",                  0},
@@ -5002,6 +5123,7 @@ static bool add_foldable_into_memop(const uint8_t *inst, size_t len,
 // negate a term. That is most of the population -- the corpus is full of
 // lea rdx, [rsp+0xa0] ; sub rdx, rsp -- and none of it is reachable.
 static bool add_foldable_into_lea(const uint8_t *inst, size_t len,
+                                  uint32_t tprops,
                                   const uint8_t *branch_targets,
                                   size_t add_offset,
                                   const xed_decoded_inst_t *lea)
@@ -5142,7 +5264,7 @@ static bool add_foldable_into_lea(const uint8_t *inst, size_t len,
         has_base = true;
         has_index = true;
     }
-    if (has_base && has_index && disp != 0) {
+    if (has_base && has_index && disp != 0 && (tprops & TARGET_SLOW_LEA3)) {
         return false;
     }
 
@@ -8676,10 +8798,15 @@ static bool cas_fetch_op_loop(const uint8_t *inst, size_t len,
 
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
-                       uint32_t extensions, x86lint_finding_fn on_finding,
-                       void *ctx)
+                       uint32_t extensions, enum x86lint_target target,
+                       x86lint_finding_fn on_finding, void *ctx)
 {
     int errors = 0;
+
+    // What the selected microarchitecture actually costs; see
+    // target_properties. GENERIC sets every bit, so the default scan is the
+    // one that was here before the axis existed.
+    const uint32_t tprops = target_properties(target);
 
     // Where every finding raised below is reported; see emit_finding.
     const struct finding_sink sink = {
@@ -8772,6 +8899,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
 
         size_t next = offset + xed_decoded_inst_get_length(&xedd);
         for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+            if ((checks[i].target_requires & ~tprops) != 0) {
+                continue;   // the rewrite is not worth making on this core
+            }
             if ((checks[i].ext_required & ~extensions) != 0) {
                 continue;
             }
@@ -8895,7 +9025,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // term the address could have carried -- the pair is one lea. Reported
         // against the lea (at `offset`), where the surviving instruction is
         // written. See add_foldable_into_lea.
-        if (add_foldable_into_lea(inst, len, branch_targets, next, &xedd)) {
+        if (add_foldable_into_lea(inst, len, tprops, branch_targets, next,
+                                  &xedd)) {
             emit_finding(&sink, "ADD foldable into LEA", offset, &xedd,
                 inst + offset);
             ++errors;
@@ -9156,7 +9287,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // redefine carries a false output dependency on affected Intel
         // cores; a zero idiom just before the count breaks it. See
         // popcnt_false_dep.
-        if (popcnt_false_dep(&xedd, &dep_history)) {
+        // The phantom destination is Sandy Bridge through Cascade Lake;
+        // Ice Lake and Zen have no such input, so the inserted XOR would
+        // be pure cost there.
+        if ((tprops & TARGET_POPCNT_FALSE_DEP) != 0 &&
+            popcnt_false_dep(&xedd, &dep_history)) {
             emit_finding(&sink, "missing POPCNT dependency break", offset,
                 &xedd, inst + offset);
             ++errors;

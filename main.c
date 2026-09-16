@@ -1702,6 +1702,34 @@ static void json_finding(void *ctx, const char *name, uint64_t vaddr,
     putchar('}');
 }
 
+// Linker-synthesized import glue: the PLT and its variants. The dynamic
+// linker owns the shape of these entries -- they are emitted from a fixed
+// template by ld, not by any compiler, and no source change reaches them --
+// so findings there are noise in a report about code generation. armlint
+// excludes the same family (ELF .plt, .iplt and the .plt.* variants; Mach-O
+// __stubs, __stub_helper and __objc_stubs) from both its scan and its census.
+//
+// Measured, the noise is a fixed block. A lazy-binding PLT entry pushes its
+// relocation index with the 5-byte `push imm32`, so every entry whose index
+// fits a signed imm8 draws an oversized-immediate finding and the count
+// saturates at exactly 128: libstdc++ (1,105 PLT entries), /bin/bash (236)
+// and libcrypto (161) each report 128 of those plus 7 oversized branch
+// displacements from the resolver jumps, 135 apiece regardless of size.
+// Every one is unfixable, and the tool's own purpose -- gating a compiler
+// test suite on a zero exit -- is what they break.
+//
+// The symbol-table restriction already hid this wherever .symtab survived
+// (glibc reports none) and could not where it did not, so the noise appeared
+// only on stripped binaries, which is exactly where a distro library is
+// usually scanned. That is why the exclusion is by section rather than by
+// symbol.
+static bool is_linker_stub_section(const char *name)
+{
+    return strcmp(name, ".plt") == 0 ||
+           strcmp(name, ".iplt") == 0 ||
+           strncmp(name, ".plt.", 5) == 0;    // .plt.sec, .plt.got
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
@@ -2070,12 +2098,18 @@ int main(int argc, char **argv)
     // BOLT-processed library keeps its unmoved functions in .bolt.org.text
     // beside the ones it moved into .text -- is ambiguous without knowing
     // which section it belongs to. -e needs it too, to identify .init and
-    // .fini by name, and --json names the section in every finding. Only
-    // those callers use it, so a failure to read the table costs the names
-    // and nothing else. e_shstrndx holds
+    // .fini by name, and --json names the section in every finding.
+    //
+    // The scan proper now needs it as well, to skip the linker's import glue
+    // (see is_linker_stub_section), so the table is read for every run rather
+    // than for those callers alone -- it was loaded only under -v, -e, -i and
+    // --json, which silently disabled that exclusion in exactly the plain
+    // invocation it exists for. A failure to read it still costs only the
+    // names: a nameless section is scanned, which is the old behaviour and
+    // the conservative direction. e_shstrndx holds
     // SHN_XINDEX when the real index does not fit, with the value in section
     // header 0's sh_link (the same overflow convention as e_shnum).
-    if ((verbose || endbr || census || json) && shnum != 0) {
+    if (shnum != 0) {
         uint64_t strndx = ehdr.e_shstrndx;
         if (strndx == SHN_XINDEX) {
             Elf64_Shdr shdr0;
@@ -2233,6 +2267,20 @@ int main(int argc, char **argv)
             continue;
         }
 
+        const char *sec_name = shstrtab != NULL &&
+            shdr.sh_name < shstrtab_size ? shstrtab + shdr.sh_name : "";
+
+        // Skip the dynamic linker's import glue; see is_linker_stub_section.
+        // -a keeps its contract -- it means scan every byte, and that now
+        // includes the glue for anyone auditing a linker rather than a
+        // compiler. The ENDBR64 verification (-e) is a separate pass and is
+        // deliberately unaffected: PLT entries really are indirect-branch
+        // targets under IBT, so whether they carry pads is the one thing
+        // about them worth checking.
+        if (!scan_all && is_linker_stub_section(sec_name)) {
+            continue;
+        }
+
         // Validate the section fits within the file. Done as two checks
         // to avoid wraparound on a forged sh_size near UINT64_MAX.
         if (shdr.sh_offset > file_size ||
@@ -2288,9 +2336,6 @@ int main(int argc, char **argv)
             mask_non_function_bytes(buf, &shdr, i, ehdr.e_type == ET_REL,
                 funcs, nfuncs);
         }
-
-        const char *sec_name = shstrtab != NULL &&
-            shdr.sh_name < shstrtab_size ? shstrtab + shdr.sh_name : "";
 
         // Name the section the following findings belong to, and give the
         // address their offsets are relative to, so a site can be located in

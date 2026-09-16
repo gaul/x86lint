@@ -95,6 +95,26 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# The dynamic linker's import glue is not compiler output, so the scan skips
+# it by section name. Linked stripped so no symbol restriction is in play:
+# that is the configuration the exclusion exists for, and it is also the one
+# where the section-name table is not otherwise read, which is where an
+# earlier version of this exclusion silently did nothing.
+cat >"$dir/pltskip.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x87, 0xc8                    # xchg eax, ecx (oversized XCHG)
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .plt,"ax",@progbits
+    .byte 0x87, 0xc8                    # same finding, in the glue
+    .section .plt.sec,"ax",@progbits
+    .byte 0x87, 0xc8                    # and in a .plt.* variant
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # A 3E-prefixed indirect call is exempt from CET indirect-branch tracking
 # and is flagged; the same prefix on an indirect JMP is the compilers'
 # switch-table idiom and must stay clean.
@@ -422,7 +442,8 @@ for f in finding clean bmi notrack census isanote perfunc; do
     fi
 done
 # The Go fixtures link stripped: the pclntab must carry the evidence alone.
-for f in gopcln gopcln116 gopclnscan; do
+# pltskip links stripped for its own reason -- see its fixture comment.
+for f in gopcln gopcln116 gopclnscan pltskip; do
     if ! cc -nostdlib -static -Wl,--build-id=none,-s \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -588,6 +609,17 @@ reject 'missing MOVBE' "MOVBE finding under -m apx"
 run 1 "$dir/notrack"
 expect '^ +1 +IBT-bypassing NOTRACK call$' "count of 1 for NOTRACK call"
 expect '^1 optimization opportunities in 3 instructions$'
+
+# .plt and its variants are the dynamic linker's template, not compiler
+# output: one finding from .text by default, all three under -a. The
+# instruction counts pin that the glue was not merely unreported but
+# unscanned.
+run 1 "$dir/pltskip"
+expect '^ +1 +oversized XCHG encoding$' "count of 1 with the glue skipped"
+expect '^1 optimization opportunities in 2 instructions$'
+run 1 -a "$dir/pltskip"
+expect '^ +3 +oversized XCHG encoding$' "count of 3 with -a"
+expect '^3 optimization opportunities in 4 instructions$'
 
 # -i replaces the lint scan with the ISA census: levels attributed, the
 # verdict line present, and none of the lint report's furniture.

@@ -1108,6 +1108,27 @@ scanning just those would silently miss almost all code -- so stripped
 binaries scan whole sections exactly as before. An unsized assembly label
 extends to the next function's start, keeping coverage conservative.
 
+The dynamic linker's import glue is skipped whatever the symbols say: the
+ELF `.plt`, `.iplt` and `.plt.*` sections are emitted from a fixed template
+by `ld`, so their shape is the dynamic-linking ABI's business and no source
+change reaches it. The noise this removes is a constant: a lazy-binding PLT
+entry pushes its relocation index with the 5-byte `push imm32`, so every
+entry whose index fits a signed imm8 draws an oversized-immediate finding and
+the count saturates at exactly 128 -- libstdc++ (1,105 PLT entries),
+`/bin/bash` (236) and libcrypto (161) each reported those 128 plus 7
+oversized branch displacements from the resolver jumps, 135 apiece regardless
+of size, none of them fixable and all of them enough to fail the non-zero
+exit a compiler test suite gates on. The exclusion is by section rather than
+by symbol because the symbol restriction already hid it wherever `.symtab`
+survived (glibc reported none) and could not where it did not, so the noise
+appeared only on stripped binaries -- which is how a distro library is
+usually scanned. `-a` keeps its contract and scans the glue too, for anyone
+auditing a linker rather than a compiler. The `-e` verification is a separate
+pass and deliberately unaffected: PLT entries really are indirect-branch
+targets under IBT, so whether they carry landing pads is the one thing about
+them worth checking. armlint excludes the same family, adding Mach-O's
+`__stubs`, `__stub_helper` and `__objc_stubs`.
+
 By default x86lint prints only a summary -- the opportunities grouped by type
 and sorted by prevalence -- followed by a total and the number of
 instructions scanned:

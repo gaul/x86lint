@@ -514,7 +514,8 @@ standing this file gives its `-a`-swept binaries.
 | Pattern | Rewrite | 2026-09 port sweep |
 | --- | --- | --- |
 | ~~`LOCK CMPXCHG` retry loop whose body is one bitwise op~~ | ~~`LOCK OR`/`AND`/`XOR`~~ | **Done: "CAS loop foldable into LOCK op".** Shape 614 in libxul (466 OR, 132 AND, 16 XOR), 3 libc, 0 elsewhere; realized **19**, all libxul. See the note below -- a 32x collapse with a single cause |
-| ~~vector load whose sole use is the next vector op's source~~ | ~~fold into that operand~~ | **Done: "load foldable into vector op".** Shape 9,298 in libxul, of which 541 were predicted to survive a deadness proof; realized **583** (libcrypto 176, and 0 in libc, libstdc++, go and bash). See the note below -- the 17x gap between shape and finding is the register allocator being right, not the proof being timid. Two scalar siblings remain unbuilt: `mov r, [m] ; movd/movq xmm, r` (370 libxul, 34 go) and `mov r, [m] ; cvtsi2sd xmm, r` (100 libxul) |
+| ~~vector load whose sole use is the next vector op's source~~ | ~~fold into that operand~~ | **Done: "load foldable into vector op".** Shape 9,298 in libxul, of which 541 were predicted to survive a deadness proof; realized **583** (libcrypto 176, and 0 in libc, libstdc++, go and bash). See the note below -- the 17x gap between shape and finding is the register allocator being right, not the proof being timid. Two scalar siblings are measured in their own row below |
+| GPR load whose sole use is a transfer into the vector file | fold into that transfer | `mov r, [m] ; movd/movq xmm, r` and `mov r, [m] ; cvtsi2sd/ss xmm, r`. Shape 470 in libxul and 34 in go; after the deadness gate, **16 and 13**, with 4 more sites and 0 findings across libc, libstdc++ and libcrypto. The published figures were the bare shape (370 and 100), overstating by 20x. See the note below |
 | adjacent immediate-zero stores at consecutive addresses | one wider store | **Filed as [#30](https://github.com/gaul/x86lint/issues/30).** Re-counted by maximal run rather than by pair: libxul **20,870** runs covering 45,626 stores, of which **11,788** are removable with no new register; libstdc++ 396 runs, libcrypto 339, go 331, libc 91, bash 78. Blocked on a policy question, not on proof -- see below |
 
 **The CAS fold, and why its shape overstated it 32x.** The check
@@ -593,6 +594,41 @@ whole sections. Two conditions the estimate never applied, both pushing
 the same way. The both-successors split is deliberately not used: 198 of
 the 9,298 end at a control transfer, so it would buy under 2% for the
 machinery it costs.
+
+**The two scalar siblings are the same fold with a general-purpose
+register as the waypoint**, and their published figures were the bare
+shape:
+
+```
+mov eax, [rip+X] ; cvtsi2ss xmm0, eax  ->  cvtsi2ss xmm0, dword ptr [rip+X]
+mov r12, [rax+4] ; movq     xmm0, r12  ->  movq     xmm0, qword ptr [rax+4]
+```
+
+MOVD/MOVQ and CVTSI2SD/SS all take a memory source, so the integer
+register is a pure waypoint. Beyond the instruction and the register
+this deletes a cross-domain transfer, which costs bypass latency on
+every core; the folded form never touches the integer file. The
+deadness gate takes libxul's 470 to **16** and go's 34 to **13**, with
+4 sites and 0 findings elsewhere -- 6% of the shape, a 20x overstatement
+by the same mistake the vector row made.
+
+`movd`/`movq` collapses hardest, and the reason is specific: **275 of
+its 370, or 74%, read the integer register again**, which is the value
+being wanted in *both* files. That is exactly why it was loaded into a
+GPR rather than straight into the xmm, so folding would load the same
+memory twice. The `cvtsi2s` half fails differently, mostly at a control
+transfer inside the window, which is why this check does take the
+both-successors split the vector one declines: 115 of the 470 end that
+way against 2% for the vector fold. What survives is the RIP-relative
+global read once and converted -- Firefox reading integer preference
+mirrors into floats, where the next load of the same register is what
+proves the previous one dead.
+
+One thing that looks like a conflict and is not: CVTSI2SD merges into
+its destination's upper bits, which is the shipped "missing SSE
+dependency break" finding, and the fold does not change that. Both fire
+on the same site, independently and correctly -- one says fold the load,
+the other says insert the XORPS.
 
 **The zero-store merge needs a policy decision before it needs code**, and
 is filed as [#30](https://github.com/gaul/x86lint/issues/30) with the

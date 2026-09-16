@@ -8135,10 +8135,20 @@ static bool vecop_takes_memory_source(const xed_decoded_inst_t *consumer,
 // vectorized polynomial kernel cycling coefficients through one scratch,
 // where the next coefficient's load is itself what proves the previous one
 // dead.
+// The window checks that tools/shapescan sizes take an optional `why`. It is
+// left untouched when the pattern does not match at all, and set to the name
+// of the gate that refused when the pattern matched but the rewrite is not
+// available. The dispatcher passes NULL and behaves exactly as before; the
+// tool passes a pointer and gets the refusal breakdown that turns a bare
+// shape count into an explanation. See tools/shapescan.c.
+#define REFUSE(why_) \
+    do { if (why != NULL) { *why = (why_); } return false; } while (0)
+
 static bool load_foldable_into_vecop(const uint8_t *inst, size_t len,
                                      const uint8_t *branch_targets,
                                      size_t consumer_offset,
-                                     const xed_decoded_inst_t *load)
+                                     const xed_decoded_inst_t *load,
+                                     const char **why)
 {
     if (!vec_load_iclass(xed_decoded_inst_get_iclass(load)) ||
         xed3_operand_get_vexvalid(load) == 2 ||
@@ -8165,13 +8175,6 @@ static bool load_foldable_into_vecop(const uint8_t *inst, size_t len,
     if (xed3_operand_get_vexvalid(&consumer) == 2 ||
         xed_decoded_inst_number_of_memory_operands(&consumer) != 0 ||
         vec_move_iclass(xed_decoded_inst_get_iclass(&consumer))) {
-        return false;
-    }
-
-    // An unaligned load proves nothing, so its consumer must be an encoding
-    // that asks nothing: VEX. An aligned load's proof carries to either.
-    if (!vec_load_proves_alignment(xed_decoded_inst_get_iclass(load)) &&
-        xed3_operand_get_vexvalid(&consumer) != 1) {
         return false;
     }
 
@@ -8214,19 +8217,31 @@ static bool load_foldable_into_vecop(const uint8_t *inst, size_t len,
         return false;
     }
 
+    // Past this point the pattern has matched and every remaining test is a
+    // gate on whether the rewrite is available, which is the split
+    // tools/shapescan reports against.
+
+    // An unaligned load proves nothing, so its consumer must be an encoding
+    // that asks nothing: VEX. An aligned load's proof carries to either.
+    if (!vec_load_proves_alignment(xed_decoded_inst_get_iclass(load)) &&
+        xed3_operand_get_vexvalid(&consumer) != 1) {
+        REFUSE("alignment unproven for legacy SSE");
+    }
     if (!vecop_takes_memory_source(&consumer, load, src_name)) {
-        return false;
+        REFUSE("no memory form in that operand slot");
     }
 
     // An incoming direct edge onto the consumer reaches it without the load.
     size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
     if (branch_target_in(branch_targets, consumer_offset, after)) {
-        return false;
+        REFUSE("a branch targets the consumer");
     }
-
-    return !vec_live_after(inst, len, after,
-                           xed_get_largest_enclosing_register(loaded),
-                           xed_get_register_width_bits64(loaded));
+    if (vec_live_after(inst, len, after,
+                       xed_get_largest_enclosing_register(loaded),
+                       xed_get_register_width_bits64(loaded))) {
+        REFUSE("the loaded register is live afterward");
+    }
+    return true;
 }
 
 // An instruction that moves a general-purpose value into the vector file:
@@ -8295,7 +8310,8 @@ static bool vec_transfer_from_gpr(xed_iclass_enum_t iclass)
 static bool load_foldable_into_vec_transfer(const uint8_t *inst, size_t len,
                                             const uint8_t *branch_targets,
                                             size_t consumer_offset,
-                                            const xed_decoded_inst_t *load)
+                                            const xed_decoded_inst_t *load,
+                                            const char **why)
 {
     if (xed_decoded_inst_get_iclass(load) != XED_ICLASS_MOV ||
         xed_decoded_inst_number_of_memory_operands(load) != 1 ||
@@ -8371,17 +8387,19 @@ static bool load_foldable_into_vec_transfer(const uint8_t *inst, size_t len,
         return false;
     }
 
+    // Shape matched; the rest are gates (cf. load_foldable_into_vecop).
     if (!vecop_takes_memory_source(&consumer, load, src_name)) {
-        return false;
+        REFUSE("no memory form in that operand slot");
     }
-
     size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
     if (branch_target_in(branch_targets, consumer_offset, after)) {
-        return false;
+        REFUSE("a branch targets the consumer");
     }
-
-    return !reg_live_after_branch(inst, len, after,
-                                  xed_get_largest_enclosing_register(loaded));
+    if (reg_live_after_branch(inst, len, after,
+                              xed_get_largest_enclosing_register(loaded))) {
+        REFUSE("the loaded register is live afterward");
+    }
+    return true;
 }
 
 // A LOCK CMPXCHG retry loop whose body recomputes the new value with one
@@ -8434,7 +8452,8 @@ static bool load_foldable_into_vec_transfer(const uint8_t *inst, size_t len,
 // does.
 static bool cas_fetch_op_loop(const uint8_t *inst, size_t len,
                               const uint8_t *branch_targets, size_t head,
-                              size_t next, const xed_decoded_inst_t *mov)
+                              size_t next, const xed_decoded_inst_t *mov,
+                              const char **why)
 {
     // Head: a register-to-register copy of the accumulator into a scratch.
     if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
@@ -8572,14 +8591,20 @@ static bool cas_fetch_op_loop(const uint8_t *inst, size_t len,
         return false;
     }
 
+    // Shape matched; the rest are gates (cf. load_foldable_into_vecop).
     if (branch_target_in(branch_targets, next, after)) {
-        return false;
+        REFUSE("a branch targets the loop body");
     }
     if (flags_live_after(inst, len, after, FLAG_ARITH)) {
-        return false;
+        REFUSE("the flags are live afterward");
     }
-    return !reg_live_after(inst, len, after, XED_REG_RAX) &&
-           !reg_live_after(inst, len, after, scratch64);
+    if (reg_live_after(inst, len, after, XED_REG_RAX)) {
+        REFUSE("the old value is live afterward");
+    }
+    if (reg_live_after(inst, len, after, scratch64)) {
+        REFUSE("the scratch is live afterward");
+    }
+    return true;
 }
 
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
@@ -8823,7 +8848,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // the SIMD forms take it from memory directly. Reported against the
         // load (at `offset`), the removable instruction. See
         // load_foldable_into_vecop.
-        if (load_foldable_into_vecop(inst, len, branch_targets, next, &xedd)) {
+        if (load_foldable_into_vecop(inst, len, branch_targets, next, &xedd,
+                                     NULL)) {
             emit_finding(&sink, "load foldable into vector op", offset, &xedd,
                 inst + offset);
             ++errors;
@@ -8834,7 +8860,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // the value into the vector file. Reported against the load (at
         // `offset`). See load_foldable_into_vec_transfer.
         if (load_foldable_into_vec_transfer(inst, len, branch_targets, next,
-                                            &xedd)) {
+                                            &xedd, NULL)) {
             emit_finding(&sink, "load foldable into vector transfer", offset,
                 &xedd, inst + offset);
             ++errors;
@@ -8846,7 +8872,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // `offset`), the first of the three instructions the fold removes.
         // See cas_fetch_op_loop.
         if (cas_fetch_op_loop(inst, len, branch_targets, offset, next,
-                              &xedd)) {
+                              &xedd, NULL)) {
             emit_finding(&sink, "CAS loop foldable into LOCK op", offset,
                 &xedd, inst + offset);
             ++errors;

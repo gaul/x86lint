@@ -670,6 +670,23 @@ binary has none at all, nothing is labeled and the line says so.
 `tools/` holds the research utilities that feed x86lint's check backlog,
 built separately with `XED_PATH=/path/to/xed make tools`:
 
+* `tools/shapescan` sizes a *named* candidate with the rewrite's own
+  conditions applied, and says what refused the rest. Where pairscan ranks
+  shapes to find what is frequent, a TODO row turns on whether a specific
+  rewrite is available at a site, and measuring that ad hoc is what this
+  exists to stop: the 2026-09 armlint port was sized four times with
+  throwaway scripts and was wrong four times, three of them overstating the
+  rewrite by 20x or more because a condition went unapplied. Candidates are
+  therefore C predicates rather than patterns -- each needed operand-role
+  matching, branch arithmetic, encodability through XED or a liveness walk --
+  and the file includes `x86lint.c` to call the shipped checks themselves, so
+  a shipped candidate is measured by the code that realizes it and an
+  unshipped one is a draft check that moves rather than being rewritten. Each
+  reports three things: how often the pattern matched, how often the rewrite
+  was available, and which gate refused the difference. The third is the
+  point -- "18,236 sites become 583" is a puzzle, while "9,126 read the
+  loaded register again and 5,743 have no memory form in that operand slot"
+  is an answer. `-e NAME` prints example sites
 * `tools/pairscan` counts adjacent-instruction pairs by normalized shape
   across the executable sections of an ELF binary, surfacing frequent
   patterns worth a new check. Registers collapse to a class and width
@@ -698,10 +715,12 @@ built separately with `XED_PATH=/path/to/xed make tools`:
   evidence labeling (the `unevidenced` annotations and `code evidence`
   line) is what they argued into existence.
 
-Both restrict the scan to the symbol table's function ranges exactly as
-the driver does, so no pair or distance spans two functions or is mined
-from the non-code that executable sections interleave; `-a` scans every
-byte. The workflow behind several current checks: run `pairscan` over a
+All of them restrict the scan to the symbol table's function ranges and skip
+the dynamic linker's import glue exactly as the driver does, so no pair or
+distance spans two functions, none is mined from the non-code that executable
+sections interleave, and none counts the PLT's one fixed template as though a
+compiler had emitted it; `-a` scans every byte. The workflow behind several
+current checks: run `pairscan` over a
 representative corpus, classify the top shapes as by-design or foldable,
 then use `defuse` to decide whether a candidate needs adjacency only or a
 liveness window -- the measurement `APX_NDD_WINDOW`'s default rests on.

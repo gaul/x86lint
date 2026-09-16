@@ -25,6 +25,19 @@
 
 #include "corpus.h"
 
+// The dynamic linker's import glue, excluded exactly as the driver's scan
+// excludes it -- see is_linker_stub_section in main.c for the measurement
+// that argued for it. It matters more here than there: PLT entries come from
+// one fixed ld template, so every entry contributes the *same* adjacent pair,
+// and a pair statistic mined across them ranks the linker's habits as though
+// they were a compiler's. scan_all keeps its meaning and mines them too.
+static bool is_linker_stub_section(const char *name)
+{
+    return strcmp(name, ".plt") == 0 ||
+           strcmp(name, ".iplt") == 0 ||
+           strncmp(name, ".plt.", 5) == 0;    // .plt.sec, .plt.got
+}
+
 void corpus_decode_init(xed_decoded_inst_t *xedd)
 {
     xed_decoded_inst_zero(xedd);
@@ -281,10 +294,39 @@ int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,
     }
 
     const Elf64_Shdr *shdrs = (const Elf64_Shdr *) (base + ehdr->e_shoff);
+
+    // Section names, for the stub exclusion below. e_shstrndx holds
+    // SHN_XINDEX when the real index does not fit, with the value in section
+    // header 0's sh_link (the same overflow convention as e_shnum). The table
+    // is required to end in a NUL, which bounds every lookup into a read-only
+    // mapping the way main.c bounds its own copy by writing one. A table that
+    // will not validate leaves every name empty and so mines the glue, which
+    // is the behaviour this had before and the conservative direction.
+    const char *shstr = NULL;
+    uint64_t shstr_size = 0;
+    uint64_t strndx = ehdr->e_shstrndx;
+    if (strndx == SHN_XINDEX) {
+        strndx = shdrs[0].sh_link;
+    }
+    if (strndx != SHN_UNDEF && strndx < shnum) {
+        const Elf64_Shdr *s = &shdrs[strndx];
+        if (s->sh_size != 0 && s->sh_offset <= map_len &&
+            s->sh_size <= map_len - s->sh_offset &&
+            base[s->sh_offset + s->sh_size - 1] == '\0') {
+            shstr = (const char *) (base + s->sh_offset);
+            shstr_size = s->sh_size;
+        }
+    }
+
     for (uint64_t i = 0; i < shnum; ++i) {
         const Elf64_Shdr *shdr = &shdrs[i];
         if (shdr->sh_type != SHT_PROGBITS ||
             (shdr->sh_flags & SHF_EXECINSTR) == 0 || shdr->sh_size == 0) {
+            continue;
+        }
+        const char *sec_name = shstr != NULL && shdr->sh_name < shstr_size
+            ? shstr + shdr->sh_name : "";
+        if (!scan_all && is_linker_stub_section(sec_name)) {
             continue;
         }
         if (shdr->sh_offset > map_len ||

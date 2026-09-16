@@ -1,0 +1,11 @@
+Optimization opportunities by type:
+       1  oversized XCHG encoding
+
+Optimization opportunities by function:
+       1  f2
+
+8 undecodable bytes skipped (data in code section?)
+
+scan restricted to function 'f2': 1 site, 3 bytes
+1 optimization opportunities in 2 instructions
+exit status: 1

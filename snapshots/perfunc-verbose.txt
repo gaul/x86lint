@@ -1,0 +1,24 @@
+== section N .text: vaddr 0xADDR, 11 bytes ==
+oversized XCHG encoding at offset: 0x0 (_start+0x0): xchg eax, ecx
+  87 c8
+
+oversized XCHG encoding at offset: 0x2 (_start+0x2): xchg eax, ecx
+  87 c8
+
+oversized XCHG encoding at offset: 0x5 (f2+0x0): xchg eax, ecx
+  87 c8
+
+oversized XCHG encoding at offset: 0x8: xchg eax, ecx
+  87 c8
+
+Optimization opportunities by type:
+       4  oversized XCHG encoding
+
+Optimization opportunities by function:
+       2  _start
+       1  f2
+       1  outside every function range
+
+scan restricted to 3 function symbols (-a scans every byte)
+4 optimization opportunities in 7 instructions
+exit status: 1

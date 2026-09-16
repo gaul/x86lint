@@ -244,6 +244,22 @@ XED_PATH=/path/to/xed make all
 Run the unit suite and the ELF-driver smoke test with
 `XED_PATH=/path/to/xed make check`.
 
+The suite has three layers. `x86lint_test.c` assembles byte sequences and
+asserts the exact category and total each one produces, which is where a
+check's soundness gates are pinned. `driver_test.sh` builds small ELF fixtures
+with the system toolchain and asserts one stated fact per line about the
+report: what each flag turns on, which exit code a path returns, what `--json`
+must not contain. The same script then snapshots each fixture's whole report
+into `snapshots/`, which catches everything the assertions do not name --
+column widths, ordering, a stray extra finding, a count on a line nobody wrote
+a grep for. Values the linker chooses (section index, load address, sample and
+target addresses) are normalized away so the files are portable. Rewrite them
+with `XED_PATH=/path/to/xed make snapshots` and read the diff: a change you can
+explain is a new check or a deliberate edit, and one you cannot is the
+regression the layer exists to catch. The script never skips itself; an
+environment that cannot build the fixtures exits 2, because a skip that exits 0
+is indistinguishable from a pass.
+
 ## Usage
 
 x86lint is intended to be part of compiler test suites, which should

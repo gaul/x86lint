@@ -1,0 +1,6 @@
+indirect branch target missing ENDBR64: 0xADDR (entry point)
+ENDBR64: IBT property note present; 1 of 1 indirect branch targets missing ENDBR64 (#CP fault when IBT is enforced)
+SHSTK: no shadow stack in the property note despite IBT (branch-only -fcf-protection?)
+scan restricted to 1 function symbols (-a scans every byte)
+0 optimization opportunities in 3 instructions
+exit status: 1

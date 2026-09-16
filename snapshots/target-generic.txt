@@ -1,0 +1,10 @@
+Optimization opportunities by type:
+       1  ADD foldable into memory
+       1  suboptimal SUB reg, reg
+
+Optimization opportunities by function:
+       2  _start
+
+scan restricted to 1 function symbols (-a scans every byte)
+2 optimization opportunities in 5 instructions
+exit status: 1

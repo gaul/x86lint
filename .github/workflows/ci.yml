@@ -15,10 +15,12 @@ jobs:
 
     steps:
       # The Fedora base image ships neither a toolchain nor git nor python3
-      # (dnf5 is C++). Install before checkout so actions/checkout finds git
-      # and does a real clone instead of the REST-API tarball fallback.
+      # (dnf5 is C++), and no diffutils either, which driver_test.sh needs to
+      # compare its report snapshots. Install before checkout so
+      # actions/checkout finds git and does a real clone instead of the
+      # REST-API tarball fallback.
       - name: Install build dependencies
-        run: dnf install -y gcc gcc-c++ make git python3
+        run: dnf install -y gcc gcc-c++ make git python3 diffutils
 
       - uses: actions/checkout@v7
 

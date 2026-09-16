@@ -1,0 +1,9 @@
+Optimization opportunities by type:
+       1  IBT-bypassing NOTRACK call
+
+Optimization opportunities by function:
+       1  _start
+
+scan restricted to 1 function symbols (-a scans every byte)
+1 optimization opportunities in 3 instructions
+exit status: 1

@@ -1,0 +1,10 @@
+{"file": "<fixtures>/finding",
+  "findings": [
+    {"vaddr": N, "check": "oversized XCHG encoding", "section": ".text", "function": "_start", "function_offset": 5, "length": 2, "bytes": "87c8", "text": "xchg eax, ecx"}
+  ],
+  "restriction": {"symbols": 1},
+  "instructions": 4,
+  "skipped": 2,
+  "opportunities": 1
+}
+exit status: 1

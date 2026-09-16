@@ -1,0 +1,11 @@
+Optimization opportunities by type:
+       4  oversized XCHG encoding
+
+Optimization opportunities by function:
+       2  _start
+       1  f2
+       1  outside every function range
+
+scan restricted to 3 function symbols (-a scans every byte)
+4 optimization opportunities in 7 instructions
+exit status: 1

@@ -52,6 +52,13 @@ check: all
 	./x86lint_test
 	./driver_test.sh
 
+# Rewrite driver_test.sh's report snapshots from this build's output. Read the
+# resulting diff before committing it: an explained change is a new check or a
+# deliberate wording edit, and an unexplained one is the regression the layer
+# exists to catch.
+snapshots: x86lint
+	REGEN=1 ./driver_test.sh
+
 clean:
 	rm -f \
 		x86lint \
@@ -60,4 +67,9 @@ clean:
 		tools/pairscan \
 		tools/defuse \
 		tools/cohere \
+		tools/shapescan \
 		*.o
+
+# None of these name a file that is built; `tools` and `snapshots` are also
+# directories that exist, so without this make would call them up to date.
+.PHONY: lib all tools check snapshots clean

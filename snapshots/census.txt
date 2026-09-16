@@ -1,0 +1,12 @@
+ISA census: 4 instructions, 0 undecodable bytes skipped
+  baseline x86-64 (v1): 2
+  x86-64-v2: POPCNT (1)
+  x86-64-v3: AVX2 (1)
+  x86-64-v4: none
+  outside the psABI levels: none
+  x87 legacy FP: 1 (control/env 1, 80-bit operands 0, other 0)
+  highest psABI level: x86-64-v3
+  code evidence: 1 function symbols + 0 .eh_frame FDEs + 0 Go pclntab functions covering 11 of 11 executable bytes
+  GNU property ISA note: none
+  IFUNC resolvers defined: 0
+exit status: 0

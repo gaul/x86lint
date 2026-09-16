@@ -1,0 +1,5 @@
+Optimization opportunities by type:
+       3  oversized XCHG encoding
+
+3 optimization opportunities in 4 instructions
+exit status: 1

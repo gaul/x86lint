@@ -1,0 +1,3 @@
+scan restricted to 1 function symbols (-a scans every byte)
+0 optimization opportunities in 3 instructions
+exit status: 0

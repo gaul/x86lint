@@ -3,4 +3,6 @@ x86lint_test
 libx86lint.a
 tools/pairscan
 tools/defuse
+tools/cohere
+tools/shapescan
 *.o

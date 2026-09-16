@@ -10,14 +10,19 @@ set -u
 
 X86LINT=${X86LINT:-./x86lint}
 
+# The suite never skips itself on toolchain grounds. A skip that exits 0 is
+# indistinguishable from a pass to make and to CI, so an environment that
+# cannot build the fixtures is a failure to run the suite (exit 2), not a
+# silent success. armlint's runner refuses the same way.
 if ! command -v cc >/dev/null 2>&1; then
-    echo "driver_test.sh: no C compiler for fixtures, skipping" >&2
-    exit 0
+    echo "driver_test.sh: no C compiler to build the fixtures" >&2
+    exit 2
 fi
 
 dir=$(mktemp -d) || exit 2
 trap 'rm -rf "$dir"' EXIT
 status=0
+snapdir="$(dirname "$0")/snapshots"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -33,6 +38,55 @@ run() {
     rc=$?
     if [ "$rc" -ne "$expected" ]; then
         fail "x86lint $* exited $rc, expected $expected"
+    fi
+}
+
+# snapshot <name> <x86lint args...>: pin the tool's whole report for a
+# fixture rather than asserting facts about it, which is what catches
+# formatting drift, a stray extra finding, and a count on a line nobody
+# thought to grep. Every mismatch is reported and the suite continues, so one
+# run shows every changed output instead of one assertion failure per rebuild.
+#
+# What the link chooses is normalized away, because it moves with binutils
+# version and default linker script and would otherwise churn the snapshots
+# across machines: the section index, the section's load address, the absolute
+# vaddr --json prints, the census's sample addresses, the address of an
+# unpadded branch target, and whether the linker synthesized an empty ISA_1_USED
+# word where it could have emitted no property note at all (the tool reports
+# both spellings faithfully; only one can be in a file). The fixture directory
+# and argv[0] are masked for the same reason. Section-relative offsets, symbol
+# names, counts, byte spellings and the summary tables all stay, which is the
+# part that is the tool's own. The exit status is recorded too, so a snapshot
+# pins the grep-convention code as well as the report.
+#
+# REGEN=1 rewrites the snapshots from current output; review that diff rather
+# than editing a snapshot by hand.
+snapshot() {  # snapshot <name> <args...>
+    snapname=$1
+    shift
+    "$X86LINT" "$@" >"$dir/raw" 2>&1
+    snaprc=$?
+    {
+        sed -e 's/vaddr 0x[0-9a-f]*/vaddr 0xADDR/' \
+            -e 's/^== section [0-9][0-9]* /== section N /' \
+            -e 's/"vaddr": [0-9][0-9]*/"vaddr": N/' \
+            -e 's/ at 0x[0-9a-f]*$/ at 0xADDR/' \
+            -e 's/ENDBR64: 0x[0-9a-f]*/ENDBR64: 0xADDR/' \
+            -e 's/^  GNU property ISA note: used = 0$/  GNU property ISA note: none/' \
+            -e "s|$dir/|<fixtures>/|g" \
+            -e "s|$X86LINT|x86lint|g" "$dir/raw"
+        echo "exit status: $snaprc"
+    } >"$dir/snap"
+    if [ "${REGEN:-0}" = 1 ]; then
+        mkdir -p "$snapdir"
+        cp "$dir/snap" "$snapdir/$snapname.txt"
+        echo "regenerated snapshots/$snapname.txt"
+    elif [ ! -f "$snapdir/$snapname.txt" ]; then
+        fail "no snapshot for '$snapname' (run REGEN=1 $0 to create it)"
+    elif ! diff -u -L "snapshots/$snapname.txt" -L "current output" \
+            "$snapdir/$snapname.txt" "$dir/snap" >"$dir/snapdiff"; then
+        fail "snapshot '$snapname' differs from snapshots/$snapname.txt:"
+        sed 's/^/    /' "$dir/snapdiff" >&2
     fi
 }
 
@@ -793,6 +847,33 @@ rc=$?
 if [ "$rc" -gt 1 ]; then
     fail "self-lint of $X86LINT exited $rc"
 fi
+
+# Whole-report snapshots. The assertions above state what each fixture is
+# for, one fact at a time; these pin everything else the report says --
+# column widths, ordering, the lines nobody wrote a grep for -- across the
+# surfaces the tool has: the default report, -a, -v, --json, the census,
+# the ENDBR64 pass, the per-function table, the three opt-in axes (-m, -c,
+# -t) and the usage text. Regenerate with REGEN=1 ./driver_test.sh and read
+# the resulting diff; a change nobody can explain is the point of the layer.
+snapshot finding "$dir/finding"
+snapshot finding-all -a "$dir/finding"
+snapshot finding-verbose -v "$dir/finding"
+snapshot finding-json --json "$dir/finding"
+snapshot clean "$dir/clean"
+snapshot perfunc "$dir/perfunc"
+snapshot perfunc-verbose -v "$dir/perfunc"
+snapshot perfunc-function -f f2 "$dir/perfunc"
+snapshot bmi1 -m bmi1 "$dir/bmi"
+snapshot notrack-security -c security "$dir/notrack"
+snapshot advisory -c advisory "$dir/advisory"
+snapshot target-generic -t generic "$dir/target"
+snapshot target-icelake -t icelake "$dir/target"
+snapshot pltskip "$dir/pltskip"
+snapshot pltskip-all -a "$dir/pltskip"
+snapshot census -i "$dir/census"
+snapshot census-verbose -i -v "$dir/census"
+snapshot endbr-missing -e "$dir/cetbad"
+snapshot usage
 
 # Tool-failure paths: usage, unknown flag, dangling or unknown -m value,
 # unreadable file, non-ELF input.

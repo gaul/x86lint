@@ -642,40 +642,16 @@ static bool c_redundant_zext(const uint8_t *inst, size_t len,
     return true;
 }
 
-// `mov r, <operand size>` before TZCNT or LZCNT provides the zero-source
-// answer those instructions already define, so the MOV is dead -- but the
-// same MOV is the false-dependency break they need through Broadwell, which
-// is why this is blocked on a target axis (#28) rather than on a proof.
+// Now shipped, gated on the target axis (#28); measured through the check
+// itself. The tool passes the properties of the core where the rewrite is
+// available, since under the conservative default it correctly reports none.
 static bool c_bitscan_default(const uint8_t *inst, size_t len,
                               const uint8_t *targets, size_t offset,
                               size_t next, const xed_decoded_inst_t *d,
                               const char **why)
 {
     (void) targets; (void) offset; (void) why;
-    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
-        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
-        !xed_operand_values_has_immediate(
-            xed_decoded_inst_operands_const(d))) {
-        return false;
-    }
-    xed_reg_enum_t dest = explicit_reg(d, XED_OPERAND_REG0);
-    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(d);
-    if (dest == XED_REG_INVALID) {
-        return false;
-    }
-    xed_decoded_inst_t use;
-    if (!decode_at(inst, len, next, &use)) {
-        return false;
-    }
-    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
-    if (uic != XED_ICLASS_TZCNT && uic != XED_ICLASS_LZCNT) {
-        return false;
-    }
-    unsigned w = xed_decoded_inst_get_operand_width(&use);
-    return imm == w &&
-        xed_get_largest_enclosing_register(
-            explicit_reg(&use, XED_OPERAND_REG0)) ==
-        xed_get_largest_enclosing_register(dest);
+    return bitscan_default_dead(inst, len, next, d);
 }
 
 // A second plain load of an address the block already loaded, with nothing

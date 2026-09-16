@@ -76,9 +76,10 @@ do { \
 // by the check whose dispatcher name is `name`) and stores
 // check_instructions's return value -- the total finding count -- into
 // *total_out.
-static int count_findings(const uint8_t *inst, size_t len,
-                          const char *name, int *total_out,
-                          uint32_t extensions)
+static int count_findings_target(const uint8_t *inst, size_t len,
+                                 const char *name, int *total_out,
+                                 uint32_t extensions,
+                                 enum x86lint_target target)
 {
     char *buf = NULL;
     size_t bufsz = 0;
@@ -91,7 +92,7 @@ static int count_findings(const uint8_t *inst, size_t len,
     // verbose=true so each finding prints its "<name> at offset:" line into
     // the captured buffer for the per-category count below.
     int total = check_instructions(inst, len, 0, true, NULL, extensions,
-        X86LINT_TARGET_GENERIC, NULL, NULL);
+        target, NULL, NULL);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -111,11 +112,35 @@ static int count_findings(const uint8_t *inst, size_t len,
     return count;
 }
 
+static int count_findings(const uint8_t *inst, size_t len, const char *name,
+                          int *total_out, uint32_t extensions)
+{
+    return count_findings_target(inst, len, name, total_out, extensions,
+                                 X86LINT_TARGET_GENERIC);
+}
+
 // Asserts that `bytes_arr` (an array-typed local with sizeof() yielding its
 // byte length) produces exactly `expected` findings of the given category
 // AND no other findings. The second clause catches the common regression
 // pattern where a new check starts firing on the same bytes and silently
 // keeps a total-count assertion happy.
+// ASSERT_FINDINGS for a rewrite whose worth is per-core: the target decides
+// whether the finding exists at all.
+#define ASSERT_FINDINGS_TARGET(bytes_arr, category, expected, target) do { \
+    int _total; \
+    int _cat = count_findings_target(bytes_arr, sizeof(bytes_arr), category, \
+                                     &_total, 0, (target)); \
+    if (_cat != (expected) || _total != (expected)) { \
+        fprintf(stderr, \
+                "%s:%d: expected %d \"%s\" finding(s) and no others on %s; " \
+                "got %d for category, %d total\n", \
+                __FILE__, __LINE__, (expected), category, #target, _cat, \
+                _total); \
+    } \
+    assert(_cat == (expected)); \
+    assert(_total == (expected)); \
+} while (0)
+
 #define ASSERT_FINDINGS(bytes_arr, category, expected) \
     ASSERT_FINDINGS_EXT(bytes_arr, category, expected, 0)
 
@@ -3164,6 +3189,75 @@ static void check_redundant_shift_test(void)
         0xC3,                          // ret
     };
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
+}
+
+// A defensive zero-source constant in front of a TZCNT or LZCNT, which
+// define that answer themselves. Target-gated: the same MOV is the
+// false-dependency break on the cores that still need one. See
+// bitscan_default_dead.
+static void check_bitscan_default_test(void)
+{
+    // mov r8d, 0x40 ; tzcnt r8, rsi -- 0x40 is exactly the width TZCNT
+    // returns for a zero source, so the MOV is dead where the destination is
+    // no longer a phantom input.
+    static const uint8_t tzcnt_default[] = {
+        0x41, 0xB8, 0x40, 0x00, 0x00, 0x00,  // mov r8d, 0x40
+        0xF3, 0x4C, 0x0F, 0xBC, 0xC6,        // tzcnt r8, rsi
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS_TARGET(tzcnt_default, "redundant bit-scan default", 1,
+                           X86LINT_TARGET_SKYLAKE);
+    ASSERT_FINDINGS_TARGET(tzcnt_default, "redundant bit-scan default", 1,
+                           X86LINT_TARGET_ZEN);
+    // Through Broadwell the MOV is the mitigation, not dead code, and the
+    // conservative default assumes as much.
+    ASSERT_FINDINGS_TARGET(tzcnt_default, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_SANDYBRIDGE);
+    ASSERT_FINDINGS_TARGET(tzcnt_default, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_GENERIC);
+
+    // BSF leaves its destination undefined for a zero source -- real silicon
+    // preserves it, which is the whole point of the constant -- so the same
+    // shape in front of one is load-bearing at any target.
+    static const uint8_t bsf_default[] = {
+        0xB9, 0x20, 0x00, 0x00, 0x00,  // mov ecx, 0x20
+        0x0F, 0xBC, 0xCA,              // bsf ecx, edx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(bsf_default, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_SKYLAKE);
+
+    // 0x3f is a sentinel rather than the answer TZCNT already gives, so the
+    // MOV is live: this is the BSR-style idiom, not the dead one.
+    static const uint8_t wrong_constant[] = {
+        0x41, 0xB8, 0x3F, 0x00, 0x00, 0x00,  // mov r8d, 0x3f
+        0xF3, 0x4C, 0x0F, 0xBC, 0xC6,        // tzcnt r8, rsi
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS_TARGET(wrong_constant, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_SKYLAKE);
+
+    // The complementary gate: POPCNT keeps its phantom destination through
+    // Cascade Lake, so the dependency-break advice survives on Skylake where
+    // the bit-scan half of the same erratum is already fixed.
+    static const uint8_t popcnt_bare[] = {
+        0xF3, 0x0F, 0xB8, 0xC1,  // popcnt eax, ecx
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_TARGET(popcnt_bare, "missing POPCNT dependency break", 1,
+                           X86LINT_TARGET_SKYLAKE);
+    ASSERT_FINDINGS_TARGET(popcnt_bare, "missing POPCNT dependency break", 0,
+                           X86LINT_TARGET_ICELAKE);
+    // The same check covers TZCNT, whose erratum ends earlier: on Skylake it
+    // must no longer advise an XOR it would also call dead.
+    static const uint8_t tzcnt_bare[] = {
+        0xF3, 0x4C, 0x0F, 0xBC, 0xC6,  // tzcnt r8, rsi
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(tzcnt_bare, "missing POPCNT dependency break", 1,
+                           X86LINT_TARGET_SANDYBRIDGE);
+    ASSERT_FINDINGS_TARGET(tzcnt_bare, "missing POPCNT dependency break", 0,
+                           X86LINT_TARGET_SKYLAKE);
 }
 
 // A direct rel8 branch whose displacement is zero arrives where falling
@@ -7763,6 +7857,7 @@ int main(int argc, char *argv[])
     check_zeroed_condition_test();
     check_movimm_condition_test();
     check_redundant_shift_test();
+    check_bitscan_default_test();
     check_branch_to_next_test();
     check_vecop_fold_test();
     check_vec_transfer_fold_test();

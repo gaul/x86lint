@@ -180,6 +180,7 @@ with the corpus populations that argue for or against each, live in
 | [oversized XCHG encoding](analyses.md#oversized-xchg-encoding) | the one-byte `90+r` accumulator form |
 | [redundant ADD/SUB zero](analyses.md#redundant-addsub-zero) | `TEST`, or remove |
 | [redundant AND immediate](analyses.md#redundant-and-immediate) | `TEST reg, reg` |
+| [redundant bit-scan default](analyses.md#redundant-bit-scan-default) | delete the MOV; needs `-t skylake` or later |
 | [redundant MOV reg, reg](analyses.md#redundant-mov-reg-reg) | remove |
 | [redundant OR/XOR zero](analyses.md#redundant-orxor-zero) | `TEST`, or remove |
 | [redundant re-extension](analyses.md#redundant-re-extension) | remove the second extension |

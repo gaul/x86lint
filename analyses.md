@@ -836,6 +836,41 @@ argue for or against each, live in [TODO.md](TODO.md).
   sets identical flags; the 32-bit form's zero-extension -- GCC's fused
   zero-extend-and-test -- is gated by register liveness)
 
+## redundant bit-scan default
+
+* `41B840000000 F34C0FBCC6` (MOV R8D, 0x40; TZCNT R8, RSI) -- a compiler
+  writing the operand size into a register before a bit scan is supplying
+  the zero-source answer by hand. That idiom exists because `BSF` and `BSR`
+  leave their destination *undefined* when the source is zero, and real
+  silicon preserves it, which is exactly what the sequence relies on.
+  `TZCNT` and `LZCNT` have no such hole: they are defined to return the
+  operand size and they write the destination unconditionally, so for those
+  two spellings the MOV is dead outright. The constant carries its own
+  proof, being equal to the width the instruction already returns.
+* `BSF` and `BSR` are never matched, for the reason that makes this sound at
+  all: their preserved destination is the mechanism, so the same MOV in
+  front of one is load-bearing. The two are easy to tell apart by the
+  constant, which is the answer in one case and a sentinel in the other --
+  `mov ecx, 0x7f ; bsr rcx, rdx ; xor ecx, 0x3f` computes `63 - index`, and
+  127 exclusive-ored with 63 gives 64 for the zero case.
+* **The same MOV is also the false-dependency break**, which is why this
+  needs a target rather than a liveness proof. `TZCNT` and `LZCNT` treat
+  their destination as a phantom input through Broadwell, the same erratum
+  class as `POPCNT`'s, and a `mov r32, imm32` is a full write with no input,
+  so it cuts the chain. The shipped dependency-break check says as much and
+  declines to flag a site "when the preceding instruction already redefined
+  the register -- the mitigation gcc and clang emit". Two checks fighting
+  over one instruction is worse than either finding, so this one reports only
+  where the erratum is gone (`-t skylake` and later, and `-t zen`) and the
+  dependency-break check drops its bit-scan arm on exactly those targets.
+  The two gates are complementary halves of one fact.
+* Measured: **305 sites in libxul** and none in the rest of the corpus, all
+  of them under a target that has the fix. Every site dumped has the constant
+  exactly equal to the operand size -- 108 of 108 sampled, 81 at 64 and 27 at
+  32, with no exceptions -- which is what makes the width test a proof rather
+  than a heuristic. The 1,067 `BSR` sites in the same shape carry a sentinel
+  and are correctly not matched
+
 ## redundant MOV reg, reg
 
 * `4889C0` (MOV RAX, RAX)

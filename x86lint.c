@@ -2107,6 +2107,72 @@ bool check_oversized_branch(const xed_decoded_inst_t *xedd)
     return new_disp < INT8_MIN || new_disp > INT8_MAX;
 }
 
+// A compiler writing `mov r8d, 0x40 ; tzcnt r8, rsi` is supplying the
+// zero-source answer by hand. That idiom exists because BSF and BSR leave
+// their destination *undefined* when the source is zero -- real silicon
+// preserves it, which is exactly what the sequence relies on -- and TZCNT
+// and LZCNT have no such hole: they are defined to return the operand size
+// and they write the destination unconditionally. For those two spellings
+// the MOV is dead outright, and the constant carries its own proof, being
+// equal to the width the instruction already returns.
+//
+// BSF and BSR are never matched, for the reason that makes this sound at
+// all: their preserved destination is the whole mechanism, so the same MOV
+// in front of one is load-bearing.
+//
+// **The same MOV is also the false-dependency break**, which is why this
+// needs a target rather than a liveness proof. TZCNT and LZCNT treat their
+// destination as a phantom input through Broadwell, the same erratum class
+// as POPCNT's, and a `mov r32, imm32` is a full write with no input, so it
+// cuts the chain. The shipped POPCNT check says as much and declines to flag
+// a site "when the preceding instruction already redefined the register --
+// the mitigation gcc and clang emit". Two checks fighting over one
+// instruction is worse than either finding, so this one reports only where
+// the erratum is gone: TARGET_BITSCAN_DEP_FIXED, which is Skylake and later
+// and Zen. Under the conservative default it stays silent.
+//
+// Measured: 305 sites in libxul and none in the rest of the corpus. Every
+// one dumped has the constant exactly equal to the operand size -- 108 of
+// 108 sampled, 81 at 64 and 27 at 32 -- with no exceptions, which is what
+// makes the width test a proof rather than a heuristic. The BSR sites in the
+// same shape (1,067 of them) carry a sentinel instead, `mov ecx, 0x7f`
+// before `bsr rcx, rdx ; xor ecx, 0x3f`, and are correctly not matched.
+static bool bitscan_default_dead(const uint8_t *inst, size_t len, size_t next,
+                                 const xed_decoded_inst_t *mov)
+{
+    if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(mov))) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(mov);
+
+    xed_decoded_inst_t use;
+    decode_init(&use);
+    if (next >= len ||
+        xed_decode(&use, inst + next, len - next) != XED_ERROR_NONE) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(&use)) {
+    case XED_ICLASS_TZCNT:
+    case XED_ICLASS_LZCNT:
+        break;
+    default:
+        return false;
+    }
+    // The constant must be the width the instruction returns for a zero
+    // source, and must land in the register it overwrites.
+    return imm == xed_decoded_inst_get_operand_width(&use) &&
+        xed_get_largest_enclosing_register(
+            xed_decoded_inst_get_reg(&use, XED_OPERAND_REG0)) ==
+        xed_get_largest_enclosing_register(dest);
+}
+
 // A direct branch whose displacement is zero transfers control to the
 // instruction after it, which is exactly where falling through arrives:
 // taken or not taken, execution continues at the same place. JMP and Jcc
@@ -3510,21 +3576,31 @@ enum {
     // (Agner Fog, microarchitecture.pdf, Silvermont). Intel's big cores and
     // AMD list XOR and SUB together, where the rewrite buys nothing.
     TARGET_SUB_FALSE_DEP = 1u << 3,
+    // TZCNT and LZCNT no longer treat their destination as a phantom input.
+    // They did through Broadwell, the same erratum class as POPCNT's, which
+    // is why this bit is stated as the fix rather than the fault: the
+    // defensive `mov r, <operand size>` in front of one is dead code where
+    // the dependency is gone and the mitigation itself where it is not, so
+    // the check that deletes it needs the *absence* of the erratum, and
+    // target_requires can only ask for bits that are set. An unmeasured core
+    // leaves it clear, which withholds the finding.
+    TARGET_BITSCAN_DEP_FIXED = 1u << 4,
 };
 
 static uint32_t target_properties(enum x86lint_target target)
 {
     switch (target) {
     case X86LINT_TARGET_SANDYBRIDGE:
-    case X86LINT_TARGET_SKYLAKE:
-        // These differ on axes no check reads yet -- the bit-scan false
-        // dependency ends at Broadwell where POPCNT's runs to Cascade Lake --
-        // and are named separately so that stays expressible.
         return TARGET_SLOW_LEA3 | TARGET_POPCNT_FALSE_DEP;
+    case X86LINT_TARGET_SKYLAKE:
+        // Where the two differ: the bit-scan false dependency ends at
+        // Broadwell, while POPCNT's runs on to Cascade Lake.
+        return TARGET_SLOW_LEA3 | TARGET_POPCNT_FALSE_DEP |
+               TARGET_BITSCAN_DEP_FIXED;
     case X86LINT_TARGET_ICELAKE:
-        return TARGET_LCP_ON_MOV;
+        return TARGET_LCP_ON_MOV | TARGET_BITSCAN_DEP_FIXED;
     case X86LINT_TARGET_ZEN:
-        return 0;
+        return TARGET_BITSCAN_DEP_FIXED;
     case X86LINT_TARGET_SILVERMONT:
         // No LCP stall at all, and the one core where the SUB zeroing idiom
         // is worth rewriting. The LEA row is left set: Agner's tables give
@@ -7454,12 +7530,24 @@ static bool dep_broken_in_history(const struct dep_history *h,
 }
 
 static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
-                             const struct dep_history *history)
+                             const struct dep_history *history,
+                             uint32_t tprops)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_POPCNT:
+        break;
     case XED_ICLASS_LZCNT:
     case XED_ICLASS_TZCNT:
+        // The three share an erratum but not its extent: the bit-scan
+        // destination stops being a phantom input at Skylake where POPCNT's
+        // runs on to Cascade Lake. Without this split, a target that fixed
+        // the bit scans would still be told to insert an XOR in front of one
+        // -- and told by the same tool that the MOV already there is dead,
+        // which is the pair of contradictory findings the target axis exists
+        // to stop.
+        if ((tprops & TARGET_BITSCAN_DEP_FIXED) != 0) {
+            return false;
+        }
         break;
     default:
         return false;
@@ -9053,6 +9141,18 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             ++errors;
         }
 
+        // Multi-instruction peephole: a defensive zero-source constant in
+        // front of a TZCNT or LZCNT, which define that answer themselves.
+        // Target-gated: the same MOV is the false-dependency break on the
+        // cores that still need one. Reported against the mov (at `offset`),
+        // the removable instruction. See bitscan_default_dead.
+        if ((tprops & TARGET_BITSCAN_DEP_FIXED) != 0 &&
+            bitscan_default_dead(inst, len, next, &xedd)) {
+            emit_finding(&sink, "redundant bit-scan default", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
         // Multi-instruction peephole: the scalar sibling of the above, where
         // the waypoint is a general-purpose register and the consumer moves
         // the value into the vector file. Reported against the load (at
@@ -9291,7 +9391,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // Ice Lake and Zen have no such input, so the inserted XOR would
         // be pure cost there.
         if ((tprops & TARGET_POPCNT_FALSE_DEP) != 0 &&
-            popcnt_false_dep(&xedd, &dep_history)) {
+            popcnt_false_dep(&xedd, &dep_history, tprops)) {
             emit_finding(&sink, "missing POPCNT dependency break", offset,
                 &xedd, inst + offset);
             ++errors;

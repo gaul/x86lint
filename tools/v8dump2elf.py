@@ -103,12 +103,17 @@ def parse_dump(fp):
             in_code = False
         m = BANNER_RE.match(line)
         if m:
-            # A code banner opens a header block and forgets the previous
-            # object's identity, so an unnamed object does not inherit its
-            # predecessor's name. Every other banner -- "Raw source" above
-            # all -- closes it, which keeps a line of JS source that happens
-            # to read `name = x` out of the symbol table.
-            in_header = 'code' in m.group(1).lower()
+            # A banner opens a header block and forgets the previous object's
+            # identity, so an unnamed object does not inherit its
+            # predecessor's name. The exception is a source banner, which
+            # closes it: that keeps a line of JS source reading `name = x`
+            # out of the symbol table. Matching on what is NOT a header
+            # rather than on what is, because V8 spells the banner three ways
+            # -- "Optimized code" for TurboFan, "Disassembly:" for Maglev,
+            # "Code" elsewhere -- and the first version of this tested for
+            # "code", which silently cost every Maglev object its tier and
+            # name (1,883 of them in one Octane run).
+            in_header = 'source' not in m.group(1).lower()
             name = ''
             kind = ''
             continue

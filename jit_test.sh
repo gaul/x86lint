@@ -48,10 +48,13 @@ reject() {  # reject <file> <pattern> [description]
 
 # === V8: a --print-opt-code listing ===
 #
-# Three code objects. The first is named and contiguous. The second has a gap
+# Four code objects. The first is named and contiguous. The second has a gap
 # in its addresses, which must split it into two sections rather than one
 # section whose bytes lie about where they are. The third has no name line at
-# all, and the "name =" inside its raw source must not become its symbol.
+# all, and the "name =" inside its raw source must not become its symbol. The
+# fourth is announced by V8's other banner: TurboFan objects say "Optimized
+# code" and Maglev ones say "Disassembly:", and a header gate that tested for
+# the word "code" cost every Maglev object its tier and name.
 cat >"$dir/v8.txt" <<'EOF'
 --- Raw source ---
 function f(a) { let name = a; return name; }
@@ -97,10 +100,20 @@ Instructions (size = 3)
 0x4002     2  c3                   ret
 
 --- End code ---
+--- Disassembly: ---
+kind = MAGLEV
+name = maglev
+compiler = maglev
+
+Instructions (size = 3)
+0x5000     0  87c8                 xchg rax,rcx
+0x5002     2  c3                   ret
+
+--- End code ---
 EOF
 
 if convert v8dump2elf.py "$dir/v8.txt" -o "$dir/v8.elf" --map "$dir/v8.map"; then
-    expect "$dir/conv" '^4 code blobs, 18 code bytes' "V8 chunk and byte count"
+    expect "$dir/conv" '^5 code blobs, 21 code bytes' "V8 chunk and byte count"
     # The tier prefix, the JS name, and the split at the address gap. The
     # second half of the split object keeps the name with a .2 suffix: it is
     # more of the same code object, not a different one.
@@ -108,6 +121,7 @@ if convert v8dump2elf.py "$dir/v8.txt" -o "$dir/v8.elf" --map "$dir/v8.map"; the
     expect "$dir/v8.map" '^ML_split 0x2000 3$'
     expect "$dir/v8.map" '^ML_split.2 0x3000 3$'
     expect "$dir/v8.map" '^BL_anonymous 0x4000 3$' "unnamed object's symbol"
+    expect "$dir/v8.map" '^ML_maglev 0x5000 3$' "object under the Disassembly banner"
     reject "$dir/v8.map" 'definitely' "raw source leaking into a symbol"
 
     # The bytes arrive: four xchg sites, one per object plus the split half,
@@ -116,9 +130,9 @@ if convert v8dump2elf.py "$dir/v8.txt" -o "$dir/v8.elf" --map "$dir/v8.map"; the
     "$X86LINT" "$dir/v8.elf" >"$dir/out" 2>&1
     rc=$?
     [ "$rc" -eq 1 ] || fail "x86lint on the V8 image exited $rc, expected 1"
-    expect "$dir/out" '^ +4 +oversized XCHG encoding$' "one finding per object"
-    expect "$dir/out" '^4 optimization opportunities in 9 instructions$'
-    expect "$dir/out" '^scan restricted to 4 function symbols'
+    expect "$dir/out" '^ +5 +oversized XCHG encoding$' "one finding per object"
+    expect "$dir/out" '^5 optimization opportunities in 11 instructions$'
+    expect "$dir/out" '^scan restricted to 5 function symbols'
 
     # -v attributes each finding to its section at the JIT address the dump
     # gave, which is what makes a finding cross-referenceable back into it.

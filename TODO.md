@@ -849,6 +849,123 @@ It carries the actionability caveat armlint records for `adrp`+`add`:
 where the LEA holds a relocation this is a codegen suggestion rather
 than a byte patch.
 
+## JIT corpora (2026-09-15)
+
+The first measurement made by *running the tool* over JIT output rather
+than by reading disassembly text, using the converters added the same
+day. Two workloads on two engines, so no figure below rests on one
+benchmark or one engine:
+
+| corpus | blobs | code | instructions |
+| --- | --- | --- | --- |
+| V8 Octane 9, TurboFan + Maglev | 2,713 | 6.9 MB | 1,619,714 |
+| V8 ARES-6, TurboFan + Maglev | 5,618 | 8.0 MB | 1,876,052 |
+| SpiderMonkey Octane 9, all tiers | 6,984 | 12.4 MB | 2,729,950 |
+| SpiderMonkey ARES-6, all tiers | 8,365 | 17.8 MB | 4,155,785 |
+
+V8 through `d8 --print-opt-code --print-maglev-code` and
+`tools/v8dump2elf.py`; SpiderMonkey through
+`tools/spidermonkey-jitdump.patch` and `tools/jitdump2elf.py`, which
+catches Ion, Baseline, RegExp and the trampolines. **The corpora are
+almost pure code**: 225 undecodable bytes in V8's 6.9 MB and 4,072 in
+SpiderMonkey's 12.4 MB, 0.003% and 0.03%, so none of what follows is a
+phantom decode of data-in-text -- the risk that dominates `-a` sweeps of
+compiled binaries.
+
+Against the same engines' own ahead-of-time code, and libxul for the
+project's usual reference:
+
+| corpus | findings | per 1k insns | branch displacement | per 1k | everything else, per 1k |
+| --- | --- | --- | --- | --- | --- |
+| V8 Octane (JIT) | 75,821 | 46.8 | 54,067 | 33.4 | 13.4 |
+| V8 ARES-6 (JIT) | 97,841 | 52.2 | 72,061 | 38.4 | 13.7 |
+| SpiderMonkey Octane (JIT) | 193,700 | 71.0 | 161,551 | 59.2 | 11.8 |
+| SpiderMonkey ARES-6 (JIT) | 221,834 | 53.4 | 177,181 | 42.6 | 10.7 |
+| `d8` (AOT) | 55,561 | 7.9 | 2,962 | 0.42 | 7.5 |
+| `libmozjs` (AOT) | 23,225 | 5.1 | 642 | 0.14 | 5.0 |
+| `libxul` (AOT) | 259,836 | 8.6 | 3,574 | 0.12 | 8.5 |
+
+**JIT code carries six to nine times the findings per instruction of AOT
+code, and one check is nearly all of the difference.** Oversized branch
+displacement runs 33-59 per thousand instructions in JIT output against
+0.12-0.42 in compiled binaries, a factor of 80 to 490. Take that class
+out and the two worlds are within a factor of two of each other: 10.7 to
+13.7 against 5.0 to 8.5. Every other class ports across unchanged, which
+is the reassuring half of the result -- the check table does not need a
+JIT dialect.
+
+**The branch class decomposes completely, and the decomposition is the
+finding.** Of all 464,860 branch findings across the four corpora,
+**464,860 are forward branches and zero are backward.** Not approximately
+zero: none. Both assemblers explain it in the same three lines of source.
+V8's `Assembler::jmp(Label*, Distance)` takes `jmp_rel` when the label
+`is_bound()`, which picks the 2-byte form whenever the displacement fits;
+an unbound (forward) label gets the short form only when the caller
+passed `Label::kNear`. SpiderMonkey's `BaseAssembler::jmp_i(JmpDst)` --
+the bound-label path -- tests `CAN_SIGN_EXTEND_8_32` and emits
+`OP_JMP_rel8`, while `jmp()` and `jCC()`, the unbound ones, emit
+`OP_JMP_rel32` and `jccRel32` unconditionally with no near-label concept
+at all.
+
+So this is not an engine that forgot the short encoding. Both use it:
+V8's Octane output holds 17,672 short branches against 254,291 long
+ones, SpiderMonkey's 14,433 against 375,392. It is the one-pass
+assembler's forward reservation, and the measurement is of how often the
+reservation turned out to be unnecessary -- **21% of V8's long branches
+and 43% of SpiderMonkey's**. SpiderMonkey's share is the higher one for
+the reason its source gives: V8 at least lets a call site declare a label
+near, and 17,672 of them do.
+
+Its price is 3 to 5% of code size: 200,610 wasted bytes in V8's 6.9 MB
+Octane output, 603,300 in SpiderMonkey's 12.4 MB, 272,073 and 663,447 on
+ARES-6. Actionability differs by engine. In V8 it is per-site and needs
+no new machinery -- a `Label::kNear` at the emitting call site, which is
+what the other 17,672 already do. In SpiderMonkey it needs either a
+near-label form in the base assembler or a relaxation pass, and a
+relaxation pass moves every offset already recorded in a safepoint,
+snapshot or IC table, which is why neither engine runs one.
+
+**A false-positive class worth naming, because the corpus makes it
+measurable.** Of SpiderMonkey Octane's 11,178 "oversized immediate"
+findings, **7,230 are 10-byte `movabs` of 0 or -1** -- exactly the
+patchable-placeholder class this file recorded in 2026-09 from reading
+Ion's assembler, now counted and confirmed in context:
+
+```
+nop ; nop
+movabs $0xffffffffffffffff, %r11      <- the placeholder
+push   %r11
+jmp    <bailout tail>
+```
+
+`pushArgWithPatch` reserves the full width because the snapshot offset
+that replaces it is not known when the code is emitted. The remaining
+3,948 are all `and eax, imm32` and are real. Nothing in the encoding
+distinguishes the two, so the honest reading of that row is 3,948 with a
+named 7,230-site exclusion, and a JIT-aware suppression -- a 10-byte
+`movabs` of 0 or -1 whose destination is immediately pushed or called --
+is a candidate the AOT corpus could never have motivated.
+
+**The census reads JIT code too.** V8 uses AVX for 66,386 of its 1.62M
+instructions (4.1%) and no AVX2 or AVX-512; SpiderMonkey 17,767 (0.65%),
+plus the only BMI in either corpus (BMI2 321, BMI1 73). V8's 109 x87
+instructions are real rather than phantom: `fld`/`fprem` is how it
+implements JavaScript `%` on doubles, which is the one place x87 still
+earns its keep on x86-64.
+
+**Per tier, normalized by code size** (findings per KB, Octane):
+Maglev 11.1 and TurboFan 11.7; Ion 17.0, Baseline 15.3, RegExp 14.4.
+The tiers differ far less than the engines do, and almost all of the
+spread is again the branch class.
+
+**The measurement found a bug in its own converter**, which is the
+argument for making these figures reproducible rather than one-off: V8
+announces Maglev code with a `--- Disassembly: ---` banner where
+TurboFan says `--- Optimized code ---`, and the first header gate tested
+for the word "code", so 1,883 Maglev objects arrived unnamed and the
+tier split read 51,676 "unknown" against 24,145 TurboFan. Fixed, and
+pinned in `jit_test.sh`.
+
 ## Investigated and closed (2026-08 sweep)
 
 Candidates measured and set aside, recorded so they are not

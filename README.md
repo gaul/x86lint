@@ -861,13 +861,18 @@ next. Each section gets an `STT_FUNC` symbol naming the tier and, where the
 engine reveals it, the JS function -- so the by-function table is a per-tier
 breakdown and `-v` names the holder.
 
-What they found on first contact, which is the reason to have them: a
-five-function benchmark through TurboFan reports 79 opportunities in 1,328
-instructions, and a four-line script's SpiderMonkey output 560 in 16,992.
-Both are dominated by the same class -- 49 and 360 oversized branch
-displacements -- because neither engine relaxes a forward branch to the
-8-bit form once the label lands within reach. An ahead-of-time assembler
-does that in a second pass the JITs deliberately do not run.
+What they found, over Octane 9 and ARES-6 on both engines -- 10.4M
+instructions of JIT output, against the same engines' own compiled code --
+is written up as "JIT corpora" in [TODO.md](TODO.md). The headline is that
+JIT code carries six to nine times the findings per instruction that AOT
+code does, and that **one check is nearly all of the difference**: oversized
+branch displacement runs 33-59 per thousand instructions against 0.12-0.42
+in compiled binaries. Every one of those 464,860 findings is a *forward*
+branch and none is backward, because both assemblers shorten a jump to an
+already-bound label and neither can know the distance to one that is not yet
+bound. Take that class out and JIT and AOT code are within a factor of two
+of each other, which is the reassuring half: the check table needs no JIT
+dialect.
 
 ## References
 

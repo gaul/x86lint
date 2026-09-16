@@ -114,6 +114,21 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# An advisory: the SETcc zero-extension's fix belongs upstream of the
+# flag-setter, which a peephole cannot prove safe, so it is suggested rather
+# than verified and the default scan withholds it.
+cat >"$dir/advisory.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x0f, 0x94, 0xc0              # setz al
+    .byte 0x0f, 0xb6, 0xc0              # movzx eax, al
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # The dynamic linker's import glue is not compiler output, so the scan skips
 # it by section name. Linked stripped so no symbol restriction is in play:
 # that is the configuration the exclusion exists for, and it is also the one
@@ -453,7 +468,7 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi notrack census isanote perfunc target; do
+for f in finding clean bmi notrack census isanote perfunc target advisory; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -625,9 +640,18 @@ reject 'missing MOVBE' "MOVBE finding under -m apx"
 
 # The NOTRACK call is flagged; the switch-table jmp idiom beside it is not
 # (the instruction count pins that the jmp decoded and produced nothing).
-run 1 "$dir/notrack"
+# The NOTRACK call is a security review item rather than a rewrite, so the
+# default scan is clean and -c security opts in. The instruction count pins
+# that the jmp still decoded either way.
+run 0 "$dir/notrack"
+reject 'NOTRACK' "security finding in the default scan"
+run 1 -c security "$dir/notrack"
 expect '^ +1 +IBT-bypassing NOTRACK call$' "count of 1 for NOTRACK call"
 expect '^1 optimization opportunities in 3 instructions$'
+run 1 -c all "$dir/notrack"
+expect '^ +1 +IBT-bypassing NOTRACK call$' "NOTRACK call under -c all"
+# An unknown class is a usage error, not a silent default.
+run 2 -c bogus "$dir/notrack"
 
 # .plt and its variants are the dynamic linker's template, not compiler
 # output: one finding from .text by default, all three under -a. The
@@ -636,6 +660,12 @@ expect '^1 optimization opportunities in 3 instructions$'
 # -t decides the rewrites whose worth is per-core, and nothing else: the
 # slow-LEA fold appears only where a three-component LEA is not slower, and
 # the SUB zeroing idiom only where SUB is not recognized as independent.
+run 0 "$dir/advisory"
+reject 'SETcc zero-extension' "advisory in the default scan"
+run 1 -c advisory "$dir/advisory"
+expect '^ +1 +suboptimal SETcc zero-extension$' "advisory under -c advisory"
+reject 'NOTRACK' "security finding under -c advisory alone"
+
 run 1 -t generic "$dir/target"
 reject 'ADD foldable into LEA' "slow-LEA fold under the conservative default"
 expect '^ +1 +suboptimal SUB reg, reg$' "SUB rewrite under the default"

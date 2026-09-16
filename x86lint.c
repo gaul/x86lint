@@ -3691,6 +3691,38 @@ static const struct {
     {"silvermont",  X86LINT_TARGET_SILVERMONT},
 };
 
+static const struct {
+    const char *name;
+    uint32_t klass;
+} class_names[] = {
+    {"rewrite",  X86LINT_CLASS_REWRITE},
+    {"advisory", X86LINT_CLASS_ADVISORY},
+    {"security", X86LINT_CLASS_SECURITY},
+    {"all",      X86LINT_CLASS_REWRITE | X86LINT_CLASS_ADVISORY |
+                 X86LINT_CLASS_SECURITY},
+};
+
+const char *x86lint_class_name(uint32_t klass)
+{
+    for (size_t i = 0; i < sizeof(class_names) / sizeof(class_names[0]); ++i) {
+        if (class_names[i].klass == klass) {
+            return class_names[i].name;
+        }
+    }
+    return NULL;
+}
+
+bool x86lint_class_parse(const char *name, uint32_t *out)
+{
+    for (size_t i = 0; i < sizeof(class_names) / sizeof(class_names[0]); ++i) {
+        if (strcmp(name, class_names[i].name) == 0) {
+            *out = class_names[i].klass;
+            return true;
+        }
+    }
+    return false;
+}
+
 const char *x86lint_target_name(enum x86lint_target target)
 {
     for (size_t i = 0; i < sizeof(target_names) / sizeof(target_names[0]); ++i) {
@@ -3750,6 +3782,10 @@ struct check_entry {
     // Declared last so the table's positional initializers keep their
     // meaning.
     uint32_t target_requires;
+    // Which kind of finding this is (enum x86lint_classes, a single bit).
+    // 0 reads as X86LINT_CLASS_REWRITE, so every row that does not say
+    // otherwise is a verified rewrite.
+    uint32_t klass;
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
@@ -3759,9 +3795,12 @@ static const struct check_entry checks[] = {
     {check_oversized_test_immediate,   "oversized TEST immediate",        0},
     {check_test_minus_one,             "redundant TEST immediate",        0},
     {check_oversized_add_sub_128,      "oversized ADD/SUB 128",           FLAG_CF},
-    {check_lcp_imm16,                  "length-changing prefix stall",    0},
+    {check_lcp_imm16,                  "length-changing prefix stall",    0,
+                                       NULL, false, 0, 0,
+                                       X86LINT_CLASS_ADVISORY},
     {check_lcp_imm16_mov,              "length-changing prefix stall",    0,
-                                       NULL, false, 0, TARGET_LCP_ON_MOV},
+                                       NULL, false, 0, TARGET_LCP_ON_MOV,
+                                       X86LINT_CLASS_ADVISORY},
     {check_unneeded_rex,               "unneeded REX prefix",             0},
     {check_cmp_zero,                   "suboptimal CMP zero",             0},
     {check_mov_zero,                   "suboptimal MOV zero",             FLAG_ARITH},
@@ -3773,7 +3812,9 @@ static const struct check_entry checks[] = {
     {check_xor_to_not,                 "suboptimal XOR immediate",        FLAG_ARITH},
     {check_superfluous_lock_prefix,    "unneeded LOCK prefix",            0},
     {check_rep_ret,                    "unneeded REP prefix on RET",      0},
-    {check_notrack_call,               "IBT-bypassing NOTRACK call",      0},
+    {check_notrack_call,               "IBT-bypassing NOTRACK call",      0,
+                                       NULL, false, 0, 0,
+                                       X86LINT_CLASS_SECURITY},
     {check_xchg_accumulator,           "oversized XCHG encoding",         0},
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_branch_to_next,             "branch to the next instruction",  0},
@@ -9300,9 +9341,16 @@ static bool cas_fetch_op_loop(const uint8_t *inst, size_t len,
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
                        uint32_t extensions, enum x86lint_target target,
-                       x86lint_finding_fn on_finding, void *ctx)
+                       uint32_t classes, x86lint_finding_fn on_finding,
+                       void *ctx)
 {
     int errors = 0;
+
+    // A row with no class stated is a verified rewrite; see
+    // enum x86lint_classes.
+    if (classes == 0) {
+        classes = X86LINT_CLASS_REWRITE;
+    }
 
     // What the selected microarchitecture actually costs; see
     // target_properties. GENERIC sets every bit, so the default scan is the
@@ -9407,6 +9455,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
 
         size_t next = offset + xed_decoded_inst_get_length(&xedd);
         for (size_t i = 0; i < sizeof(checks) / sizeof(checks[0]); ++i) {
+            uint32_t klass = checks[i].klass != 0 ? checks[i].klass
+                                                  : X86LINT_CLASS_REWRITE;
+            if ((klass & classes) == 0) {
+                continue;   // a kind of finding the caller did not ask for
+            }
             if ((checks[i].target_requires & ~tprops) != 0) {
                 continue;   // the rewrite is not worth making on this core
             }
@@ -9745,13 +9798,16 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (setcc_movzx_zero_extend(inst, len, branch_targets, next, &xedd,
                                     &widen_movzx)) {
             if ((extensions & X86LINT_EXT_APX) != 0) {
+                // The zero-upper form replaces the pair in place, so under
+                // APX this is a verified rewrite rather than advice.
                 emit_finding(&sink, "missing APX SETZU", offset, &xedd,
                     inst + offset);
-            } else {
+                ++errors;
+            } else if ((classes & X86LINT_CLASS_ADVISORY) != 0) {
                 emit_finding(&sink, "suboptimal SETcc zero-extension", next,
                     &widen_movzx, inst + next);
+                ++errors;
             }
-            ++errors;
         }
 
         // Multi-instruction peephole, only when the caller enabled BMI1:

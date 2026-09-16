@@ -76,10 +76,10 @@ do { \
 // by the check whose dispatcher name is `name`) and stores
 // check_instructions's return value -- the total finding count -- into
 // *total_out.
-static int count_findings_target(const uint8_t *inst, size_t len,
-                                 const char *name, int *total_out,
-                                 uint32_t extensions,
-                                 enum x86lint_target target)
+static int count_findings_full(const uint8_t *inst, size_t len,
+                               const char *name, int *total_out,
+                               uint32_t extensions,
+                               enum x86lint_target target, uint32_t classes)
 {
     char *buf = NULL;
     size_t bufsz = 0;
@@ -92,7 +92,7 @@ static int count_findings_target(const uint8_t *inst, size_t len,
     // verbose=true so each finding prints its "<name> at offset:" line into
     // the captured buffer for the per-category count below.
     int total = check_instructions(inst, len, 0, true, NULL, extensions,
-        target, NULL, NULL);
+        target, classes, NULL, NULL);
     fflush(mem);
     stdout = saved;
     fclose(mem);
@@ -112,6 +112,27 @@ static int count_findings_target(const uint8_t *inst, size_t len,
     return count;
 }
 
+static int count_findings_target(const uint8_t *inst, size_t len,
+                                 const char *name, int *total_out,
+                                 uint32_t extensions,
+                                 enum x86lint_target target)
+{
+    return count_findings_full(inst, len, name, total_out, extensions, target,
+                               X86LINT_CLASS_REWRITE);
+}
+
+// Every class enabled, for the advisory and security rows: those are opt-in
+// in the driver, so a fixture asserting one has to opt in too.
+static int count_findings_all_classes(const uint8_t *inst, size_t len,
+                                      const char *name, int *total_out,
+                                      uint32_t extensions)
+{
+    return count_findings_full(inst, len, name, total_out, extensions,
+                               X86LINT_TARGET_GENERIC,
+                               X86LINT_CLASS_REWRITE | X86LINT_CLASS_ADVISORY |
+                               X86LINT_CLASS_SECURITY);
+}
+
 static int count_findings(const uint8_t *inst, size_t len, const char *name,
                           int *total_out, uint32_t extensions)
 {
@@ -124,6 +145,39 @@ static int count_findings(const uint8_t *inst, size_t len, const char *name,
 // AND no other findings. The second clause catches the common regression
 // pattern where a new check starts firing on the same bytes and silently
 // keeps a total-count assertion happy.
+// ASSERT_FINDINGS_AMONG with every class enabled.
+#define ASSERT_FINDINGS_AMONG_CLASSES(bytes_arr, category, expected, \
+                                      total_expected) do { \
+    int _total; \
+    int _cat = count_findings_all_classes(bytes_arr, sizeof(bytes_arr), \
+                                          category, &_total, 0); \
+    if (_cat != (expected) || _total != (total_expected)) { \
+        fprintf(stderr, \
+                "%s:%d: expected %d \"%s\" finding(s) of %d total with " \
+                "every class enabled; got %d for category, %d total\n", \
+                __FILE__, __LINE__, (expected), category, (total_expected), \
+                _cat, _total); \
+    } \
+    assert(_cat == (expected)); \
+    assert(_total == (total_expected)); \
+} while (0)
+
+// ASSERT_FINDINGS with every class enabled, for the advisory and security
+// rows the default scan does not report.
+#define ASSERT_FINDINGS_CLASSES(bytes_arr, category, expected) do { \
+    int _total; \
+    int _cat = count_findings_all_classes(bytes_arr, sizeof(bytes_arr), \
+                                          category, &_total, 0); \
+    if (_cat != (expected) || _total != (expected)) { \
+        fprintf(stderr, \
+                "%s:%d: expected %d \"%s\" finding(s) and no others with " \
+                "every class enabled; got %d for category, %d total\n", \
+                __FILE__, __LINE__, (expected), category, _cat, _total); \
+    } \
+    assert(_cat == (expected)); \
+    assert(_total == (expected)); \
+} while (0)
+
 // ASSERT_FINDINGS for a rewrite whose worth is per-core: the target decides
 // whether the finding exists at all.
 #define ASSERT_FINDINGS_TARGET(bytes_arr, category, expected, target) do { \
@@ -454,7 +508,7 @@ static void check_lcp_imm16_test(void)
         0x66, 0x81, 0xC1, 0x34, 0x12,  // add cx, 0x1234
         0xC3,                          // ret
     };
-    ASSERT_FINDINGS(lcp, "length-changing prefix stall", 1);
+    ASSERT_FINDINGS_CLASSES(lcp, "length-changing prefix stall", 1);
 }
 
 static void check_unneeded_rex_test(void)
@@ -753,7 +807,7 @@ static void check_notrack_call_test(void)
     static const uint8_t notrack_call[] = {
         0x3E, 0xFF, 0xD0,  // notrack call rax
     };
-    ASSERT_FINDINGS(notrack_call, "IBT-bypassing NOTRACK call", 1);
+    ASSERT_FINDINGS_CLASSES(notrack_call, "IBT-bypassing NOTRACK call", 1);
 }
 
 static void check_xchg_accumulator_test(void)
@@ -5416,7 +5470,7 @@ static void check_setcc_movzx_test(void)
         0x0F, 0x94, 0xC0,  // setz al
         0x0F, 0xB6, 0xC0,  // movzx eax, al
     };
-    ASSERT_FINDINGS(widen, "suboptimal SETcc zero-extension", 1);
+    ASSERT_FINDINGS_CLASSES(widen, "suboptimal SETcc zero-extension", 1);
 
     // setz cl ; movzx rcx, cl -- the 64-bit destination is the same idiom,
     // but its REX.W is itself droppable (movzx r32 zero-extends), so the
@@ -5426,7 +5480,7 @@ static void check_setcc_movzx_test(void)
         0x48, 0x0F, 0xB6, 0xC9,  // movzx rcx, cl
     };
     int total;
-    assert(count_findings(widen64, sizeof(widen64),
+    assert(count_findings_all_classes(widen64, sizeof(widen64),
                           "suboptimal SETcc zero-extension", &total, 0) == 1);
     assert(total == 2);
     assert(count_findings(widen64, sizeof(widen64),
@@ -5438,7 +5492,7 @@ static void check_setcc_movzx_test(void)
         0x0F, 0x94, 0xC0,  // setz al
         0x0F, 0xB6, 0xC8,  // movzx ecx, al
     };
-    ASSERT_FINDINGS(cross_reg, "suboptimal SETcc zero-extension", 0);
+    ASSERT_FINDINGS_CLASSES(cross_reg, "suboptimal SETcc zero-extension", 0);
 
     // A high-byte setcc destination puts the value at bits 8-15; the xor
     // form's setcc writes the low byte: suppress.
@@ -5446,21 +5500,21 @@ static void check_setcc_movzx_test(void)
         0x0F, 0x94, 0xC4,  // setz ah
         0x0F, 0xB6, 0xC4,  // movzx eax, ah
     };
-    ASSERT_FINDINGS(high_byte, "suboptimal SETcc zero-extension", 0);
+    ASSERT_FINDINGS_CLASSES(high_byte, "suboptimal SETcc zero-extension", 0);
 
     // A 16-bit movzx leaves bits 16-63 the xor form would zero: suppress.
     static const uint8_t narrow[] = {
         0x0F, 0x94, 0xC0,        // setz al
         0x66, 0x0F, 0xB6, 0xC0,  // movzx ax, al
     };
-    ASSERT_FINDINGS(narrow, "suboptimal SETcc zero-extension", 0);
+    ASSERT_FINDINGS_CLASSES(narrow, "suboptimal SETcc zero-extension", 0);
 
     // setcc to memory has no register to widen.
     static const uint8_t mem_dest[] = {
         0x0F, 0x94, 0x06,  // setz byte [rsi]
         0x0F, 0xB6, 0xC0,  // movzx eax, al
     };
-    ASSERT_FINDINGS(mem_dest, "suboptimal SETcc zero-extension", 0);
+    ASSERT_FINDINGS_CLASSES(mem_dest, "suboptimal SETcc zero-extension", 0);
 
     // An incoming direct edge onto the movzx reaches it without the setcc:
     // that path's byte was set elsewhere, so zeroing upstream of this setcc
@@ -5470,7 +5524,7 @@ static void check_setcc_movzx_test(void)
         0x0F, 0x94, 0xC0,  // 2: setz al
         0x0F, 0xB6, 0xC0,  // 5: movzx eax, al  <- branch target
     };
-    ASSERT_FINDINGS(edge_on_movzx, "suboptimal SETcc zero-extension", 0);
+    ASSERT_FINDINGS_CLASSES(edge_on_movzx, "suboptimal SETcc zero-extension", 0);
 
     // An edge onto the setcc (the window head) executes the whole pattern:
     // fires.
@@ -5479,7 +5533,8 @@ static void check_setcc_movzx_test(void)
         0x0F, 0x94, 0xC0,  // 2: setz al  <- branch target
         0x0F, 0xB6, 0xC0,  // 5: movzx eax, al
     };
-    ASSERT_FINDINGS_AMONG(edge_on_head, "suboptimal SETcc zero-extension", 1, 2);
+    ASSERT_FINDINGS_AMONG_CLASSES(edge_on_head,
+        "suboptimal SETcc zero-extension", 1, 2);
 }
 
 // Multi-instruction peephole: setcc X ; xor X, 1 inverts the boolean the
@@ -7657,10 +7712,16 @@ static void check_missing_apx_setzu_test(void)
         0xC3,              // ret
     };
     ASSERT_FINDINGS_EXT(pair32, "missing APX SETZU", 1, X86LINT_EXT_APX);
-    ASSERT_FINDINGS(pair32, "suboptimal SETcc zero-extension", 1);
-    ASSERT_FINDINGS_EXT(pair32, "suboptimal SETcc zero-extension", 1,
-                        X86LINT_EXT_BMI1 | X86LINT_EXT_BMI2 |
-                            X86LINT_EXT_MOVBE);
+    ASSERT_FINDINGS_CLASSES(pair32, "suboptimal SETcc zero-extension", 1);
+    // Unrelated extension bits leave the advisory in place -- only APX
+    // turns the pair into a verified rewrite -- and it is opt-in either way.
+    {
+        int total;
+        assert(count_findings_full(pair32, sizeof(pair32),
+            "suboptimal SETcc zero-extension", &total,
+            X86LINT_EXT_BMI1 | X86LINT_EXT_BMI2 | X86LINT_EXT_MOVBE,
+            X86LINT_TARGET_GENERIC, X86LINT_CLASS_ADVISORY) == 1);
+    }
 
     // The 64-bit widening form folds the same way (SETZU zero-extends to
     // 64 bits regardless); the movzx's REX.W is separately the unneeded-
@@ -7742,7 +7803,7 @@ static void check_decode_resync_test(void)
     x86lint_summary *summary = x86lint_summary_create();
     assert(summary != NULL);
     int findings = check_instructions(inst, sizeof(inst), 0, false, summary,
-        0, X86LINT_TARGET_GENERIC, NULL, NULL);
+        0, X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL);
     assert(findings == 1);                              // not -1; scan continued
     assert(x86lint_summary_skipped(summary) == 1);      // the one bad byte
     assert(x86lint_summary_instructions(summary) == 2); // nop + push, not the byte
@@ -7768,7 +7829,7 @@ static void summary_functions_test(void)
     assert(summary != NULL);
     x86lint_summary_set_functions(summary, funcs, 2);
     int findings = check_instructions(inst, sizeof(inst), 0x1000, false,
-        summary, 0, X86LINT_TARGET_GENERIC, NULL, NULL);
+        summary, 0, X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL);
     assert(findings == 3);
     assert(x86lint_summary_function_findings(summary, 0) == 1);
     assert(x86lint_summary_function_findings(summary, 1) == 1);
@@ -7779,13 +7840,13 @@ static void summary_functions_test(void)
     summary = x86lint_summary_create();
     assert(summary != NULL);
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary,
-        0, X86LINT_TARGET_GENERIC, NULL, NULL) == 3);
+        0, X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL) == 3);
     assert(x86lint_summary_function_findings(summary, 0) == 0);
     x86lint_summary_destroy(summary);
 
     // NULL summary still tolerated with attribution in the code path.
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
-        0, X86LINT_TARGET_GENERIC, NULL, NULL) == 3);
+        0, X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL) == 3);
 }
 
 // Records the per-finding callback's arguments so the test can assert on
@@ -7825,7 +7886,7 @@ static void finding_callback_test(void)
     // report.
     struct finding_log log = {0};
     int findings = check_instructions(inst, sizeof(inst), 0x1000, false, NULL,
-        0, X86LINT_TARGET_GENERIC, finding_log_cb, &log);
+        0, X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, finding_log_cb, &log);
     assert(findings == 3);
     assert(log.count == 3);
 
@@ -7852,13 +7913,13 @@ static void finding_callback_test(void)
     assert(summary != NULL);
     struct finding_log both = {0};
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, summary, 0,
-        X86LINT_TARGET_GENERIC, finding_log_cb, &both) == 3);
+        X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, finding_log_cb, &both) == 3);
     assert(both.count == 3);
     x86lint_summary_destroy(summary);
 
     // A NULL callback leaves the scan exactly as it was.
     assert(check_instructions(inst, sizeof(inst), 0x1000, false, NULL, 0,
-        X86LINT_TARGET_GENERIC, NULL, NULL) == 3);
+        X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL) == 3);
 }
 
 static void census_test(void)

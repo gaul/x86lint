@@ -483,6 +483,43 @@ enum x86lint_target {
     X86LINT_TARGET_SILVERMONT,    // the low-power line
 };
 
+// What kind of thing a finding is, which decides whether it is reported at
+// all. Most of x86lint's checks state a verified byte-level rewrite: the
+// replacement is equivalent, the tool proved the conditions, and applying it
+// is mechanical. Those are the default, and they are what makes the exit
+// status meaningful for gating a compiler test suite.
+//
+// Two other kinds do not fit that description and, until now, were reported
+// beside it as though they did.
+//
+// ADVISORY is a real improvement whose fix the tool cannot verify or cannot
+// even see. The SETcc zero-extension's rewrite belongs upstream of the
+// flag-setter, whose surroundings a peephole cannot prove safe; the
+// length-changing prefix stall's clean fix is 32-bit operands, which needs
+// upper-16 liveness this tool does not track. Both say as much in their own
+// documentation. A build should not fail on advice the tool cannot check.
+//
+// SECURITY is not a rewrite at all. The IBT-bypassing NOTRACK call is a
+// review item -- dropping the prefix without padding the target trades the
+// bypass for a #CP fault -- so the reader is being asked to look, not to
+// patch. armlint keeps the same kind behind its own opt-in flag (-a pac).
+//
+// The bits are independent, so a caller can ask for advisories without
+// security review items or the other way round. Enabling a class makes its
+// findings count like any other, exit status included: you asked for them.
+enum x86lint_classes {
+    X86LINT_CLASS_REWRITE = 1u << 0,   // the default; a verified rewrite
+    X86LINT_CLASS_ADVISORY = 1u << 1,  // a fix the tool cannot verify
+    X86LINT_CLASS_SECURITY = 1u << 2,  // a review item, not a rewrite
+};
+
+// The name accepted by the driver's -c, or NULL for an unknown class.
+const char *x86lint_class_name(uint32_t klass);
+
+// Parse a -c name into its bit; returns false for an unknown one. "all"
+// yields every class.
+bool x86lint_class_parse(const char *name, uint32_t *out);
+
 // The name accepted by the driver's -t, or NULL for an unknown target.
 const char *x86lint_target_name(enum x86lint_target target);
 
@@ -521,13 +558,17 @@ bool x86lint_target_parse(const char *name, enum x86lint_target *out);
 // enum x86lint_extensions values; 0 restricts the scan to baseline x86-64
 // checks. target names the microarchitecture being tuned for, which decides
 // the rewrites whose worth is per-core rather than universal;
-// X86LINT_TARGET_GENERIC assumes every documented penalty applies. If on_finding is non-NULL it is invoked once per finding with ctx
+// X86LINT_TARGET_GENERIC assumes every documented penalty applies. classes
+// is a bitwise OR of enum x86lint_classes values saying which kinds of
+// finding to report; X86LINT_CLASS_REWRITE alone is the verified-rewrite
+// scan. If on_finding is non-NULL it is invoked once per finding with ctx
 // as its first argument; it is independent of both summary and verbose, so a
 // consumer wanting only the per-finding stream passes NULL for the summary
 // and false for verbose.
 int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        bool verbose, x86lint_summary *summary,
                        uint32_t extensions, enum x86lint_target target,
-                       x86lint_finding_fn on_finding, void *ctx);
+                       uint32_t classes, x86lint_finding_fn on_finding,
+                       void *ctx);
 
 #endif

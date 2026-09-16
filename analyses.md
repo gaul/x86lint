@@ -232,6 +232,8 @@ argue for or against each, live in [TODO.md](TODO.md).
 
 ## IBT-bypassing NOTRACK call
 
+*Security class: reported only under `-c security` or `-c all`.*
+
 * `3E FFD0` (NOTRACK CALL RAX) -- the 3E prefix exempts this one indirect
   call from CET indirect-branch tracking: the CPU will not require an
   ENDBR64 landing pad at its target. Compilers emit NOTRACK only for
@@ -275,6 +277,8 @@ argue for or against each, live in [TODO.md](TODO.md).
   suggestion rather than a byte patch
 
 ## length-changing prefix stall
+
+*Advisory class: reported only under `-c advisory` or `-c all`.*
 
 * `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
   immediate's length (imm32 -> imm16) defeats the pre-decoder's length
@@ -1160,6 +1164,10 @@ argue for or against each, live in [TODO.md](TODO.md).
   write it
 
 ## suboptimal SETcc zero-extension
+
+*Advisory class: reported only under `-c advisory` or `-c all`. Under `-m apx`
+the same pair is "missing APX SETZU" instead, which is a verified rewrite and
+stays in the default scan.*
 
 * `0F94C0 0FB6C0` (SETZ AL; MOVZX EAX, AL) -- Intel's preferred form zeroes
   the register ahead of the flag-setting compare (XOR EAX, EAX; CMP ...;

@@ -446,6 +446,38 @@ Lake. An unknown name is a usage error rather than a silent fallback to the
 default, since a typo that quietly changed which findings appear would be
 worse than a refusal.
 
+Pass `-c advisory`, `-c security` or `-c all` to report kinds of finding the
+default scan withholds. Most checks state a verified byte-level rewrite: the
+replacement is equivalent, the tool proved the conditions, and applying it is
+mechanical. Those are the default, and they are what makes a non-zero exit
+mean "there is something here to fix". Two other kinds do not fit that
+description and were, until now, reported beside them as though they did.
+
+* **advisory** is a real improvement whose fix the tool cannot verify or
+  cannot even see. The SETcc zero-extension's rewrite belongs upstream of the
+  flag-setter, whose surroundings a peephole cannot prove safe; the
+  length-changing prefix stall's clean fix is 32-bit operands, which needs
+  upper-16 liveness this tool does not track. Both said so in their own
+  documentation before they had a class to sit in. A build should not fail on
+  advice the tool cannot check.
+* **security** is not a rewrite at all. The IBT-bypassing NOTRACK call is a
+  review item, since dropping the prefix without padding the target trades
+  the bypass for a `#CP` fault, so the reader is being asked to look rather
+  than to patch. armlint keeps the same kind behind its own opt-in flag,
+  `-a pac`.
+
+The bits are independent, so advisories can be asked for without review items
+or the other way round, and an unknown name is a usage error rather than a
+silent default. Enabling a class makes its findings count like any other,
+exit status included: you asked for them. On glibc the default scan reports
+7,130 findings and `-c advisory` reports 7,464, the difference being 194
+SETcc zero-extensions and 140 prefix stalls.
+
+One finding changes class rather than appearing: under `-m apx` the SETcc
+pair is reported as "missing APX SETZU" instead, and that *is* a verified
+rewrite -- the zero-upper form replaces the pair in place -- so it stays in
+the default scan.
+
 Pass `--json` to replace the human report with the findings as a JSON
 document, one object per line inside a `findings` array:
 

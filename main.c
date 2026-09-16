@@ -1743,6 +1743,7 @@ int main(int argc, char **argv)
     bool json = false;
     uint32_t extensions = 0;
     enum x86lint_target target = X86LINT_TARGET_GENERIC;
+    uint32_t classes = X86LINT_CLASS_REWRITE;
     const char *path = NULL;
     const char *fname = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -1758,6 +1759,19 @@ int main(int argc, char **argv)
             census = true;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = true;
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            // Additional kinds of finding. The default scan reports only
+            // verified rewrites, which is what makes a non-zero exit mean
+            // "there is something here to fix"; advice the tool cannot check
+            // and review items that are not rewrites at all are opt-in. Once
+            // enabled they count like any other finding.
+            uint32_t klass;
+            if (!x86lint_class_parse(argv[++i], &klass)) {
+                fprintf(stderr, "%s: unknown -c class '%s'\n",
+                    argv[0], argv[i]);
+                return 2;
+            }
+            classes |= klass;
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             // The microarchitecture being tuned for. A different axis from
             // -m: that says an encoding exists on the target, this says a
@@ -1788,7 +1802,7 @@ int main(int argc, char **argv)
                     "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "<ELF_FILE>\n",
+                "[-c advisory|security|all] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -1799,7 +1813,7 @@ int main(int argc, char **argv)
                 "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "<ELF_FILE>\n",
+                "[-c advisory|security|all] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
@@ -1809,7 +1823,7 @@ int main(int argc, char **argv)
             "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "<ELF_FILE>\n",
+                "[-c advisory|security|all] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }
@@ -2366,8 +2380,8 @@ int main(int argc, char **argv)
         jctx.section = sec_name;
 
         int n = check_instructions(buf, shdr.sh_size, shdr.sh_addr, verbose,
-            summary, extensions, target, json ? json_finding : NULL,
-            json ? &jctx : NULL);
+            summary, extensions, target, classes,
+            json ? json_finding : NULL, json ? &jctx : NULL);
         if (n < 0) {
             goto out;
         }

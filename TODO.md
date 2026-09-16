@@ -1,9 +1,10 @@
 # TODO: candidate analyses
 
 The research-backed backlog of checks considered but not yet
-implemented. Implemented checks are documented in the "Implemented
-analyses" section of [README.md](README.md); the soundness model every
-candidate here has to satisfy is in "Design and soundness model" there.
+implemented. Implemented checks are documented in
+[analyses.md](analyses.md), which [README.md](README.md) indexes; the
+soundness model every candidate here has to satisfy is in "Design and
+soundness model" there.
 Sources: the Intel optimization manual, Agner Fog's guides, uops.info,
 gaps noted while building the existing checks, and the shipped-check
 backlog of [armlint](https://github.com/gaul/armlint), whose
@@ -712,7 +713,7 @@ rather than merely missing.
 | Snapshot/integration suite | armlint assembles 95 `.s` fixtures with clang and diffs the output against checked-in `.expected` files, with a regen target; x86lint has one 717-line `driver_test.sh` smoke test. The snapshot suite is what covers the ELF parser and the report formatting that unit tests bypass, and it is the larger half of the gap: unit tests are 16,086 lines against x86lint's 7,496 |
 | JIT-dump → ELF converters | armlint ships `v8dump2elf.py`, `jscdump2elf.py` and `smdump2elf.py`, plus a SpiderMonkey `jit::Linker` hook, so its whole check table applies to JIT output. x86lint has none, which is why the 2026-09 SpiderMonkey and V8 work in this file was done with ad-hoc awk over `IONFLAGS=codegen` text rather than by running the tool |
 | Differential against the decoder's own model | `ARMLINT_LIVENESS_SWEEP=1` sweeps all 2^32 A64 encodings asserting that anything Capstone reports as read is never classified dead, and found four real defects on its first run. x86 has no enumerable encoding space, but the same differential is available over XED's iform table: check `flag_concerns` and `reg_kill_iclass` against XED's flag and operand records. The `CMOVcc` mis-model is already known and corrected by hand; nothing has looked for the rest |
-| Doc split | armlint keeps a 554-line README plus a 3,795-line `analyses.md`; x86lint carries everything in a 1,411-line README. This file's own header already says it mirrors armlint's pair, so half the split is intended |
+| ~~Doc split~~ | **Done, 2026-09-15.** armlint keeps a 554-line README plus a 3,795-line `analyses.md`; x86lint carried everything in one file that had reached 1,542 lines. The 77 implemented analyses moved to [analyses.md](analyses.md) verbatim, and the README's section became a linked two-column table: 729 lines and 1,057. The move was mechanical and checked as such -- every heading has exactly one link and every link a heading, and a token-level diff confirms the only prose that did not cross is the struck-through NOP row, which is not an implemented analysis and stayed in the table |
 
 ## Coverage gaps in shipped checks
 

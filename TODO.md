@@ -515,7 +515,7 @@ standing this file gives its `-a`-swept binaries.
 | --- | --- | --- |
 | ~~`LOCK CMPXCHG` retry loop whose body is one bitwise op~~ | ~~`LOCK OR`/`AND`/`XOR`~~ | **Done: "CAS loop foldable into LOCK op".** Shape 614 in libxul (466 OR, 132 AND, 16 XOR), 3 libc, 0 elsewhere; realized **19**, all libxul. See the note below -- a 32x collapse with a single cause |
 | ~~vector load whose sole use is the next vector op's source~~ | ~~fold into that operand~~ | **Done: "load foldable into vector op".** Shape 9,298 in libxul, of which 541 were predicted to survive a deadness proof; realized **583** (libcrypto 176, and 0 in libc, libstdc++, go and bash). See the note below -- the 17x gap between shape and finding is the register allocator being right, not the proof being timid. Two scalar siblings are measured in their own row below |
-| GPR load whose sole use is a transfer into the vector file | fold into that transfer | `mov r, [m] ; movd/movq xmm, r` and `mov r, [m] ; cvtsi2sd/ss xmm, r`. Shape 470 in libxul and 34 in go; after the deadness gate, **16 and 13**, with 4 more sites and 0 findings across libc, libstdc++ and libcrypto. The published figures were the bare shape (370 and 100), overstating by 20x. See the note below |
+| ~~GPR load whose sole use is a transfer into the vector file~~ | ~~fold into that transfer~~ | **Done: "load foldable into vector transfer".** `mov r, [m] ; movd/movq xmm, r` and `mov r, [m] ; cvtsi2sd/ss xmm, r`. Shape 470 in libxul and 34 in go; an estimate put the survivors at 16 and 13, and the check reports **10 and 2**, with 0 in libc, libstdc++, libcrypto and bash. The originally published figures were the bare shape (370 and 100). See the note below |
 | adjacent immediate-zero stores at consecutive addresses | one wider store | **Filed as [#30](https://github.com/gaul/x86lint/issues/30).** Re-counted by maximal run rather than by pair: libxul **20,870** runs covering 45,626 stores, of which **11,788** are removable with no new register; libstdc++ 396 runs, libcrypto 339, go 331, libc 91, bash 78. Blocked on a policy question, not on proof -- see below |
 
 **The CAS fold, and why its shape overstated it 32x.** The check
@@ -628,7 +628,19 @@ One thing that looks like a conflict and is not: CVTSI2SD merges into
 its destination's upper bits, which is the shipped "missing SSE
 dependency break" finding, and the fold does not change that. Both fire
 on the same site, independently and correctly -- one says fold the load,
-the other says insert the XORPS.
+the other says insert the XORPS. The unit fixture pins the pair at two
+findings rather than hiding it.
+
+**Realized 10 and 2 against the 16 and 13 estimated**, and this is the
+one row here whose estimate ran *high*. The cause is the same rule that
+explains every other miss, applied in the other direction: the estimate
+was made by weaker machinery than the one that realized it. Its
+read-detection was a regular expression over disassembly text, where
+`inst_reads_reg64` also sees implicit operands and memory base and index
+registers, so the estimate under-counted reads and therefore
+over-counted deaths. go's 34-site shape falling to 2 rather than 13 is
+almost entirely that. A shape count is an upper bound, but so is a
+liveness estimate built on a cruder reader than the check's own.
 
 **The zero-store merge needs a policy decision before it needs code**, and
 is filed as [#30](https://github.com/gaul/x86lint/issues/30) with the

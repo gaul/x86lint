@@ -441,6 +441,39 @@ argue for or against each, live in [TODO.md](TODO.md).
     dead. libcrypto's are OpenSSL's hand-written AES-NI perlasm loading a round
     key per round (`vmovups xmm14, [r15+0x60]; vaesenc xmm12, xmm12, xmm14`),
     the population a fold the compiler already performs leaves behind
+* load foldable into vector transfer
+  - `8B07 660F6EC0` (MOV EAX, [RDI]; MOVD XMM0, EAX) -- the scalar sibling of
+    the fold above, with a general-purpose register as the waypoint rather
+    than a vector one. MOVD/MOVQ and CVTSI2SD/SS all take their source from
+    memory, so the integer register exists only to carry the value across the
+    register-file boundary and disappears with the load: MOVD XMM0, dword
+    [RDI]. Beyond the instruction and the register this deletes a cross-domain
+    transfer, which costs bypass latency on every core; the folded form never
+    touches the integer file at all
+  - Alignment, the gate the vector fold needs, does not arise: these operands
+    are eight bytes or fewer and x86 requires no alignment for them. A width
+    argument replaces it, and the exact-register match carries it for free --
+    `MOV EAX, [M]; MOVQ XMM0, RAX` names EAX and RAX, which are not the same
+    register, so the pair that would read four bytes the load never wrote is
+    refused without a width test (cf. load foldable into compare, whose CMP
+    must likewise name the loaded register exactly). The moffs absolute loads
+    are excluded, their full 64-bit address having no modrm spelling to fold
+    into. Unlike the vector fold this one takes the both-successors split at a
+    following Jcc, because the corpus asks for it: 115 of the 470 adjacent
+    sites end at a control transfer, against 2% for the vector one
+  - Small, and the deadness gate is again why: **10 findings in libxul and 2
+    in go** against a 470-site shape. MOVD/MOVQ is the half that collapses,
+    and for a reason specific to it -- 275 of its 370 sites read the integer
+    register again, the value being wanted in *both* files, which is exactly
+    why it was loaded into a GPR rather than straight into the xmm; folding
+    would load the same memory twice. What survives is the global read once
+    and converted, Firefox's integer preference mirrors being the modal shape
+    (`mov eax, [rip+sMirror_apz_fixed_margin_override_top]; cvtsi2ss xmm0,
+    eax`, where the next mirror's load is what proves the previous one dead).
+    CVTSI2SD merges into its destination's upper bits whatever its source, so
+    "missing SSE dependency break" reports the same site; the two findings are
+    independent and both correct, one saying fold the load and the other
+    saying zero the destination first
 * missing ANDN (only with `-m bmi1`)
   - `F7D0 21C8` (NOT EAX; AND EAX, ECX) -- one ANDN EAX, EAX, ECX (BMI1)
     computes ~x & y directly. An exact fold: both forms write only the

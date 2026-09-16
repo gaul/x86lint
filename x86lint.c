@@ -8229,6 +8229,161 @@ static bool load_foldable_into_vecop(const uint8_t *inst, size_t len,
                            xed_get_register_width_bits64(loaded));
 }
 
+// An instruction that moves a general-purpose value into the vector file:
+// the MOVD/MOVQ transfers and the integer-to-float conversions. All of them
+// take their source from memory directly, which is what makes the register a
+// removable waypoint.
+static bool vec_transfer_from_gpr(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_MOVD:
+    case XED_ICLASS_MOVQ:
+    case XED_ICLASS_VMOVD:
+    case XED_ICLASS_VMOVQ:
+    case XED_ICLASS_CVTSI2SD:
+    case XED_ICLASS_CVTSI2SS:
+    case XED_ICLASS_VCVTSI2SD:
+    case XED_ICLASS_VCVTSI2SS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The scalar sibling of load_foldable_into_vecop: the same fold with a
+// general-purpose register as the waypoint rather than a vector one.
+//
+//   mov eax, [rip+X] ; cvtsi2ss xmm0, eax  ->  cvtsi2ss xmm0, dword [rip+X]
+//   mov r12, [rax+4] ; movq     xmm0, r12  ->  movq     xmm0, qword [rax+4]
+//
+// MOVD/MOVQ and CVTSI2SD/SS all take a memory source, so the integer register
+// exists only to carry the value across the file boundary and disappears with
+// the load. Beyond the instruction and the register this deletes a
+// cross-domain transfer, which costs bypass latency on every core; the folded
+// form never touches the integer file at all.
+//
+// Alignment, the one gate the vector fold needed, does not arise: these
+// operands are eight bytes or fewer and x86 requires no alignment for them.
+// What replaces it is a width argument, and the exact-register match carries
+// it for free -- `mov eax, [m] ; movq xmm0, rax` names EAX and RAX, which are
+// not the same register, so the pair that would read four bytes the load
+// never wrote is refused without a width test (cf. load foldable into
+// compare, whose CMP must likewise name the loaded register exactly).
+//
+// The moffs absolute loads are excluded: their address is a full 64-bit
+// displacement that the modrm memory operand the fold builds cannot spell,
+// and no transfer has a moffs form to fold into anyway. Rejecting every
+// base-less, index-less address covers them and costs almost nothing, since
+// compiled code addresses globals RIP-relatively.
+//
+// This check takes the both-successors split at a following Jcc where the
+// vector fold declines it, and the corpus is why: 115 of the 470 adjacent
+// sites end at a control transfer against 2% for the vector one.
+//
+// Small and measured: 16 findings in libxul and 13 in go, against a 470-site
+// shape. MOVD/MOVQ is the half that collapses, and specifically because 275
+// of its 370 sites read the integer register again -- the value is wanted in
+// *both* files, which is exactly why it was loaded into a GPR rather than
+// straight into the xmm, so folding would load the same memory twice. What
+// survives is the global read once and converted, Firefox's integer
+// preference mirrors being the modal shape.
+//
+// CVTSI2SD merges into its destination's upper bits, which is the separate
+// "missing SSE dependency break" finding. The fold does not change that, and
+// both checks report the same site independently and correctly: one says fold
+// the load, the other says insert the XORPS.
+static bool load_foldable_into_vec_transfer(const uint8_t *inst, size_t len,
+                                            const uint8_t *branch_targets,
+                                            size_t consumer_offset,
+                                            const xed_decoded_inst_t *load)
+{
+    if (xed_decoded_inst_get_iclass(load) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(load) != 1 ||
+        xed_decoded_inst_mem_written(load, 0) ||
+        xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(load))) {
+        return false;
+    }
+    xed_reg_enum_t loaded = xed_decoded_inst_get_reg(load, XED_OPERAND_REG0);
+    if (xed_reg_class(loaded) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(load, 0);
+    xed_reg_enum_t index = xed_decoded_inst_get_index_reg(load, 0);
+    if (base == XED_REG_INVALID && index == XED_REG_INVALID) {
+        return false;   // absolute or moffs; see the note above
+    }
+
+    if (consumer_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t consumer;
+    decode_init(&consumer);
+    if (xed_decode(&consumer, inst + consumer_offset, len - consumer_offset) !=
+            XED_ERROR_NONE) {
+        return false;
+    }
+    if (!vec_transfer_from_gpr(xed_decoded_inst_get_iclass(&consumer)) ||
+        xed3_operand_get_vexvalid(&consumer) == 2 ||
+        xed_decoded_inst_number_of_memory_operands(&consumer) != 0) {
+        return false;
+    }
+    // MOVD and MOVQ run both ways; this fold is the one writing the vector
+    // file, so the destination must be a vector register.
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(&consumer, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_XMM &&
+        xed_reg_class(dest) != XED_REG_CLASS_YMM) {
+        return false;
+    }
+
+    // The loaded register must appear exactly once and read-only, and the
+    // consumer must not write a register the address is built from.
+    xed_operand_enum_t src_name = XED_OPERAND_INVALID;
+    unsigned uses = 0;
+    const xed_inst_t *xi = xed_decoded_inst_inst(&consumer);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name)) {
+            continue;
+        }
+        xed_reg_enum_t r = xed_decoded_inst_get_reg(&consumer, name);
+        if (r == loaded) {
+            if (xed_operand_written(op) ||
+                xed_operand_operand_visibility(op) != XED_OPVIS_EXPLICIT) {
+                return false;
+            }
+            ++uses;
+            src_name = name;
+        } else if (xed_operand_written(op) &&
+                   xed_reg_class(r) == XED_REG_CLASS_GPR) {
+            xed_reg_enum_t w = xed_get_largest_enclosing_register(r);
+            if ((base != XED_REG_INVALID &&
+                 xed_get_largest_enclosing_register(base) == w) ||
+                (index != XED_REG_INVALID &&
+                 xed_get_largest_enclosing_register(index) == w)) {
+                return false;
+            }
+        }
+    }
+    if (uses != 1) {
+        return false;
+    }
+
+    if (!vecop_takes_memory_source(&consumer, load, src_name)) {
+        return false;
+    }
+
+    size_t after = consumer_offset + xed_decoded_inst_get_length(&consumer);
+    if (branch_target_in(branch_targets, consumer_offset, after)) {
+        return false;
+    }
+
+    return !reg_live_after_branch(inst, len, after,
+                                  xed_get_largest_enclosing_register(loaded));
+}
+
 // A LOCK CMPXCHG retry loop whose body recomputes the new value with one
 // bitwise op is an atomic fetch-op spelled the long way:
 //
@@ -8671,6 +8826,17 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (load_foldable_into_vecop(inst, len, branch_targets, next, &xedd)) {
             emit_finding(&sink, "load foldable into vector op", offset, &xedd,
                 inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: the scalar sibling of the above, where
+        // the waypoint is a general-purpose register and the consumer moves
+        // the value into the vector file. Reported against the load (at
+        // `offset`). See load_foldable_into_vec_transfer.
+        if (load_foldable_into_vec_transfer(inst, len, branch_targets, next,
+                                            &xedd)) {
+            emit_finding(&sink, "load foldable into vector transfer", offset,
+                &xedd, inst + offset);
             ++errors;
         }
 

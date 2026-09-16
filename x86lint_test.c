@@ -135,6 +135,26 @@ static int count_findings(const uint8_t *inst, size_t len,
     assert(_total == (expected)); \
 } while (0)
 
+// ASSERT_FINDINGS for a fixture where another check legitimately reports the
+// same bytes, so the total is pinned explicitly rather than assumed equal to
+// the category count. Use it only where the co-firing finding is correct and
+// named in a comment; a surprise finding should fail the stricter macro.
+#define ASSERT_FINDINGS_AMONG(bytes_arr, category, expected, total_expected) \
+do { \
+    int _total; \
+    int _cat = count_findings(bytes_arr, sizeof(bytes_arr), category, &_total, \
+                              0); \
+    if (_cat != (expected) || _total != (total_expected)) { \
+        fprintf(stderr, \
+                "%s:%d: expected %d \"%s\" finding(s) of %d total; " \
+                "got %d for category, %d total\n", \
+                __FILE__, __LINE__, (expected), category, (total_expected), \
+                _cat, _total); \
+    } \
+    assert(_cat == (expected)); \
+    assert(_total == (total_expected)); \
+} while (0)
+
 static void decode_instruction(xed_decoded_inst_t *xedd, const uint8_t *inst, size_t len)
 {
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
@@ -3167,6 +3187,78 @@ static void check_vecop_fold_test(void)
         0xC3,                    // ret
     };
     ASSERT_FINDINGS(wrong_operand_slot, "load foldable into vector op", 0);
+}
+
+// Multi-instruction peephole: the scalar sibling of the vector fold -- a
+// general-purpose load whose sole use is a transfer into the vector file,
+// where the register is a removable waypoint. See
+// load_foldable_into_vec_transfer.
+static void check_vec_transfer_fold_test(void)
+{
+    // mov eax, [rdi] ; movd xmm0, eax ; mov eax, edx -- the copy kills eax,
+    // so the integer register is pure waypoint: movd xmm0, dword ptr [rdi].
+    static const uint8_t movd_load[] = {
+        0x8B, 0x07,              // mov eax, [rdi]
+        0x66, 0x0F, 0x6E, 0xC0,  // movd xmm0, eax
+        0x89, 0xD0,              // mov eax, edx (kills rax)
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(movd_load, "load foldable into vector transfer", 1);
+
+    // The 64-bit transfer: movq xmm0, qword ptr [rdi].
+    static const uint8_t movq_load[] = {
+        0x48, 0x8B, 0x07,              // mov rax, [rdi]
+        0x66, 0x48, 0x0F, 0x6E, 0xC0,  // movq xmm0, rax
+        0x48, 0x89, 0xD0,              // mov rax, rdx (kills rax)
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(movq_load, "load foldable into vector transfer", 1);
+
+    // The conversion form: cvtsi2sd xmm0, dword ptr [rdi]. CVTSI2SD merges
+    // into its destination's upper bits whether its source is a register or
+    // memory, so "missing SSE dependency break" reports the same site -- both
+    // findings are correct and independent, one saying fold the load and the
+    // other saying zero xmm0 first.
+    static const uint8_t cvtsi2sd_load[] = {
+        0x8B, 0x07,              // mov eax, [rdi]
+        0xF2, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, eax
+        0x89, 0xD0,              // mov eax, edx (kills rax)
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_AMONG(cvtsi2sd_load, "load foldable into vector transfer",
+                          1, 2);
+
+    // mov eax, [rdi] ; movq xmm0, rax -- the transfer reads eight bytes where
+    // the load wrote four. The exact-register match refuses it without a
+    // width test, EAX and RAX not being the same register.
+    static const uint8_t width_mismatch[] = {
+        0x8B, 0x07,                    // mov eax, [rdi]
+        0x66, 0x48, 0x0F, 0x6E, 0xC0,  // movq xmm0, rax
+        0x48, 0x89, 0xD0,              // mov rax, rdx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(width_mismatch, "load foldable into vector transfer", 0);
+
+    // mov eax, [rdi] ; movd xmm0, eax ; add ecx, eax -- the value is wanted in
+    // both register files, so the integer copy is not dead and folding would
+    // load the same memory twice. This is 74% of the shape on real code.
+    static const uint8_t wanted_in_both_files[] = {
+        0x8B, 0x07,              // mov eax, [rdi]
+        0x66, 0x0F, 0x6E, 0xC0,  // movd xmm0, eax
+        0x01, 0xC1,              // add ecx, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(wanted_in_both_files, "load foldable into vector transfer",
+                    0);
+
+    // The same pair with nothing after it: a register is conservatively live
+    // across a return, since it can escape as a return value.
+    static const uint8_t escapes_at_ret[] = {
+        0x8B, 0x07,              // mov eax, [rdi]
+        0x66, 0x0F, 0x6E, 0xC0,  // movd xmm0, eax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(escapes_at_ret, "load foldable into vector transfer", 0);
 }
 
 // Multi-instruction peephole: a LOCK CMPXCHG retry loop whose body is a single
@@ -7564,6 +7656,7 @@ int main(int argc, char *argv[])
     check_movimm_condition_test();
     check_redundant_shift_test();
     check_vecop_fold_test();
+    check_vec_transfer_fold_test();
     check_cas_fetch_op_test();
     check_lea_fold_test();
     check_mov_const_fold_test();

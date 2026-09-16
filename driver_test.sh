@@ -54,7 +54,9 @@ run() {
 # unpadded branch target, and whether the linker synthesized an empty ISA_1_USED
 # word where it could have emitted no property note at all (the tool reports
 # both spellings faithfully; only one can be in a file). The fixture directory
-# and argv[0] are masked for the same reason. Section-relative offsets, symbol
+# and argv[0] are masked for the same reason; a one-digit address is left alone,
+# since no linker chooses one and 0x0 is what an unlinked object says of itself.
+# Section-relative offsets, symbol
 # names, counts, byte spellings and the summary tables all stay, which is the
 # part that is the tool's own. The exit status is recorded too, so a snapshot
 # pins the grep-convention code as well as the report.
@@ -67,7 +69,7 @@ snapshot() {  # snapshot <name> <args...>
     "$X86LINT" "$@" >"$dir/raw" 2>&1
     snaprc=$?
     {
-        sed -e 's/vaddr 0x[0-9a-f]*/vaddr 0xADDR/' \
+        sed -e 's/vaddr 0x[0-9a-f]\{2,\}/vaddr 0xADDR/' \
             -e 's/^== section [0-9][0-9]* /== section N /' \
             -e 's/"vaddr": [0-9][0-9]*/"vaddr": N/' \
             -e 's/ at 0x[0-9a-f]*$/ at 0xADDR/' \
@@ -554,7 +556,8 @@ if ! cc -nostdlib -pie -Wl,--build-id=none \
         -o "$dir/cleandyn" "$dir/clean.s" ||
    ! cc -shared -nostdlib -Wl,--build-id=none \
         -o "$dir/cetso.so" "$dir/cetso.s" ||
-   ! cc -c -o "$dir/clean.o" "$dir/clean.s"; then
+   ! cc -c -o "$dir/clean.o" "$dir/clean.s" ||
+   ! cc -c -o "$dir/finding.o" "$dir/finding.s"; then
     echo "driver_test.sh: fixture build failed" >&2
     exit 2
 fi
@@ -837,6 +840,20 @@ run 1 -e "$dir/cetso.so"
 expect 'missing ENDBR64: 0x[0-9a-f]+ <fn_bad> \(exported function\)'
 expect '1 of 2 indirect branch targets missing ENDBR64'
 
+# A relocatable object still gets the symbol restriction -- its symbols are
+# located by section index and offset rather than by address, so the
+# out-of-function xchg is masked exactly as in the linked fixture -- but a
+# section at address 0 gets no attribution, because every section of an
+# ordinary object starts there and the names would pile up at one address.
+# The ET_REL images that do carry real addresses are the JIT dumps, where
+# attribution is the tier breakdown; see jit_test.sh.
+run 1 -v "$dir/finding.o"
+expect '^1 optimization opportunities in 4 instructions$' \
+    "symbols located by section index"
+expect '^oversized XCHG encoding at offset: 0x5: ' "bare line at address 0"
+reject '^Optimization opportunities by function:$' \
+    "attribution for an unaddressed object"
+
 # Relocatable objects have no link-time target evidence: tool failure.
 run 2 -e "$dir/clean.o"
 expect 'requires a linked executable or shared object'
@@ -873,6 +890,7 @@ snapshot pltskip-all -a "$dir/pltskip"
 snapshot census -i "$dir/census"
 snapshot census-verbose -i -v "$dir/census"
 snapshot endbr-missing -e "$dir/cetbad"
+snapshot relocatable -v "$dir/finding.o"
 snapshot usage
 
 # Tool-failure paths: usage, unknown flag, dangling or unknown -m value,

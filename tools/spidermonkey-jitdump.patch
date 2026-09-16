@@ -1,0 +1,132 @@
+x86lint JIT dump hook for SpiderMonkey.
+
+On x86-64 no SpiderMonkey spew channel prints encoding bytes: IONFLAGS=codegen
+is AT&T assembly with offsets, and the shell's disnative() reaches one function
+at a time from JS. This adds a few lines to jit::Linker::newCode -- the one
+place every JIT code blob passes through, Ion, Baseline, RegExp and the
+trampolines alike -- which append each linked blob to the file named by
+X86LINT_JITDUMP, as the record tools/jitdump2elf.py reads. Nothing happens
+unless the variable is set.
+
+    cd /path/to/gecko
+    patch -p1 < /path/to/x86lint/tools/spidermonkey-jitdump.patch
+    ./mach build            # or make -C js/src in a JS-shell objdir
+
+    X86LINT_JITDUMP=sm.jitdump dist/bin/js workload.js
+    python3 /path/to/x86lint/tools/jitdump2elf.py sm.jitdump -o sm.elf
+    /path/to/x86lint/x86lint sm.elf
+
+Verified against SpiderMonkey's own IONFLAGS=codegen listing: the dumped bytes
+disassemble to the same instructions at the same offsets, with the patch
+placeholders (movabsq $0x0) carrying their linked values, which is what a
+linter should see.
+
+diff --git a/js/src/jit/Linker.cpp b/js/src/jit/Linker.cpp
+index 2598cc9d73e8..2809270111b5 100644
+--- a/js/src/jit/Linker.cpp
++++ b/js/src/jit/Linker.cpp
+@@ -4,6 +4,11 @@
+ 
+ #include "jit/Linker.h"
+ 
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
+ #include "jit/JitZone.h"
+ #include "util/Memory.h"
+ 
+@@ -12,6 +17,84 @@
+ namespace js {
+ namespace jit {
+ 
++// x86lint JIT dump (https://github.com/gaul/x86lint).
++//
++// On x86-64 no SpiderMonkey spew channel prints encoding bytes: IONFLAGS=
++// codegen is AT&T assembly with offsets, and disnative() reaches one function
++// at a time from JS. So a linter that decodes machine code has to be handed
++// the bytes, and this is the one place every JIT code blob passes through --
++// Ion, Baseline, RegExp and the trampolines alike.
++//
++// When X86LINT_JITDUMP names a file, each linked blob is appended as one
++// self-describing record,
++//
++//   "X86J" | u64 address | u32 code size | u32 name size | name | code
++//
++// which x86lint's tools/jitdump2elf.py reassembles into an ELF object. There
++// is no file header and no index, so a dump from a process that was killed
++// rather than exited still parses up to its truncation.
++//
++// The record is assembled in one buffer and written with a single fwrite, so
++// concurrent linking on helper threads interleaves whole records rather than
++// halves of two. Nothing happens unless the variable is set.
++static void X86lintDumpCode(JitCode* code, CodeKind kind) {
++  static FILE* out = nullptr;
++  static bool opened = false;
++  if (!opened) {
++    opened = true;
++    if (const char* path = getenv("X86LINT_JITDUMP")) {
++      out = fopen(path, "wb");
++      if (!out) {
++        fprintf(stderr, "X86LINT_JITDUMP: cannot write %s\n", path);
++      }
++    }
++  }
++  if (!out) {
++    return;
++  }
++
++  const char* kindName;
++  switch (kind) {
++    case CodeKind::Ion:
++      kindName = "Ion";
++      break;
++    case CodeKind::Baseline:
++      kindName = "Baseline";
++      break;
++    case CodeKind::RegExp:
++      kindName = "RegExp";
++      break;
++    default:
++      kindName = "Other";
++      break;
++  }
++
++  uint64_t addr = (uint64_t)(uintptr_t)code->raw();
++  uint32_t size = (uint32_t)code->instructionsSize();
++  uint32_t namelen = (uint32_t)strlen(kindName);
++  size_t total = 4 + sizeof(addr) + sizeof(size) + sizeof(namelen) + namelen +
++                 size;
++  char* rec = (char*)malloc(total);
++  if (!rec) {
++    return;
++  }
++  size_t at = 0;
++  memcpy(rec + at, "X86J", 4);
++  at += 4;
++  memcpy(rec + at, &addr, sizeof(addr));
++  at += sizeof(addr);
++  memcpy(rec + at, &size, sizeof(size));
++  at += sizeof(size);
++  memcpy(rec + at, &namelen, sizeof(namelen));
++  at += sizeof(namelen);
++  memcpy(rec + at, kindName, namelen);
++  at += namelen;
++  memcpy(rec + at, code->raw(), size);
++  fwrite(rec, 1, total, out);
++  fflush(out);
++  free(rec);
++}
++
+ JitCode* Linker::newCode(JSContext* cx, CodeKind kind) {
+   JS::AutoAssertNoGC nogc(cx);
+   if (masm.oom()) {
+@@ -70,6 +153,7 @@ JitCode* Linker::newCode(JSContext* cx, CodeKind kind) {
+   if (masm.embedsNurseryPointers()) {
+     cx->runtime()->gc.storeBuffer().putWholeCell(code);
+   }
++  X86lintDumpCode(code, kind);
+   return code;
+ }
+ 

@@ -1866,6 +1866,7 @@ int main(int argc, char **argv)
     size_t nstrtabs = 0;        // func_sym names point into
     x86lint_func_range *attr = NULL;
     size_t nattr = 0;
+    uint64_t *sec_addr = NULL;  // section addresses, for placing ET_REL symbols
     char *shstrtab = NULL;
     uint64_t shstrtab_size = 0;
 
@@ -1951,6 +1952,12 @@ int main(int argc, char **argv)
     // along for -f matching and finding attribution; their string tables
     // stay live in strtabs[].
     if ((!scan_all && !census) || fname != NULL) {
+        // An ET_REL symbol's value is an offset into its own section, so
+        // placing it needs that section's address; remember them all while
+        // the headers are being read anyway. Only ET_REL asks.
+        if (ehdr.e_type == ET_REL && shnum > 0) {
+            sec_addr = calloc(shnum, sizeof(*sec_addr));
+        }
         for (uint64_t i = 0; i < shnum; ++i) {
             Elf64_Shdr shdr;
             if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)), &shdr,
@@ -1958,6 +1965,9 @@ int main(int argc, char **argv)
                 fprintf(stderr, "%s: failed to read section header %lu\n",
                     path, (unsigned long) i);
                 goto out;
+            }
+            if (sec_addr != NULL) {
+                sec_addr[i] = shdr.sh_addr;
             }
             if (shdr.sh_type != SHT_SYMTAB &&
                 (fname == NULL || shdr.sh_type != SHT_DYNSYM)) {
@@ -2090,12 +2100,20 @@ int main(int argc, char **argv)
     // Attribution: hand the summary the named function ranges, sorted and
     // disjoint, so findings tally per function and -v names the holder.
     // Sized symbols only -- a finding in unsized-label code lands in the
-    // honest outside-every-range row -- and none for ET_REL, whose
-    // section-relative symbol values share no address space (the same
-    // rule the census evidence follows). Aliases collapse to one name
-    // (start ascending, end descending, then name, so the widest range
-    // wins and ties break deterministically); overlaps are clipped.
-    if (!census && funcs != NULL && ehdr.e_type != ET_REL) {
+    // honest outside-every-range row. Aliases collapse to one name (start
+    // ascending, end descending, then name, so the widest range wins and
+    // ties break deterministically); overlaps are clipped.
+    //
+    // An ET_REL symbol is placed by adding its section's address, and only
+    // where that address is non-zero. An ordinary object file leaves every
+    // section at 0, so its symbols would all pile up at the same addresses
+    // and attribute findings to whichever name sorted first -- which is why
+    // this used to skip ET_REL outright. A JIT-dump image (tools/*2elf.py)
+    // is the case that makes it worth doing: it is relocatable because
+    // nothing loads it, yet every section carries the address the engine
+    // really compiled at, so the tier and function names are as real as an
+    // executable's and the by-function table is the per-tier breakdown.
+    if (!census && funcs != NULL) {
         attr = malloc(nfuncs * sizeof(*attr));
         if (attr != NULL) {
             size_t n = 0;
@@ -2104,8 +2122,20 @@ int main(int argc, char **argv)
                     funcs[s].size == 0) {
                     continue;
                 }
-                attr[n].start = funcs[s].value;
-                attr[n].end = funcs[s].value + funcs[s].size;
+                uint64_t base = 0;
+                if (ehdr.e_type == ET_REL) {
+                    if (sec_addr == NULL || funcs[s].shndx >= shnum ||
+                        sec_addr[funcs[s].shndx] == 0) {
+                        continue;
+                    }
+                    base = sec_addr[funcs[s].shndx];
+                }
+                if (funcs[s].value > UINT64_MAX - base ||
+                    funcs[s].size > UINT64_MAX - base - funcs[s].value) {
+                    continue;
+                }
+                attr[n].start = base + funcs[s].value;
+                attr[n].end = attr[n].start + funcs[s].size;
                 attr[n].name = funcs[s].name;
                 ++n;
             }
@@ -2534,6 +2564,7 @@ out:
     free(evidence.r);
     x86lint_summary_destroy(summary);
     free(attr);
+    free(sec_addr);
     for (size_t s = 0; s < nstrtabs; ++s) {
         free(strtabs[s]);
     }

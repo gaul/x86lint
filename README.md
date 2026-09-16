@@ -829,6 +829,46 @@ dataflow -- the prior value survives a not-taken move -- so the tools
 add a conditional writer's destination to its read set, the same
 correction `reg_kill_iclass` embodies in `x86lint.c`.
 
+## JIT output
+
+A JIT has no object file: its code lives in an anonymous mapping that
+disappears with the process, which is why every measurement in this project's
+backlog that mentions a JavaScript engine was made by reading disassembly text
+rather than by running the tool. `tools/` converts what an engine can be made
+to hand over into an ELF object x86lint scans like any other, so the whole
+check table applies to JIT output:
+
+* `tools/v8dump2elf.py` reads a V8 `--print-opt-code` listing, which already
+  carries the encoding bytes, so nothing has to be patched. `d8
+  --print-opt-code bench.js | python3 tools/v8dump2elf.py - -o v8.elf` and
+  then `./x86lint -m v8 v8.elf`; the `-m v8` flag is what tells the linter
+  that R13 holds a 4 GB-aligned pointer-compression cage base, which is the
+  invariant the `OR`-into-address fold rests on.
+* `tools/jitdump2elf.py` reads a container of raw code blobs --
+  `"X86J" | u64 address | u32 code size | u32 name size | name | code`,
+  concatenated with no file header, so a dump from a process that was killed
+  still parses up to its truncation. `tools/spidermonkey-jitdump.patch` adds
+  the eighty lines to `jit::Linker::newCode` that write it, covering Ion,
+  Baseline, RegExp and the trampolines; JavaScriptCore's `LinkBuffer` takes
+  the same few lines, and the record is the whole interface. `--raw` reads a
+  bare blob, which is what SpiderMonkey's `disnative(f, "file")` writes for
+  one function with nothing patched at all.
+
+Both write one section per code object at the address the engine compiled it
+to, so a finding cross-references straight back into the dump, and separate
+sections stop a window peephole from walking off one code object into the
+next. Each section gets an `STT_FUNC` symbol naming the tier and, where the
+engine reveals it, the JS function -- so the by-function table is a per-tier
+breakdown and `-v` names the holder.
+
+What they found on first contact, which is the reason to have them: a
+five-function benchmark through TurboFan reports 79 opportunities in 1,328
+instructions, and a four-line script's SpiderMonkey output 560 in 16,992.
+Both are dominated by the same class -- 49 and 360 oversized branch
+displacements -- because neither engine relaxes a forward branch to the
+8-bit form once the label lands within reach. An ahead-of-time assembler
+does that in a second pass the JITs deliberately do not run.
+
 ## References
 
 * [Agner Fog optimization guide](https://www.agner.org/optimize/)

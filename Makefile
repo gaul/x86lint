@@ -47,10 +47,11 @@ tools/defuse: tools/defuse.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
 		tools/defuse.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
 
-# Run the unit suite and the ELF-driver smoke test.
+# Run the unit suite, the ELF-driver smoke test and the JIT-converter tests.
 check: all
 	./x86lint_test
 	./driver_test.sh
+	./jit_test.sh
 
 # Rewrite driver_test.sh's report snapshots from this build's output. Read the
 # resulting diff before committing it: an explained change is a new check or a

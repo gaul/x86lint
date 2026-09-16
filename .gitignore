@@ -6,3 +6,4 @@ tools/defuse
 tools/cohere
 tools/shapescan
 *.o
+tools/__pycache__/

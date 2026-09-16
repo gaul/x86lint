@@ -1,0 +1,12 @@
+== section N .text: vaddr 0x0, 13 bytes ==
+oversized XCHG encoding at offset: 0x5: xchg eax, ecx
+  87 c8
+
+Optimization opportunities by type:
+       1  oversized XCHG encoding
+
+2 undecodable bytes skipped (data in code section?)
+
+scan restricted to 1 function symbols (-a scans every byte)
+1 optimization opportunities in 4 instructions
+exit status: 1

@@ -2107,6 +2107,56 @@ bool check_oversized_branch(const xed_decoded_inst_t *xedd)
     return new_disp < INT8_MIN || new_disp > INT8_MAX;
 }
 
+// CMOVcc naming one register twice moves a value onto itself, reading the
+// flags and changing nothing. The 16- and 64-bit forms are pure no-ops. The
+// 32-bit form is not, quite: CMOVcc writes its destination whether or not
+// the condition holds, and a 32-bit write zero-extends, so deleting it is
+// sound only while bits 63:32 are dead -- reg0_upper32_concern and the
+// dispatcher's gate, with the backward escape licensed because the rewrite
+// deletes the write rather than replacing it (cf. check_mov_self). The
+// memory form never matches: it has no second register, and it loads
+// unconditionally, so it is not a no-op at all.
+bool check_cmov_self(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_category(xedd) != XED_CATEGORY_CMOV ||
+        xed_decoded_inst_number_of_memory_operands(xedd) != 0) {
+        return true;
+    }
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    if (xed_reg_class(r0) != XED_REG_CLASS_GPR || r0 != r1) {
+        return true;
+    }
+    return false;
+}
+
+// Extracting lane 0 of a vector register is a plain cross-file move, which
+// the MOV forms spell in fewer bytes and on an older feature level:
+//   pextrd eax, xmm0, 0      66 0F 3A 16 C0 00   ->  movd eax, xmm0     4 bytes
+//   pextrq rax, xmm0, 0      +REX.W, 7 bytes     ->  movq rax, xmm0     5 bytes
+//   vextractps [m], xmm0, 0  C4 E3 79 17 ... 00  ->  vmovss [m], xmm0   4 bytes
+// The index is the whole condition: only lane 0 is what MOVD/MOVQ/MOVSS
+// address, and the instructions are otherwise identical in what they read
+// and write. PEXTR is SSE4.1 and MOVD is SSE2, so the rewrite also lowers
+// the feature level the code needs, which no target can turn into a loss.
+bool check_lane0_extract(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_PEXTRD:
+    case XED_ICLASS_PEXTRQ:
+    case XED_ICLASS_VPEXTRD:
+    case XED_ICLASS_VPEXTRQ:
+    case XED_ICLASS_EXTRACTPS:
+    case XED_ICLASS_VEXTRACTPS:
+        break;
+    default:
+        return true;
+    }
+    return !xed_operand_values_has_immediate(
+               xed_decoded_inst_operands_const(xedd)) ||
+           xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
+}
+
 // A compiler writing `mov r8d, 0x40 ; tzcnt r8, rsi` is supplying the
 // zero-source answer by hand. That idiom exists because BSF and BSR leave
 // their destination *undefined* when the source is zero -- real silicon
@@ -3714,6 +3764,8 @@ static const struct check_entry checks[] = {
     {check_oversized_branch,           "oversized branch displacement",   0},
     {check_branch_to_next,             "branch to the next instruction",  0},
     {check_mov_self,                   "redundant MOV reg, reg",          0, reg0_upper32_concern, true},
+    {check_cmov_self,                  "redundant CMOVcc reg, reg",       0, reg0_upper32_concern, true},
+    {check_lane0_extract,              "suboptimal lane-0 extract",       0},
     {check_add_sub_zero,               "redundant ADD/SUB zero",          0, reg0_upper32_concern, true},
     {check_or_xor_zero,                "redundant OR/XOR zero",           0, reg0_upper32_concern, true},
     {check_inc_dec,                    "oversized ADD/SUB one",           FLAG_CF},
@@ -8421,6 +8473,187 @@ static bool vecop_takes_memory_source(const xed_decoded_inst_t *consumer,
 #define REFUSE(why_) \
     do { if (why != NULL) { *why = (why_); } return false; } while (0)
 
+// NEG then an ADD of the negated value is a SUB of the original, and the
+// mirror: `neg edx ; add r14d, edx` is `sub r14d, edx`, one instruction and
+// one scratch register fewer.
+//
+// The flags are what make this conditional rather than free. SUB's CF is a
+// borrow where ADD's, on the negated operand, is an unsigned carry, and the
+// two disagree on exactly that bit for every operand but zero, so they must
+// be dead past the pair. The negated value dies with the instruction that
+// produced it, so it must be dead too.
+static bool neg_foldable_into_add_sub(const uint8_t *inst, size_t len,
+                                      const uint8_t *branch_targets,
+                                      size_t next,
+                                      const xed_decoded_inst_t *neg,
+                                      const char **why)
+{
+    if (xed_decoded_inst_get_iclass(neg) != XED_ICLASS_NEG ||
+        xed_decoded_inst_number_of_memory_operands(neg) != 0) {
+        return false;
+    }
+    xed_reg_enum_t negated = xed_decoded_inst_get_reg(neg, XED_OPERAND_REG0);
+    if (xed_reg_class(negated) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    decode_init(&use);
+    if (next >= len ||
+        xed_decode(&use, inst + next, len - next) != XED_ERROR_NONE) {
+        return false;
+    }
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if ((uic != XED_ICLASS_ADD && uic != XED_ICLASS_SUB) ||
+        xed_decoded_inst_number_of_memory_operands(&use) != 0 ||
+        xed_decoded_inst_get_reg(&use, XED_OPERAND_REG1) != negated) {
+        return false;
+    }
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(&use, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR || dest == negated) {
+        return false;
+    }
+
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(branch_targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    if (flags_live_after(inst, len, after, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    if (reg_live_after(inst, len, after,
+            xed_get_largest_enclosing_register(negated))) {
+        REFUSE("the negated value is live afterward");
+    }
+    return true;
+}
+
+// The bits a producer guarantees are zero, as the half-open range
+// [*from, *upto) of its destination. armlint tracks only the lower bound,
+// because an AArch64 W-form write zeroes the upper half and the guarantee
+// always reaches the top of the register. x86 has no such rule -- an 8- or
+// 16-bit write merges -- so the upper bound has to be carried too. Leaving
+// it out is not hypothetical: `setz al` guarantees bits 7:1 are zero and
+// says nothing whatever about 63:8, so it cannot make the `movzx eax, al`
+// after it redundant, and that pair is the shipped "suboptimal SETcc
+// zero-extension" rather than this finding.
+static void zero_guarantee(const xed_decoded_inst_t *d, unsigned *from,
+                           unsigned *upto)
+{
+    *from = 64;
+    xed_reg_enum_t dest = xed_decoded_inst_get_reg(d, XED_OPERAND_REG0);
+    if (xed_reg_class(dest) != XED_REG_CLASS_GPR) {
+        *upto = 0;
+        return;
+    }
+    unsigned w = xed_get_register_width_bits64(dest);
+    *upto = w == 32 ? 64 : w;       // a 32-bit write zero-extends
+
+    bool has_imm = xed_operand_values_has_immediate(
+        xed_decoded_inst_operands_const(d));
+    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(d);
+    switch (xed_decoded_inst_get_iclass(d)) {
+    case XED_ICLASS_SHR:
+        if (has_imm) {
+            unsigned n = (unsigned) (imm & (w == 64 ? 63u : 31u));
+            *from = n < w ? w - n : 0;
+        }
+        break;
+    case XED_ICLASS_AND:
+        if (has_imm) {
+            unsigned bits = 0;
+            while (imm != 0) { imm >>= 1; ++bits; }
+            *from = bits;
+        }
+        break;
+    default:
+        if (xed_decoded_inst_get_category(d) == XED_CATEGORY_SETCC) {
+            *from = 1;              // 0 or 1, within the byte register alone
+        }
+        break;
+    }
+}
+
+// A zero-extension that re-establishes bits a producer already zeroed:
+//   shr eax, 24 ; movzx eax, al        the shift left only 8 bits standing
+//   setz al ; and al, 1                SETcc writes 0 or 1 already
+// The shipped "redundant re-extension" owns extension-after-extension, and
+// MOVZX and MOVSX producers are deliberately absent here so the two do not
+// report the same site. That exclusion is most of the shape: counting them
+// put this at 285 on libxul against that check's own 254.
+//
+// Redundant when the producer's guarantee starts at or below the bit the
+// consumer clears from AND reaches at least as high as the consumer writes.
+// Both halves are needed, and the second is the one x86 adds.
+static bool redundant_zero_extension(const uint8_t *inst, size_t len,
+                                     const uint8_t *branch_targets,
+                                     size_t next,
+                                     const xed_decoded_inst_t *producer,
+                                     const char **why)
+{
+    unsigned from = 0, upto = 0;
+    zero_guarantee(producer, &from, &upto);
+    xed_reg_enum_t produced =
+        xed_decoded_inst_get_reg(producer, XED_OPERAND_REG0);
+    if (from >= 64 || xed_reg_class(produced) != XED_REG_CLASS_GPR ||
+        xed_decoded_inst_number_of_memory_operands(producer) > 0) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    decode_init(&use);
+    if (next >= len ||
+        xed_decode(&use, inst + next, len - next) != XED_ERROR_NONE ||
+        xed_decoded_inst_number_of_memory_operands(&use) != 0) {
+        return false;
+    }
+
+    xed_reg_enum_t cdest = xed_decoded_inst_get_reg(&use, XED_OPERAND_REG0);
+    xed_reg_enum_t csrc = xed_decoded_inst_get_reg(&use, XED_OPERAND_REG1);
+    if (xed_reg_class(cdest) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    unsigned cw = xed_get_register_width_bits64(cdest);
+    unsigned c_upto = cw == 32 ? 64 : cw;
+    unsigned c;
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if (uic == XED_ICLASS_MOVZX) {
+        if (xed_reg_class(csrc) != XED_REG_CLASS_GPR) {
+            return false;
+        }
+        c = xed_get_register_width_bits64(csrc);
+    } else if (uic == XED_ICLASS_AND &&
+               xed_operand_values_has_immediate(
+                   xed_decoded_inst_operands_const(&use))) {
+        uint64_t m = xed_decoded_inst_get_unsigned_immediate(&use);
+        if (m == 0 || (m & (m + 1)) != 0) {
+            return false;           // not a run of low bits
+        }
+        c = 0;
+        while (m != 0) { m >>= 1; ++c; }
+        csrc = cdest;
+    } else {
+        return false;
+    }
+    xed_reg_enum_t parent = xed_get_largest_enclosing_register(produced);
+    if (c >= 64 || c < from || upto < c_upto ||
+        xed_get_largest_enclosing_register(cdest) != parent ||
+        xed_get_largest_enclosing_register(csrc) != parent) {
+        return false;
+    }
+
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(branch_targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    // AND writes the flags where dropping it writes none; MOVZX writes none
+    // either way and needs no gate.
+    if (uic == XED_ICLASS_AND &&
+        flags_live_after(inst, len, after, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    return true;
+}
+
+
 static bool load_foldable_into_vecop(const uint8_t *inst, size_t len,
                                      const uint8_t *branch_targets,
                                      size_t consumer_offset,
@@ -9139,6 +9372,31 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             emit_finding(&sink, "load foldable into vector op", offset, &xedd,
                 inst + offset);
             ++errors;
+        }
+
+        // Multi-instruction peephole: neg then an add of the negated value
+        // is a sub of the original. Reported against the neg (at `offset`),
+        // the removable instruction. See neg_foldable_into_add_sub.
+        if (neg_foldable_into_add_sub(inst, len, branch_targets, next, &xedd,
+                                      NULL)) {
+            emit_finding(&sink, "NEG foldable into ADD/SUB", offset, &xedd,
+                inst + offset);
+            ++errors;
+        }
+
+        // Multi-instruction peephole: a zero-extension re-establishing bits
+        // the producer already zeroed. Reported against the consumer, the
+        // removable instruction, so at `next` rather than `offset`. See
+        // redundant_zero_extension.
+        if (redundant_zero_extension(inst, len, branch_targets, next, &xedd,
+                                     NULL)) {
+            xed_decoded_inst_t ext;
+            decode_init(&ext);
+            if (xed_decode(&ext, inst + next, len - next) == XED_ERROR_NONE) {
+                emit_finding(&sink, "redundant zero-extension", next, &ext,
+                    inst + next);
+                ++errors;
+            }
         }
 
         // Multi-instruction peephole: a defensive zero-source constant in

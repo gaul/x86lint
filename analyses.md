@@ -428,6 +428,20 @@ argue for or against each, live in [TODO.md](TODO.md).
   independent and both correct, one saying fold the load and the other
   saying zero the destination first
 
+## NEG foldable into ADD/SUB
+
+* `F7DA 4101D6` (NEG EDX; ADD R14D, EDX) -- negating a value and adding it
+  is subtracting it: SUB R14D, EDX, one instruction and one scratch
+  register fewer. The mirror holds too, a NEG feeding a SUB being an ADD.
+* The flags are what make this conditional rather than free. SUB's CF is a
+  borrow where ADD's, on the negated operand, is an unsigned carry, and the
+  two disagree on exactly that bit for every operand but zero, so every
+  arithmetic flag must be dead past the pair. The negated value dies with
+  the instruction that produced it, so it must be dead as well -- which a
+  return does not establish, a register being able to escape there.
+* 16 findings of 61 adjacent sites in libxul, none elsewhere; the gap is
+  almost entirely the negated value still being live
+
 ## missing ANDN (only with `-m bmi1`)
 
 * `F7D0 21C8` (NOT EAX; AND EAX, ECX) -- one ANDN EAX, EAX, ECX (BMI1)
@@ -871,6 +885,20 @@ argue for or against each, live in [TODO.md](TODO.md).
   than a heuristic. The 1,067 `BSR` sites in the same shape carry a sentinel
   and are correctly not matched
 
+## redundant CMOVcc reg, reg
+
+* `480F44C0` (CMOVE RAX, RAX) -- a conditional move naming one register
+  twice moves a value onto itself: it reads the flags and changes nothing.
+  The 16- and 64-bit forms are pure no-ops.
+* The 32-bit form is not, quite. CMOVcc writes its destination whether or
+  not the condition holds, and a 32-bit write zero-extends, so deleting it
+  is sound only while bits 63:32 are dead (register liveness, with the
+  backward escape licensed because the rewrite deletes the write rather
+  than replacing it -- cf. redundant MOV reg, reg).
+* The memory form never matches and could not: it carries no second
+  register, and it loads unconditionally, so it is not a no-op at all.
+* 3 sites in libxul and none elsewhere in the corpus
+
 ## redundant MOV reg, reg
 
 * `4889C0` (MOV RAX, RAX)
@@ -883,6 +911,32 @@ argue for or against each, live in [TODO.md](TODO.md).
 
 * `83C8 00` (OR EAX, 0) -- no-op that sets flags; use TEST or remove (the
   32-bit form's zero-extension is gated by register liveness)
+
+## redundant zero-extension
+
+* `C1EA18 0FB6D2` (SHR EDX, 24; MOVZX EDX, DL) -- the shift leaves at most
+  the low eight bits standing and, being a 32-bit write, zeroes bits 63:32
+  as well, so the extension after it clears nothing. Also `SETZ AL; AND AL,
+  1`, where SETcc has already written 0 or 1.
+* The producer's guarantee is a *range*, bits `[from, upto)` of the
+  destination, and both ends matter. armlint tracks only the lower bound,
+  because an AArch64 W-form write zeroes the upper half and the guarantee
+  always reaches the top of the register; x86's 8- and 16-bit writes merge,
+  so the upper bound has to be carried too. Dropping it is not hypothetical:
+  `SETZ AL` guarantees bits 7:1 are zero and says nothing whatever about
+  63:8, so it cannot excuse a following `MOVZX EAX, AL` -- that pair is the
+  shipped "suboptimal SETcc zero-extension" and not this finding.
+* Redundant when the guarantee starts at or below the bit the consumer
+  clears from and reaches at least as high as the consumer writes. Producers
+  recognized: an immediate `SHR`, an immediate `AND`, and any `SETcc`.
+  Consumers: an in-place `MOVZX`, and an `AND` with a run of low bits, which
+  writes the flags and so needs them dead where `MOVZX` does not.
+* **MOVZX and MOVSX producers are deliberately absent**, being the shipped
+  "redundant re-extension" check's own. That exclusion is most of the shape:
+  counting them put this at 285 on libxul against that check's 254, which is
+  re-reporting covered ground rather than sizing a candidate.
+* 48 findings of 55 sites in libxul and 6 in go, the residue being consumers
+  a branch targets
 
 ## redundant re-extension
 
@@ -995,6 +1049,26 @@ argue for or against each, live in [TODO.md](TODO.md).
   remove the same-register form outright (its dropped zero-extension is
   gated by register liveness)
 * `6BC0 FF` (IMUL EAX, EAX, -1) -- in-place negation: use NEG
+
+## suboptimal lane-0 extract
+
+* `660F3A16C000` (PEXTRD EAX, XMM0, 0) -- extracting lane 0 of a vector
+  register is a plain cross-file move, which the MOV forms spell in fewer
+  bytes and on an older feature level:
+
+  ```
+  pextrd eax, xmm0, 0      66 0F 3A 16 C0 00   ->  movd eax, xmm0      4 bytes
+  pextrq rax, xmm0, 0      +REX.W, 7 bytes     ->  movq rax, xmm0      5 bytes
+  vextractps [m], xmm0, 0  C4 E3 79 17 ... 00  ->  vmovss [m], xmm0    4 bytes
+  ```
+
+* The index is the whole condition: lane 0 is exactly what MOVD, MOVQ and
+  MOVSS address, and the instructions are otherwise identical in what they
+  read and write. PEXTR is SSE4.1 where MOVD is SSE2, so the rewrite also
+  lowers the feature level the code requires, which no target turns into a
+  loss.
+* 10 sites in libxul, every one the `vextractps` spelling, and none
+  elsewhere in the corpus
 
 ## suboptimal LEA
 

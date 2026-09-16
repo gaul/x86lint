@@ -3191,6 +3191,83 @@ static void check_redundant_shift_test(void)
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
 }
 
+// The four small sound checks promoted from tools/shapescan: a conditional
+// move onto itself, a lane-0 extract, a NEG folded into the arithmetic that
+// consumes it, and a zero-extension of bits a producer already zeroed.
+static void check_small_sound_test(void)
+{
+    // cmove rax, rax -- a 64-bit conditional move onto itself is a pure
+    // no-op whatever the flags say.
+    static const uint8_t cmov_self64[] = {
+        0x48, 0x0F, 0x44, 0xC0,  // cmove rax, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(cmov_self64, "redundant CMOVcc reg, reg", 1);
+
+    // The 32-bit form writes its destination zero-extended whether or not
+    // the condition holds, so it is a no-op only while bits 63:32 are dead;
+    // the mov that follows kills them.
+    static const uint8_t cmov_self32[] = {
+        0x0F, 0x44, 0xC0,  // cmove eax, eax
+        0x89, 0xD0,        // mov eax, edx (kills rax)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(cmov_self32, "redundant CMOVcc reg, reg", 1);
+
+    // The same pair with nothing to kill the upper half: a register escapes
+    // across a return, so the zero-extension may be observed.
+    static const uint8_t cmov_self32_live[] = {
+        0x0F, 0x44, 0xC0,  // cmove eax, eax
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(cmov_self32_live, "redundant CMOVcc reg, reg", 0);
+
+    // pextrd eax, xmm0, 0 is movd eax, xmm0 in four bytes instead of six,
+    // and on SSE2 instead of SSE4.1.
+    static const uint8_t pextr0[] = {
+        0x66, 0x0F, 0x3A, 0x16, 0xC0, 0x00,  // pextrd eax, xmm0, 0
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(pextr0, "suboptimal lane-0 extract", 1);
+    static const uint8_t vextract0[] = {
+        0xC4, 0xE3, 0x79, 0x17, 0xC1, 0x00,  // vextractps ecx, xmm0, 0
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(vextract0, "suboptimal lane-0 extract", 1);
+
+    // neg edx ; add r14d, edx -- one sub, with the flags dead at the ret.
+    // The negated value has to be killed explicitly: a register is
+    // conservatively live across a return, since it can escape as a return
+    // value or in a callee-saved slot.
+    static const uint8_t neg_add[] = {
+        0xF7, 0xDA,        // neg edx
+        0x41, 0x01, 0xD6,  // add r14d, edx
+        0x89, 0xCA,        // mov edx, ecx (kills the negated value)
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(neg_add, "NEG foldable into ADD/SUB", 1);
+
+    // shr edx, 24 leaves at most bits 7:0 standing and zero-extends to 64,
+    // so the movzx clears nothing.
+    static const uint8_t shr_movzx[] = {
+        0xC1, 0xEA, 0x18,  // shr edx, 24
+        0x0F, 0xB6, 0xD2,  // movzx edx, dl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(shr_movzx, "redundant zero-extension", 1);
+
+    // setz al writes 0 or 1 into AL alone, so masking AL with 1 is
+    // redundant -- and the guarantee reaching only bit 8 is what stops the
+    // same producer from excusing a movzx eax, al, which clears bits the
+    // SETcc never touched and is the shipped SETcc zero-extension finding.
+    static const uint8_t setcc_and1[] = {
+        0x0F, 0x94, 0xC0,  // setz al
+        0x24, 0x01,        // and al, 1
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(setcc_and1, "redundant zero-extension", 1);
+}
+
 // A defensive zero-source constant in front of a TZCNT or LZCNT, which
 // define that answer themselves. Target-gated: the same MOV is the
 // false-dependency break on the cores that still need one. See
@@ -7328,8 +7405,10 @@ static void check_missing_apx_ndd_test(void)
         0x0F, 0x44, 0xC0,  // cmovz eax, eax
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(cmov_src_alias, "missing APX NDD", 0,
-                        X86LINT_EXT_APX);
+    // The aliasing spelling is also a genuine redundant same-register CMOV,
+    // which is the other finding this fixture carries.
+    ASSERT_FINDINGS_AMONG_EXT(cmov_src_alias, "missing APX NDD", 0, 1,
+                              X86LINT_EXT_APX);
     static const uint8_t cmov_addr_dst[] = {
         0x48, 0x89, 0xF1,        // mov rcx, rsi
         0x48, 0x0F, 0x44, 0x09,  // cmovz rcx, [rcx]
@@ -7857,6 +7936,7 @@ int main(int argc, char *argv[])
     check_zeroed_condition_test();
     check_movimm_condition_test();
     check_redundant_shift_test();
+    check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();
     check_vecop_fold_test();

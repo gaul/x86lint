@@ -688,15 +688,24 @@ bash:
 | armlint check | x86 spelling | shape | realized |
 | --- | --- | --- | --- |
 | compare whose flags are overwritten unread | delete the `CMP`/`TEST` | 2,327,914 | 396 |
-| `neg` + `add`/`sub` | `neg r ; add r2, r` -> `sub r2, r` | 61 | 16 |
-| redundant zero-extension by producer threshold | generalized past extension-after-extension | 39 | 37 |
+| ~~`neg` + `add`/`sub`~~ | ~~`neg r ; add r2, r` -> `sub r2, r`~~ | **Done: "NEG foldable into ADD/SUB", 16** |
+| ~~redundant zero-extension by producer threshold~~ | ~~generalized past extension-after-extension~~ | **Done: "redundant zero-extension", 54** (libxul 48, go 6) |
 | `shift` foldable into shifted-register form | `shl r, k<=3 ; add r2, r` -> `lea` | 17 | 0 |
-| `umov` of lane 0 | `pextrd/q ..., 0` -> `movd/movq` | 10 | 10 |
+| ~~`umov` of lane 0~~ | ~~`pextrd/q ..., 0` -> `movd/movq`~~ | **Done: "suboptimal lane-0 extract", 10** |
 | `mov #C` + variable shift | `mov ecx, imm ; shl r, cl` | 6 | 0 |
-| `csel Rd, Rn, Rn` | same-register `CMOVcc` | 3 | 3 |
-| vector self-op identity | `pand`/`por`/`psub` with one source | 3 | 3 |
+| ~~`csel Rd, Rn, Rn`~~ | ~~same-register `CMOVcc`~~ | **Done: "redundant CMOVcc reg, reg", 3** |
+| vector self-op identity | `pand`/`por`/`psub` with one source | 0 | 0 |
 | `and xd, xn, #0xffffffff` | `and r64, 0xffffffff` -> `mov r32, r32` | 0 | 0 |
 | widening extend + `scvtf` | `movsxd` + `cvtsi2sd` -> 32-bit convert | 0 | 0 |
+
+**The vector self-op row is zero, and was 3 for an unsound reason.** All
+three of libxul's sites were `subps xmm1, xmm1`, and the floating-point
+self-subtract is not a zeroing idiom: `x - x` is `+0.0` only for a finite
+`x` and NaN for an infinity or a NaN, so rewriting it to `XORPS` would change
+the result. Excluding `SUBPS` and `SUBPD` -- the integer `PSUB` and the
+signed `PCMPGT` really are always zero -- empties the row. It was the only
+candidate here whose shape count came from a rewrite that does not hold, and
+it was caught by writing the exclusion down rather than by any measurement.
 
 **The branch-to-next row was recorded here as zero, and it shipped
 instead.** It is **964** findings -- libxul 909, libcrypto 47, go 8 -- every

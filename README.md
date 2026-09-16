@@ -150,6 +150,7 @@ with the corpus populations that argue for or against each, live in
 | [load foldable into extend](analyses.md#load-foldable-into-extend) | `MOVZX`/`MOVSX reg, byte [mem]` |
 | [load foldable into vector op](analyses.md#load-foldable-into-vector-op) | fold the load into the SIMD instruction's source operand |
 | [load foldable into vector transfer](analyses.md#load-foldable-into-vector-transfer) | `MOVD`/`MOVQ`/`CVTSI2SD xmm, [mem]` |
+| [NEG foldable into ADD/SUB](analyses.md#neg-foldable-into-addsub) | `SUB`/`ADD` of the original |
 | [missing ANDN (only with `-m bmi1`)](analyses.md#missing-andn-only-with--m-bmi1) | `ANDN` |
 | [missing APX NDD (only with `-m apx`)](analyses.md#missing-apx-ndd-only-with--m-apx) | the EVEX new-data-destination form, dropping the copy |
 | [missing APX SETZU (only with `-m apx`)](analyses.md#missing-apx-setzu-only-with--m-apx) | the zero-upper `SETcc`, dropping the `MOVZX` |
@@ -179,10 +180,12 @@ with the corpus populations that argue for or against each, live in
 | [oversized VEX encoding](analyses.md#oversized-vex-encoding) | the two-byte VEX prefix |
 | [oversized XCHG encoding](analyses.md#oversized-xchg-encoding) | the one-byte `90+r` accumulator form |
 | [redundant ADD/SUB zero](analyses.md#redundant-addsub-zero) | `TEST`, or remove |
+| [redundant CMOVcc reg, reg](analyses.md#redundant-cmovcc-reg-reg) | remove; a conditional move onto itself |
 | [redundant AND immediate](analyses.md#redundant-and-immediate) | `TEST reg, reg` |
 | [redundant bit-scan default](analyses.md#redundant-bit-scan-default) | delete the MOV; needs `-t skylake` or later |
 | [redundant MOV reg, reg](analyses.md#redundant-mov-reg-reg) | remove |
 | [redundant OR/XOR zero](analyses.md#redundant-orxor-zero) | `TEST`, or remove |
+| [redundant zero-extension](analyses.md#redundant-zero-extension) | drop it; the producer already zeroed those bits |
 | [redundant re-extension](analyses.md#redundant-re-extension) | remove the second extension |
 | [redundant shift/rotate by zero](analyses.md#redundant-shiftrotate-by-zero) | remove |
 | [redundant TEST after flags](analyses.md#redundant-test-after-flags) | delete the `TEST`; the ALU before it already set the flags |
@@ -195,6 +198,7 @@ with the corpus populations that argue for or against each, live in
 | [suboptimal CMP zero](analyses.md#suboptimal-cmp-zero) | `TEST reg, reg` |
 | [suboptimal CMP one](analyses.md#suboptimal-cmp-one) | `TEST reg, reg` with the equality branch |
 | [suboptimal IMUL constant](analyses.md#suboptimal-imul-constant) | `LEA`, `SHL`, `MOV`, `NEG` or `XOR`, by the multiplier |
+| [suboptimal lane-0 extract](analyses.md#suboptimal-lane-0-extract) | `MOVD`/`MOVQ`/`MOVSS` |
 | [suboptimal LEA](analyses.md#suboptimal-lea) | `MOV`, or `ADD` while the flags are dead |
 | [suboptimal MOV zero](analyses.md#suboptimal-mov-zero) | `XOR reg, reg`, while the flags are dead |
 | [suboptimal OR/AND reg, reg](analyses.md#suboptimal-orand-reg-reg) | `TEST reg, reg` |

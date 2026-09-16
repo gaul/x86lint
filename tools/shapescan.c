@@ -210,29 +210,15 @@ static bool c_dead_compare(const uint8_t *inst, size_t len,
     return true;
 }
 
-// CMOVcc with one register named twice moves a value onto itself. The 8-,
-// 16- and 64-bit forms are pure no-ops; the 32-bit form writes its
-// destination zero-extended whether or not the condition holds, so it is one
-// only while bits 63:32 are dead.
+// Now shipped; measured through the check itself. The table checks return
+// true when there is nothing to report, so the sense inverts.
 static bool c_cmov_self(const uint8_t *inst, size_t len,
                         const uint8_t *targets, size_t offset, size_t next,
                         const xed_decoded_inst_t *d, const char **why)
 {
-    (void) targets; (void) offset;
-    if (xed_decoded_inst_get_category(d) != XED_CATEGORY_CMOV) {
-        return false;
-    }
-    xed_reg_enum_t r0 = explicit_reg(d, XED_OPERAND_REG0);
-    xed_reg_enum_t r1 = explicit_reg(d, XED_OPERAND_REG1);
-    if (r0 == XED_REG_INVALID || r0 != r1) {
-        return false;
-    }
-    if (xed_decoded_inst_get_operand_width(d) == 32 &&
-        reg_upper32_live_after(inst, len, next,
-            xed_get_largest_enclosing_register(r0))) {
-        REFUSE("the zero-extension is live");
-    }
-    return true;
+    (void) inst; (void) len; (void) targets; (void) offset; (void) next;
+    (void) why;
+    return !check_cmov_self(d);
 }
 
 // A vector logical or arithmetic instruction naming one register as both
@@ -251,9 +237,12 @@ static bool c_vec_self_op(const uint8_t *inst, size_t len,
     case XED_ICLASS_ORPS:  case XED_ICLASS_ORPD:
     case XED_ICLASS_PSUBB: case XED_ICLASS_PSUBW:
     case XED_ICLASS_PSUBD: case XED_ICLASS_PSUBQ:
-    case XED_ICLASS_SUBPS: case XED_ICLASS_SUBPD:
     case XED_ICLASS_PCMPGTB: case XED_ICLASS_PCMPGTW:
     case XED_ICLASS_PCMPGTD:
+    // SUBPS and SUBPD are deliberately absent: x - x is +0.0 only for a
+    // finite x, and NaN for an infinity or a NaN, so the floating-point
+    // self-subtract is not a zeroing idiom and rewriting it to XORPS would
+    // change the result. All three of libxul's sites were that spelling.
         break;
     default:
         return false;
@@ -271,26 +260,14 @@ static bool c_vec_self_op(const uint8_t *inst, size_t len,
     return a != XED_REG_INVALID && a == explicit_reg(d, XED_OPERAND_REG0);
 }
 
-// Extracting lane 0 is a plain cross-file move: PEXTRD/Q with an index of
-// zero is MOVD/MOVQ, and EXTRACTPS with one is MOVD or MOVSS, each a shorter
-// encoding on an older feature level.
+// Now shipped; measured through the check itself.
 static bool c_lane0_extract(const uint8_t *inst, size_t len,
                             const uint8_t *targets, size_t offset, size_t next,
                             const xed_decoded_inst_t *d, const char **why)
 {
     (void) inst; (void) len; (void) targets; (void) offset; (void) next;
     (void) why;
-    switch (xed_decoded_inst_get_iclass(d)) {
-    case XED_ICLASS_PEXTRD:  case XED_ICLASS_PEXTRQ:
-    case XED_ICLASS_VPEXTRD: case XED_ICLASS_VPEXTRQ:
-    case XED_ICLASS_EXTRACTPS: case XED_ICLASS_VEXTRACTPS:
-        break;
-    default:
-        return false;
-    }
-    return xed_operand_values_has_immediate(
-               xed_decoded_inst_operands_const(d)) &&
-           xed_decoded_inst_get_unsigned_immediate(d) == 0;
+    return !check_lane0_extract(d);
 }
 
 // AND of a 64-bit register with 0xffffffff keeps exactly the low half, which
@@ -327,49 +304,13 @@ static bool c_branch_to_next(const uint8_t *inst, size_t len,
     return !check_branch_to_next(d);
 }
 
-// NEG then an ADD of the negated value is a SUB of the original, and the
-// mirror. The negation's register dies with it, and the flags must too: CF
-// after `add rD, -X` is an unsigned carry where after `sub rD, X` it is a
-// borrow, so the two disagree on exactly that bit.
+// Now shipped; measured through the check itself.
 static bool c_neg_add(const uint8_t *inst, size_t len, const uint8_t *targets,
                       size_t offset, size_t next, const xed_decoded_inst_t *d,
                       const char **why)
 {
     (void) offset;
-    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_NEG ||
-        xed_decoded_inst_number_of_memory_operands(d) != 0) {
-        return false;
-    }
-    xed_reg_enum_t negated = explicit_reg(d, XED_OPERAND_REG0);
-    if (negated == XED_REG_INVALID) {
-        return false;
-    }
-    xed_decoded_inst_t use;
-    if (!decode_at(inst, len, next, &use)) {
-        return false;
-    }
-    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
-    if ((uic != XED_ICLASS_ADD && uic != XED_ICLASS_SUB) ||
-        xed_decoded_inst_number_of_memory_operands(&use) != 0 ||
-        explicit_reg(&use, XED_OPERAND_REG1) != negated) {
-        return false;
-    }
-    xed_reg_enum_t dest = explicit_reg(&use, XED_OPERAND_REG0);
-    if (dest == XED_REG_INVALID || dest == negated) {
-        return false;
-    }
-    size_t after = next + xed_decoded_inst_get_length(&use);
-    if (branch_target_in(targets, next, after)) {
-        REFUSE("a branch targets the consumer");
-    }
-    if (flags_live_after(inst, len, after, FLAG_ARITH)) {
-        REFUSE("the flags are live afterward");
-    }
-    if (reg_live_after(inst, len, after,
-            xed_get_largest_enclosing_register(negated))) {
-        REFUSE("the negated value is live afterward");
-    }
-    return true;
+    return neg_foldable_into_add_sub(inst, len, targets, next, d, why);
 }
 
 // A shift count materialized into CL and used once is an immediate count.
@@ -519,127 +460,14 @@ static bool c_movsxd_cvt(const uint8_t *inst, size_t len,
     return true;
 }
 
-// A producer's zero guarantee: bits [*from, *upto) of the destination are
-// known zero. armlint tracks only the lower bound, because on AArch64 a
-// W-form write zeroes the upper half and the guarantee always reaches the
-// top of the register. x86 has no such rule -- an 8- or 16-bit write merges
-// -- so the upper bound has to be carried too, and leaving it out is a false
-// positive this tool caught on its own first run: `setz al` guarantees bits
-// 7:1 are zero and says nothing whatever about 63:8, so it cannot make the
-// `movzx eax, al` after it redundant. That shape is the shipped "suboptimal
-// SETcc zero-extension" and not this one.
-static void zero_guarantee(const xed_decoded_inst_t *d, unsigned *from,
-                           unsigned *upto)
-{
-    *from = 64;
-    xed_reg_enum_t dest = explicit_reg(d, XED_OPERAND_REG0);
-    if (dest == XED_REG_INVALID) {
-        *upto = 0;
-        return;
-    }
-    // A 32-bit write zero-extends, so its guarantee reaches bit 64.
-    unsigned w = xed_get_register_width_bits64(dest);
-    *upto = w == 32 ? 64 : w;
-
-    bool has_imm = xed_operand_values_has_immediate(
-        xed_decoded_inst_operands_const(d));
-    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(d);
-    switch (xed_decoded_inst_get_iclass(d)) {
-    case XED_ICLASS_SHR:
-        if (has_imm) {
-            unsigned n = (unsigned) (imm & (w == 64 ? 63u : 31u));
-            *from = n < w ? w - n : 0;
-        }
-        break;
-    case XED_ICLASS_AND:
-        if (has_imm) {
-            unsigned bits = 0;
-            while (imm != 0) { imm >>= 1; ++bits; }
-            *from = bits;
-        }
-        break;
-    // MOVZX and MOVSX producers are deliberately absent: an extension
-    // after an extension is the shipped "redundant re-extension" check, and
-    // counting them here re-reports covered ground. Measured, that is most
-    // of the shape -- with them the row read 285 on libxul against that
-    // check's own 254 -- so what is left below is the generalization alone.
-    default:
-        if (xed_decoded_inst_get_category(d) == XED_CATEGORY_SETCC) {
-            *from = 1;              // 0 or 1, within AL alone
-        }
-        break;
-    }
-}
-
-// A zero-extension that re-establishes bits a producer already zeroed. The
-// shipped "redundant re-extension" owns extension-after-extension; this is
-// armlint's generalization to any producer with a known threshold, which
-// adds `shr eax, 24 ; movzx eax, al` and `setz al ; and al, 1`. Redundant
-// when the producer's guarantee starts at or below where the consumer
-// clears AND reaches at least as high as the consumer writes.
+// Now shipped; measured through the check itself.
 static bool c_redundant_zext(const uint8_t *inst, size_t len,
                              const uint8_t *targets, size_t offset,
                              size_t next, const xed_decoded_inst_t *d,
                              const char **why)
 {
     (void) offset;
-    unsigned from = 0, upto = 0;
-    zero_guarantee(d, &from, &upto);
-    xed_reg_enum_t produced = explicit_reg(d, XED_OPERAND_REG0);
-    if (from >= 64 || produced == XED_REG_INVALID ||
-        xed_decoded_inst_number_of_memory_operands(d) > 1) {
-        return false;
-    }
-    xed_decoded_inst_t use;
-    if (!decode_at(inst, len, next, &use)) {
-        return false;
-    }
-    if (xed_decoded_inst_number_of_memory_operands(&use) != 0) {
-        return false;
-    }
-    // The consumer must clear bits [c, c_upto) in place on the same register.
-    unsigned c = 64, c_upto = 0;
-    xed_reg_enum_t cdest = explicit_reg(&use, XED_OPERAND_REG0);
-    xed_reg_enum_t csrc = explicit_reg(&use, XED_OPERAND_REG1);
-    if (cdest == XED_REG_INVALID) {
-        return false;
-    }
-    unsigned cw = xed_get_register_width_bits64(cdest);
-    c_upto = cw == 32 ? 64 : cw;
-    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
-    if (uic == XED_ICLASS_MOVZX) {
-        if (csrc == XED_REG_INVALID) {
-            return false;
-        }
-        c = xed_get_register_width_bits64(csrc);
-    } else if (uic == XED_ICLASS_AND &&
-               xed_operand_values_has_immediate(
-                   xed_decoded_inst_operands_const(&use))) {
-        uint64_t m = xed_decoded_inst_get_unsigned_immediate(&use);
-        if (m == 0 || (m & (m + 1)) != 0) {
-            return false;               // not a run of low bits
-        }
-        c = 0;
-        while (m != 0) { m >>= 1; ++c; }
-        csrc = cdest;
-    } else {
-        return false;
-    }
-    xed_reg_enum_t parent = xed_get_largest_enclosing_register(produced);
-    if (c >= 64 || c < from || upto < c_upto ||
-        xed_get_largest_enclosing_register(cdest) != parent ||
-        xed_get_largest_enclosing_register(csrc) != parent) {
-        return false;
-    }
-    size_t after = next + xed_decoded_inst_get_length(&use);
-    if (branch_target_in(targets, next, after)) {
-        REFUSE("a branch targets the consumer");
-    }
-    if (uic == XED_ICLASS_AND &&
-        flags_live_after(inst, len, after, FLAG_ARITH)) {
-        REFUSE("the flags are live afterward");
-    }
-    return true;
+    return redundant_zero_extension(inst, len, targets, next, d, why);
 }
 
 // Now shipped, gated on the target axis (#28); measured through the check

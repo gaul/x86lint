@@ -111,6 +111,13 @@ bool check_branch_to_next(const xed_decoded_inst_t *xedd);
 // register liveness (reg_upper32_live_after)
 bool check_mov_self(const xed_decoded_inst_t *xedd);
 
+// CMOVcc naming one register twice: a conditional move onto itself. See
+// x86lint.c.
+bool check_cmov_self(const xed_decoded_inst_t *xedd);
+
+// PEXTR/EXTRACTPS of lane 0, which MOVD/MOVQ/MOVSS spell more cheaply.
+bool check_lane0_extract(const xed_decoded_inst_t *xedd);
+
 // return false if instruction is add reg, 0 or sub reg, 0 (use TEST
 // reg, reg instead for the flag side-effect, or remove the instruction
 // if flags are unused). The 32-bit form also zero-extends, so the

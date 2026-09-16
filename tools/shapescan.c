@@ -154,6 +154,627 @@ static bool w_cas(const uint8_t *inst, size_t len, const uint8_t *targets,
     return cas_fetch_op_loop(inst, len, targets, offset, next, d, why);
 }
 
+// === window candidates: TODO rows not yet shipped ===
+//
+// Each is written as the check it would become -- match the pattern, then
+// call x86lint's own gates -- so that promoting one is a move. Where a row
+// carries a figure from an earlier throwaway script, that figure is named
+// here, and a divergence is a disagreement to explain rather than a silent
+// correction.
+
+// The explicit register operand at `name`, or XED_REG_INVALID.
+static xed_reg_enum_t explicit_reg(const xed_decoded_inst_t *d,
+                                   xed_operand_enum_t name)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(d);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (xed_operand_name(op) == name &&
+            xed_operand_operand_visibility(op) == XED_OPVIS_EXPLICIT &&
+            xed_operand_is_register(name)) {
+            return xed_decoded_inst_get_reg(d, name);
+        }
+    }
+    return XED_REG_INVALID;
+}
+
+// Decode the instruction at `off`, or report failure.
+static bool decode_at(const uint8_t *inst, size_t len, size_t off,
+                      xed_decoded_inst_t *out)
+{
+    if (off >= len) {
+        return false;
+    }
+    decode_init(out);
+    return xed_decode(out, inst + off, len - off) == XED_ERROR_NONE;
+}
+
+// A register-only CMP or TEST whose flags die unread writes nothing at all,
+// so it is deletable outright (armlint's check_dead_compare, 315 findings on
+// /bin/ls). A memory operand is excluded rather than gated: deleting the
+// access removes a fault that may be the point, which is what go's
+// `test BYTE PTR [rax], al` nil check is. Measured at 291 in libxul.
+static bool c_dead_compare(const uint8_t *inst, size_t len,
+                           const uint8_t *targets, size_t offset, size_t next,
+                           const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets; (void) offset;
+    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(d);
+    if ((ic != XED_ICLASS_CMP && ic != XED_ICLASS_TEST) ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0) {
+        return false;
+    }
+    if (flags_live_after(inst, len, next, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    return true;
+}
+
+// CMOVcc with one register named twice moves a value onto itself. The 8-,
+// 16- and 64-bit forms are pure no-ops; the 32-bit form writes its
+// destination zero-extended whether or not the condition holds, so it is one
+// only while bits 63:32 are dead.
+static bool c_cmov_self(const uint8_t *inst, size_t len,
+                        const uint8_t *targets, size_t offset, size_t next,
+                        const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets; (void) offset;
+    if (xed_decoded_inst_get_category(d) != XED_CATEGORY_CMOV) {
+        return false;
+    }
+    xed_reg_enum_t r0 = explicit_reg(d, XED_OPERAND_REG0);
+    xed_reg_enum_t r1 = explicit_reg(d, XED_OPERAND_REG1);
+    if (r0 == XED_REG_INVALID || r0 != r1) {
+        return false;
+    }
+    if (xed_decoded_inst_get_operand_width(d) == 32 &&
+        reg_upper32_live_after(inst, len, next,
+            xed_get_largest_enclosing_register(r0))) {
+        REFUSE("the zero-extension is live");
+    }
+    return true;
+}
+
+// A vector logical or arithmetic instruction naming one register as both
+// sources: AND/OR give the operand back, SUB and the signed-compare give
+// zero. PXOR and XORPS are excluded, being the canonical zero idioms this
+// would otherwise report as findings against themselves.
+static bool c_vec_self_op(const uint8_t *inst, size_t len,
+                          const uint8_t *targets, size_t offset, size_t next,
+                          const xed_decoded_inst_t *d, const char **why)
+{
+    (void) inst; (void) len; (void) targets; (void) offset; (void) next;
+    (void) why;
+    switch (xed_decoded_inst_get_iclass(d)) {
+    case XED_ICLASS_PAND:  case XED_ICLASS_POR:
+    case XED_ICLASS_ANDPS: case XED_ICLASS_ANDPD:
+    case XED_ICLASS_ORPS:  case XED_ICLASS_ORPD:
+    case XED_ICLASS_PSUBB: case XED_ICLASS_PSUBW:
+    case XED_ICLASS_PSUBD: case XED_ICLASS_PSUBQ:
+    case XED_ICLASS_SUBPS: case XED_ICLASS_SUBPD:
+    case XED_ICLASS_PCMPGTB: case XED_ICLASS_PCMPGTW:
+    case XED_ICLASS_PCMPGTD:
+        break;
+    default:
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(d) != 0) {
+        return false;
+    }
+    // Legacy two-operand: destination and source are one register. VEX
+    // three-operand: the two sources are, and the destination is free.
+    xed_reg_enum_t a = explicit_reg(d, XED_OPERAND_REG1);
+    xed_reg_enum_t b = explicit_reg(d, XED_OPERAND_REG2);
+    if (b != XED_REG_INVALID) {
+        return a != XED_REG_INVALID && a == b;
+    }
+    return a != XED_REG_INVALID && a == explicit_reg(d, XED_OPERAND_REG0);
+}
+
+// Extracting lane 0 is a plain cross-file move: PEXTRD/Q with an index of
+// zero is MOVD/MOVQ, and EXTRACTPS with one is MOVD or MOVSS, each a shorter
+// encoding on an older feature level.
+static bool c_lane0_extract(const uint8_t *inst, size_t len,
+                            const uint8_t *targets, size_t offset, size_t next,
+                            const xed_decoded_inst_t *d, const char **why)
+{
+    (void) inst; (void) len; (void) targets; (void) offset; (void) next;
+    (void) why;
+    switch (xed_decoded_inst_get_iclass(d)) {
+    case XED_ICLASS_PEXTRD:  case XED_ICLASS_PEXTRQ:
+    case XED_ICLASS_VPEXTRD: case XED_ICLASS_VPEXTRQ:
+    case XED_ICLASS_EXTRACTPS: case XED_ICLASS_VEXTRACTPS:
+        break;
+    default:
+        return false;
+    }
+    return xed_operand_values_has_immediate(
+               xed_decoded_inst_operands_const(d)) &&
+           xed_decoded_inst_get_unsigned_immediate(d) == 0;
+}
+
+// AND of a 64-bit register with 0xffffffff keeps exactly the low half, which
+// a 32-bit register copy does in two bytes. AND writes the flags and MOV
+// does not, so they must be dead.
+static bool c_and_lo32(const uint8_t *inst, size_t len,
+                       const uint8_t *targets, size_t offset, size_t next,
+                       const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets; (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_AND ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        xed_decoded_inst_get_operand_width(d) != 64 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d)) ||
+        (uint64_t) xed_decoded_inst_get_unsigned_immediate(d) != 0xffffffffu ||
+        explicit_reg(d, XED_OPERAND_REG0) == XED_REG_INVALID) {
+        return false;
+    }
+    if (flags_live_after(inst, len, next, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    return true;
+}
+
+// A direct branch to the instruction after it transfers control exactly
+// where falling through would: deletable whatever the condition, and with no
+// liveness to prove since neither form writes a register. CALL is excluded,
+// its return-address push being the point of `call .+0`.
+static bool c_branch_to_next(const uint8_t *inst, size_t len,
+                             const uint8_t *targets, size_t offset,
+                             size_t next, const xed_decoded_inst_t *d,
+                             const char **why)
+{
+    (void) inst; (void) len; (void) targets; (void) offset; (void) why;
+    xed_category_enum_t cat = xed_decoded_inst_get_category(d);
+    if ((cat != XED_CATEGORY_COND_BR && cat != XED_CATEGORY_UNCOND_BR) ||
+        xed_decoded_inst_get_branch_displacement_width_bits(d) == 0) {
+        return false;
+    }
+    return xed_decoded_inst_get_branch_displacement(d) == 0 && next != 0;
+}
+
+// NEG then an ADD of the negated value is a SUB of the original, and the
+// mirror. The negation's register dies with it, and the flags must too: CF
+// after `add rD, -X` is an unsigned carry where after `sub rD, X` it is a
+// borrow, so the two disagree on exactly that bit.
+static bool c_neg_add(const uint8_t *inst, size_t len, const uint8_t *targets,
+                      size_t offset, size_t next, const xed_decoded_inst_t *d,
+                      const char **why)
+{
+    (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_NEG ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0) {
+        return false;
+    }
+    xed_reg_enum_t negated = explicit_reg(d, XED_OPERAND_REG0);
+    if (negated == XED_REG_INVALID) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, next, &use)) {
+        return false;
+    }
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if ((uic != XED_ICLASS_ADD && uic != XED_ICLASS_SUB) ||
+        xed_decoded_inst_number_of_memory_operands(&use) != 0 ||
+        explicit_reg(&use, XED_OPERAND_REG1) != negated) {
+        return false;
+    }
+    xed_reg_enum_t dest = explicit_reg(&use, XED_OPERAND_REG0);
+    if (dest == XED_REG_INVALID || dest == negated) {
+        return false;
+    }
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    if (flags_live_after(inst, len, after, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    if (reg_live_after(inst, len, after,
+            xed_get_largest_enclosing_register(negated))) {
+        REFUSE("the negated value is live afterward");
+    }
+    return true;
+}
+
+// A shift count materialized into CL and used once is an immediate count.
+// The two forms mask the count identically and write the same flags, so the
+// only condition is that RCX dies with the MOV.
+static bool c_mov_cl_shift(const uint8_t *inst, size_t len,
+                           const uint8_t *targets, size_t offset, size_t next,
+                           const xed_decoded_inst_t *d, const char **why)
+{
+    (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d))) {
+        return false;
+    }
+    xed_reg_enum_t dest = explicit_reg(d, XED_OPERAND_REG0);
+    if (dest == XED_REG_INVALID ||
+        xed_get_largest_enclosing_register(dest) != XED_REG_RCX) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, next, &use)) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(&use)) {
+    case XED_ICLASS_SHL: case XED_ICLASS_SHR: case XED_ICLASS_SAR:
+    case XED_ICLASS_ROL: case XED_ICLASS_ROR:
+        break;
+    default:
+        return false;
+    }
+    bool by_cl = false;
+    const xed_inst_t *xi = xed_decoded_inst_inst(&use);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t nm = xed_operand_name(op);
+        by_cl |= xed_operand_is_register(nm) &&
+            xed_decoded_inst_get_reg(&use, nm) == XED_REG_CL;
+    }
+    if (!by_cl) {
+        return false;
+    }
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    if (reg_live_after(inst, len, after, XED_REG_RCX)) {
+        REFUSE("RCX is live afterward");
+    }
+    return true;
+}
+
+// SHL by one to three then an ADD of the result is an address computation:
+// `lea rD, [rD + rX*2^k]`. The scale field only reaches eight, so a larger
+// count has no LEA form at all and is not matched.
+static bool c_shl_add_lea(const uint8_t *inst, size_t len,
+                          const uint8_t *targets, size_t offset, size_t next,
+                          const xed_decoded_inst_t *d, const char **why)
+{
+    (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_SHL ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d))) {
+        return false;
+    }
+    uint64_t k = xed_decoded_inst_get_unsigned_immediate(d);
+    xed_reg_enum_t shifted = explicit_reg(d, XED_OPERAND_REG0);
+    if (k < 1 || k > 3 || shifted == XED_REG_INVALID) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, next, &use)) {
+        return false;
+    }
+    if (xed_decoded_inst_get_iclass(&use) != XED_ICLASS_ADD ||
+        xed_decoded_inst_number_of_memory_operands(&use) != 0 ||
+        explicit_reg(&use, XED_OPERAND_REG1) != shifted) {
+        return false;
+    }
+    xed_reg_enum_t dest = explicit_reg(&use, XED_OPERAND_REG0);
+    if (dest == XED_REG_INVALID || dest == shifted ||
+        xed_decoded_inst_get_operand_width(&use) !=
+            xed_decoded_inst_get_operand_width(d)) {
+        return false;
+    }
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    if (flags_live_after(inst, len, after, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    if (reg_live_after(inst, len, after,
+            xed_get_largest_enclosing_register(shifted))) {
+        REFUSE("the shifted value is live afterward");
+    }
+    return true;
+}
+
+// A widening sign-extension feeding an integer-to-float conversion is the
+// 32-bit conversion, which sign-extends its own source.
+static bool c_movsxd_cvt(const uint8_t *inst, size_t len,
+                         const uint8_t *targets, size_t offset, size_t next,
+                         const xed_decoded_inst_t *d, const char **why)
+{
+    (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOVSXD ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0) {
+        return false;
+    }
+    xed_reg_enum_t widened = explicit_reg(d, XED_OPERAND_REG0);
+    if (widened == XED_REG_INVALID) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, next, &use)) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(&use)) {
+    case XED_ICLASS_CVTSI2SD: case XED_ICLASS_CVTSI2SS:
+    case XED_ICLASS_VCVTSI2SD: case XED_ICLASS_VCVTSI2SS:
+        break;
+    default:
+        return false;
+    }
+    bool reads = false;
+    const xed_inst_t *xi = xed_decoded_inst_inst(&use);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t nm = xed_operand_name(op);
+        reads |= xed_operand_is_register(nm) && xed_operand_read(op) &&
+            xed_decoded_inst_get_reg(&use, nm) == widened;
+    }
+    if (!reads) {
+        return false;
+    }
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    if (reg_live_after(inst, len, after,
+            xed_get_largest_enclosing_register(widened))) {
+        REFUSE("the widened value is live afterward");
+    }
+    return true;
+}
+
+// A producer's zero guarantee: bits [*from, *upto) of the destination are
+// known zero. armlint tracks only the lower bound, because on AArch64 a
+// W-form write zeroes the upper half and the guarantee always reaches the
+// top of the register. x86 has no such rule -- an 8- or 16-bit write merges
+// -- so the upper bound has to be carried too, and leaving it out is a false
+// positive this tool caught on its own first run: `setz al` guarantees bits
+// 7:1 are zero and says nothing whatever about 63:8, so it cannot make the
+// `movzx eax, al` after it redundant. That shape is the shipped "suboptimal
+// SETcc zero-extension" and not this one.
+static void zero_guarantee(const xed_decoded_inst_t *d, unsigned *from,
+                           unsigned *upto)
+{
+    *from = 64;
+    xed_reg_enum_t dest = explicit_reg(d, XED_OPERAND_REG0);
+    if (dest == XED_REG_INVALID) {
+        *upto = 0;
+        return;
+    }
+    // A 32-bit write zero-extends, so its guarantee reaches bit 64.
+    unsigned w = xed_get_register_width_bits64(dest);
+    *upto = w == 32 ? 64 : w;
+
+    bool has_imm = xed_operand_values_has_immediate(
+        xed_decoded_inst_operands_const(d));
+    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(d);
+    switch (xed_decoded_inst_get_iclass(d)) {
+    case XED_ICLASS_SHR:
+        if (has_imm) {
+            unsigned n = (unsigned) (imm & (w == 64 ? 63u : 31u));
+            *from = n < w ? w - n : 0;
+        }
+        break;
+    case XED_ICLASS_AND:
+        if (has_imm) {
+            unsigned bits = 0;
+            while (imm != 0) { imm >>= 1; ++bits; }
+            *from = bits;
+        }
+        break;
+    // MOVZX and MOVSX producers are deliberately absent: an extension
+    // after an extension is the shipped "redundant re-extension" check, and
+    // counting them here re-reports covered ground. Measured, that is most
+    // of the shape -- with them the row read 285 on libxul against that
+    // check's own 254 -- so what is left below is the generalization alone.
+    default:
+        if (xed_decoded_inst_get_category(d) == XED_CATEGORY_SETCC) {
+            *from = 1;              // 0 or 1, within AL alone
+        }
+        break;
+    }
+}
+
+// A zero-extension that re-establishes bits a producer already zeroed. The
+// shipped "redundant re-extension" owns extension-after-extension; this is
+// armlint's generalization to any producer with a known threshold, which
+// adds `shr eax, 24 ; movzx eax, al` and `setz al ; and al, 1`. Redundant
+// when the producer's guarantee starts at or below where the consumer
+// clears AND reaches at least as high as the consumer writes.
+static bool c_redundant_zext(const uint8_t *inst, size_t len,
+                             const uint8_t *targets, size_t offset,
+                             size_t next, const xed_decoded_inst_t *d,
+                             const char **why)
+{
+    (void) offset;
+    unsigned from = 0, upto = 0;
+    zero_guarantee(d, &from, &upto);
+    xed_reg_enum_t produced = explicit_reg(d, XED_OPERAND_REG0);
+    if (from >= 64 || produced == XED_REG_INVALID ||
+        xed_decoded_inst_number_of_memory_operands(d) > 1) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, next, &use)) {
+        return false;
+    }
+    if (xed_decoded_inst_number_of_memory_operands(&use) != 0) {
+        return false;
+    }
+    // The consumer must clear bits [c, c_upto) in place on the same register.
+    unsigned c = 64, c_upto = 0;
+    xed_reg_enum_t cdest = explicit_reg(&use, XED_OPERAND_REG0);
+    xed_reg_enum_t csrc = explicit_reg(&use, XED_OPERAND_REG1);
+    if (cdest == XED_REG_INVALID) {
+        return false;
+    }
+    unsigned cw = xed_get_register_width_bits64(cdest);
+    c_upto = cw == 32 ? 64 : cw;
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if (uic == XED_ICLASS_MOVZX) {
+        if (csrc == XED_REG_INVALID) {
+            return false;
+        }
+        c = xed_get_register_width_bits64(csrc);
+    } else if (uic == XED_ICLASS_AND &&
+               xed_operand_values_has_immediate(
+                   xed_decoded_inst_operands_const(&use))) {
+        uint64_t m = xed_decoded_inst_get_unsigned_immediate(&use);
+        if (m == 0 || (m & (m + 1)) != 0) {
+            return false;               // not a run of low bits
+        }
+        c = 0;
+        while (m != 0) { m >>= 1; ++c; }
+        csrc = cdest;
+    } else {
+        return false;
+    }
+    xed_reg_enum_t parent = xed_get_largest_enclosing_register(produced);
+    if (c >= 64 || c < from || upto < c_upto ||
+        xed_get_largest_enclosing_register(cdest) != parent ||
+        xed_get_largest_enclosing_register(csrc) != parent) {
+        return false;
+    }
+    size_t after = next + xed_decoded_inst_get_length(&use);
+    if (branch_target_in(targets, next, after)) {
+        REFUSE("a branch targets the consumer");
+    }
+    if (uic == XED_ICLASS_AND &&
+        flags_live_after(inst, len, after, FLAG_ARITH)) {
+        REFUSE("the flags are live afterward");
+    }
+    return true;
+}
+
+// `mov r, <operand size>` before TZCNT or LZCNT provides the zero-source
+// answer those instructions already define, so the MOV is dead -- but the
+// same MOV is the false-dependency break they need through Broadwell, which
+// is why this is blocked on a target axis (#28) rather than on a proof.
+static bool c_bitscan_default(const uint8_t *inst, size_t len,
+                              const uint8_t *targets, size_t offset,
+                              size_t next, const xed_decoded_inst_t *d,
+                              const char **why)
+{
+    (void) targets; (void) offset; (void) why;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d))) {
+        return false;
+    }
+    xed_reg_enum_t dest = explicit_reg(d, XED_OPERAND_REG0);
+    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(d);
+    if (dest == XED_REG_INVALID) {
+        return false;
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, next, &use)) {
+        return false;
+    }
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if (uic != XED_ICLASS_TZCNT && uic != XED_ICLASS_LZCNT) {
+        return false;
+    }
+    unsigned w = xed_decoded_inst_get_operand_width(&use);
+    return imm == w &&
+        xed_get_largest_enclosing_register(
+            explicit_reg(&use, XED_OPERAND_REG0)) ==
+        xed_get_largest_enclosing_register(dest);
+}
+
+// A second plain load of an address the block already loaded, with nothing
+// between that could have changed it. The heap, global and TLS halves of
+// this shape select for the unsound case -- a load surviving -O2 CSE is one
+// the source forbade merging, an atomic or a volatile the bytes cannot show
+// -- so only a frame slot is a candidate, which is what #29 records.
+static bool c_stack_reload(const uint8_t *inst, size_t len,
+                           const uint8_t *targets, size_t offset, size_t next,
+                           const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets; (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(d) != 1 ||
+        xed_decoded_inst_mem_written(d, 0) ||
+        xed_decoded_inst_get_seg_reg(d, 0) != XED_REG_INVALID) {
+        return false;
+    }
+    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(d, 0);
+    xed_reg_enum_t index = xed_decoded_inst_get_index_reg(d, 0);
+    int64_t disp = xed_decoded_inst_get_memory_displacement(d, 0);
+    unsigned width = xed_decoded_inst_get_memory_operand_length(d, 0);
+    xed_reg_enum_t first_dest = explicit_reg(d, XED_OPERAND_REG0);
+    if (index != XED_REG_INVALID || width == 0 ||
+        first_dest == XED_REG_INVALID) {
+        return false;
+    }
+    bool value_gone = false;
+
+    // Walk forward for the twin, stopping at anything that could change
+    // either the address or the value.
+    const int WINDOW = 8;
+    size_t off = next;
+    for (int step = 0; step < WINDOW; ++step) {
+        xed_decoded_inst_t x;
+        if (!decode_at(inst, len, off, &x)) {
+            return false;
+        }
+        size_t x_next = off + xed_decoded_inst_get_length(&x);
+        if (xed_decoded_inst_get_iclass(&x) == XED_ICLASS_MOV &&
+            xed_decoded_inst_number_of_memory_operands(&x) == 1 &&
+            !xed_decoded_inst_mem_written(&x, 0) &&
+            xed_decoded_inst_get_base_reg(&x, 0) == base &&
+            xed_decoded_inst_get_index_reg(&x, 0) == XED_REG_INVALID &&
+            xed_decoded_inst_get_memory_displacement(&x, 0) == disp &&
+            xed_decoded_inst_get_memory_operand_length(&x, 0) == width) {
+            if (base != XED_REG_RBP && base != XED_REG_RSP) {
+                REFUSE("not a thread-private frame slot");
+            }
+            // Same destination: the reload is a duplicate and is simply
+            // deleted. A different one needs a copy, so the first value has
+            // to still be there -- where it is not, #29 calls the site
+            // register allocation rather than a peephole.
+            if (explicit_reg(&x, XED_OPERAND_REG0) != first_dest &&
+                value_gone) {
+                REFUSE("the first value was overwritten");
+            }
+            return true;
+        }
+        xed_category_enum_t cat = xed_decoded_inst_get_category(&x);
+        if (cat == XED_CATEGORY_CALL || cat == XED_CATEGORY_RET ||
+            cat == XED_CATEGORY_UNCOND_BR || cat == XED_CATEGORY_COND_BR ||
+            cat == XED_CATEGORY_INTERRUPT) {
+            return false;
+        }
+        if (xed_decoded_inst_number_of_memory_operands(&x) > 0 &&
+            xed_decoded_inst_mem_written(&x, 0)) {
+            return false;               // a store may alias
+        }
+        // A write to the base moves the address out from under the twin; a
+        // write to the first destination takes the value the copy would use.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&x);
+        for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t nm = xed_operand_name(op);
+            if (!xed_operand_is_register(nm) || !xed_operand_written(op)) {
+                continue;
+            }
+            xed_reg_enum_t w = xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(&x, nm));
+            if (w == xed_get_largest_enclosing_register(base)) {
+                return false;
+            }
+            if (w == xed_get_largest_enclosing_register(first_dest)) {
+                value_gone = true;
+            }
+        }
+        off = x_next;
+    }
+    return false;
+}
+
 // === run candidate: adjacent immediate-zero stores (issue #30) ===
 
 // Decode one `mov <width> PTR [base+index*scale+disp], 0` and report the
@@ -273,6 +894,30 @@ static const struct candidate candidates[] = {
       w_vec_transfer, NULL },
     { "adjacent zero-store run (#30)", "one wider store",
       NULL, zero_store_runs },
+
+    // TODO rows, not yet shipped. The figure in the comment on each
+    // predicate is what an earlier throwaway script reported, where there
+    // was one.
+    { "dead compare", "delete the CMP/TEST", c_dead_compare, NULL },
+    { "same-register CMOVcc", "remove", c_cmov_self, NULL },
+    { "vector self-op identity", "MOVAPS, or the zero idiom",
+      c_vec_self_op, NULL },
+    { "lane-0 extract", "MOVD/MOVQ/MOVSS", c_lane0_extract, NULL },
+    { "AND r64, 0xffffffff", "MOV r32, r32", c_and_lo32, NULL },
+    { "branch to the next instruction", "delete", c_branch_to_next, NULL },
+    { "NEG folded into ADD/SUB", "SUB/ADD of the original", c_neg_add, NULL },
+    { "MOV into CL before a shift", "an immediate count",
+      c_mov_cl_shift, NULL },
+    { "SHL + ADD foldable to LEA", "LEA rD, [rD + rX*2^k]",
+      c_shl_add_lea, NULL },
+    { "MOVSXD before CVTSI2SD/SS", "the 32-bit conversion",
+      c_movsxd_cvt, NULL },
+    { "redundant zero-extension by threshold", "drop the extension",
+      c_redundant_zext, NULL },
+    { "bit-scan defensive default (#28)", "delete the MOV, Skylake+ only",
+      c_bitscan_default, NULL },
+    { "reloaded frame slot (#29)", "reuse the first value",
+      c_stack_reload, NULL },
 };
 
 #define NCAND (sizeof(candidates) / sizeof(candidates[0]))

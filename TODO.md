@@ -679,23 +679,49 @@ rather than `MOVAPS` since byte and dword stores prove nothing about
 alignment. That register is the whole difference from armlint, where
 `xzr` exists and the wider store needs nothing allocated.
 
-**Measured and near-dead.** Every remaining armlint check with an x86
-spelling, counted the same way. Recorded so the table is not walked
-again:
+**Measured and near-dead, with one exception that was neither.** Every
+remaining armlint check with an x86 spelling, now carried by
+`tools/shapescan` so the figures are the gates' own and re-runnable. Shape
+and realized are corpus-wide over libxul, go, libcrypto, libstdc++, libc and
+bash:
 
-| armlint check | x86 spelling | 2026-09 port sweep |
-| --- | --- | --- |
-| compare whose flags are overwritten unread | delete the `CMP`/`TEST` | **291 of 2,118,109** register-only candidates in libxul (0.014%), 38 go, 1 libc, 0 in bash, libcrypto and libstdc++ -- measured with a 16-instruction forward window, not adjacency. armlint reports 315 on `/bin/ls` alone. The difference is structural: x86 pairs a compare with its branch by design for macro-fusion, where AArch64 schedules them apart and leaves `ccmp`/`cset` chains behind. Memory-operand compares are excluded outright and are 683,613 of libxul's sites -- go's `test BYTE PTR [rax], al` is the nil-check idiom, and deleting it removes the fault that *is* the check |
-| `csel Rd, Rn, Rn` | same-register `CMOVcc` | 3 libxul, 0 elsewhere |
-| vector self-op identity | `pand`/`por`/`psub` with one source | 3 libxul, 0 elsewhere. x86's canonical zero and all-ones idioms (`pxor`, `pcmpeqd`) are already the shipped SSE zero-idiom check's business |
-| `umov` of lane 0 | `pextrd/q ..., 0` -> `movd/movq` | **0** everywhere. `vextractps m32, xmm, 0` -> `vmovss` appears 10 times in libxul, the only member of the family with any population |
-| `and xd, xn, #0xffffffff` | `and r64, 0xffffffff` -> `mov r32, r32` | **0** everywhere |
-| branch to the next instruction | `jmp`/`jcc` to the next instruction | **0** everywhere |
-| `neg` + `add`/`sub` | `neg r ; add r2, r` -> `sub r2, r` | 60 libxul, 0 elsewhere |
-| `mov #C` + variable shift | `mov ecx, imm ; shl r, cl` -> `shl r, imm` | 6 libxul, 0 elsewhere. The shipped "MOV constant foldable" covers the ALU consumers and not this one |
-| shift foldable into shifted-register form | `shl r, k<=3 ; add r2, r` -> `lea` | 8 libxul, 4 libcrypto, 2 libc, 2 libstdc++, 1 bash |
-| widening extend + `scvtf` | `movsxd` + `cvtsi2sd` -> 32-bit convert | **0** everywhere |
-| redundant zero-extension by producer threshold | generalized past extension-after-extension | `setcc` + `and 1` 13 libxul; `shr >= 24` + `movzx` 3 libxul, 5 go. The shipped "redundant re-extension" already owns the extension-after-extension case, and the generalization buys these |
+| armlint check | x86 spelling | shape | realized |
+| --- | --- | --- | --- |
+| branch to the next instruction | `jmp`/`jcc` to the next instruction | **1,009** | **1,009** |
+| compare whose flags are overwritten unread | delete the `CMP`/`TEST` | 2,327,914 | 396 |
+| `neg` + `add`/`sub` | `neg r ; add r2, r` -> `sub r2, r` | 61 | 16 |
+| redundant zero-extension by producer threshold | generalized past extension-after-extension | 39 | 37 |
+| `shift` foldable into shifted-register form | `shl r, k<=3 ; add r2, r` -> `lea` | 17 | 0 |
+| `umov` of lane 0 | `pextrd/q ..., 0` -> `movd/movq` | 10 | 10 |
+| `mov #C` + variable shift | `mov ecx, imm ; shl r, cl` | 6 | 0 |
+| `csel Rd, Rn, Rn` | same-register `CMOVcc` | 3 | 3 |
+| vector self-op identity | `pand`/`por`/`psub` with one source | 3 | 3 |
+| `and xd, xn, #0xffffffff` | `and r64, 0xffffffff` -> `mov r32, r32` | 0 | 0 |
+| widening extend + `scvtf` | `movsxd` + `cvtsi2sd` -> 32-bit convert | 0 | 0 |
+
+**The branch-to-next row was recorded here as zero and is not.** It is
+**1,009** sites, every one realized -- there is nothing to gate, since
+neither form writes a register and both outcomes fall through. The earlier
+census parsed each instruction's address out of `objdump` with its trailing
+colon still attached, so `strtonum` returned 0 and every "is the target the
+next instruction" test compared against zero. It reported a plausible number
+-- none -- and nothing looked wrong, which is the silent-failure mode
+armlint's `--selftest` was built for and the reason a candidate belongs in a
+tool rather than in a shell pipeline.
+
+What the sites are is worth keeping too: hand-written SIMD, not compiler
+output. libjpeg-turbo's `jsimd_ycc_rgb_convert_avx2` emits `jmp` to a NASM
+macro label that lands on the very next instruction, 949 times across libxul,
+with 47 more in libcrypto's perlasm. That is exactly the population armlint
+documents for its own version -- compilers emit none, and the catch is
+assembly and JIT emitters.
+
+Two rows shifted on better gates rather than on a bug. The dead compare rose
+from 291 to 396 because `flags_live_after` reads a `RET` as flag death where
+the census did not, and the zero-extension row is quoted here as the
+*generalization alone*: counting extension-after-extension too put it at 285
+against the shipped "redundant re-extension" check's own 254, which is
+re-reporting covered ground rather than sizing a candidate.
 
 ## Parity gaps with armlint (2026-09 cross-check)
 
@@ -784,8 +810,8 @@ in the corpus until it was traced to a build flag.
 | `ADD r, imm` + `ADD r, imm` chain (armlint ships this as `check_add_sub_imm_chain`) | one `ADD` | **0 real.** 16,002 pairscan hits, every dumped one on *different* registers (`add r10, 0x4 ; add r9, 0x3`) -- interleaved JIT-style sequences, which the shape key cannot separate from a chain because it collapses register identity. The coupled spelling (`dep,fdead`) is empty |
 | `LEA` + `CMOVcc` reading its result | fold the address into the CMOV's memory operand | **Unsound**, 10,679 sites. `CMOVcc r, m` loads unconditionally regardless of the condition; the LEA does not load at all. Any site where the address is only conditionally valid would fault |
 | sole-use load + shift reading it | fold into the shift | **Not encodable**, 19,729 sites. A shift takes a memory operand only as its destination, and these consume the loaded value as the shifted operand with a register destination |
-| redundant reload of one address (`reload\|same`, `reload\|copy`) | reuse the first value | **7,237** across the 2026-08 corpus (libc 196/Minsn, bash 205, libxul 228, go 108), about 7,700 with the Rust sweep. **Dissected 2026-09 and filed as [#29](https://github.com/gaul/x86lint/issues/29).** The heap, global and TLS sites are atomics, `volatile` signal flags and wasm2c sandbox memory: a plain load that survives -O2 CSE with no store between is one the source forbade merging, so for those addresses the shape selects for the unsound case. The stack sites are spill reloads -- **2,666** in libxul, 365 in uutils, 65 in libc, 2 in go -- and sound as thread-private memory, about 2,900 of them within the check window. Blocked on the tool's standard that no finding changes the set of memory accesses; see the note below |
-| `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** See the note below; the knob is filed as [#28](https://github.com/gaul/x86lint/issues/28) |
+| redundant reload of one address (`reload\|same`, `reload\|copy`) | reuse the first value | **7,237** across the 2026-08 corpus (libc 196/Minsn, bash 205, libxul 228, go 108), about 7,700 with the Rust sweep. **Dissected 2026-09 and filed as [#29](https://github.com/gaul/x86lint/issues/29).** The heap, global and TLS sites are atomics, `volatile` signal flags and wasm2c sandbox memory: a plain load that survives -O2 CSE with no store between is one the source forbade merging, so for those addresses the shape selects for the unsound case. The stack sites are spill reloads -- **2,666** in libxul, 365 in uutils, 65 in libc, 2 in go -- and sound as thread-private memory, about 2,900 of them within the check window. `tools/shapescan` now carries the candidate with the gates a check would apply -- an 8-instruction window, no store, call or branch between, the base unwritten, and the first value still in its register for the copy rewrite -- and reports **538** realized of a 15,358 shape corpus-wide (libxul 418 of 14,669). That is well under defuse's 2,666 for libxul alone, and the gap is the window and the branch rule rather than a disagreement: defuse resets at branch targets where this refuses any control transfer outright. Blocked on the tool's standard that no finding changes the set of memory accesses; see the note below |
+| `MOV r, imm` + `TZCNT`/`LZCNT` (the defensive default) | delete the `MOV` | **Sound, 305 sites, and blocked on a knob the tool does not have.** Carried by `tools/shapescan`, which confirms the 305 exactly and finds none outside libxul. See the note below; the knob is filed as [#28](https://github.com/gaul/x86lint/issues/28) |
 | ~~one-operand `MUL` whose low half is dead~~ | ~~`MULX`~~ | **Done: "missing MULX" (`-m bmi2`).** The row said 415 sites; the operand condition takes it to **101**, and the check reports **94**, all in libxul. See the note below -- this is the second estimate in this file to land, and for the same reason as the first |
 | `XOR r32, r32` + `XOR r32, r32` | -- | **28,516 sites and nothing to fix.** The most frequent flag-coupled pair in the corpus after the compare/branch families, and it is two independent zeroing idioms; the `fdead` tag says only that the first's flag write is dead, which is true of every zeroing idiom |
 | `PUSH r` + `POP r` of one register (an [#24](https://github.com/gaul/x86lint/issues/24) candidate) | delete the pair | **Rejected: the shape is a stack-clash probe.** 0 sites in compiled code across eight binaries (libxul, geckodriver, uutils, go, bash, libc, libcrypto) except **89** in libstdc++, every one GCC's `-fstack-clash-protection` probe in a function whose only frame activity is a call to a `noreturn` function -- `endbr64 ; push rax ; pop rax ; mov edi, 8 ; sub rsp, 8 ; call g`, reproduced with gcc 16 at `-O2 -fstack-clash-protection` and gone under `-fno-stack-clash-protection`. The push touches the page below the return address so a guard page faults before the callee runs; deleting the pair removes the protection. The shape selects for the intentional case, as the reload row's heap half does |

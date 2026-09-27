@@ -657,6 +657,26 @@ static bool zero_store(const xed_decoded_inst_t *x, xed_reg_enum_t *base,
 // "Realized" is the conservative arm alone -- merge up to eight bytes with
 // `MOV QWORD PTR, 0` and never allocate a register -- since the wider merge
 // wants a zeroed vector register the surrounding code may not have.
+// The fewest immediate stores that cover `span` contiguous bytes, which is
+// what a run has to beat to be worth reporting. A store covers 1, 2, 4 or 8
+// bytes and nothing between, so a span is covered by writing one store per set
+// bit of its length: popcount(span), since x86 permits the unaligned pieces.
+// That is the whole arithmetic, and getting it wrong is what made this
+// candidate look fifteen times larger than it is -- an eight-byte store over a
+// five-byte span would clobber three bytes the original never wrote, so five
+// bytes costs two stores however they are spelled, and a run of two is already
+// optimal. Beyond eight bytes the remainder rule would be
+// span / 8 + popcount(span % 8), but those runs are refused for wanting a zero
+// vector register.
+static int min_stores_for_span(int64_t span)
+{
+    int n = 0;
+    for (int64_t b = span; b != 0; b >>= 1) {
+        n += (int) (b & 1);
+    }
+    return n;
+}
+
 static void zero_store_runs(const uint8_t *inst, size_t len,
                             const uint8_t *targets, struct tally *t,
                             const char *path, uint64_t vaddr,
@@ -709,6 +729,9 @@ static void zero_store_runs(const uint8_t *inst, size_t len,
                 } else if (span > 8) {
                     tally_refusal(t,
                         "over 8 bytes: needs a zero vector register");
+                } else if (n <= min_stores_for_span(span)) {
+                    tally_refusal(t,
+                        "the run is already the shortest cover of its span");
                 } else {
                     ++t->realized;
                     if (example != NULL && *left > 0) {

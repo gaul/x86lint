@@ -559,7 +559,7 @@ standing this file gives its `-a`-swept binaries.
 | ~~`LOCK CMPXCHG` retry loop whose body is one bitwise op~~ | ~~`LOCK OR`/`AND`/`XOR`~~ | **Done: "CAS loop foldable into LOCK op".** Shape 614 in libxul (466 OR, 132 AND, 16 XOR), 3 libc, 0 elsewhere; realized **19**, all libxul. See the note below -- a 32x collapse with a single cause |
 | ~~vector load whose sole use is the next vector op's source~~ | ~~fold into that operand~~ | **Done: "load foldable into vector op".** Shape 9,298 in libxul, of which 541 were predicted to survive a deadness proof; realized **583** (libcrypto 176, and 0 in libc, libstdc++, go and bash). See the note below -- the 17x gap between shape and finding is the register allocator being right, not the proof being timid. Two scalar siblings are measured in their own row below |
 | ~~GPR load whose sole use is a transfer into the vector file~~ | ~~fold into that transfer~~ | **Done: "load foldable into vector transfer".** `mov r, [m] ; movd/movq xmm, r` and `mov r, [m] ; cvtsi2sd/ss xmm, r`. Shape 470 in libxul and 34 in go; an estimate put the survivors at 16 and 13, and the check reports **10 and 2**, with 0 in libc, libstdc++, libcrypto and bash. The originally published figures were the bare shape (370 and 100). See the note below |
-| adjacent immediate-zero stores at consecutive addresses | one wider store | **Filed as [#30](https://github.com/gaul/x86lint/issues/30).** Re-counted by maximal run rather than by pair: libxul **20,870** runs covering 45,626 stores; libstdc++ 396 runs, libcrypto 339, go 331, libc 91, bash 78. `tools/shapescan` now carries the candidate and sharpens the yield to **7,225** libxul runs that merge to a single store with no new register and no side entry, against the 11,788 the issue quotes -- a different unit (instructions rather than runs) and, more to the point, no side-entry gate, where 1,765 runs turn out to have a branch entering them. Blocked on a policy question, not on proof -- see below |
+| adjacent immediate-zero stores at consecutive addresses | one wider store | **Filed as [#30](https://github.com/gaul/x86lint/issues/30); sized at 528 after a 15x correction.** Re-counted by maximal run rather than by pair: libxul **20,870** runs covering 45,626 stores; libstdc++ 396 runs, libcrypto 339, go 331, libc 91, bash 78. `tools/shapescan` carries the candidate and realizes **488** in libxul plus 40 elsewhere (bash 23, libcrypto 8, go 6, libc 3, libstdc++ 0). It reported 7,225 until 2026-09-26, when the span arithmetic was applied: a store covers 1, 2, 4 or 8 bytes and nothing between, so most spans were never mergeable at all -- see the two notes below. Blocked on a policy question, not on proof |
 
 **The CAS fold, and why its shape overstated it 32x.** The check
 ships, and the collapse from 5,192 `LOCK CMPXCHG` + `JNE` pairs to 614
@@ -698,7 +698,11 @@ behind `check_shift_zero` and
 the set of memory accesses -- was written to forbid. Merging is not
 deleting, nothing stops being written, and every compiler's store-merging
 pass does exactly this, so the rule may simply be about deletion; that is
-the call to make.
+the call to make. The 2026-09-26 finding below strengthens the case: the
+residue is stores to distinct objects, which is a gap no source-level pass can
+close, and the merged store writes byte-for-byte the same values to the same
+addresses -- so it cannot fault where the originals did not, the span being
+contiguous by construction.
 
 **Counting by run rather than by pair is what made the row honest.** An
 eight-store run is one opportunity, not seven, and the pair count also
@@ -711,6 +715,77 @@ empty (21 in libstdc++, 28 in libcrypto) for a reason worth keeping:
 their runs are overwhelmingly *pairs of qword stores* spanning 16 bytes,
 which the no-new-register model cannot improve at all. That is not the
 shape being absent, it is the cheap half of the rewrite not applying.
+
+**Then counting by run turned out not to be enough either, and the fix is one
+line of arithmetic (found 2026-09-26).** The gate accepted any span from 3 to 8
+bytes on the reasoning that it becomes one `MOV QWORD PTR, 0`, and that is
+false for five of those six lengths: a store covers 1, 2, 4 or 8 bytes and
+nothing between, so an eight-byte store over a five-byte span would clobber
+three bytes the original never wrote. The fewest stores covering B contiguous
+bytes is **popcount(B)** -- one per set bit, since x86 permits the unaligned
+pieces -- and a run is worth reporting only when it exceeds that. The realized
+libxul runs, bucketed:
+
+| stores | span | count | popcount(span) | gain |
+| --- | --- | --- | --- | --- |
+| 2 | 5 bytes | **5,297** | 2 (`4+1`) | **none** |
+| 2 | 3 bytes | 946 | 2 (`2+1`) | **none** |
+| 2 | 6 bytes | 435 | 2 (`4+2`) | **none** |
+| 3 | 7 bytes | 59 | 3 (`4+2+1`) | **none** |
+| 2 | 8 bytes | **465** | 1 | 1 store |
+| 3 | 3 bytes | 12 | 2 | 1 store |
+| 2-4 | 4 bytes | 9 | 1 | 1-3 stores |
+| 3 | 6 bytes | 2 | 2 | 1 store |
+
+So **73% of the population was two stores spanning five bytes, which is already
+the shortest cover of its span**, and 7,225 becomes 488 -- the refusal is now a
+line of its own in `shapescan`, and 6,737 + 488 is exactly the old figure.
+Corpus-wide the candidate is **528**, of which 502 are one shape: two dword
+zero stores spanning eight bytes. This is the third row in this file whose
+count was defined by a condition the rewrite imposes and the gate did not
+apply, after the ALU fold's operand role and the LEA fold's encodability, and
+the first where the missing condition was pure arithmetic on the *output*
+rather than a property of the input.
+
+**Why the residue exists at all: the stores are to different objects, which no
+compiler will merge across.** Both toolchains merge within one object and
+neither merges between two, at `-O2`, in the same file:
+
+```c
+struct s2 { int x, y; };
+void struct_members(struct s2 *p) { p->x = 0; p->y = 0; }
+    // clang AND gcc:  movq $0x0,(%rdi)
+
+void two_locals(void) { int a = 0, b = 0; sink(&a, &b); }
+    // clang AND gcc:  movl $0x0,0x4(%rsp) ; movl $0x0,(%rsp)
+```
+
+The store-merging pass is not weak -- it is the object boundary it will not
+cross, and cannot: those are two `alloca`s, and one store spanning both is out
+of bounds for each in the IR's model. Their adjacency exists only after
+stack-slot assignment, by which point the pass has run. **338 of the 465
+improvable libxul sites are rbp/rsp frame slots**, which is exactly that shape:
+
+```
+32004e6: movl $0x0,-0x154(%rbp) ; movl $0x0,-0x158(%rbp)
+3482988: movl $0x0,-0x44(%rbp)  ; movl $0x0,-0x48(%rbp)
+```
+
+The dominant *unmergeable* shape has the same explanation running the other
+way: `struct { int x; char c; }` with both members zeroed gives `movl` +
+`movb`, which is correct output and is what libxul's SIPCC SDP parser is full
+of.
+
+That reframes the policy question in the rewrite's favour, and it is the best
+justification any candidate in this file has: **this is a gap a source-level
+pass structurally cannot close and a binary-level tool can.** Two things still
+open. 47 of the improvable sites go through a pointer rather than the frame,
+and those *should* have merged per the control above -- either an alignment
+refusal or two distinct objects reached through one register, worth one dump
+before the row is called settled. And a caveat for the documentation rather
+than a gate: an eight-byte store over a four-aligned span can straddle a
+64-byte line where two four-byte stores would not, which the tool cannot see
+for a frame slot, `rsp` being unknown at scan time.
 
 Two x86-only wrinkles if it proceeds: a 2-byte span must not be merged,
 since a `66`-prefixed `imm16` store is this tool's own

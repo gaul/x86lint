@@ -793,7 +793,7 @@ rather than merely missing.
 | ~~An audit or advisory finding class~~ | **Done, 2026-09-15: `-c`.** Three kinds, and the hard half was deciding what the class means rather than adding the flag. A check states a verified rewrite (the default, and what makes a non-zero exit meaningful), advice whose fix the tool cannot check, or a review item that is not a rewrite at all. Membership is the checks that already described themselves that way: the SETcc zero-extension and the length-changing prefix stall are advisory, the IBT-bypassing NOTRACK call is security. The naming collision was real -- `-a` already means scan every byte -- so the flag is `-c`. Enabling a class makes its findings count like any other, matching how `-e` findings already behave |
 | ~~Snapshot/integration suite~~ | **Done, 2026-09-15: `snapshots/`, 19 files.** Added as a layer over `driver_test.sh` rather than as a migration, because armlint's shape does not transfer: its `.expected` files replace assertions, and x86lint's 115 `expect`/`reject` lines each state *why* a fixture exists, which a snapshot cannot. So the assertions stay and the snapshots pin everything they do not name -- column widths, ordering, a count on a line nobody wrote a grep for -- across all 19 report surfaces (default, `-a`, `-v`, `--json`, `-f`, `-i`, `-i -v`, `-e`, `-m`, `-c`, `-t`, the PLT skip and the usage text). The work that made them portable was deciding what belongs to the linker rather than the tool: section index, section load address, `--json`'s absolute vaddr, the census's sample addresses, an unpadded target's address, and whether the host's `ld` synthesizes an empty `ISA_1_USED` word or emits no note at all -- the last is why the existing assertion had accepted two spellings. Section-relative offsets, symbol names, byte spellings and every count stay. `make snapshots` regenerates; a missing snapshot is a failure, not a silent create; mismatches print a labelled diff and the run continues, so one invocation shows every changed report. The same commit deleted the suite's own skip: no C compiler now exits 2, because a skip that exits 0 is indistinguishable from a pass to `make` and to CI |
 | ~~JIT-dump → ELF converters~~ | **Done, 2026-09-15: `tools/v8dump2elf.py`, `tools/jitdump2elf.py`, `tools/spidermonkey-jitdump.patch`.** Two converters where armlint has three, because the x86 half of the problem is shaped differently: V8's `--print-opt-code` prints encoding bytes and needs no patch, while **neither SpiderMonkey nor JSC prints a byte on x86-64** -- `IONFLAGS=codegen` is AT&T assembly with offsets, which is exactly why the 2026-09 sweeps in this file were awk over text. Both therefore need a hook, and a hook hands over the same four things whatever the engine (address, length, name, bytes), so one binary container serves both: `"X86J" | u64 addr | u32 size | u32 namelen | name | code`, concatenated with no file header so a killed process's dump still parses up to its truncation. The SpiderMonkey half is shipped as a patch to `jit::Linker::newCode`, the one place every blob passes through, and was **verified against SpiderMonkey's own `IONFLAGS=codegen` listing**: same instructions at the same offsets, with the `movabsq $0x0` patch placeholders carrying their linked values, which is what a linter should see. `--raw` reads a bare blob from the shell's own `disnative(f, file)` for a spot check with nothing patched. The driver needed one fix to make the naming worth anything: attribution skipped ET_REL outright, since an ordinary object leaves every section at address 0 and the names would pile up -- a JIT image is the ET_REL case that *does* carry real addresses, and now gets a per-tier by-function table. First contact: TurboFan 79 findings in 1,328 instructions, SpiderMonkey 560 in 16,992, both dominated by the same class (49 and 360 oversized branch displacements) because neither engine runs the relaxation pass an assembler does. `jit_test.sh` covers the parsers on synthetic dumps, so `make check` needs no engine |
-| Differential against the decoder's own model | `ARMLINT_LIVENESS_SWEEP=1` sweeps all 2^32 A64 encodings asserting that anything Capstone reports as read is never classified dead, and found four real defects on its first run. x86 has no enumerable encoding space, but the same differential is available over XED's iform table: check `flag_concerns` and `reg_kill_iclass` against XED's flag and operand records. The `CMOVcc` mis-model is already known and corrected by hand; nothing has looked for the rest |
+| ~~Differential against the decoder's own model~~ | **Done, 2026-09-26: `x86lint_model_check`, a `make check` layer.** `ARMLINT_LIVENESS_SWEEP=1` sweeps all 2^32 A64 encodings asserting that anything Capstone reports as read is never classified dead, and found four real defects on its first run. x86 has no enumerable encoding space, but XED's static instruction table is an enumeration of every iform it knows, and the oracle is better than a second opinion -- it is the decoder the findings are built on. **Five properties over 10,879 iforms and 17 fixtures; zero disagreements**, which is a weaker result than armlint's and needed its own evidence to be worth anything. See the write-up below |
 | ~~Doc split~~ | **Done, 2026-09-15.** armlint keeps a 554-line README plus a 3,795-line `analyses.md`; x86lint carried everything in one file that had reached 1,542 lines. The 77 implemented analyses moved to [analyses.md](analyses.md) verbatim, and the README's section became a linked two-column table: 729 lines and 1,057. The move was mechanical and checked as such -- every heading has exactly one link and every link a heading, and a token-level diff confirms the only prose that did not cross is the struck-through NOP row, which is not an implemented analysis and stayed in the table |
 
 ## Coverage gaps in shipped checks
@@ -1222,6 +1222,91 @@ being named, and a build using `-mindirect-branch=thunk` without
 attempted: matching the kernel's runtime-patched return thunks by
 enumeration -- `thunk_family` matches the shared `return_thunk` ending, so
 `srso_return_thunk` and its siblings count, and any future spelling will too.
+
+## Model differential (2026-09-26)
+
+**Shipped as `x86lint_model_check`**, called from the unit suite, and the first
+thing in this file whose subject is the tool's own reasoning rather than a
+binary's. Every check proves a register or a flag dead, and those proofs rest on
+claims about what instructions do that were read out of the SDM by hand and
+written into a switch. XED holds the same facts in its operand and flag
+records, so the two can be compared over every node of XED's static instruction
+table.
+
+**It found nothing, and that is the result that needed the most work to make
+trustworthy.** armlint's equivalent found four real defects on its first run;
+this one reports zero disagreements across 10,879 iforms, 311 of them in the
+flag-silent families, plus 17 instruction fixtures. A differential that passes
+immediately is indistinguishable from one that checks nothing, so two things
+stand behind the zero:
+
+* **A positive control inside the property.** `reg_kill_iclass` excludes
+  `CMOVcc`, the shifts and rotates, and `BSF`/`BSR` deliberately; the
+  differential asserts XED records each of those 27 iclasses as a conditional
+  register write, so the conditional-write property cannot hold by XED marking
+  nothing conditional. It would also start failing the day one of them was
+  added to the whitelist.
+* **Fault injection, one per property.** Adding `CMOVZ` to `reg_kill_iclass`
+  produces three disagreements (its two conditional iforms plus the control);
+  adding `ADD` to the flag-silent list produces 62, one per ADD iform carrying
+  a flag record; claiming `INC` writes CF reports `needs XED to record 0x1f
+  written; it records 0x1e`; claiming a shift by CL is unconditional reports the
+  `may_write` marker disagreeing; and giving the INC row DEC's bytes reports the
+  fixture encoding the wrong instruction. Putting an iclass XED does *not* mark
+  conditional into the control list -- `MOVSB` -- reports `the
+  reg_kill_iclass property holds vacuously there`, which is the shape that would
+  catch XED's operand records going flat under an upgrade. Each message names
+  the reasoning rather than an opcode, which is the difference between a failing
+  assert and a usable one.
+
+**The one thing it did catch was in itself**, and it is the reason the 17
+fixtures pin the iclass they encode the way `CHECK_BYTES_ASM` does: `f3 a6`
+decodes as `REPE_CMPSB`, not as `CMPSB` with a prefix attached, so the row
+naming the REP claim was written against an iclass XED does not produce there.
+The claim was being tested against the right bytes either way, but a
+hand-encoding typo would have been invisible without the pin -- a fixture that
+tests a claim against some other instruction, and agrees with XED about it.
+
+**Two hand-made SDM arguments came back confirmed by a second source**, which
+is the closest thing to a finding here. `reg_kill_iclass` omits the shifts
+because the SDM's count-0 pseudocode performs no destination write, and
+`BSF`/`BSR` because the destination is undefined when the source is zero. Both
+exclusions were argued in prose, and XED independently spells both as
+conditional register writes -- 32 of SHL's 168 iforms, 4 of 4 for each bit
+scan. XED also records INC's written set as exactly `PF|ZF|SF|OF`, which is the
+"INC and DEC leave CF alone" that three checks compute their flag gate from.
+
+**What it cannot cover, both stated rather than left as gaps.** The third
+`reg_kill_iclass` exclusion, REP-prefixed string writes, is invisible here:
+that conditionality lives in the prefix, not the iform, so XED's operand
+records call `MOVSB` an unconditional writer. And the per-check `flag_concerns`
+field cannot be checked at all, which this row originally asked for -- it is
+the symmetric difference between the original instruction's flag effects and
+the *replacement's*, and XED knows only the original's. `suboptimal MOV zero`
+declares every arithmetic flag while `MOV` writes none, because the concern is
+what the suggested `XOR` would clobber, so any invariant of the form
+"`flag_concerns` is a subset of what the instruction writes" is false by
+construction. The differential therefore pins the instruction-level claims the
+gates are *built from*, and each check's own declaration stays a matter for its
+unit fixture.
+
+**The `may_write` rows are the ones most likely to earn their keep later.** The
+whole flag walk can treat a written flag set as a kill only because XED folds a
+conditionally written flag into the same written and undefined sets as an
+unconditional one and distinguishes the two solely by the instruction-level
+`may_write` marker. That is an assumption about a dependency's API, not about
+the ISA, and it is the kind that breaks quietly on an upgrade: if the marker
+stopped discriminating, `flags_live_after` would conclude DEAD on flags that a
+shift by a zero CL count leaves untouched. Two fixtures pin it -- `shl eax, cl`
+must carry the marker and `add eax, ecx` must not -- so the next XED bump
+either passes or says why not.
+
+Not done as part of this: the recall direction. Asking XED which iclasses it
+calls unconditional full-width GPR writers that `reg_kill_iclass` omits returns
+about 1,500 names, because the static table records operand templates rather
+than concrete registers and the width test admits every vector write. Omitting
+an iclass costs findings and never soundness, so a list that size is not worth
+filtering into something reviewable.
 
 ## Relocation placeholders (2026-09-26)
 

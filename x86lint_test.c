@@ -8538,6 +8538,26 @@ static void jcc_test(void)
     x86lint_jcc_destroy(jcc);
 }
 
+static void model_check_test(void)
+{
+    // The differential proper: every claim this file's tables make about
+    // instruction semantics must agree with the XED linked into this binary.
+    // A disagreement is a defect in a shipped check's soundness argument, not
+    // a test-fixture problem, so it fails the suite.
+    size_t iforms = 0;
+    size_t flaws = x86lint_model_check(false, &iforms);
+    if (flaws != 0) {
+        // Re-run verbose so the failure names what disagreed, then abort.
+        x86lint_model_check(true, NULL);
+    }
+    assert(flaws == 0);
+
+    // A walk that examined nothing would report zero disagreements too. XED's
+    // table is thousands of nodes; pin the order of magnitude rather than the
+    // count, which moves with every XED release.
+    assert(iforms > 1000);
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -8640,6 +8660,7 @@ int main(int argc, char *argv[])
     build_test();
     thunk_test();
     jcc_test();
+    model_check_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per
     // category rather than as a bare total (a total alone lets one check

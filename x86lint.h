@@ -910,4 +910,30 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                        uint32_t classes, x86lint_finding_fn on_finding,
                        void *ctx);
 
+// Audit this file's own instruction model against XED's records, by walking
+// every node of XED's static instruction table. Returns the number of
+// disagreements; zero means the model agrees with the decoder everywhere it
+// makes a claim. *iforms, when non-NULL, receives the number of iforms the
+// walk examined, so a caller can tell "nothing disagreed" from "nothing was
+// looked at". Prints one line per disagreement when verbose, and nothing
+// otherwise.
+//
+// Every check here proves a register or a flag dead, and the proofs rest on
+// claims about what instructions do -- reg_kill_iclass's list of
+// unconditional full-register writers, and the flag silence that half the
+// multi-instruction rewrites are gated on. Those claims were read out of the
+// SDM by hand and written into a switch, and XED holds the same facts in its
+// own operand and flag records, so the two can be compared. This is
+// armlint's `ARMLINT_LIVENESS_SWEEP=1` differential in the form x86 admits:
+// there is no enumerable encoding space to sweep, but there is a table of
+// every iform XED knows, and it is the decoder the findings are built on
+// rather than a second opinion -- a disagreement means a check is reasoning
+// about an instruction the decoder in the same process describes differently.
+//
+// Fast enough to run unconditionally (XED's table is ten thousand nodes, not
+// 2^32), so it is a `make check` layer rather than an opt-in sweep, and it
+// runs against whatever XED the caller linked rather than the one it was
+// written against.
+size_t x86lint_model_check(bool verbose, size_t *iforms);
+
 #endif

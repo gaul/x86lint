@@ -10813,3 +10813,416 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
     free(branch_targets);
     return errors;
 }
+
+// ---------------------------------------------------------------------------
+// The model differential: this file's hand-written instruction semantics
+// against XED's own records. See x86lint_model_check in x86lint.h for why it
+// exists and what shape of defect it is looking for.
+
+// True when any register operand of this iform is one XED marks as
+// conditionally written. A conditional write leaves the prior value in place
+// whenever the condition does not hold, so it cannot kill the register --
+// which is exactly the claim reg_kill_iclass's whitelist makes about every
+// iclass it admits.
+static bool iform_conditional_reg_write(const xed_inst_t *xi)
+{
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (!xed_operand_is_register(xed_operand_name(op))) {
+            continue;
+        }
+        if (xed_operand_written(op) && xed_operand_conditional_write(op)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Instruction classes whose flag silence a soundness argument in this file
+// rests on: a rewrite substitutes or inserts one of them and must not disturb
+// the flags something later reads, or a gate reasons that the flags visible
+// after the instruction are the ones set before it. The property asserted is
+// that XED holds no flag record for them at all, which is stronger than
+// "writes none" and is what the arguments use -- a flag *read* would make the
+// instruction part of the dependence the gate is reasoning about, and none of
+// these may be.
+//
+// SETcc and CMOVcc belong to the same family of claims and are absent here on
+// purpose: both read flags, so their record is non-empty and the property has
+// to be stated as "writes none" instead. They are checked separately below.
+static const xed_iclass_enum_t model_flag_silent[] = {
+    // "lea writes no flags", the gate that separates LEA foldable into memory,
+    // ADD foldable into LEA, MOV+ADD foldable to LEA and suboptimal LEA from
+    // their ADD-shaped siblings.
+    XED_ICLASS_LEA,
+    // suboptimal MOV zero is gated only because MOV writes no flags where the
+    // XOR it suggests writes all five.
+    XED_ICLASS_MOV,
+    // "movsx/movzx write no flags" -- shift pair foldable into extend,
+    // suboptimal AND immediate.
+    XED_ICLASS_MOVZX, XED_ICLASS_MOVSX, XED_ICLASS_MOVSXD,
+    // the replacements unneeded MOVSX and unneeded MOVSXD name.
+    XED_ICLASS_CBW, XED_ICLASS_CWDE, XED_ICLASS_CDQE,
+    // MULX "writes no flags at all" where the MUL it replaces defines CF and
+    // OF, so missing MULX must prove those dead.
+    XED_ICLASS_MULX,
+    // the BMI2 shifts, whose whole advantage over SHL/SHR/SAR is writing no
+    // flags -- missing SHLX/SHRX/SARX.
+    XED_ICLASS_SHLX, XED_ICLASS_SHRX, XED_ICLASS_SARX,
+    // "vector XOR writes no flags", which is what makes inserting one
+    // architecturally invisible -- missing SSE dependency break, stale VEX
+    // merge operand, suboptimal SSE zero idiom.
+    XED_ICLASS_PXOR, XED_ICLASS_XORPS, XED_ICLASS_XORPD,
+    // replacements that must not introduce a flag write the original lacked:
+    // suboptimal lane-0 extract, load foldable into vector transfer, merging
+    // scalar move, merging narrow move, suboptimal SSE MOV opcode, missing
+    // MOVBE.
+    XED_ICLASS_MOVD, XED_ICLASS_MOVQ, XED_ICLASS_VMOVD, XED_ICLASS_VMOVQ,
+    XED_ICLASS_MOVSS, XED_ICLASS_MOVSD_XMM, XED_ICLASS_MOVAPS,
+    XED_ICLASS_MOVUPS, XED_ICLASS_MOVDQA, XED_ICLASS_MOVDQU,
+    XED_ICLASS_MOVBE,
+    // the VZEROUPPER the AVX-SSE transition finding asks for.
+    XED_ICLASS_VZEROUPPER,
+    // reg_kill_iclass members that carry no arithmetic identity of their own:
+    // a kill is worth nothing if the instruction granting it also perturbed
+    // flags some gate had proven dead.
+    XED_ICLASS_PUSH, XED_ICLASS_POP, XED_ICLASS_BSWAP, XED_ICLASS_XCHG,
+    // the NOP a merged padding run leaves behind.
+    XED_ICLASS_NOP,
+};
+
+// The positive control for the conditional-write property. reg_kill_iclass
+// excludes each of these deliberately, and its comment gives a reason per
+// family; XED must record every one as a conditional register write. Without
+// this list the property above could hold because XED marks nothing
+// conditional, and would go on holding if CMOVcc were added to the whitelist
+// tomorrow.
+//
+// Two of the three exclusions were argued from the SDM by hand and are
+// confirmed here rather than assumed: the shifts, because the count-0
+// pseudocode performs no destination write, and BSF/BSR, because the
+// destination is undefined when the source is zero -- XED spells both as
+// conditional writes. The third, REP-prefixed string writes, is NOT covered:
+// the conditionality lives in the prefix rather than in the iform, so XED's
+// operand records call MOVSB and STOSB unconditional writers and this property
+// cannot speak to that exclusion at all.
+static const xed_iclass_enum_t model_conditional_writers[] = {
+    XED_ICLASS_CMOVB, XED_ICLASS_CMOVBE, XED_ICLASS_CMOVL, XED_ICLASS_CMOVLE,
+    XED_ICLASS_CMOVNB, XED_ICLASS_CMOVNBE, XED_ICLASS_CMOVNL,
+    XED_ICLASS_CMOVNLE, XED_ICLASS_CMOVNO, XED_ICLASS_CMOVNP,
+    XED_ICLASS_CMOVNS, XED_ICLASS_CMOVNZ, XED_ICLASS_CMOVO, XED_ICLASS_CMOVP,
+    XED_ICLASS_CMOVS, XED_ICLASS_CMOVZ,
+    XED_ICLASS_SHL, XED_ICLASS_SHR, XED_ICLASS_SAR, XED_ICLASS_ROL,
+    XED_ICLASS_ROR, XED_ICLASS_RCL, XED_ICLASS_RCR, XED_ICLASS_SHLD,
+    XED_ICLASS_SHRD,
+    XED_ICLASS_BSF, XED_ICLASS_BSR,
+};
+
+// A flag claim a soundness argument in this file makes about one instruction,
+// stated as the sets XED must agree on. `claim` quotes the argument so a
+// failure names the reasoning rather than an opcode. must_write is checked
+// against XED's written set unioned with its undefined set -- the walks treat
+// an undefined write as a write, since the old value is destroyed either way --
+// and must_not_write against that same union, which is what "leaves CF alone"
+// has to mean for a gate to rely on it.
+// `iclass` pins what the bytes encode, for the reason CHECK_BYTES_ASM exists
+// in the test suite: a hand-encoding typo otherwise yields a fixture that
+// tests a claim against some other instruction and agrees with XED about it.
+struct model_flag_claim {
+    const char *claim;
+    uint8_t bytes[4];
+    size_t len;
+    xed_iclass_enum_t iclass;
+    uint32_t must_write;
+    uint32_t must_not_write;
+    uint32_t must_read;
+    bool may_write;
+};
+
+static const struct model_flag_claim model_flag_claims[] = {
+    // "the XOR writes all the arithmetic ones" (suboptimal SETcc inversion),
+    // and the same for the rest of the two-operand ALU: every one of these is
+    // the flag producer a redundant-compare or constant-condition finding
+    // claims recomputes what is already there.
+    { "XOR writes every arithmetic flag",
+      {0x31, 0xc8}, 2, XED_ICLASS_XOR, FLAG_ARITH, 0, 0, false },
+    { "AND writes the flags where dropping it writes none",
+      {0x21, 0xc8}, 2, XED_ICLASS_AND, FLAG_ARITH, 0, 0, false },
+    { "OR writes every arithmetic flag",
+      {0x09, 0xc8}, 2, XED_ICLASS_OR, FLAG_ARITH, 0, 0, false },
+    { "ADD writes every arithmetic flag",
+      {0x01, 0xc8}, 2, XED_ICLASS_ADD, FLAG_ARITH, 0, 0, false },
+    { "SUB writes every arithmetic flag",
+      {0x29, 0xc8}, 2, XED_ICLASS_SUB, FLAG_ARITH, 0, 0, false },
+    { "TEST sets SF/ZF/PF from the value and clears CF/OF",
+      {0x85, 0xc8}, 2, XED_ICLASS_TEST, FLAG_ARITH, 0, 0, false },
+    { "CMP writes every arithmetic flag",
+      {0x39, 0xc8}, 2, XED_ICLASS_CMP, FLAG_ARITH, 0, 0, false },
+    { "NEG writes every arithmetic flag",
+      {0xf7, 0xd8}, 2, XED_ICLASS_NEG, FLAG_ARITH, 0, 0, false },
+    // "INC and DEC leave CF alone and are gated on the rest" -- oversized
+    // ADD/SUB one, ADD foldable into LEA and ADD foldable into memory all
+    // compute their flag gate from exactly this. A CF write here would make
+    // all three unsound.
+    { "INC leaves CF alone and writes the other four",
+      {0xff, 0xc0}, 2, XED_ICLASS_INC, FLAG_ARITH & ~(uint32_t) FLAG_CF, FLAG_CF, 0, false },
+    { "DEC leaves CF alone and writes the other four",
+      {0xff, 0xc8}, 2, XED_ICLASS_DEC, FLAG_ARITH & ~(uint32_t) FLAG_CF, FLAG_CF, 0, false },
+    // "MUL defines CF and OF" where MULX writes nothing -- missing MULX proves
+    // every arithmetic flag dead, so it only needs these two to be in the set.
+    { "MUL defines CF and OF", {0xf7, 0xe1}, 2, XED_ICLASS_MUL, FLAG_CF | FLAG_OF, 0, 0,
+      false },
+    { "IMUL defines CF and OF", {0xf7, 0xe9}, 2, XED_ICLASS_IMUL, FLAG_CF | FLAG_OF, 0, 0,
+      false },
+    // ADC and SBB read CF, which is what makes them the consumers that gate
+    // the INC/DEC rewrites above ("a following adc gates the sub 1 form").
+    { "ADC reads CF", {0x11, 0xc8}, 2, XED_ICLASS_ADC, FLAG_ARITH, 0, FLAG_CF, false },
+    { "SBB reads CF", {0x19, 0xc8}, 2, XED_ICLASS_SBB, FLAG_ARITH, 0, FLAG_CF, false },
+    // "The SDM defines SF/ZF/PF according to the result for every nonzero
+    // masked count" -- redundant TEST after shift, whose whole existence is
+    // that a statically nonzero count closes the hole the CL form leaves.
+    { "a shift by an immediate writes SF/ZF/PF and CF",
+      {0xd1, 0xe0}, 2, XED_ICLASS_SHL, FLAG_CF | FLAG_SF | FLAG_ZF | FLAG_PF, 0, 0, false },
+    // The may_write rows. A shift by CL updates its flags only when the masked
+    // runtime count is nonzero, and a REP-prefixed compare touches none when
+    // RCX is zero; both are why the general fold excludes shifts and why the
+    // walk cannot treat either as a kill.
+    { "a shift by CL writes its flags only conditionally",
+      {0xd3, 0xe0}, 2, XED_ICLASS_SHL, FLAG_CF | FLAG_SF | FLAG_ZF | FLAG_PF, 0, 0, true },
+    { "a REP-prefixed compare writes no flag at a zero count",
+      // XED gives the prefixed form its own iclass rather than decoding CMPSB
+      // with a prefix attached, which is what the pin is here to notice.
+      {0xf3, 0xa6}, 2, XED_ICLASS_REPE_CMPSB, FLAG_ARITH, 0, 0, true },
+};
+
+static bool model_iclass_listed(const xed_iclass_enum_t *list, size_t n,
+                                xed_iclass_enum_t iclass)
+{
+    for (size_t i = 0; i < n; ++i) {
+        if (list[i] == iclass) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Decode one member of a condition-code family -- 0f 9x c0 for SETcc, 0f 4x c0
+// for CMOVcc -- so the flag record can be read. XED exposes a flag set only
+// through a decoded instruction, and these two families are the ones whose
+// claim ("reads the flags, never writes them") needs the written set rather
+// than the presence of a record.
+static bool model_decode_cc(xed_decoded_inst_t *xedd, uint8_t opcode,
+                            unsigned cc)
+{
+    const uint8_t bytes[] = { 0x0f, (uint8_t) (opcode + cc), 0xc0 };
+    decode_init(xedd);
+    return xed_decode(xedd, bytes, sizeof(bytes)) == XED_ERROR_NONE;
+}
+
+size_t x86lint_model_check(bool verbose, size_t *iforms)
+{
+    size_t flaws = 0;
+    size_t examined = 0;
+
+#define MODEL_FLAW(...) \
+    do { \
+        ++flaws; \
+        if (verbose) { \
+            fprintf(stderr, "x86lint model: " __VA_ARGS__); \
+        } \
+    } while (0)
+
+    // Property 1: every iclass reg_kill_iclass admits writes its registers
+    // unconditionally. The walk asks the predicate rather than a copy of its
+    // list, so an iclass added to the switch later is covered without
+    // touching this file's tables.
+    //
+    // Property 3 rides the same walk: every iclass whose flag silence an
+    // argument rests on carries no flag record.
+    const xed_inst_t *base = xed_inst_table_base();
+    size_t flag_silent_iforms = 0;
+    for (unsigned i = 0; i < XED_MAX_INST_TABLE_NODES; ++i) {
+        const xed_inst_t *xi = base + i;
+        xed_iclass_enum_t iclass = xed_inst_iclass(xi);
+        if (iclass == XED_ICLASS_INVALID) {
+            continue;
+        }
+        ++examined;
+        if (reg_kill_iclass(iclass) && iform_conditional_reg_write(xi)) {
+            MODEL_FLAW("reg_kill_iclass admits %s, but XED marks %s as a "
+                       "conditional register write\n",
+                       xed_iclass_enum_t2str(iclass),
+                       xed_iform_enum_t2str(xed_inst_iform_enum(xi)));
+        }
+        if (model_iclass_listed(model_flag_silent,
+                                sizeof(model_flag_silent) /
+                                sizeof(model_flag_silent[0]), iclass)) {
+            ++flag_silent_iforms;
+            if (xed_inst_flag_info_index(xi) != 0) {
+                MODEL_FLAW("%s is relied on to touch no flag, but XED holds a "
+                           "flag record for %s\n",
+                           xed_iclass_enum_t2str(iclass),
+                           xed_iform_enum_t2str(xed_inst_iform_enum(xi)));
+            }
+        }
+    }
+
+    // Every entry of the flag-silent list must name an iclass XED has iforms
+    // for: a misspelled or retired one would otherwise pass by matching
+    // nothing, the silent-failure mode this differential exists to close.
+    for (size_t k = 0; k < sizeof(model_flag_silent) /
+                           sizeof(model_flag_silent[0]); ++k) {
+        bool found = false;
+        for (unsigned i = 0; i < XED_MAX_INST_TABLE_NODES && !found; ++i) {
+            found = xed_inst_iclass(base + i) == model_flag_silent[k];
+        }
+        if (!found) {
+            MODEL_FLAW("the flag-silent list names %s, which XED has no iform "
+                       "for\n", xed_iclass_enum_t2str(model_flag_silent[k]));
+        }
+    }
+
+    // Property 2: the conditional-write property has teeth. Each deliberately
+    // excluded iclass must be absent from the whitelist AND recorded by XED as
+    // a conditional register write on at least one iform.
+    for (size_t k = 0; k < sizeof(model_conditional_writers) /
+                           sizeof(model_conditional_writers[0]); ++k) {
+        xed_iclass_enum_t iclass = model_conditional_writers[k];
+        if (reg_kill_iclass(iclass)) {
+            MODEL_FLAW("reg_kill_iclass admits %s, which is excluded on "
+                       "purpose\n", xed_iclass_enum_t2str(iclass));
+        }
+        bool conditional = false;
+        for (unsigned i = 0; i < XED_MAX_INST_TABLE_NODES && !conditional;
+             ++i) {
+            const xed_inst_t *xi = base + i;
+            conditional = xed_inst_iclass(xi) == iclass &&
+                iform_conditional_reg_write(xi);
+        }
+        if (!conditional) {
+            MODEL_FLAW("XED records no conditional register write for %s, so "
+                       "the reg_kill_iclass property holds vacuously there\n",
+                       xed_iclass_enum_t2str(iclass));
+        }
+    }
+
+    // Property 4: SETcc and CMOVcc read the flags and never write them, which
+    // is what "SETcc writes no flags" (redundant TEST after SETcc, suboptimal
+    // SETcc inversion) and "the condition flags are read, never written"
+    // (missing APX NDD's CMOVcc arm) assert. Checked across all sixteen
+    // condition codes rather than one representative, since the read set is
+    // what varies and a family-wide claim should be tested family-wide.
+    static const struct {
+        const char *name;
+        uint8_t opcode;
+    } cc_families[] = { { "SETcc", 0x90 }, { "CMOVcc", 0x40 } };
+    for (size_t f = 0; f < sizeof(cc_families) / sizeof(cc_families[0]); ++f) {
+        for (unsigned cc = 0; cc < 16; ++cc) {
+            xed_decoded_inst_t xedd;
+            if (!model_decode_cc(&xedd, cc_families[f].opcode, cc)) {
+                MODEL_FLAW("%s cc=%x does not decode\n", cc_families[f].name,
+                           cc);
+                continue;
+            }
+            xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
+            const xed_simple_flag_t *fi =
+                xed_decoded_inst_get_rflags_info(&xedd);
+            if (fi == NULL) {
+                MODEL_FLAW("%s reads the flags a preceding compare set, but "
+                           "XED holds no flag record for it\n",
+                           xed_iclass_enum_t2str(iclass));
+                continue;
+            }
+            if (flag_set_to_mask(xed_simple_flag_get_read_flag_set(fi)) == 0) {
+                MODEL_FLAW("%s is relied on to read the condition flags, and "
+                           "XED records it reading none\n",
+                           xed_iclass_enum_t2str(iclass));
+            }
+            uint32_t written =
+                flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
+                flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi));
+            if (written != 0) {
+                MODEL_FLAW("%s is relied on to write no flag, and XED records "
+                           "it writing 0x%x\n", xed_iclass_enum_t2str(iclass),
+                           written);
+            }
+        }
+    }
+
+    // Property 5: the flag sets the gates name by hand. Where a soundness
+    // argument says which flags an instruction produces -- rather than that it
+    // produces none -- getting that set too small is unsound rather than
+    // merely timid, since the gate then proves the wrong flags dead. Each row
+    // carries the claim its comment makes, and the INC/DEC rows are the
+    // load-bearing ones: three checks rest on those two leaving CF alone.
+    for (size_t k = 0; k < sizeof(model_flag_claims) /
+                           sizeof(model_flag_claims[0]); ++k) {
+        const struct model_flag_claim *c = &model_flag_claims[k];
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, c->bytes, c->len) != XED_ERROR_NONE) {
+            MODEL_FLAW("the fixture for \"%s\" does not decode\n", c->claim);
+            continue;
+        }
+        if (xed_decoded_inst_get_iclass(&xedd) != c->iclass ||
+            xed_decoded_inst_get_length(&xedd) != c->len) {
+            MODEL_FLAW("the fixture for \"%s\" encodes %s at %u bytes, not %s "
+                       "at %zu\n", c->claim,
+                       xed_iclass_enum_t2str(xed_decoded_inst_get_iclass(&xedd)),
+                       xed_decoded_inst_get_length(&xedd),
+                       xed_iclass_enum_t2str(c->iclass), c->len);
+            continue;
+        }
+        const xed_simple_flag_t *fi = xed_decoded_inst_get_rflags_info(&xedd);
+        uint32_t written = 0, read = 0;
+        if (fi != NULL) {
+            written =
+                flag_set_to_mask(xed_simple_flag_get_written_flag_set(fi)) |
+                flag_set_to_mask(xed_simple_flag_get_undefined_flag_set(fi));
+            read = flag_set_to_mask(xed_simple_flag_get_read_flag_set(fi));
+        }
+        const char *name =
+            xed_iclass_enum_t2str(xed_decoded_inst_get_iclass(&xedd));
+        if ((c->must_write & ~written) != 0) {
+            MODEL_FLAW("\"%s\" (%s) needs XED to record 0x%x written; it "
+                       "records 0x%x\n", c->claim, name, c->must_write,
+                       written);
+        }
+        if ((c->must_not_write & written) != 0) {
+            MODEL_FLAW("\"%s\" (%s) needs XED to leave 0x%x alone; it records "
+                       "0x%x written\n", c->claim, name, c->must_not_write,
+                       written);
+        }
+        if ((c->must_read & ~read) != 0) {
+            MODEL_FLAW("\"%s\" (%s) needs XED to record 0x%x read; it records "
+                       "0x%x\n", c->claim, name, c->must_read, read);
+        }
+        // Property 6: the may_write marker, which is the whole reason
+        // flags_live_after can treat a written flag set as a kill. XED folds a
+        // conditionally written flag into the same written and undefined sets
+        // as an unconditional one and distinguishes the two only here, so the
+        // walk keeps a concern live across any may_write instruction. If that
+        // marker stopped discriminating, every conditional flag writer would
+        // start reading as a kill and the walk would conclude DEAD on flags a
+        // shift by a zero CL count leaves untouched.
+        bool may_write = fi != NULL && xed_simple_flag_get_may_write(fi);
+        if (may_write != c->may_write) {
+            MODEL_FLAW("\"%s\" (%s) needs may_write %s; XED says %s\n",
+                       c->claim, name, c->may_write ? "set" : "clear",
+                       may_write ? "set" : "clear");
+        }
+    }
+
+#undef MODEL_FLAW
+
+    if (verbose) {
+        printf("model differential: %zu iforms examined, %zu of them in the "
+               "flag-silent families, %zu disagreement%s\n", examined,
+               flag_silent_iforms, flaws, flaws == 1 ? "" : "s");
+    }
+    if (iforms != NULL) {
+        *iforms = examined;
+    }
+    return flaws;
+}

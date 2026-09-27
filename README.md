@@ -125,6 +125,53 @@ never suggests a rewrite whose soundness would hinge on a fact about a branch
 target it cannot see. The one boundary it reads through is a function return,
 and only for flags -- the ABI guarantees they do not survive it.
 
+**The model differential.** Both scans above rest on claims about what
+instructions do, and those claims were read out of the SDM by hand and written
+into a switch: `reg_kill_iclass`'s list of instructions that overwrite a
+register's upper half unconditionally, and the flag behaviour half the
+multi-instruction rewrites are gated on -- "LEA writes no flags", "INC and DEC
+leave CF alone", "a shift by CL writes its flags only conditionally". XED holds
+the same facts in its own operand and flag records, so the two can be compared,
+and `x86lint_model_check` does it over every node of XED's static instruction
+table. A disagreement means a shipped check is reasoning about an instruction
+the decoder in the same process describes differently.
+
+This is [armlint](https://github.com/gaul/armlint)'s
+`ARMLINT_LIVENESS_SWEEP=1` differential in the form x86 admits. There is no
+enumerable encoding space to sweep -- armlint walks all 2^32 A64 encodings
+against Capstone -- but there is a table of every iform XED knows, and the
+oracle is better than a second opinion: it is the decoder the findings are
+built on. It is also cheap enough (ten thousand nodes, not 2^32) to run on
+every `make check` rather than behind an environment variable, and it runs
+against whatever XED the caller linked rather than the one it was written
+against. Five properties, over 10,879 iforms and 17 instruction fixtures:
+
+| property | what it pins |
+| --- | --- |
+| no conditional register write in any iform of a `reg_kill_iclass` member | a conditional write leaves the prior value in place, so it cannot kill the register |
+| every deliberate exclusion *is* a conditional writer | the positive control: without it the property above could hold because XED marks nothing conditional |
+| no flag record at all for the iclasses whose silence a gate relies on | a substituted or inserted instruction must not disturb flags something later reads |
+| SETcc and CMOVcc read the condition flags and write none, across all 16 condition codes | two checks branch on flags a `SETcc` is claimed to leave in place |
+| the flag sets a gate names by hand are the sets XED records | naming one too small is unsound rather than timid: the gate then proves the wrong flags dead |
+
+The exclusions are the interesting half. `reg_kill_iclass` omits the shifts
+because the SDM's count-0 pseudocode performs no destination write, and
+`BSF`/`BSR` because the destination is undefined when the source is zero; both
+arguments were made by hand, and XED independently spells both as conditional
+writes. The third exclusion, REP-prefixed string writes, is **not** covered:
+that conditionality lives in the prefix rather than in the iform, so XED's
+operand records call `MOVSB` an unconditional writer and the property cannot
+speak to it.
+
+What the differential cannot check is the per-check `flag_concerns`
+declaration, and the reason is worth stating rather than leaving as a gap.
+`flag_concerns` is the symmetric difference between the original instruction's
+flag effects and the *replacement's*, and XED knows only the original's:
+`suboptimal MOV zero` declares every arithmetic flag while `MOV` writes none of
+them, because the concern is what the suggested `XOR` would clobber. So the
+differential pins the instruction-level claims the gates are built from, and
+each check's own declaration stays a matter for its unit fixture.
+
 ## Implemented analyses
 
 Each row links to its full description -- the encoding or sequence it

@@ -2827,6 +2827,55 @@ bool check_endbr64_target(const uint8_t *inst, size_t len, size_t offset)
     return xed_decoded_inst_get_iclass(&xedd) == XED_ICLASS_ENDBR64;
 }
 
+size_t x86lint_mask_relocated(uint8_t *inst, size_t len,
+                              const uint8_t *field_starts,
+                              size_t *bytes_masked)
+{
+    if (bytes_masked != NULL) {
+        *bytes_masked = 0;
+    }
+    if (inst == NULL || field_starts == NULL) {
+        return 0;
+    }
+    // The sweep has to agree with check_instructions' about where each
+    // instruction begins, or the mask lands across a boundary and turns one
+    // placeholder into a stretch of garbage. That is why this lives here
+    // rather than in the driver: both sweeps are linear from inst[0] through
+    // the same decode_init, so they identify the same instructions by
+    // construction, and they re-converge after a mask -- every byte of a
+    // masked run is an invalid first byte, so the resync steps through the
+    // run and lands exactly where this sweep went next.
+    size_t masked = 0;
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            continue;
+        }
+        unsigned ilen = xed_decoded_inst_get_length(&xedd);
+        bool relocated = false;
+        for (unsigned k = 0; k < ilen && i + k < len; ++k) {
+            if (field_starts[i + k] != 0) {
+                relocated = true;
+                break;
+            }
+        }
+        if (relocated) {
+            // The whole instruction, not the field: an opcode with its
+            // immediate cut out decodes as something else entirely, which
+            // would replace a wrong finding with an invented one.
+            memset(inst + i, 0x06, ilen);
+            ++masked;
+            if (bytes_masked != NULL) {
+                *bytes_masked += ilen;
+            }
+        }
+        i += ilen;
+    }
+    return masked;
+}
+
 #define X86LINT_SUMMARY_MAX 64
 
 struct x86lint_summary {

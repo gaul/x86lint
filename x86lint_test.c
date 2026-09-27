@@ -8016,6 +8016,65 @@ static void census_test(void)
     x86lint_census_destroy(NULL);
 }
 
+static void mask_relocated_test(void)
+{
+    // mov rdi, imm32 (7 bytes) ; jmp rel32 (5) ; xchg eax, ecx (2). The first
+    // two carry the zero an assembler leaves for the linker.
+    static const uint8_t code[] = {
+        0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00,
+        0xe9, 0x00, 0x00, 0x00, 0x00,
+        0x87, 0xc8,
+    };
+    // Read as values, the placeholders are two findings: the imm32 fits a
+    // shorter MOV encoding, and the rel32 fits rel8. Both are wrong once the
+    // linker writes the field, and acting on either corrupts the relocation.
+    assert(check_instructions(code, sizeof(code), 0, false, NULL, 0,
+        X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL) == 3);
+
+    uint8_t buf[sizeof(code)];
+    uint8_t starts[sizeof(code)];
+    memcpy(buf, code, sizeof(code));
+    memset(starts, 0, sizeof(starts));
+    starts[3] = 1;      // the MOV's imm32
+    starts[8] = 1;      // the JMP's rel32
+    size_t bytes = 0;
+    assert(x86lint_mask_relocated(buf, sizeof(buf), starts, &bytes) == 2);
+    assert(bytes == 12);
+    // The whole instruction each time, not the four field bytes: a C7 opcode
+    // with its immediate cut out decodes as something else.
+    for (size_t i = 0; i < 12; ++i) {
+        assert(buf[i] == 0x06);
+    }
+    assert(buf[12] == 0x87 && buf[13] == 0xc8);
+    // What is left is the one finding that was never about a placeholder.
+    assert(check_instructions(buf, sizeof(buf), 0, false, NULL, 0,
+        X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL) == 1);
+
+    // A mark on an instruction's first byte reaches it too -- the field of a
+    // branch-relative relocation can begin one byte in, but a R_X86_64_64 on
+    // a bare .quad begins at the start.
+    memcpy(buf, code, sizeof(code));
+    memset(starts, 0, sizeof(starts));
+    starts[7] = 1;
+    assert(x86lint_mask_relocated(buf, sizeof(buf), starts, &bytes) == 1);
+    assert(bytes == 5);
+    assert(buf[0] == 0x48 && buf[7] == 0x06 && buf[12] == 0x87);
+
+    // No marks, no masking: the linked case, where the scan must be exactly
+    // what it was before this existed.
+    memcpy(buf, code, sizeof(code));
+    memset(starts, 0, sizeof(starts));
+    assert(x86lint_mask_relocated(buf, sizeof(buf), starts, &bytes) == 0);
+    assert(bytes == 0);
+    assert(memcmp(buf, code, sizeof(code)) == 0);
+
+    bytes = 99;
+    assert(x86lint_mask_relocated(NULL, 0, starts, &bytes) == 0);
+    assert(bytes == 0);
+    assert(x86lint_mask_relocated(buf, sizeof(buf), NULL, NULL) == 0);
+    assert(memcmp(buf, code, sizeof(code)) == 0);
+}
+
 static void jcc_test(void)
 {
     // The boundary condition, one two-byte Jcc placed three ways. The scan
@@ -8290,6 +8349,7 @@ int main(int argc, char *argv[])
     summary_functions_test();
     finding_callback_test();
     census_test();
+    mask_relocated_test();
     jcc_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

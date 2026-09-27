@@ -524,6 +524,33 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Relocation fixtures, a matched pair. Both assemble to byte-identical .text;
+# the only difference is whether a relocation covers the two placeholder
+# fields, so the scan's disagreement between them is entirely the exclusion
+# under test and not the bytes.
+#
+# The placeholders are what the stakes are: read as values, `mov rdi, 0` looks
+# like an oversized MOV encoding and `jmp +0` like a rel32 that would fit
+# rel8, and both suggestions would corrupt the field the linker is about to
+# write. The trailing xchg carries no relocation and must survive, or the
+# exclusion is just a mute button.
+cat >"$dir/reloc.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x48, 0xc7, 0xc7          # mov rdi, imm32 (REX.W C7 /0) ...
+    .long extdata                   # ... whose imm32 a relocation writes
+    .byte 0xe9                      # jmp rel32 ...
+    .long extfunc - . - 4           # ... whose rel32 a relocation writes
+    .byte 0x87, 0xc8                # xchg eax, ecx: unrelocated, a finding
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+sed -e 's/^    \.long extdata.*$/    .long 0/' \
+    -e 's/^    \.long extfunc - \. - 4.*$/    .long 0/' \
+    "$dir/reloc.s" >"$dir/noreloc.s"
+
 # Fixtures for the JCC-erratum audit (-j), which is a verdict about where
 # jumps landed rather than about what they encode, so each one is built by
 # placing the same two-byte Jcc at chosen offsets from a 32-byte boundary.
@@ -625,6 +652,8 @@ if ! cc -nostdlib -pie -Wl,--build-id=none \
         -o "$dir/cetso.so" "$dir/cetso.s" ||
    ! cc -c -o "$dir/clean.o" "$dir/clean.s" ||
    ! cc -c -o "$dir/jccpad.o" "$dir/jccpad.s" ||
+   ! cc -c -o "$dir/reloc.o" "$dir/reloc.s" ||
+   ! cc -c -o "$dir/noreloc.o" "$dir/noreloc.s" ||
    ! cc -c -o "$dir/finding.o" "$dir/finding.s"; then
     echo "driver_test.sh: fixture build failed" >&2
     exit 2
@@ -926,6 +955,31 @@ reject '^Optimization opportunities by function:$' \
 run 2 -e "$dir/clean.o"
 expect 'requires a linked executable or shared object'
 
+# An unlinked object's immediates and displacements are not values, and a
+# peephole that reads one is reasoning about a number that will not be there at
+# run time. The pair of fixtures has byte-identical .text: with the
+# relocations, both placeholder instructions are excluded and only the
+# unrelocated xchg is reported; without them, the same bytes draw the two
+# findings whose rewrites would corrupt the field the linker writes.
+run 1 "$dir/reloc.o"
+expect '^ +1 +oversized XCHG encoding$' "the unrelocated finding survives"
+reject 'oversized MOV encoding' "a finding on a relocated immediate"
+reject 'oversized branch displacement' "a finding on a relocated displacement"
+expect '^2 instructions were excluded \(12 of the undecodable bytes above\): a relocation rewrites'
+expect '^1 optimization opportunities in 1 instructions$'
+
+run 1 "$dir/noreloc.o"
+expect '^ +1 +oversized MOV encoding$' "the placeholder read as a value"
+expect '^ +1 +oversized branch displacement$' "the placeholder read as a value"
+expect '^ +1 +oversized XCHG encoding$'
+reject 'instructions were excluded' "an exclusion with nothing to exclude"
+expect '^3 optimization opportunities in 3 instructions$'
+
+# The exclusion is per instruction, not per section: a relocated object whose
+# other instructions are clean still gets scanned.
+run 0 "$dir/clean.o"
+reject 'instructions were excluded' "an exclusion on a relocation-free object"
+
 # The JCC-erratum audit (-j). A verdict about the whole binary, so the three
 # fixtures differ only in where their jumps sit relative to a 32-byte
 # boundary; see their comments for the arithmetic each one realizes.
@@ -1028,6 +1082,8 @@ snapshot jcc-present -j "$dir/jccpad"
 snapshot jcc-partial -j -v "$dir/jccmixed"
 snapshot jcc-unplaced -j "$dir/clean.o"
 snapshot relocatable -v "$dir/finding.o"
+snapshot reloc-excluded -v "$dir/reloc.o"
+snapshot reloc-unmarked -v "$dir/noreloc.o"
 snapshot usage
 
 # Tool-failure paths: usage, unknown flag, dangling or unknown -m value,

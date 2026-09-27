@@ -277,6 +277,59 @@ static uint8_t *load_section(FILE *f, const Elf64_Shdr *shdr,
     return buf;
 }
 
+// One byte per byte of section `shndx`, nonzero where a relocation field
+// begins, for x86lint_mask_relocated. NULL means nothing relocates into the
+// section -- the case for every linked binary's .text, where the only RELA
+// sections are .rela.dyn and .rela.plt and neither names a target section --
+// so this costs an allocation only where it has work to do. *nrelocs counts
+// the fields found, and *oom distinguishes "no relocations" from "could not
+// tell", which the caller must not treat alike: unmasked relocated bytes are
+// findings that would corrupt a relocation if applied.
+static uint8_t *relocated_field_starts(FILE *f, const Elf64_Ehdr *ehdr,
+                                       uint64_t shnum, uint64_t shndx,
+                                       uint64_t sec_size, uint64_t file_size,
+                                       size_t *nrelocs, bool *oom)
+{
+    uint8_t *map = NULL;
+    *nrelocs = 0;
+    *oom = false;
+    for (uint64_t i = 0; i < shnum; ++i) {
+        Elf64_Shdr sh;
+        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
+                     sizeof(sh))) {
+            break;
+        }
+        if (sh.sh_type != SHT_RELA || sh.sh_info != shndx ||
+            sh.sh_entsize != sizeof(Elf64_Rela) || sh.sh_size == 0) {
+            continue;
+        }
+        uint8_t *buf = load_section(f, &sh, file_size);
+        if (buf == NULL) {
+            *oom = true;
+            break;
+        }
+        if (map == NULL && (map = calloc(sec_size, 1)) == NULL) {
+            free(buf);
+            *oom = true;
+            break;
+        }
+        size_t n = sh.sh_size / sizeof(Elf64_Rela);
+        for (size_t r = 0; r < n; ++r) {
+            Elf64_Rela rela;
+            memcpy(&rela, buf + r * sizeof(rela), sizeof(rela));
+            // A field starts inside the instruction that encodes it, so the
+            // offset alone locates the instruction; the field's width, which
+            // varies by relocation type, adds nothing.
+            if (rela.r_offset < sec_size) {
+                map[rela.r_offset] = 1;
+                ++*nrelocs;
+            }
+        }
+        free(buf);
+    }
+    return map;
+}
+
 // One word from the GNU property note (an NT_GNU_PROPERTY_TYPE_0 note named
 // "GNU"): pr_type selects which -- GNU_PROPERTY_X86_FEATURE_1_AND holds the
 // CET bits the loader enables enforcement from, GNU_PROPERTY_X86_ISA_1_NEEDED
@@ -1859,6 +1912,8 @@ int main(int argc, char **argv)
     x86lint_census *census_data = NULL;
     x86lint_jcc *jcc_data = NULL;
     uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
+    uint64_t relocated_insts = 0;   // instructions a relocation will rewrite
+    uint64_t relocated_bytes = 0;   // and the bytes they hold
     struct evidence_build evidence = {NULL, 0, 0};
     size_t evidence_funcs = 0;
     size_t evidence_fdes = 0;
@@ -2451,6 +2506,33 @@ int main(int argc, char **argv)
             continue;
         }
 
+        // Exclude the instructions a relocation will rewrite, before the
+        // function masking, so the sweep that finds their boundaries reads
+        // the section exactly as the assembler emitted it. Unlike its
+        // sibling below, a failure here is fatal rather than degrading to the
+        // full sweep: masking out non-function bytes only suppresses noise,
+        // where this suppresses advice that would corrupt a relocation if
+        // anyone acted on it, and emitting that quietly is the one outcome
+        // this tool must not choose.
+        size_t sec_relocs = 0;
+        bool reloc_oom = false;
+        uint8_t *reloc_map = relocated_field_starts(f, &ehdr, shnum, i,
+            shdr.sh_size, file_size, &sec_relocs, &reloc_oom);
+        if (reloc_oom) {
+            fprintf(stderr, "%s: failed to read the relocations of section "
+                "%lu; cannot tell which instructions they rewrite\n", path,
+                (unsigned long) i);
+            free(reloc_map);
+            goto out;
+        }
+        if (reloc_map != NULL) {
+            size_t rbytes = 0;
+            relocated_insts += x86lint_mask_relocated(buf, shdr.sh_size,
+                reloc_map, &rbytes);
+            relocated_bytes += rbytes;
+            free(reloc_map);
+        }
+
         if (funcs != NULL) {
             mask_non_function_bytes(buf, &shdr, i, ehdr.e_type == ET_REL,
                 funcs, nfuncs);
@@ -2625,6 +2707,15 @@ int main(int argc, char **argv)
         } else if (funcs != NULL) {
             printf("scan restricted to %zu function symbols "
                 "(-a scans every byte)\n", nfuncs);
+        }
+        // What the relocations took out, stated rather than left to be
+        // inferred from the undecodable-byte count they inflate.
+        if (relocated_insts != 0) {
+            printf("%lu instruction%s excluded (%lu of the undecodable bytes "
+                "above): a relocation rewrites the immediate or displacement "
+                "they encode\n", (unsigned long) relocated_insts,
+                relocated_insts == 1 ? " was" : "s were",
+                (unsigned long) relocated_bytes);
         }
         if (!census) {
             printf("%d optimization opportunities in %zu instructions\n",

@@ -319,6 +319,24 @@ scanning just those would silently miss almost all code -- so stripped
 binaries scan whole sections exactly as before. An unsized assembly label
 extends to the next function's start, keeping coverage conservative.
 
+An instruction whose bytes a relocation will rewrite is excluded whatever the
+symbols say, because its immediate or displacement is not a value. It is zero,
+or a bare addend, waiting for the linker, and a peephole that reads one is
+reasoning about a number that will not be there at run time. Two findings on
+a Fedora kernel module show the stakes: 143 relocated `e9 00000000` -- every
+return in a `-mfunction-return=thunk-extern` build -- whose rel32 placeholder
+reads as a displacement that would fit `rel8`, and 132 `mov r64, imm32`
+carrying `R_X86_64_32S`, where the shorter encoding the finding asks for
+cannot express the sign-extended kernel address the linker is about to write.
+Acting on either corrupts the relocation, which makes these worse than noise;
+they were 275 of that module's 314 findings, and excluding them leaves 31.
+The whole instruction goes, not the field, since an opcode with its immediate
+cut out decodes as something else entirely -- so the exclusion also stops any
+multi-instruction window from reasoning across a placeholder. A linked binary
+has no relocations into `.text` (only `.rela.dyn` and `.rela.plt`, neither of
+which names a target section), so this costs nothing there and the summary
+line appears only when something was actually excluded.
+
 The dynamic linker's import glue is skipped whatever the symbols say: the
 ELF `.plt`, `.iplt` and `.plt.*` sections are emitted from a fixed template
 by `ld`, so their shape is the dynamic-linking ABI's business and no source

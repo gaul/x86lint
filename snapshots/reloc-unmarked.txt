@@ -1,0 +1,18 @@
+== section N .text: vaddr 0x0, 14 bytes ==
+oversized MOV encoding at offset: 0x0: mov rdi, 0x0
+  48 c7 c7 00 00 00 00
+
+oversized branch displacement at offset: 0x7: jmp 0xc
+  e9 00 00 00 00
+
+oversized XCHG encoding at offset: 0xc: xchg eax, ecx
+  87 c8
+
+Optimization opportunities by type:
+       1  oversized MOV encoding
+       1  oversized XCHG encoding
+       1  oversized branch displacement
+
+scan restricted to 1 function symbols (-a scans every byte)
+3 optimization opportunities in 3 instructions
+exit status: 1

@@ -264,6 +264,41 @@ bool check_oversized_vex(const xed_decoded_inst_t *xedd);
 // target materialized by LEA leaves no relocation behind)
 bool check_endbr64_target(const uint8_t *inst, size_t len, size_t offset);
 
+// Overwrite every instruction whose encoding a relocation will rewrite, so
+// that the scan neither reads a placeholder as a value nor suggests a rewrite
+// the link would undo. `field_starts` is one byte per byte of `inst`, nonzero
+// where a relocation field begins; the caller supplies it because only the
+// container knows, exactly as with check_endbr64_target above. Returns the
+// number of instructions masked.
+//
+// An unlinked object's immediates and displacements are not values. They are
+// zero, or a bare addend, waiting for the linker, and a peephole that reads
+// one is reasoning about a number that will not be there at run time. On a
+// Fedora kernel module (amt.ko, 8,441 instructions) 275 of 314 findings were
+// this: 143 relocated `e9 00000000` -- every return in a
+// -mfunction-return=thunk-extern build -- whose rel32 placeholder reads as a
+// branch to the next instruction and as a displacement that would fit rel8,
+// and 132 `mov r64, imm32` carrying R_X86_64_32S, where the narrower encoding
+// the finding asks for cannot express the sign-extended kernel address the
+// linker is about to write. Both are worse than noise: applying either
+// corrupts the relocation.
+//
+// The masked bytes become 0x06, an opcode invalid in 64-bit mode, which is
+// what the ELF driver already writes over bytes outside the function symbols.
+// That spelling is load-bearing rather than decorative: the scan's
+// decode-and-resync loop skips the instruction, tallies its bytes as
+// undecodable so the excluded volume stays visible in the report, and -- the
+// part a value-level suppression could not give -- treats it as a barrier, so
+// no multi-instruction window reasons across a placeholder either.
+//
+// Returns the number of instructions masked, and through `bytes_masked` (when
+// non-NULL) how many bytes they held, so a caller can say how much of the
+// report's undecodable-byte count is this exclusion rather than data in the
+// code section -- on that kernel module it is 5,061 of 5,061.
+size_t x86lint_mask_relocated(uint8_t *inst, size_t len,
+                              const uint8_t *field_starts,
+                              size_t *bytes_masked);
+
 // A by-type tally of findings accumulated across one or more
 // check_instructions runs, so a driver can print a by-prevalence summary.
 // Opaque; created and destroyed by the caller. A NULL summary is accepted

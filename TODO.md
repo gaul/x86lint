@@ -1061,6 +1061,55 @@ Nothing in the table flags them today, and the finding count barely moved
 (432 → 435), but a future "useless prefix" check would light up on every
 mitigated binary. It needs to know about this.
 
+## Relocation placeholders (2026-09-26)
+
+**A false positive in the default scan on relocatable input, now fixed**
+(`x86lint_mask_relocated`). An unlinked object's immediates and
+displacements are not values -- they are zero, or a bare addend, waiting for
+the linker -- and every check that reads one was reasoning about a number
+that will not be there at run time. Found by accident while probing
+candidate verdict modes on a Fedora kernel module, which is the input that
+makes it loud: `amt.ko`, 8,441 instructions, **275 of 314 findings were
+placeholders**.
+
+| class | count | what the finding asked for |
+| --- | --- | --- |
+| oversized branch displacement | 143 | shorten a relocated `e9 00000000` to rel8 -- and in a `-mfunction-return=thunk-extern` build that is *every return in the module* |
+| oversized MOV encoding | 132 | narrow a `mov r64, imm32` whose `R_X86_64_32S` will hold a sign-extended kernel address the shorter form cannot express |
+
+Both are worse than noise: applying either corrupts the field the linker
+writes. After the fix the module reports 31, and the three classes that
+remain (`oversized ADD/SUB one` 29, two constant conditions) are on
+unrelocated instructions.
+
+**The whole instruction is masked, not the field**, with the same `0x06`
+the function-range masking uses. An opcode with its immediate cut out
+decodes as something else entirely, so a field-level suppression would
+replace a wrong finding with an invented one; and the byte-level spelling
+buys the part a value-level suppression could not, since the scan's
+decode-and-resync treats the masked run as a **barrier** and no
+multi-instruction window reasons across a placeholder either. The excluded
+volume lands in the report's undecodable-byte count, and a summary line says
+how much of that count it is (5,061 of 5,061 on the module).
+
+**Deliberately not applied to `-i` or `-j`.** The census tallies isa-sets and
+the JCC audit measures lengths and addresses; neither claim depends on an
+immediate's value, and masking would drop real instructions from both
+tallies. The census still sees all 8,441 instructions of that module.
+
+**Costs nothing on linked input, by construction.** A linked binary's only
+RELA sections are `.rela.dyn` and `.rela.plt`, and neither names a target
+section, so no map is even allocated and the summary line never appears --
+confirmed by every existing snapshot being byte-identical across the change.
+
+**Still open: the same class where nothing marks it.** SpiderMonkey's
+`pushArgWithPatch` sentinels are placeholders in *final* code (see the JIT
+corpora section), and no relocation covers them because there is no link
+coming. 7,230 of Octane's 11,178 oversized-immediate findings are that, and
+this fix cannot reach them -- a JIT-aware suppression would have to
+recognize the shape (`movabs` of 0 or -1 whose destination is immediately
+pushed or called) rather than read a table.
+
 ## Investigated and closed (2026-08 sweep)
 
 Candidates measured and set aside, recorded so they are not

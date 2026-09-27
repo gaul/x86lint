@@ -1,0 +1,5 @@
+JCC erratum audit: 385 instructions, 0 undecodable bytes skipped
+  Jcc 128 + JMP 0: 0 touch a 32-byte boundary (0.0%), 8.00 expected unpadded
+  verdict: mitigation present (no jump touches a boundary)
+  not in the verdict's scope: 0 fused compare+Jcc pairs (0 touching), 0 CALL (0), 1 RET (0)
+exit status: 0

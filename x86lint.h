@@ -526,6 +526,130 @@ const char *x86lint_target_name(enum x86lint_target target);
 // Parse a -t name; returns false and leaves *out alone if it is not one.
 bool x86lint_target_parse(const char *name, enum x86lint_target *out);
 
+// A tally of how a binary's jumps fall against 32-byte boundaries, for
+// auditing whether it was built with the JCC-erratum mitigation (the driver's
+// -j). Opaque; NULL is accepted everywhere.
+//
+// Skylake-derived cores cannot cache a jump in the decoded-icache when the
+// jump's bytes cross a 32-byte boundary or its last byte is the last byte of
+// one. Fetch falls back to legacy decode, and the cost is per execution, so a
+// hot loop pays it every iteration. The affected population is a list of
+// models and steppings rather than a range -- V8 enumerates it in
+// src/base/cpu/cpu-x86.cc, and it comes to Skylake through Comet Lake with
+// Cascade Lake among them. Ice Lake and later do not have the erratum and no
+// AMD core ever did.
+//
+// This is a verdict rather than a check because the fix is padding. Every
+// other analysis here reads an instruction and says its bytes could have been
+// better; here the bytes are fine and what is wrong is where they landed.
+// Moving a jump off a boundary means inserting NOPs or prefixes *earlier*,
+// which shifts everything after it, so the actionable advice is one build
+// flag and not a rewrite: gas's -mbranches-within-32B-boundaries (that is,
+// -malign-branch-boundary=32 -malign-branch=jcc+fused+jmp), LLVM's flag of
+// the same name, Go's assembler (padJump in
+// src/cmd/internal/obj/x86/asm6.go, on for compiler output and off for
+// hand-written assembly), V8's Assembler::AlignForJCCErratum. So the report
+// is one verdict for the whole binary, not a finding per site -- which is
+// also the only honest shape, since 10-13% of the jumps in an unmitigated
+// binary touch a boundary and no one of them is individually at fault.
+//
+// What makes the verdict sound without a calibrated threshold is that
+// unmitigated code is exactly uniform with respect to the boundary. A jump of
+// length L occupies [s, s+L-1] and touches a boundary precisely when
+// s mod 32 >= 32 - L, which is L of the 32 residues: it contributes L/32
+// expected witnesses, and the expectation for a whole scan is therefore its
+// jump bytes over 32 -- an arithmetic null hypothesis, not a fitted one.
+// Measured against it on 2026-09-26: bash, glibc, libcrypto, ld.so and libxul
+// all land within 5% of the expectation (10.7-12.9% of their Jcc and JMP), a
+// gas-mitigated object reports 0 of 2,366, and /bin/go reports 92 of 165,353
+// against an expected 16,582, because Go pads what its compiler emits and not
+// what its runtime hand-writes.
+//
+// The evidence is asymmetric, and the verdicts below are shaped accordingly:
+// a single witness proves the mitigation did not cover the code that holds
+// it, while the absence of witnesses means nothing until enough jumps have
+// been examined for chance to have produced one.
+typedef struct x86lint_jcc x86lint_jcc;
+
+// What kind of transfer a tally counts. The verdict rests on COND and UNCOND
+// alone: those are what every mitigation pads and their count is unambiguous.
+// CALL and RET are padded by Go's assembler and not by gas, and which
+// compare+Jcc pairs actually macro-fuse depends on the core and on operand
+// shape -- an approximate predicate must not be allowed to manufacture a
+// witness. Both are reported beside the verdict and neither decides it.
+enum x86lint_jcc_kind {
+    X86LINT_JCC_COND,     // Jcc -- XED's COND_BR, which also holds the LOOPs
+                          // and JRCXZ that compilers do not emit
+    X86LINT_JCC_UNCOND,   // JMP, direct or indirect
+    X86LINT_JCC_CALL,     // CALL, direct or indirect
+    X86LINT_JCC_RET,      // RET
+    // A macro-fusible compare immediately followed by a Jcc, measured as one
+    // unit because the pair can straddle a boundary when neither instruction
+    // does. Its Jcc is also counted under X86LINT_JCC_COND.
+    X86LINT_JCC_FUSED,
+};
+
+#define X86LINT_JCC_KINDS (X86LINT_JCC_FUSED + 1)
+
+enum x86lint_jcc_verdict {
+    // No jumps, or too few for the absence of witnesses to mean anything.
+    X86LINT_JCC_UNKNOWN,
+    X86LINT_JCC_MITIGATED,  // no witness, over a scan large enough to expect one
+    X86LINT_JCC_PARTIAL,    // witnesses, but far below what chance predicts:
+                            // some of the code was padded and some was not,
+                            // which is what a mixed link looks like -- and
+                            // what Go's own binaries look like
+    X86LINT_JCC_ABSENT,     // witnesses at the rate chance predicts
+};
+
+x86lint_jcc *x86lint_jcc_create(void);
+void x86lint_jcc_destroy(x86lint_jcc *jcc);
+
+// Linear-sweep decode of `len` bytes, tallying every transfer by kind and by
+// whether it touches a 32-byte boundary. An undecodable byte is skipped and
+// the sweep resyncs, tallied like the lint scan's skipped count.
+//
+// `vaddr` must be the address inst[0] will hold when it runs, since the
+// boundaries are absolute: a linked executable's sh_addr (a PIE's load bias
+// is page-aligned, so it cannot change any address mod 32), or the real
+// address a JIT reported for its code. An ordinary relocatable object's
+// section satisfies this only if the section is at least 32-byte aligned,
+// which gas raises .text to precisely so that the padding it just inserted
+// survives the link; below that the linker may place the section at 16 mod 32
+// and half the analysis is wrong. Deciding that is the caller's job.
+void x86lint_jcc_scan(x86lint_jcc *jcc, const uint8_t *inst, size_t len,
+                      uint64_t vaddr);
+
+// Print the audit: the scope, the witnesses against the expectation, the
+// verdict, and the classes that do not decide it. Returns what
+// x86lint_jcc_findings would.
+int x86lint_jcc_print(const x86lint_jcc *jcc, enum x86lint_target target,
+                      bool verbose);
+
+// The findings this audit contributes: 1 when the mitigation is missing and
+// `target` is a core that has the erratum, 0 otherwise. The erratum is one
+// named group of cores, which makes this the only place a -t value decides
+// whether something is a finding at all rather than which rewrite is worth
+// making -- -t skylake is what turns the audit into something a build can fail
+// on. Every other target leaves it informational, the conservative GENERIC
+// default included: GENERIC assumes every penalty applies, and applied here
+// that would fail every binary on a system that may never run on an affected
+// core.
+int x86lint_jcc_findings(const x86lint_jcc *jcc, enum x86lint_target target);
+
+enum x86lint_jcc_verdict x86lint_jcc_verdict(const x86lint_jcc *jcc);
+
+size_t x86lint_jcc_count(const x86lint_jcc *jcc, enum x86lint_jcc_kind kind);
+size_t x86lint_jcc_touching(const x86lint_jcc *jcc,
+                            enum x86lint_jcc_kind kind);
+size_t x86lint_jcc_instructions(const x86lint_jcc *jcc);
+size_t x86lint_jcc_skipped(const x86lint_jcc *jcc);
+
+// Witnesses expected in the verdict's scope if the code were laid out with no
+// regard to the boundary: the scope's jump bytes over 32 (see above), scaled
+// by 100 so the caller needs no floating point.
+uint64_t x86lint_jcc_expected_centi(const x86lint_jcc *jcc);
+
 // How many instructions the copy folds -- missing APX NDD and MOV+ADD
 // foldable to LEA, which divide the same pairs by flag liveness -- may
 // examine, counting the copy and its consumer: 2 matches only adjacent

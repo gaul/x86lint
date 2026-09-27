@@ -1,0 +1,6 @@
+JCC erratum audit: 0 instructions, 0 undecodable bytes skipped
+  Jcc 0 + JMP 0: 0 touch a 32-byte boundary, 0.00 expected unpadded
+  verdict: not enough code to judge (0.00 witnesses expected; 8 needed)
+  not in the verdict's scope: 0 fused compare+Jcc pairs (0 touching), 0 CALL (0), 0 RET (0)
+  1 executable section skipped: relocatable and aligned under 32, so the boundaries are the linker's to choose
+exit status: 0

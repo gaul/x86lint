@@ -1,0 +1,7 @@
+JCC erratum audit: 401 instructions, 0 undecodable bytes skipped
+  Jcc 144 + JMP 0: 1 touch a 32-byte boundary (0.7%), 9.00 expected unpadded
+  verdict: partially mitigated (witnesses far below chance -- mixed objects, or a toolchain that pads compiler output and not hand-written assembly)
+  not in the verdict's scope: 0 fused compare+Jcc pairs (0 touching), 0 CALL (0), 1 RET (0)
+  informational: the erratum is Skylake through Comet Lake, Cascade Lake included; pass -t skylake to count it
+    touching at 0xADDR
+exit status: 0

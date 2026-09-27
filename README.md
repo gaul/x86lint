@@ -530,19 +530,20 @@ memory; the totals close the document because the scan only knows them then.
 Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
-than half a document. `--json` describes the peephole scan alone: `-v`, `-i`
-and `-e` are separate reports whose output would interleave with it, and the
-driver refuses the combination rather than choosing for the caller.
+than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
+`-e` and `-j` are separate reports whose output would interleave with it, and
+the driver refuses the combination rather than choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
-pads, and `-i` to replace the lint scan with an ISA census of the binary;
-see the next sections.
+pads, `-i` to replace the lint scan with an ISA census of the binary, and `-j`
+to replace it with a JCC-erratum verdict; see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
 broken run. `-e` findings set the exit status like any other; the `-i` census
-is informational and never sets it.
+never sets it, and the `-j` audit sets it only under `-t skylake`, the one
+target that has the erratum.
 
 ## ENDBR64 (CET IBT) verification
 
@@ -761,6 +762,92 @@ emits no FDEs for Haskell code, so a shellcheck census flags all 30864
 x87 hits (correctly: they are info tables), but real Haskell code is
 equally unlabeled there. Evidence quality varies by build; when a
 binary has none at all, nothing is labeled and the line says so.
+
+## JCC erratum audit (`-j`)
+
+Skylake-derived cores cannot cache a jump in the decoded-icache when the
+jump's bytes cross a 32-byte boundary or its last byte is the last byte of
+one; fetch falls back to legacy decode, and the cost is paid per execution,
+so a hot loop pays it every iteration. `x86lint -j` reports whether a binary
+was built with the assembler padding that avoids it.
+
+This is the one report here that is a verdict rather than a finding. Every
+check in the table above reads an instruction and says its bytes could have
+been better; here the bytes are fine and what is wrong is where they landed,
+so the fix is padding something *earlier* -- one build flag, not a rewrite --
+and no single one of the 10-13% of jumps that touch a boundary is
+individually at fault.
+
+```console
+$ ./x86lint -j /bin/bash
+JCC erratum audit: 254073 instructions, 0 undecodable bytes skipped
+  Jcc 30799 + JMP 12442: 5458 touch a 32-byte boundary (12.6%), 5688.50 expected unpadded
+  verdict: mitigation absent (witnesses at the rate chance predicts)
+  not in the verdict's scope: 29266 fused compare+Jcc pairs (6428 touching), 19612 CALL (3018), 3032 RET (92)
+  informational: the erratum is Skylake through Comet Lake, Cascade Lake included; pass -t skylake to count it
+```
+
+What makes the verdict sound without a calibrated threshold is that
+unmitigated code is *exactly* uniform with respect to the boundary. A jump of
+length L occupies `[s, s+L-1]` and touches a boundary precisely when
+`s mod 32 >= 32 - L`, which is L of the 32 residues, so each jump contributes
+L/32 expected witnesses and the expectation for a whole scan is its jump
+bytes over 32. That is arithmetic, not a fit, and the corpus lands on it:
+bash, glibc, libcrypto, ld.so and libxul report 10.7-12.9% of their `Jcc` and
+`JMP` on a boundary, every one of them within 5% of its own expectation. An
+object assembled with `cc -Wa,-mbranches-within-32B-boundaries` reports 0 of
+2,366, for 2.6% more text.
+
+The evidence is asymmetric, and the four verdicts say so. One witness is
+proof that whatever produced the code holding it did not pad, so `mitigation
+absent` needs no minimum sample; the absence of witnesses means nothing until
+enough jumps have been seen for chance to have produced one, so `mitigation
+present` requires a scan expecting at least eight. Between them,
+`partially mitigated` is a real configuration rather than a hedge -- a
+mixed link, or a toolchain that pads compiler output and not hand-written
+assembly, which is exactly what Go's own binaries are:
+
+```console
+$ ./x86lint -j /bin/go | sed -n '2,3p'
+  Jcc 113255 + JMP 52098: 92 touch a 32-byte boundary (0.1%), 16581.65 expected unpadded
+  verdict: partially mitigated (witnesses far below chance -- mixed objects, or a toolchain that pads compiler output and not hand-written assembly)
+```
+
+Go pads what its compiler emits and not what its runtime hand-writes
+(`padJump` and `isJump` in `src/cmd/internal/obj/x86/asm6.go`, which
+`makePjcCtx` turns off for `ctxt.IsAsm`), and those 92 are the hand-written
+half. Its scope is also wider than gas's: `CALL` and `RET` come out at 55 of
+104,059 and 8 of 28,022, where gas's `-malign-branch=jcc+fused+jmp` leaves
+both alone. Reading the out-of-scope line beside the verdict is what
+identifies which toolchain was at work, which is why those classes are
+printed and why they never decide the verdict -- that and the fact that
+whether a given compare and `Jcc` really macro-fuse depends on the core and
+on operand shape, so an approximate predicate must not be allowed to
+manufacture a witness.
+
+Only `-t skylake` makes a missing mitigation a finding (exit 1); every other
+target, the conservative `-t generic` default included, leaves the report
+informational. The erratum is one named group of cores -- V8 enumerates the
+affected models and steppings in `src/base/cpu/cpu-x86.cc` -- so unlike every
+other per-core question here, the pessimistic reading is not the safe one:
+applied by default it would fail every binary on a system that may never run
+on an affected core.
+
+The audit needs the address each jump will run at, which is why a
+*relocatable* object is judged only when the section holding it is at least
+32-byte aligned. That is not a formality: gas raises `.text` to 32-byte
+alignment precisely when it pads, so that the padding it just inserted is not
+undone by a linker placing the section at 16 mod 32. Sections below that are
+counted and reported as skipped rather than guessed at. Sections with a real
+address -- a linked executable's, or the JIT addresses
+`tools/jitdump2elf.py` records -- are judged exactly.
+
+The JIT case is the one this cannot be measured any other way. V8 implements
+the mitigation (`Assembler::AlignForJCCErratum`) and SpiderMonkey implements
+nothing, but V8's is gated on the host CPU actually having the erratum, so a
+dump's verdict describes the machine that produced it and not the engine: on
+an AMD host a V8 corpus reports `mitigation absent`, correctly, because
+nothing there needed padding.
 
 ## Mining tools
 

@@ -966,6 +966,101 @@ for the word "code", so 1,883 Maglev objects arrived unnamed and the
 tier split read 51,676 "unknown" against 24,145 TurboFan. Fixed, and
 pinned in `jit_test.sh`.
 
+## JCC erratum audit (2026-09-26)
+
+**Shipped as `-j`, a verdict mode rather than a check**, and the shape was
+the whole question. Skylake-derived cores cannot cache a jump in the
+decoded-icache when the jump crosses a 32-byte boundary or ends on one;
+10.7-12.9% of the jumps in an unmitigated binary do. Reported per site
+that is 12-13 findings per thousand instructions -- the largest class the
+table would have, on every binary on the system, and not one of them
+individually at fault, because the fix is padding something *earlier* and
+the advice is one build flag. So the tool says once, for the whole file,
+whether the binary was built with the padding.
+
+**The null hypothesis is arithmetic, which is why the verdict needs no
+calibrated threshold.** A jump of length L touches a boundary exactly when
+its start is `>= 32 - L` mod 32, which is L of the 32 residues, so the
+expectation for a scan is its jump bytes over 32. Every unmitigated binary
+measured lands within 5% of its own expectation:
+
+| binary | Jcc+JMP | on a boundary | expected | ratio |
+| --- | --- | --- | --- | --- |
+| bash | 43,241 | 5,458 (12.6%) | 5,688.50 | 0.96 |
+| glibc | 54,572 | 7,037 (12.9%) | 6,975.65 | 1.01 |
+| libcrypto | 77,151 | 9,194 (11.9%) | 9,674.06 | 0.95 |
+| ld.so | 5,887 | 731 (12.4%) | 744.15 | 0.98 |
+| libxul | 3,833,480 | 411,083 (10.7%) | 417,568.90 | 0.98 |
+| x86lint.o, stock | 2,366 | 289 (12.2%) | 288.37 | 1.00 |
+| x86lint.o, `-Wa,-mbranches-within-32B-boundaries` | 2,366 | **0** | 290.40 | 0.00 |
+| /bin/go | 165,353 | 92 (0.1%) | 16,581.65 | 0.01 |
+
+The mitigated object cost 2.6% more text (69,173 → 70,983 bytes). It also
+gained four "oversized branch displacement" findings, 19 → 23: padding
+moves every downstream byte, so the two analyses genuinely interact, and
+the report keeps them apart rather than pretending otherwise.
+
+**The evidence is asymmetric and the four verdicts say so.** One witness is
+proof that whatever produced the code holding it did not pad, so `absent`
+needs no minimum sample; no witness means nothing until chance would have
+produced one, so `present` requires a scan expecting at least eight
+(Poisson, so ~3e-4 of seeing none). `partially mitigated` between them is a
+real configuration, not a hedge: **Go's own binaries are it**, because
+`padJump`/`isJump` in `src/cmd/internal/obj/x86/asm6.go` run for compiler
+output and `makePjcCtx` turns them off for `ctxt.IsAsm`, and those 92
+witnesses are the hand-written half.
+
+**Go's scope also validated the counter.** Go pads `CALL` and `RET`
+(55 of 104,059 and 8 of 28,022) where gas's `-malign-branch=jcc+fused+jmp`
+leaves both alone (gas-mitigated: 344 of 1,377 and 9 of 194 -- *worse* than
+unpadded, since the padding moved them). Two toolchains, two documented
+scopes, and each produced the per-class pattern its own source predicts,
+which is stronger evidence that the tally is real than any single number.
+
+**What is deliberately outside the verdict.** Fused compare+Jcc pairs are
+padded by both toolchains and counted here, but which pairs really
+macro-fuse depends on the core and on operand shape; the approximation in
+`jcc_fusible_compare` reports 40 surviving touches on the gas-mitigated
+object, so a verdict resting on it would have called a fully padded object
+`partially mitigated`. The measurement chose the rule. `CALL` and `RET` are
+out for the toolchain-dependence above. Both print beside the verdict,
+because reading them together is what identifies which toolchain was at
+work.
+
+**Only `-t skylake` makes it a finding.** The erratum is one named group of
+models and steppings (V8 enumerates them in `src/base/cpu/cpu-x86.cc`), so
+this is the one place where the `-t` axis decides whether something is a
+finding at all rather than which rewrite is worth making -- and the one
+place the pessimistic `generic` reading is wrong, since applied by default
+it would fail every binary on a machine that may never run on an affected
+core.
+
+**The JIT case is the one nothing else can measure**, and the reason the
+audit was worth building rather than left as a note. V8 implements the
+mitigation (`Assembler::AlignForJCCErratum`, `kJCCErratumAlignment = 32`)
+and SpiderMonkey implements nothing -- the grep over `js/src/jit/` is
+empty. But V8's is gated on `cpu.has_intel_jcc_erratum()`, so a dump's
+verdict describes the host that produced it: a V8 corpus captured here (an
+AMD Ryzen) reports 50 witnesses against 49.00 expected, correctly
+`absent`, because nothing on this machine needed padding. **Still open: a
+dump captured on an affected Intel host**, which is the only way to see
+V8's padding in the output and the only way to confirm the engine
+asymmetry end to end rather than from source.
+
+**Relocatable objects are judged only at 32-byte alignment or better**,
+which is not a formality: gas raises `.text` from 1 to 32 when it pads
+(verified on a minimal object), precisely so a linker cannot place the
+section at 16 mod 32 and undo the padding it just paid for. Sections below
+that are counted and reported as skipped. A JIT ELF passes on its real
+`sh_addr` instead, which is what `tools/jitdump2elf.py` records.
+
+**One thing to watch.** The gas-mitigated object carries 347 instructions
+with a redundant segment prefix where the stock object has none -- that is
+how gas shifts a jump without a NOP (`-malign-branch-prefix-size=5`).
+Nothing in the table flags them today, and the finding count barely moved
+(432 → 435), but a future "useless prefix" check would light up on every
+mitigated binary. It needs to know about this.
+
 ## Investigated and closed (2026-08 sweep)
 
 Candidates measured and set aside, recorded so they are not

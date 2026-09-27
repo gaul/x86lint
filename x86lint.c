@@ -3530,6 +3530,296 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
     }
 }
 
+// ==== the JCC erratum audit ==========================================
+//
+// See the block comment on x86lint_jcc in the header for the erratum, why
+// this is a verdict rather than a check, and where the expectation comes
+// from.
+
+#define JCC_SAMPLES 4
+
+// Witnesses the scan must expect before their absence is evidence of
+// anything. Under uniform placement the witness count is Poisson, so eight
+// expected puts the chance of seeing none near 3e-4; below that a clean scan
+// is a small scan, not a mitigated one. The measured gap either side is
+// enormous -- unmitigated binaries land at 1.0 times the expectation and
+// gas-mitigated code at 0.0 -- so nothing here is sensitive to the value.
+#define JCC_MIN_EXPECTED 8
+
+struct x86lint_jcc {
+    size_t count[X86LINT_JCC_KINDS];
+    size_t touching[X86LINT_JCC_KINDS];
+    // Bytes of Jcc and JMP seen, which is 32 times the expectation for the
+    // verdict's scope. Kept as a sum rather than a rate so the expectation
+    // stays exact across sections of any size.
+    uint64_t scope_bytes;
+    size_t instructions;
+    size_t skipped;
+    // The first few witnesses, so a verdict can be spot-checked in a
+    // disassembler: the erratum is about an address, and the address is the
+    // whole of what a reader needs to confirm one.
+    uint64_t samples[JCC_SAMPLES];
+    uint8_t nsamples;
+};
+
+x86lint_jcc *x86lint_jcc_create(void)
+{
+    return calloc(1, sizeof(struct x86lint_jcc));
+}
+
+void x86lint_jcc_destroy(x86lint_jcc *jcc)
+{
+    free(jcc);
+}
+
+// Whether an instruction at `addr` of `len` bytes is one the erratum affects:
+// its bytes cross a 32-byte boundary, or its last byte IS a boundary's last
+// byte. Both assemblers spell the condition that way (gas's manual, and the
+// comment on Go's isJump), and for a length under 32 the two cases are
+// disjoint -- an instruction that ends at a boundary has not crossed one.
+static bool jcc_touches_boundary(uint64_t addr, unsigned len)
+{
+    uint64_t last = addr + len - 1;
+    return (addr >> 5) != (last >> 5) || (last & 31) == 31;
+}
+
+// The compare half of a macro-fusible compare+Jcc pair. Intel's optimization
+// manual lists CMP, TEST, ADD, SUB, AND, INC and DEC, with further conditions
+// on operand shape (an immediate together with a memory operand does not
+// fuse) and differences between cores. This approximates it, which is why the
+// pair count is reported but never decides the verdict.
+static bool jcc_fusible_compare(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_CMP:
+    case XED_ICLASS_TEST:
+    case XED_ICLASS_ADD:
+    case XED_ICLASS_SUB:
+    case XED_ICLASS_AND:
+    case XED_ICLASS_INC:
+    case XED_ICLASS_DEC:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void x86lint_jcc_scan(x86lint_jcc *jcc, const uint8_t *inst, size_t len,
+                      uint64_t vaddr)
+{
+    if (jcc == NULL) {
+        return;
+    }
+    // The previous instruction, for the fused pair: its start address, and
+    // whether it was a compare at all. An undecodable byte clears it, since
+    // nothing that needs resynchronizing is a fusible pair.
+    bool prev_fusible = false;
+    uint64_t prev_addr = 0;
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            ++jcc->skipped;
+            prev_fusible = false;
+            continue;
+        }
+        unsigned ilen = xed_decoded_inst_get_length(&xedd);
+        uint64_t addr = vaddr + i;
+        xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
+        int kind = -1;
+        switch (xed_decoded_inst_get_category(&xedd)) {
+        case XED_CATEGORY_COND_BR:
+            kind = X86LINT_JCC_COND;
+            break;
+        case XED_CATEGORY_UNCOND_BR:
+            kind = X86LINT_JCC_UNCOND;
+            break;
+        case XED_CATEGORY_CALL:
+            kind = X86LINT_JCC_CALL;
+            break;
+        case XED_CATEGORY_RET:
+            kind = X86LINT_JCC_RET;
+            break;
+        default:
+            break;
+        }
+        if (kind >= 0) {
+            jcc->count[kind]++;
+            bool touches = jcc_touches_boundary(addr, ilen);
+            if (touches) {
+                jcc->touching[kind]++;
+            }
+            if (kind == X86LINT_JCC_COND || kind == X86LINT_JCC_UNCOND) {
+                jcc->scope_bytes += ilen;
+                if (touches && jcc->nsamples < JCC_SAMPLES) {
+                    jcc->samples[jcc->nsamples++] = addr;
+                }
+            }
+            // The pair is measured from the compare's first byte to the Jcc's
+            // last, which is what the assemblers keep off a boundary: a
+            // fused pair decodes as one macro-op and so must fit one window
+            // whole, even where neither half crosses alone.
+            if (kind == X86LINT_JCC_COND && prev_fusible) {
+                jcc->count[X86LINT_JCC_FUSED]++;
+                if (jcc_touches_boundary(prev_addr,
+                        (unsigned) (addr + ilen - prev_addr))) {
+                    jcc->touching[X86LINT_JCC_FUSED]++;
+                }
+            }
+        }
+        prev_fusible = jcc_fusible_compare(iclass);
+        prev_addr = addr;
+        jcc->instructions++;
+        i += ilen;
+    }
+}
+
+size_t x86lint_jcc_count(const x86lint_jcc *jcc, enum x86lint_jcc_kind kind)
+{
+    if (jcc == NULL || (int) kind < 0 || (int) kind >= X86LINT_JCC_KINDS) {
+        return 0;
+    }
+    return jcc->count[kind];
+}
+
+size_t x86lint_jcc_touching(const x86lint_jcc *jcc, enum x86lint_jcc_kind kind)
+{
+    if (jcc == NULL || (int) kind < 0 || (int) kind >= X86LINT_JCC_KINDS) {
+        return 0;
+    }
+    return jcc->touching[kind];
+}
+
+size_t x86lint_jcc_instructions(const x86lint_jcc *jcc)
+{
+    return jcc == NULL ? 0 : jcc->instructions;
+}
+
+size_t x86lint_jcc_skipped(const x86lint_jcc *jcc)
+{
+    return jcc == NULL ? 0 : jcc->skipped;
+}
+
+uint64_t x86lint_jcc_expected_centi(const x86lint_jcc *jcc)
+{
+    return jcc == NULL ? 0 : jcc->scope_bytes * 100 / 32;
+}
+
+enum x86lint_jcc_verdict x86lint_jcc_verdict(const x86lint_jcc *jcc)
+{
+    if (jcc == NULL) {
+        return X86LINT_JCC_UNKNOWN;
+    }
+    uint64_t witnesses = jcc->touching[X86LINT_JCC_COND] +
+        jcc->touching[X86LINT_JCC_UNCOND];
+    if (jcc->count[X86LINT_JCC_COND] + jcc->count[X86LINT_JCC_UNCOND] == 0) {
+        return X86LINT_JCC_UNKNOWN;
+    }
+    // Asymmetric, because the two errors are not alike. One witness is proof
+    // that whatever produced that code did not pad it, so a small scan can
+    // still reach ABSENT; no witness is only ever evidence in proportion to
+    // how many were expected, so MITIGATED needs the sample below.
+    if (witnesses == 0) {
+        return jcc->scope_bytes >= 32 * JCC_MIN_EXPECTED
+            ? X86LINT_JCC_MITIGATED : X86LINT_JCC_UNKNOWN;
+    }
+    // witnesses >= expected / 2, with the expectation left as scope_bytes/32
+    // so the comparison is exact: 64 * witnesses >= scope_bytes.
+    if (witnesses * 64 >= jcc->scope_bytes) {
+        return X86LINT_JCC_ABSENT;
+    }
+    return X86LINT_JCC_PARTIAL;
+}
+
+int x86lint_jcc_findings(const x86lint_jcc *jcc, enum x86lint_target target)
+{
+    enum x86lint_jcc_verdict verdict = x86lint_jcc_verdict(jcc);
+    if (verdict != X86LINT_JCC_ABSENT && verdict != X86LINT_JCC_PARTIAL) {
+        return 0;
+    }
+    return target == X86LINT_TARGET_SKYLAKE ? 1 : 0;
+}
+
+int x86lint_jcc_print(const x86lint_jcc *jcc, enum x86lint_target target,
+                      bool verbose)
+{
+    if (jcc == NULL) {
+        return 0;
+    }
+
+    size_t scope = jcc->count[X86LINT_JCC_COND] +
+        jcc->count[X86LINT_JCC_UNCOND];
+    size_t witnesses = jcc->touching[X86LINT_JCC_COND] +
+        jcc->touching[X86LINT_JCC_UNCOND];
+    uint64_t centi = x86lint_jcc_expected_centi(jcc);
+
+    printf("JCC erratum audit: %zu instructions, %zu undecodable bytes "
+        "skipped\n", jcc->instructions, jcc->skipped);
+    printf("  Jcc %zu + JMP %zu: %zu touch a 32-byte boundary",
+        jcc->count[X86LINT_JCC_COND], jcc->count[X86LINT_JCC_UNCOND],
+        witnesses);
+    if (scope != 0) {
+        printf(" (%.1f%%)", 100.0 * (double) witnesses / (double) scope);
+    }
+    printf(", %" PRIu64 ".%02" PRIu64 " expected unpadded\n",
+        centi / 100, centi % 100);
+
+    enum x86lint_jcc_verdict verdict = x86lint_jcc_verdict(jcc);
+    switch (verdict) {
+    case X86LINT_JCC_MITIGATED:
+        printf("  verdict: mitigation present (no jump touches a boundary)\n");
+        break;
+    case X86LINT_JCC_PARTIAL:
+        printf("  verdict: partially mitigated (witnesses far below chance -- "
+            "mixed objects, or a toolchain that pads compiler output and not "
+            "hand-written assembly)\n");
+        break;
+    case X86LINT_JCC_ABSENT:
+        printf("  verdict: mitigation absent (witnesses at the rate chance "
+            "predicts)\n");
+        break;
+    case X86LINT_JCC_UNKNOWN:
+        printf("  verdict: not enough code to judge (%" PRIu64 ".%02" PRIu64
+            " witnesses expected; %d needed)\n", centi / 100, centi % 100,
+            JCC_MIN_EXPECTED);
+        break;
+    }
+
+    // Beside the verdict, never deciding it: the classes whose padding is a
+    // toolchain's choice rather than every toolchain's. gas pads fused pairs
+    // and leaves CALL and RET alone; Go's assembler pads all four. Reading
+    // them together is what identifies which toolchain was at work.
+    printf("  not in the verdict's scope: %zu fused compare+Jcc pairs (%zu "
+        "touching), %zu CALL (%zu), %zu RET (%zu)\n",
+        jcc->count[X86LINT_JCC_FUSED], jcc->touching[X86LINT_JCC_FUSED],
+        jcc->count[X86LINT_JCC_CALL], jcc->touching[X86LINT_JCC_CALL],
+        jcc->count[X86LINT_JCC_RET], jcc->touching[X86LINT_JCC_RET]);
+
+    int findings = x86lint_jcc_findings(jcc, target);
+    if (verdict == X86LINT_JCC_ABSENT || verdict == X86LINT_JCC_PARTIAL) {
+        if (findings != 0) {
+            printf("  counted as a finding: -t skylake has the erratum "
+                "(Skylake and Cascade Lake)\n");
+        } else {
+            printf("  informational: the erratum is Skylake through Comet "
+                "Lake, Cascade Lake included; pass -t skylake to count it\n");
+        }
+    }
+
+    if (verbose && jcc->nsamples > 0) {
+        printf("    touching at");
+        for (uint8_t k = 0; k < jcc->nsamples; ++k) {
+            printf("%s 0x%" PRIx64, k == 0 ? "" : ",", jcc->samples[k]);
+        }
+        if (witnesses > jcc->nsamples) {
+            printf(" (+%zu more)", witnesses - jcc->nsamples);
+        }
+        printf("\n");
+    }
+    return findings;
+}
+
 // In verbose mode print a finding as a one-line summary -- the offending
 // instruction disassembled at its address, suffixed with the containing
 // function when the summary carries a table -- followed by the raw

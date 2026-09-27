@@ -8016,6 +8016,182 @@ static void census_test(void)
     x86lint_census_destroy(NULL);
 }
 
+static void jcc_test(void)
+{
+    // The boundary condition, one two-byte Jcc placed three ways. The scan
+    // takes the address from the caller, so the fixture needs no padding:
+    // 0x1000 is clear of the boundary, 0x101e ends exactly on it (last byte
+    // 0x101f), and 0x101f crosses it.
+    static const uint8_t je[] = {0x74, 0x00};   // je .+0
+    struct {
+        uint64_t vaddr;
+        size_t touching;
+    } places[] = {{0x1000, 0}, {0x101e, 1}, {0x101f, 1}};
+    for (size_t p = 0; p < sizeof(places) / sizeof(places[0]); ++p) {
+        x86lint_jcc *jcc = x86lint_jcc_create();
+        assert(jcc != NULL);
+        x86lint_jcc_scan(jcc, je, sizeof(je), places[p].vaddr);
+        assert(x86lint_jcc_count(jcc, X86LINT_JCC_COND) == 1);
+        assert(x86lint_jcc_touching(jcc, X86LINT_JCC_COND) ==
+            places[p].touching);
+        // One witness is proof that whatever produced this did not pad it,
+        // however little code there is; no witness over two bytes of scope
+        // proves nothing at all.
+        assert(x86lint_jcc_verdict(jcc) == (places[p].touching != 0
+            ? X86LINT_JCC_ABSENT : X86LINT_JCC_UNKNOWN));
+        x86lint_jcc_destroy(jcc);
+    }
+
+    // Kinds, and that only Jcc and JMP contribute to the verdict's scope: a
+    // CALL that touches cannot make a verdict on its own.
+    x86lint_jcc *jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    static const uint8_t kinds[] = {
+        0x74, 0x00,                          // je .+0
+        0xeb, 0x00,                          // jmp .+0
+        0xe8, 0x00, 0x00, 0x00, 0x00,        // call .+0
+        0xc3,                                // ret
+    };
+    x86lint_jcc_scan(jcc, kinds, sizeof(kinds), 0x1000);
+    assert(x86lint_jcc_instructions(jcc) == 4);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_COND) == 1);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_UNCOND) == 1);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_CALL) == 1);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_RET) == 1);
+    // Jcc 2 bytes + JMP 2 bytes = 4 scope bytes, so 4/32 = 0.125 expected.
+    assert(x86lint_jcc_expected_centi(jcc) == 12);
+    x86lint_jcc_destroy(jcc);
+
+    // A CALL alone, placed across a boundary: counted, and still no verdict.
+    jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    static const uint8_t call[] = {0xe8, 0x00, 0x00, 0x00, 0x00};
+    x86lint_jcc_scan(jcc, call, sizeof(call), 0x101e);
+    assert(x86lint_jcc_touching(jcc, X86LINT_JCC_CALL) == 1);
+    assert(x86lint_jcc_verdict(jcc) == X86LINT_JCC_UNKNOWN);
+    x86lint_jcc_destroy(jcc);
+
+    // The fused pair is why the unit is measured from the compare's first
+    // byte: here the compare ends on the boundary and the Jcc begins after
+    // it, so neither instruction touches one and the pair straddles it. The
+    // Jcc is counted under COND as well, and the pair does not become a
+    // witness -- the verdict stays UNKNOWN on two bytes of scope.
+    jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    static const uint8_t fused[] = {
+        0x39, 0xd8,     // cmp eax, ebx
+        0x74, 0x00,     // je .+0
+    };
+    x86lint_jcc_scan(jcc, fused, sizeof(fused), 0x101e);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_COND) == 1);
+    assert(x86lint_jcc_touching(jcc, X86LINT_JCC_COND) == 0);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_FUSED) == 1);
+    assert(x86lint_jcc_touching(jcc, X86LINT_JCC_FUSED) == 1);
+    assert(x86lint_jcc_verdict(jcc) == X86LINT_JCC_UNKNOWN);
+    x86lint_jcc_destroy(jcc);
+
+    // An undecodable byte between the compare and the Jcc is not a fusible
+    // pair: the sweep resynchronized, so it does not know what precedes.
+    jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    static const uint8_t broken[] = {
+        0x39, 0xd8,     // cmp eax, ebx
+        0x06,           // invalid in 64-bit mode
+        0x74, 0x00,     // je .+0
+    };
+    x86lint_jcc_scan(jcc, broken, sizeof(broken), 0x1000);
+    assert(x86lint_jcc_skipped(jcc) == 1);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_COND) == 1);
+    assert(x86lint_jcc_count(jcc, X86LINT_JCC_FUSED) == 0);
+    x86lint_jcc_destroy(jcc);
+
+    // The sample threshold, pinned from both sides. A Jcc every four bytes
+    // from a 32-byte boundary can never touch one (its address is 0, 4, ...
+    // 28 mod 32), so each scan adds two scope bytes and no witness. 128 of
+    // them is 256 bytes, which is 32 times the eight expected witnesses the
+    // MITIGATED verdict requires; 127 is one short of it, and a clean scan
+    // that small says nothing.
+    static const uint8_t padded_je[] = {0x74, 0x00, 0x90, 0x90};
+    for (int n = 127; n <= 128; ++n) {
+        jcc = x86lint_jcc_create();
+        assert(jcc != NULL);
+        for (int i = 0; i < n; ++i) {
+            x86lint_jcc_scan(jcc, padded_je, sizeof(padded_je),
+                0x1000 + 4 * (uint64_t) i);
+        }
+        assert(x86lint_jcc_count(jcc, X86LINT_JCC_COND) == (size_t) n);
+        assert(x86lint_jcc_touching(jcc, X86LINT_JCC_COND) == 0);
+        assert(x86lint_jcc_expected_centi(jcc) == (uint64_t) n * 2 * 100 / 32);
+        assert(x86lint_jcc_verdict(jcc) == (n == 128
+            ? X86LINT_JCC_MITIGATED : X86LINT_JCC_UNKNOWN));
+        if (n == 128) {
+            // One witness on top of an otherwise padded scan is the mixed
+            // link: far below chance, but proof that something was not
+            // padded.
+            x86lint_jcc_scan(jcc, je, sizeof(je), 0x101e);
+            assert(x86lint_jcc_touching(jcc, X86LINT_JCC_COND) == 1);
+            assert(x86lint_jcc_verdict(jcc) == X86LINT_JCC_PARTIAL);
+        }
+        x86lint_jcc_destroy(jcc);
+    }
+
+    // Witnesses at the rate chance predicts, which is what unpadded code
+    // looks like: a Jcc every 32 bytes, each one ending on the boundary.
+    jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    for (int i = 0; i < 128; ++i) {
+        x86lint_jcc_scan(jcc, je, sizeof(je), 0x101e + 32 * (uint64_t) i);
+    }
+    assert(x86lint_jcc_touching(jcc, X86LINT_JCC_COND) == 128);
+    assert(x86lint_jcc_verdict(jcc) == X86LINT_JCC_ABSENT);
+    x86lint_jcc_destroy(jcc);
+
+    // NULL is accepted everywhere.
+    x86lint_jcc_scan(NULL, je, sizeof(je), 0x1000);
+    assert(x86lint_jcc_count(NULL, X86LINT_JCC_COND) == 0);
+    assert(x86lint_jcc_touching(NULL, X86LINT_JCC_COND) == 0);
+    assert(x86lint_jcc_instructions(NULL) == 0);
+    assert(x86lint_jcc_skipped(NULL) == 0);
+    assert(x86lint_jcc_expected_centi(NULL) == 0);
+    assert(x86lint_jcc_verdict(NULL) == X86LINT_JCC_UNKNOWN);
+    assert(x86lint_jcc_findings(NULL, X86LINT_TARGET_SKYLAKE) == 0);
+    assert(x86lint_jcc_print(NULL, X86LINT_TARGET_GENERIC, false) == 0);
+    x86lint_jcc_destroy(NULL);
+
+    // An out-of-range kind reads back as zero rather than off the end of the
+    // arrays.
+    jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    x86lint_jcc_scan(jcc, je, sizeof(je), 0x101e);
+    assert(x86lint_jcc_count(jcc, (enum x86lint_jcc_kind) -1) == 0);
+    assert(x86lint_jcc_count(jcc,
+        (enum x86lint_jcc_kind) X86LINT_JCC_KINDS) == 0);
+    assert(x86lint_jcc_touching(jcc, (enum x86lint_jcc_kind) -1) == 0);
+    // Only -t skylake makes the absent mitigation a finding; the
+    // conservative default must not, or every unpadded binary fails.
+    assert(x86lint_jcc_verdict(jcc) == X86LINT_JCC_ABSENT);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_SKYLAKE) == 1);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_GENERIC) == 0);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_SANDYBRIDGE) == 0);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_ICELAKE) == 0);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_ZEN) == 0);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_SILVERMONT) == 0);
+    x86lint_jcc_destroy(jcc);
+
+    // A mitigated scan is not a finding even on the affected core, and an
+    // undecidable one is not either: only a witness makes one.
+    jcc = x86lint_jcc_create();
+    assert(jcc != NULL);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_SKYLAKE) == 0);
+    for (int i = 0; i < 128; ++i) {
+        x86lint_jcc_scan(jcc, padded_je, sizeof(padded_je),
+            0x1000 + 4 * (uint64_t) i);
+    }
+    assert(x86lint_jcc_verdict(jcc) == X86LINT_JCC_MITIGATED);
+    assert(x86lint_jcc_findings(jcc, X86LINT_TARGET_SKYLAKE) == 0);
+    x86lint_jcc_destroy(jcc);
+}
+
 int main(int argc, char *argv[])
 {
     xed_tables_init();
@@ -8114,6 +8290,7 @@ int main(int argc, char *argv[])
     summary_functions_test();
     finding_callback_test();
     census_test();
+    jcc_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per
     // category rather than as a bare total (a total alone lets one check

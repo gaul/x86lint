@@ -1,0 +1,6 @@
+JCC erratum audit: 129 instructions, 0 undecodable bytes skipped
+  Jcc 128 + JMP 0: 8 touch a 32-byte boundary (6.2%), 8.00 expected unpadded
+  verdict: mitigation absent (witnesses at the rate chance predicts)
+  not in the verdict's scope: 0 fused compare+Jcc pairs (0 touching), 0 CALL (0), 1 RET (0)
+  counted as a finding: -t skylake has the erratum (Skylake and Cascade Lake)
+exit status: 1

@@ -1740,6 +1740,7 @@ int main(int argc, char **argv)
     bool scan_all = false;
     bool endbr = false;
     bool census = false;
+    bool jcc_audit = false;
     bool json = false;
     uint32_t extensions = 0;
     enum x86lint_target target = X86LINT_TARGET_GENERIC;
@@ -1757,6 +1758,8 @@ int main(int argc, char **argv)
             fname = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0) {
             census = true;
+        } else if (strcmp(argv[i], "-j") == 0) {
+            jcc_audit = true;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = true;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -1799,7 +1802,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -1810,7 +1813,7 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -1820,7 +1823,7 @@ int main(int argc, char **argv)
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [--json] "
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -1834,12 +1837,12 @@ int main(int argc, char **argv)
         return 2;
     }
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i and -e are separate reports whose
+    // prose with the document, and -i, -e and -j are separate reports whose
     // shapes this schema does not describe. Refused rather than resolved,
     // since either choice would surprise half the callers.
-    if (json && (verbose || census || endbr)) {
-        fprintf(stderr, "%s: --json cannot be combined with -v, -i or -e\n",
-            argv[0]);
+    if (json && (verbose || census || endbr || jcc_audit)) {
+        fprintf(stderr,
+            "%s: --json cannot be combined with -v, -i, -e or -j\n", argv[0]);
         return 2;
     }
 
@@ -1854,6 +1857,8 @@ int main(int argc, char **argv)
     uint8_t *buf = NULL;
     x86lint_summary *summary = NULL;
     x86lint_census *census_data = NULL;
+    x86lint_jcc *jcc_data = NULL;
+    uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
     struct evidence_build evidence = {NULL, 0, 0};
     size_t evidence_funcs = 0;
     size_t evidence_fdes = 0;
@@ -1943,15 +1948,15 @@ int main(int argc, char **argv)
     // internal function -- a clean report that scanned nothing. With no
     // .symtab (every stripped distro binary) the scan covers whole
     // sections exactly as before; -a forces that even when symbols exist.
-    // The census always scans every executable byte -- it is a
-    // description of the file, not a per-function report -- so it skips
-    // the restriction the same way -a does. -f NAME is different on both
-    // counts: an explicit request for one function is meaningful in every
-    // mode, and naming an exported function of a stripped library is its
-    // point, so it loads always and draws on .dynsym too. Names ride
+    // The census and the JCC audit always scan every executable byte --
+    // each is a description of the file, not a per-function report -- so
+    // they skip the restriction the same way -a does. -f NAME is different
+    // on both counts: an explicit request for one function is meaningful in
+    // every mode, and naming an exported function of a stripped library is
+    // its point, so it loads always and draws on .dynsym too. Names ride
     // along for -f matching and finding attribution; their string tables
     // stay live in strtabs[].
-    if ((!scan_all && !census) || fname != NULL) {
+    if ((!scan_all && !census && !jcc_audit) || fname != NULL) {
         // An ET_REL symbol's value is an offset into its own section, so
         // placing it needs that section's address; remember them all while
         // the headers are being read anyway. Only ET_REL asks.
@@ -2209,6 +2214,17 @@ int main(int argc, char **argv)
         x86lint_summary_set_functions(summary, attr, nattr);
     }
 
+    // Likewise the JCC audit: it is the whole report of its own block, and
+    // printing zeros there would read as a mitigated binary.
+    if (jcc_audit) {
+        jcc_data = x86lint_jcc_create();
+        if (jcc_data == NULL) {
+            fprintf(stderr, "%s: failed to allocate the JCC erratum audit\n",
+                path);
+            goto out;
+        }
+    }
+
     // The census, by contrast, IS the whole report of a -i run, so failing
     // to allocate it degrades to printing zeros; fail hard instead.
     if (census) {
@@ -2338,8 +2354,12 @@ int main(int argc, char **argv)
         // compiler. The ENDBR64 verification (-e) is a separate pass and is
         // deliberately unaffected: PLT entries really are indirect-branch
         // targets under IBT, so whether they carry pads is the one thing
-        // about them worth checking.
-        if (!scan_all && is_linker_stub_section(sec_name)) {
+        // about them worth checking. The JCC audit (-j) is exempt for the
+        // same kind of reason -- a PLT entry's jump executes and pays the
+        // erratum like any other -- and because a verdict about a binary must
+        // not come out differently depending on -a.
+        bool stub_section = !scan_all && is_linker_stub_section(sec_name);
+        if (stub_section && !jcc_audit) {
             continue;
         }
 
@@ -2364,6 +2384,43 @@ int main(int argc, char **argv)
             fprintf(stderr, "%s: failed to read section %lu\n", path,
                 (unsigned long) i);
             goto out;
+        }
+
+        // The JCC audit runs before the census and before the symbol masking
+        // below, because it needs every executable byte exactly as it will be
+        // executed: masking rewrites the buffer, and a jump in the padding
+        // between two functions still pays the erratum. Like -e it is a
+        // separate pass over the whole file, so -a and -f do not change what
+        // it sees.
+        //
+        // It needs the address the code will run at, which a section only
+        // supplies two ways. A nonzero sh_addr is that address: a linked
+        // executable's, or the real one a JIT reported through
+        // tools/jitdump2elf.py (a PIE's load bias is page-aligned and cannot
+        // change an address mod 32). A relocatable section at address 0 has
+        // yet to be placed, and only its alignment says anything -- at 32 or
+        // more the linker must keep every offset's residue, which is exactly
+        // why gas raises .text to 32 when it pads; below that the section can
+        // land at 16 mod 32 and half the analysis would be wrong. Counted and
+        // reported rather than silently analyzed.
+        if (jcc_audit) {
+            if (shdr.sh_addr != 0 || shdr.sh_addralign >= 32) {
+                x86lint_jcc_scan(jcc_data, buf, shdr.sh_size, shdr.sh_addr);
+            } else {
+                ++jcc_unplaced;
+            }
+        }
+
+        // The glue was loaded for the audit alone; nothing else looks at it.
+        // Neither does anything else when -j is the whole request: the audit
+        // replaces the lint scan for the same reason the census does -- it
+        // asks a different question about the file rather than adding
+        // findings to it -- and a -j run over a large binary should not pay
+        // for a peephole sweep nobody asked for.
+        if (stub_section || (jcc_audit && !census)) {
+            free(buf);
+            buf = NULL;
+            continue;
         }
 
         if (census) {
@@ -2501,7 +2558,7 @@ int main(int argc, char **argv)
         }
         printf("  IFUNC resolvers defined: %ld%s\n", ifuncs,
             ifuncs > 0 ? " (runtime CPU dispatch present)" : "");
-    } else if (!json) {
+    } else if (!json && !jcc_audit) {
         x86lint_summary_print(summary);
     }
 
@@ -2515,6 +2572,20 @@ int main(int argc, char **argv)
             shstrtab, shstrtab_size, verbose);
         if (endbr_errors < 0) {
             goto out;
+        }
+    }
+
+    // The JCC audit likewise reports its own block: one verdict about how the
+    // binary was built, which is a different kind of claim from a finding
+    // about an instruction.
+    int jcc_errors = 0;
+    if (jcc_audit) {
+        jcc_errors = x86lint_jcc_print(jcc_data, target, verbose);
+        if (jcc_unplaced != 0) {
+            printf("  %lu executable section%s skipped: relocatable and "
+                "aligned under 32, so the boundaries are the linker's to "
+                "choose\n", (unsigned long) jcc_unplaced,
+                jcc_unplaced == 1 ? "" : "s");
         }
     }
 
@@ -2544,7 +2615,10 @@ int main(int argc, char **argv)
                "  \"opportunities\": %d\n}\n",
             x86lint_summary_instructions(summary),
             x86lint_summary_skipped(summary), errors);
-    } else {
+    } else if (!jcc_audit) {
+        // Nothing of this belongs under -j: the audit is that run's whole
+        // report and it covered every executable byte, so both a restriction
+        // line and an opportunity count would describe a scan that never ran.
         if (fname != NULL) {
             printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
                 fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
@@ -2557,9 +2631,10 @@ int main(int argc, char **argv)
                 errors, x86lint_summary_instructions(summary));
         }
     }
-    rc = errors != 0 || endbr_errors != 0;
+    rc = errors != 0 || endbr_errors != 0 || jcc_errors != 0;
 
 out:
+    x86lint_jcc_destroy(jcc_data);
     x86lint_census_destroy(census_data);
     free(evidence.r);
     x86lint_summary_destroy(summary);

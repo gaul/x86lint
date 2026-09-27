@@ -524,7 +524,74 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-for f in finding clean bmi notrack census isanote perfunc target advisory; do
+# Fixtures for the JCC-erratum audit (-j), which is a verdict about where
+# jumps landed rather than about what they encode, so each one is built by
+# placing the same two-byte Jcc at chosen offsets from a 32-byte boundary.
+# _start is .balign 32, which also raises the section's alignment to 32 --
+# the condition the audit requires of an object it is asked to judge.
+#
+# jccpad is what a mitigated build looks like: a Jcc every four bytes, so its
+# address is 0, 4, ... 28 mod 32 and it can never touch a boundary. 128 of
+# them is 256 bytes of jump, exactly the 8 expected witnesses the verdict
+# needs before their absence means anything.
+cat >"$dir/jccpad.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+    .balign 32
+_start:
+    .rept 128
+    .byte 0x74, 0x02                    # je .+2 (never within 2 of a boundary)
+    .byte 0x90, 0x90                    # padding, as an assembler would insert
+    .endr
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# jccraw is what an unmitigated build looks like, and it is the null
+# hypothesis made literal: back-to-back two-byte Jcc tile the 32-byte window
+# at 0, 2, ... 30, so exactly one of every sixteen ends on the boundary. The
+# 8 witnesses that produces ARE the 8 the expectation predicts, which is the
+# relation every unpadded binary in the corpus turns out to satisfy.
+cat >"$dir/jccraw.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+    .balign 32
+_start:
+    .rept 128
+    .byte 0x74, 0x02                    # je .+2
+    .endr
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# jccmixed is the mixed link, and the reason the verdict has a third value:
+# jccpad's padded body followed by sixteen tiled Jcc, of which one lands on a
+# boundary. One witness against nine expected is proof that something here
+# was not padded and proof that most of it was.
+cat >"$dir/jccmixed.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+    .balign 32
+_start:
+    .rept 128
+    .byte 0x74, 0x02                    # je .+2
+    .byte 0x90, 0x90
+    .endr
+    .rept 16
+    .byte 0x74, 0x02                    # je .+2, tiled: the last one touches
+    .endr
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+for f in finding clean bmi notrack census isanote perfunc target advisory \
+         jccpad jccraw jccmixed; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -557,6 +624,7 @@ if ! cc -nostdlib -pie -Wl,--build-id=none \
    ! cc -shared -nostdlib -Wl,--build-id=none \
         -o "$dir/cetso.so" "$dir/cetso.s" ||
    ! cc -c -o "$dir/clean.o" "$dir/clean.s" ||
+   ! cc -c -o "$dir/jccpad.o" "$dir/jccpad.s" ||
    ! cc -c -o "$dir/finding.o" "$dir/finding.s"; then
     echo "driver_test.sh: fixture build failed" >&2
     exit 2
@@ -858,6 +926,71 @@ reject '^Optimization opportunities by function:$' \
 run 2 -e "$dir/clean.o"
 expect 'requires a linked executable or shared object'
 
+# The JCC-erratum audit (-j). A verdict about the whole binary, so the three
+# fixtures differ only in where their jumps sit relative to a 32-byte
+# boundary; see their comments for the arithmetic each one realizes.
+#
+# Padded: no witness over a scan big enough to expect eight, which is the only
+# configuration that can support "present". Exit 0 -- the audit is
+# informational unless asked about an affected core, and there is nothing to
+# report here in any case.
+run 0 -j "$dir/jccpad"
+expect '^JCC erratum audit: [0-9]+ instructions, 0 undecodable bytes skipped$'
+expect '^  Jcc 128 \+ JMP 0: 0 touch a 32-byte boundary \(0\.0%\), 8\.00 expected'
+expect '^  verdict: mitigation present'
+reject 'informational:' "target note on a mitigated binary"
+
+# Unpadded: the witnesses are there and there are as many as chance predicts.
+run 0 -j "$dir/jccraw"
+expect '^  Jcc 128 \+ JMP 0: 8 touch a 32-byte boundary \(6\.2%\), 8\.00 expected'
+expect '^  verdict: mitigation absent'
+expect '^  informational: the erratum is Skylake through Comet Lake'
+
+# ... and -t skylake is what turns that into a finding, because the erratum
+# belongs to one named group of cores. Every other target, the conservative
+# default included, leaves the exit status clean.
+run 1 -j -t skylake "$dir/jccraw"
+expect '^  counted as a finding: -t skylake has the erratum'
+run 0 -j -t icelake "$dir/jccraw"
+expect '^  informational:'
+run 0 -j -t zen "$dir/jccraw"
+run 0 -j -t generic "$dir/jccraw"
+
+# One witness against nine expected: most of this was padded and something
+# was not, which is what a mixed link and a Go binary both look like.
+run 0 -j "$dir/jccmixed"
+expect '^  Jcc 144 \+ JMP 0: 1 touch a 32-byte boundary \(0\.7%\), 9\.00 expected'
+expect '^  verdict: partially mitigated'
+run 1 -j -t skylake "$dir/jccmixed"
+expect '^  counted as a finding'
+
+# Too little code to judge: the clean fixture's three instructions hold no
+# jump at all, so there is nothing for the absence of witnesses to mean.
+run 0 -j "$dir/clean"
+expect '^  verdict: not enough code to judge \(0\.00 witnesses expected; 8 needed\)$'
+
+# -v names the first few witnesses, since the erratum is a fact about an
+# address and the address is all a reader needs to confirm one.
+run 0 -j -v "$dir/jccraw"
+expect '^    touching at 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+ \(\+4 more\)$'
+
+# A relocatable object is judged only when its placement mod 32 survives the
+# link, which means a section alignment of 32 or more -- what gas raises .text
+# to when it pads, and the whole reason the padding it inserts is not undone
+# by the linker. jccpad.o has it (.balign 32) and is judged at address 0;
+# clean.o is 1-aligned, so where its jumps would land is not yet decided and
+# the section is skipped rather than guessed at.
+run 0 -j "$dir/jccpad.o"
+expect '^  verdict: mitigation present'
+reject 'executable section.* skipped' "alignment gate on a 32-aligned object"
+run 0 -j "$dir/clean.o"
+expect '^  verdict: not enough code to judge'
+expect '^  1 executable section skipped: relocatable and aligned under 32, so the boundaries are the linker.s to choose$'
+
+# The audit is its own report, like -e, and --json describes neither.
+run 2 --json -j "$dir/jccraw"
+expect 'cannot be combined with'
+
 # A real binary must never be a tool failure (0 or 1 both fine).
 "$X86LINT" "$X86LINT" >/dev/null 2>&1
 rc=$?
@@ -890,6 +1023,10 @@ snapshot pltskip-all -a "$dir/pltskip"
 snapshot census -i "$dir/census"
 snapshot census-verbose -i -v "$dir/census"
 snapshot endbr-missing -e "$dir/cetbad"
+snapshot jcc-absent -j -t skylake "$dir/jccraw"
+snapshot jcc-present -j "$dir/jccpad"
+snapshot jcc-partial -j -v "$dir/jccmixed"
+snapshot jcc-unplaced -j "$dir/clean.o"
 snapshot relocatable -v "$dir/finding.o"
 snapshot usage
 

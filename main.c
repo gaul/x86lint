@@ -353,17 +353,22 @@ static int thunk_family(const char *name)
     return 0;
 }
 
-// Whether the image names a thunk of each family anywhere in its symbol
-// tables, which is the evidence that survives linking: a relocatable object
-// names an undefined thunk it will be linked against, and a linked one has
-// the definition. Both tables are read -- .symtab where it survived, .dynsym
-// otherwise -- since either can hold the name.
-static void find_thunk_symbols(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
-                               uint64_t file_size, bool *returns_named,
-                               bool *indirects_named)
+// Which of the names the audits ask about the image carries anywhere in its
+// symbol tables. This is the evidence that survives linking: a relocatable
+// object names an undefined symbol it will be linked against, and a linked one
+// has the definition. Both tables are read -- .symtab where it survived,
+// .dynsym otherwise -- since either can hold the name, and all of them are
+// answered in one walk because the walk is what costs.
+struct named_symbols {
+    bool return_thunk;      // __x86_return_thunk and the kernel's variants
+    bool indirect_thunk;    // __x86_indirect_thunk_<reg>, __llvm_retpoline_<reg>
+    bool stack_chk_fail;    // the stack protector's failure handler
+};
+
+static void find_named_symbols(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
+                               uint64_t file_size, struct named_symbols *out)
 {
-    *returns_named = false;
-    *indirects_named = false;
+    memset(out, 0, sizeof(*out));
     for (uint64_t i = 0; i < shnum; ++i) {
         Elf64_Shdr sh;
         if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
@@ -390,15 +395,19 @@ static void find_thunk_symbols(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
                 if (sym.st_name == 0 || sym.st_name >= strh.sh_size) {
                     continue;
                 }
-                switch (thunk_family(str + sym.st_name)) {
+                const char *name = str + sym.st_name;
+                switch (thunk_family(name)) {
                 case 1:
-                    *returns_named = true;
+                    out->return_thunk = true;
                     break;
                 case 2:
-                    *indirects_named = true;
+                    out->indirect_thunk = true;
                     break;
                 default:
                     break;
+                }
+                if (strcmp(name, "__stack_chk_fail") == 0) {
+                    out->stack_chk_fail = true;
                 }
             }
         }
@@ -2066,6 +2075,7 @@ int main(int argc, char **argv)
     bool census = false;
     bool jcc_audit = false;
     bool thunk_audit = false;
+    bool prop_audit = false;
     bool json = false;
     uint32_t extensions = 0;
     enum x86lint_target target = X86LINT_TARGET_GENERIC;
@@ -2087,6 +2097,8 @@ int main(int argc, char **argv)
             jcc_audit = true;
         } else if (strcmp(argv[i], "-s") == 0) {
             thunk_audit = true;
+        } else if (strcmp(argv[i], "-p") == 0) {
+            prop_audit = true;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = true;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -2129,7 +2141,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] "
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2140,7 +2152,7 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] "
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2150,7 +2162,7 @@ int main(int argc, char **argv)
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] "
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2164,12 +2176,13 @@ int main(int argc, char **argv)
         return 2;
     }
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i, -e, -j and -s are separate reports
+    // prose with the document, and -i, -e, -j, -s and -p are separate reports
     // whose shapes this schema does not describe. Refused rather than
     // resolved, since either choice would surprise half the callers.
-    if (json && (verbose || census || endbr || jcc_audit || thunk_audit)) {
+    if (json && (verbose || census || endbr || jcc_audit || thunk_audit ||
+                 prop_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -e, -j or -s\n",
+            "%s: --json cannot be combined with -v, -i, -e, -j, -s or -p\n",
             argv[0]);
         return 2;
     }
@@ -2187,6 +2200,7 @@ int main(int argc, char **argv)
     x86lint_census *census_data = NULL;
     x86lint_jcc *jcc_data = NULL;
     uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
+    x86lint_build *prop_data = NULL;
     x86lint_thunk *thunk_data = NULL;
     size_t thunk_ret_relocs = 0;    // branches a relocation routes to a thunk
     size_t thunk_ind_relocs = 0;
@@ -2289,8 +2303,27 @@ int main(int argc, char **argv)
     // its point, so it loads always and draws on .dynsym too. Names ride
     // along for -f matching and finding attribution; their string tables
     // stay live in strtabs[].
+    // -p measures fractions of the functions, so it needs a denominator. Where
+    // .symtab is gone -- most distro binaries -- it falls back to the dynamic
+    // table and the report says which it used: exported functions are a biased
+    // sample of a library's, but a biased fraction is still a fraction where no
+    // sample at all is nothing. Never both, or every exported function would
+    // be counted twice and the denominator would be fiction.
+    bool have_symtab = false;
+    for (uint64_t i = 0; prop_audit && i < shnum; ++i) {
+        Elf64_Shdr sh;
+        if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(sh)), &sh,
+                     sizeof(sh))) {
+            break;
+        }
+        if (sh.sh_type == SHT_SYMTAB && sh.sh_size != 0) {
+            have_symtab = true;
+            break;
+        }
+    }
+    bool use_dynsym = fname != NULL || (prop_audit && !have_symtab);
     if ((!scan_all && !census && !jcc_audit && !thunk_audit) ||
-        fname != NULL) {
+        fname != NULL || prop_audit) {
         // An ET_REL symbol's value is an offset into its own section, so
         // placing it needs that section's address; remember them all while
         // the headers are being read anyway. Only ET_REL asks.
@@ -2309,7 +2342,7 @@ int main(int argc, char **argv)
                 sec_addr[i] = shdr.sh_addr;
             }
             if (shdr.sh_type != SHT_SYMTAB &&
-                (fname == NULL || shdr.sh_type != SHT_DYNSYM)) {
+                !(use_dynsym && shdr.sh_type == SHT_DYNSYM)) {
                 continue;
             }
             if (shdr.sh_entsize != sizeof(Elf64_Sym)) {
@@ -2559,6 +2592,15 @@ int main(int argc, char **argv)
         }
     }
 
+    if (prop_audit) {
+        prop_data = x86lint_build_create();
+        if (prop_data == NULL) {
+            fprintf(stderr, "%s: failed to allocate the build-property "
+                "audit\n", path);
+            goto out;
+        }
+    }
+
     if (thunk_audit) {
         thunk_data = x86lint_thunk_create();
         if (thunk_data == NULL) {
@@ -2753,6 +2795,36 @@ int main(int argc, char **argv)
             }
         }
 
+        // The build-property audit is the one pass that walks functions
+        // rather than bytes, because its answers are fractions of them. Each
+        // symbol placed in this section is examined once, over its own range
+        // and from its own entry, so the counts and the denominator move
+        // together.
+        if (prop_audit) {
+            for (size_t s = 0; s < nfuncs; ++s) {
+                uint64_t off;
+                if (ehdr.e_type == ET_REL) {
+                    if (funcs[s].shndx != i ||
+                        funcs[s].value >= shdr.sh_size) {
+                        continue;
+                    }
+                    off = funcs[s].value;
+                } else {
+                    if (funcs[s].value < shdr.sh_addr ||
+                        funcs[s].value - shdr.sh_addr >= shdr.sh_size) {
+                        continue;
+                    }
+                    off = funcs[s].value - shdr.sh_addr;
+                }
+                if (funcs[s].size == 0) {
+                    continue;   // unsized: no range to measure a property over
+                }
+                uint64_t n = funcs[s].size > shdr.sh_size - off
+                    ? shdr.sh_size - off : funcs[s].size;
+                x86lint_build_scan_function(prop_data, buf + off, n);
+            }
+        }
+
         // The thunk audit counts the instructions a routed build does not
         // contain, so like the JCC audit it wants every executable byte and
         // the buffer before any masking. Its other half -- which branches a
@@ -2773,7 +2845,8 @@ int main(int argc, char **argv)
         // it asks a different question about the file rather than adding
         // findings to it -- and a run over a large binary should not pay for a
         // peephole sweep nobody asked for.
-        if (stub_section || ((jcc_audit || thunk_audit) && !census)) {
+        if (stub_section ||
+            ((jcc_audit || thunk_audit || prop_audit) && !census)) {
             free(buf);
             buf = NULL;
             continue;
@@ -2941,7 +3014,7 @@ int main(int argc, char **argv)
         }
         printf("  IFUNC resolvers defined: %ld%s\n", ifuncs,
             ifuncs > 0 ? " (runtime CPU dispatch present)" : "");
-    } else if (!json && !jcc_audit && !thunk_audit) {
+    } else if (!json && !jcc_audit && !thunk_audit && !prop_audit) {
         x86lint_summary_print(summary);
     }
 
@@ -2972,16 +3045,31 @@ int main(int argc, char **argv)
         }
     }
 
+    // The build-property audit, with its corroborating symbol: a protected
+    // function calls __stack_chk_fail when the guard does not match, and
+    // whether the image names it at all is a cross-check on the coverage the
+    // bytes reported.
+    if (prop_audit) {
+        struct named_symbols named;
+        find_named_symbols(f, &ehdr, shnum, file_size, &named);
+        x86lint_build_set_evidence(prop_data, named.stack_chk_fail);
+        x86lint_build_print(prop_data, verbose);
+        if (x86lint_build_functions(prop_data) != 0) {
+            printf("  measured over %s\n", have_symtab
+                ? "the function symbols in .symtab"
+                : "the exported functions in .dynsym (.symtab is stripped, so "
+                  "this is a biased sample of the binary's functions)");
+        }
+    }
+
     // The thunk audit: its byte-level half is counted, and the symbol
     // evidence that the bytes cannot carry is read now, once for the file.
     int thunk_errors = 0;
     if (thunk_audit) {
-        bool returns_named = false;
-        bool indirects_named = false;
-        find_thunk_symbols(f, &ehdr, shnum, file_size, &returns_named,
-            &indirects_named);
+        struct named_symbols named;
+        find_named_symbols(f, &ehdr, shnum, file_size, &named);
         x86lint_thunk_set_evidence(thunk_data, thunk_ret_relocs,
-            thunk_ind_relocs, returns_named, indirects_named);
+            thunk_ind_relocs, named.return_thunk, named.indirect_thunk);
         thunk_errors = x86lint_thunk_print(thunk_data, verbose);
     }
 
@@ -3011,7 +3099,7 @@ int main(int argc, char **argv)
                "  \"opportunities\": %d\n}\n",
             x86lint_summary_instructions(summary),
             x86lint_summary_skipped(summary), errors);
-    } else if (!jcc_audit && !thunk_audit) {
+    } else if (!jcc_audit && !thunk_audit && !prop_audit) {
         // Nothing of this belongs under -j or -s: the audit is that run's
         // whole report and it covered every executable byte, so both a
         // restriction line and an opportunity count would describe a scan
@@ -3041,6 +3129,7 @@ int main(int argc, char **argv)
         thunk_errors != 0;
 
 out:
+    x86lint_build_destroy(prop_data);
     x86lint_thunk_destroy(thunk_data);
     x86lint_jcc_destroy(jcc_data);
     x86lint_census_destroy(census_data);

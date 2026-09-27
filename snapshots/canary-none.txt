@@ -1,0 +1,4 @@
+build properties: 1 function examined
+  stack protector: 0 of 1 function (0.0%) -- no stack protector
+  measured over the function symbols in .symtab
+exit status: 0

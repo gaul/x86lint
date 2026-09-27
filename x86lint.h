@@ -784,6 +784,71 @@ size_t x86lint_thunk_count(const x86lint_thunk *thunk,
                            enum x86lint_thunk_kind kind);
 size_t x86lint_thunk_instructions(const x86lint_thunk *thunk);
 
+// A per-function tally of the build properties a function's own code reveals
+// (the driver's -p). Opaque; NULL is accepted everywhere.
+//
+// The other audits here describe a whole image from a sweep of its bytes.
+// These properties are per function and only meaningful as a *fraction* of
+// them, which makes the function symbols part of the measurement rather than
+// an optimization: a stripped binary has no denominator and gets no verdict.
+// That is the one contract this shares with nothing else in the tool.
+//
+// It is informational and never sets the exit status. Coverage here is a
+// policy choice rather than a defect at any level -- partial stack-protector
+// coverage is precisely what -fstack-protector-strong means -- so unlike the
+// thunk audit there is no incomplete-opt-in to report. The value is that
+// nothing else answers the question: checksec and hardening-check read the
+// symbol table and say whether __stack_chk_fail is *present*, where counting
+// the functions that actually load the guard separates none from some from
+// every one, which is what distinguishes the three flag settings.
+typedef struct x86lint_build x86lint_build;
+
+enum x86lint_build_prop {
+    // The function reads the stack-guard slot, %fs:0x28 -- the glibc x86-64
+    // TLS layout's tcbhead_t.stack_guard, which is what -fstack-protector
+    // and its variants compile to. Another libc placing the guard elsewhere
+    // would not be recognized; that is measured against glibc, musl and the
+    // rest being unverified here.
+    X86LINT_BUILD_CANARY,
+};
+
+#define X86LINT_BUILD_PROPS (X86LINT_BUILD_CANARY + 1)
+
+enum x86lint_build_verdict {
+    X86LINT_BUILD_UNKNOWN,   // no function symbols: no denominator
+    X86LINT_BUILD_ABSENT,    // no function has it
+    X86LINT_BUILD_PARTIAL,   // some do
+    X86LINT_BUILD_ALL,       // every one does
+};
+
+x86lint_build *x86lint_build_create(void);
+void x86lint_build_destroy(x86lint_build *build);
+
+// Examine one function's bytes -- inst[0] being its entry -- and tally the
+// properties its code shows. Called once per function symbol, so the counts
+// and the function total move together and the fraction means what it says.
+// An undecodable byte is skipped and the sweep resyncs.
+void x86lint_build_scan_function(x86lint_build *build, const uint8_t *inst,
+                                 size_t len);
+
+// Corroboration from the container: whether the image names
+// __stack_chk_fail, which a protected function calls when the guard does not
+// match. Printed beside the coverage rather than folded into it -- a function
+// can read the guard without checking it, which is what a libc setting the
+// guard up does, so the two signals differ by a handful per binary and the
+// report says so instead of picking one.
+void x86lint_build_set_evidence(x86lint_build *build, bool chk_fail_named);
+
+// Print the audit. No return value: this mode never sets the exit status.
+void x86lint_build_print(const x86lint_build *build, bool verbose);
+
+enum x86lint_build_verdict x86lint_build_verdict(const x86lint_build *build,
+                                                 enum x86lint_build_prop prop);
+
+size_t x86lint_build_functions(const x86lint_build *build);
+size_t x86lint_build_count(const x86lint_build *build,
+                           enum x86lint_build_prop prop);
+
 // How many instructions the copy folds -- missing APX NDD and MOV+ADD
 // foldable to LEA, which divide the same pairs by flag liveness -- may
 // examine, counting the copy and its consumer: 2 matches only adjacent

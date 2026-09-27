@@ -1061,6 +1061,60 @@ Nothing in the table flags them today, and the finding count barely moved
 (432 → 435), but a future "useless prefix" check would light up on every
 mitigated binary. It needs to know about this.
 
+## Build-property audit (2026-09-26)
+
+**Shipped as `-p`**, the third verdict mode and the first whose answers are
+*fractions of the functions* rather than facts about the image. That makes the
+symbol table part of the measurement rather than an optimization, which nothing
+else here does: a stripped binary has no denominator and gets no verdict.
+
+**Stack-protector coverage is the first property, and the fraction is the
+whole point.** `checksec` and `hardening-check` read the symbol table and
+report whether `__stack_chk_fail` is present -- a yes or no. Counting the
+functions that load the guard separates none from some from every one, which
+is what distinguishes the three flag settings, verified against all three:
+
+| build | functions carrying the guard |
+| --- | --- |
+| no flag | 0 of 4 (0.0%) |
+| `-fstack-protector-strong` | 1 of 4 (25.0%) -- the one with an escaping array |
+| `-fstack-protector-all` | 4 of 4 (100.0%) |
+| glibc | 1,513 of 6,943 (21.8%) |
+| /bin/bash | 274 of 1,763 exported (15.5%) |
+| libcrypto | 637 of 5,867 exported (10.9%) |
+| /bin/go | 0 of 14,862 (0.0%) |
+| ld.so | 1 of 474 (0.2%) -- **not** protected; see below |
+
+**The loader is why the verdict rests on two signals.** Reading the guard is
+not being protected by it: ld.so touches `%fs:0x28` in exactly one function,
+being where the guard is established for everyone else, and names no
+`__stack_chk_fail` at all. The first working version called it
+`-fstack-protector` on the strength of that one initializer. A protected
+function must be able to fail, so with no handler named the verdict is
+`no stack protector` however many functions touch the slot -- and the report
+says which of the two signals it is looking at.
+
+**Two measurement corrections worth keeping.** The guard load is not a
+prologue-only phenomenon: GCC schedules it wherever register pressure allows,
+and the first probe searched the first dozen instructions of each function,
+which undercounted bash by **35%** (231 against 357). And `.symtab` is absent
+from most distro binaries, so where it is stripped the audit measures over
+`.dynsym` and labels the denominator: exported functions are a biased sample
+of a library's, but a biased fraction answers the question where no sample
+answers nothing. Never both tables at once, or every exported function would
+be counted twice.
+
+**Informational by design, unlike `-s`.** Coverage is a policy choice rather
+than a defect at any level -- partial coverage is precisely what `-strong`
+means -- so there is no incomplete-opt-in to report and the mode never sets
+the exit status. Which functions `-strong` protects is not decidable from the
+bytes (it turns on having a local array or an address-taken local), so the
+partial verdict names both flags and does not choose.
+
+**Not covered: another libc's guard slot.** `%fs:0x28` is the glibc x86-64
+TLS layout's `tcbhead_t.stack_guard`; musl and the rest are unverified here,
+and a libc placing the guard elsewhere would read as unprotected.
+
 ## Speculation thunk audit (2026-09-26)
 
 **Shipped as `-s`**, the second verdict mode, and the one with proven demand:

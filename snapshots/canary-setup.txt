@@ -1,0 +1,5 @@
+build properties: 1 function examined
+  stack protector: 1 of 1 function (100.0%) -- no stack protector (the guard is read but no handler is named, so this is where it gets set up)
+    __stack_chk_fail absent in the symbol table
+  measured over the function symbols in .symtab
+exit status: 0

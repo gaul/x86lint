@@ -524,6 +524,56 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Fixtures for the build-property audit (-p), which measures fractions of the
+# functions and so needs the symbol table as its denominator.
+#
+# canary: three sized functions, two of which read the stack guard at %fs:0x28,
+# plus a reference to __stack_chk_fail so the image names a handler -- without
+# which reading the guard is setting it up rather than being protected by it.
+# fn3 reads another TLS slot, which must not count: the displacement is half
+# the signal.
+cat >"$dir/canary.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00  # mov rax, fs:0x28
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .globl fn2
+    .type fn2, @function
+fn2:
+    .byte 0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00  # mov rax, fs:0x28
+    .byte 0xc3                          # ret
+    .size fn2, . - fn2
+    .globl fn3
+    .type fn3, @function
+fn3:
+    .byte 0x64, 0x48, 0x8b, 0x04, 0x25, 0x10, 0x00, 0x00, 0x00  # mov rax, fs:0x10
+    .byte 0xc3                          # ret
+    .size fn3, . - fn3
+    .globl __stack_chk_fail
+    .type __stack_chk_fail, @function
+__stack_chk_fail:
+    .byte 0xc3
+    .size __stack_chk_fail, . - __stack_chk_fail
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# canarysetup: the same guard read with no handler anywhere, which is what
+# ld.so looks like -- it is where the guard is established for everyone else,
+# and reporting it as -fstack-protector would be wrong.
+cat >"$dir/canarysetup.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x64, 0x48, 0x89, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00  # mov fs:0x28, rax
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # Fixtures for the speculation-thunk audit (-s), which asks whether returns
 # and indirect branches were routed through the Spectre-v2 and Retbleed
 # thunks. Hand-written, because the shape is a symbol name plus a relocation
@@ -686,7 +736,7 @@ _start:
 EOF
 
 for f in finding clean bmi notrack census isanote perfunc target advisory \
-         jccpad jccraw jccmixed; do
+         jccpad jccraw jccmixed canary canarysetup; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -1051,6 +1101,36 @@ expect '^3 optimization opportunities in 3 instructions$'
 run 0 "$dir/clean.o"
 reject 'instructions were excluded' "an exclusion on a relocation-free object"
 
+# The build-property audit (-p). Two of three functions read the stack guard
+# and the image names the handler, so this is a partial-coverage build; the
+# third reads a different TLS slot and must not count.
+run 0 -p "$dir/canary"
+expect '^build properties: 4 functions examined$'
+expect '^  stack protector: 2 of 4 functions \(50\.0%\) -- -fstack-protector or -strong$'
+expect '^  measured over the function symbols in \.symtab$'
+
+# -v names the corroborating symbol the verdict rests on.
+run 0 -p -v "$dir/canary"
+expect '^    __stack_chk_fail named in the symbol table$'
+
+# Reading the guard with no handler named is where the guard gets set up, not
+# code protected by it -- ld.so does exactly this in one function.
+run 0 -p "$dir/canarysetup"
+expect 'no stack protector \(the guard is read but no handler is named'
+run 0 -p -v "$dir/canarysetup"
+expect '^    __stack_chk_fail absent in the symbol table$'
+
+# Nothing reads the guard at all.
+run 0 -p "$dir/clean"
+expect '^  stack protector: 0 of 1 function \(0\.0%\) -- no stack protector$'
+
+# The audit is informational: it never sets the exit status, whatever it finds.
+run 0 -p -t skylake "$dir/canarysetup"
+
+# The audit is its own report, and --json describes none of them.
+run 2 --json -p "$dir/canary"
+expect 'cannot be combined with'
+
 # The speculation-thunk audit (-s). Routed: the image names both thunks and
 # holds neither the RET nor the indirect branch they replace.
 run 0 -s "$dir/thunkfull.o"
@@ -1189,6 +1269,9 @@ snapshot jcc-absent -j -t skylake "$dir/jccraw"
 snapshot jcc-present -j "$dir/jccpad"
 snapshot jcc-partial -j -v "$dir/jccmixed"
 snapshot jcc-unplaced -j "$dir/clean.o"
+snapshot canary-partial -p -v "$dir/canary"
+snapshot canary-setup -p -v "$dir/canarysetup"
+snapshot canary-none -p "$dir/clean"
 snapshot thunk-routed -s "$dir/thunkfull.o"
 snapshot thunk-hole -s "$dir/thunkhole.o"
 snapshot thunk-local -s "$dir/thunklocal.o"

@@ -549,21 +549,22 @@ Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
 than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
-`-e`, `-j` and `-s` are separate reports whose output would interleave with it,
-and the driver refuses the combination rather than choosing for the caller.
+`-e`, `-j`, `-s` and `-p` are separate reports whose output would interleave
+with it, and the driver refuses the combination rather than choosing for the
+caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
 pads, `-i` to replace the lint scan with an ISA census of the binary, `-j` to
-replace it with a JCC-erratum verdict, and `-s` with a speculation-thunk
-verdict; see the next sections.
+replace it with a JCC-erratum verdict, `-s` with a speculation-thunk verdict,
+and `-p` with a per-function build-property audit; see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
 broken run. `-e` findings set the exit status like any other; the `-i` census
 never sets it, the `-j` audit sets it only under `-t skylake` (the one target
-that has the erratum), and the `-s` audit only for a mitigation left
-incomplete.
+that has the erratum), the `-s` audit only for a mitigation left incomplete,
+and the `-p` audit never.
 
 ## ENDBR64 (CET IBT) verification
 
@@ -928,6 +929,55 @@ retpoline-built program linked against an ordinary libc reports `INCOMPLETE`
 because libc's returns really are unrouted, which is accurate but says more
 about the link than about the code. A kernel module has no such passengers,
 which is why it is the case with clean semantics.
+
+## Build-property audit (`-p`)
+
+`x86lint -p` reports build properties that a function's own code reveals, as
+fractions of the functions rather than facts about the image. That makes the
+symbol table part of the measurement rather than an optimization: a stripped
+binary has no denominator, which is the one contract this shares with nothing
+else here.
+
+So far it answers one question -- what fraction of functions carry a stack
+canary -- and the fraction is the point. `checksec` and `hardening-check` read
+the symbol table and report whether `__stack_chk_fail` is *present*, which is
+a yes or no; counting the functions that actually load the guard separates
+*none* from *some* from *every one*, which is what distinguishes the three
+flag settings. Verified against all three: 0% with no flag, 25% under
+`-fstack-protector-strong` for the one function of four with an escaping
+array, 100% under `-fstack-protector-all`.
+
+```console
+$ ./x86lint -p /usr/lib64/libc.so.6 | sed -n '2,3p'
+  stack protector: 1513 of 6943 functions (21.8%) -- -fstack-protector or -strong
+  measured over the function symbols in .symtab
+
+$ ./x86lint -p /usr/lib64/ld-linux-x86-64.so.2 | sed -n '2p'
+  stack protector: 1 of 474 functions (0.2%) -- no stack protector (the guard is read but no handler is named, so this is where it gets set up)
+```
+
+The loader is why the verdict rests on two signals and not one. Reading the
+guard is not being protected by it: `ld.so` touches `%fs:0x28` in exactly one
+function, that being where the guard is established for everyone else, and it
+names no `__stack_chk_fail` at all. An earlier version called that binary
+`-fstack-protector` on the strength of one initializer. A protected function
+must be able to fail, so with no handler named anywhere the verdict is
+`no stack protector` however many functions touch the slot.
+
+Which functions `-strong` protects is not decidable from the bytes -- it turns
+on having a local array or an address-taken local -- so the partial verdict
+names both flags and does not choose between them. The audit is informational
+and never sets the exit status: coverage is a policy choice rather than a
+defect at any level, and partial coverage is precisely what `-strong` means.
+
+Two things to know about the denominator. `.symtab` is preferred; where it has
+been stripped -- most distro binaries -- the audit measures over `.dynsym`
+instead and says so, because exported functions are a biased sample of a
+library's but a biased fraction still answers the question where no sample
+answers nothing. And the guard load is not a prologue-only phenomenon: GCC
+schedules it wherever the register pressure allows, and the first version of
+this measured only the first dozen instructions of each function, which
+undercounted `/bin/bash` by 35%.
 
 ## Mining tools
 

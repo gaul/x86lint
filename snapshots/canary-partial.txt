@@ -1,0 +1,5 @@
+build properties: 4 functions examined
+  stack protector: 2 of 4 functions (50.0%) -- -fstack-protector or -strong
+    __stack_chk_fail named in the symbol table
+  measured over the function symbols in .symtab
+exit status: 0

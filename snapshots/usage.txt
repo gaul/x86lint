@@ -1,2 +1,2 @@
-usage: x86lint [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] [-m bmi1|bmi2|movbe|apx|v8] [-t generic|sandybridge|skylake|icelake|zen|silvermont] [-c advisory|security|all] <ELF_FILE>
+usage: x86lint [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] [-m bmi1|bmi2|movbe|apx|v8] [-t generic|sandybridge|skylake|icelake|zen|silvermont] [-c advisory|security|all] <ELF_FILE>
 exit status: 2

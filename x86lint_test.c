@@ -8075,6 +8075,103 @@ static void mask_relocated_test(void)
     assert(memcmp(buf, code, sizeof(code)) == 0);
 }
 
+static void build_test(void)
+{
+    // mov rax, fs:0x28 -- the stack guard -- then a plain return.
+    static const uint8_t guarded[] = {
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00,
+        0x31, 0xc0,                     // xor eax, eax
+        0xc3,                           // ret
+    };
+    static const uint8_t plain[] = {0x31, 0xc0, 0xc3};
+    // The same access at another TLS offset is another variable, not the
+    // guard: the displacement is half the signal, not decoration.
+    static const uint8_t other_tls[] = {
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x10, 0x00, 0x00, 0x00,
+        0xc3,
+    };
+
+    x86lint_build *b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, guarded, sizeof(guarded));
+    x86lint_build_scan_function(b, plain, sizeof(plain));
+    x86lint_build_scan_function(b, other_tls, sizeof(other_tls));
+    assert(x86lint_build_functions(b) == 3);
+    assert(x86lint_build_count(b, X86LINT_BUILD_CANARY) == 1);
+    // No handler named: reading the guard is not being protected by it, so
+    // however many functions touch the slot, none of them is protected.
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_ABSENT);
+    x86lint_build_set_evidence(b, true);
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_PARTIAL);
+    x86lint_build_destroy(b);
+
+    // Every function guarded, which is what -fstack-protector-all produces.
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, guarded, sizeof(guarded));
+    x86lint_build_scan_function(b, guarded, sizeof(guarded));
+    x86lint_build_set_evidence(b, true);
+    assert(x86lint_build_count(b, X86LINT_BUILD_CANARY) == 2);
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_ALL);
+    x86lint_build_destroy(b);
+
+    // Counted once per function however many times it reads the guard --
+    // a protected function reads it at least twice, loading and comparing.
+    b = x86lint_build_create();
+    assert(b != NULL);
+    uint8_t twice[sizeof(guarded) + 9];
+    memcpy(twice, guarded, sizeof(guarded));
+    memcpy(twice + sizeof(guarded), guarded, 9);
+    x86lint_build_scan_function(b, twice, sizeof(twice));
+    assert(x86lint_build_functions(b) == 1);
+    assert(x86lint_build_count(b, X86LINT_BUILD_CANARY) == 1);
+    x86lint_build_destroy(b);
+
+    // No functions at all: the denominator IS the measurement, so its
+    // absence is not a zero-percent answer.
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_set_evidence(b, true);
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_UNKNOWN);
+    assert(x86lint_build_functions(b) == 0);
+    x86lint_build_destroy(b);
+
+    // An undecodable byte resyncs, and the guard after it is still found.
+    b = x86lint_build_create();
+    assert(b != NULL);
+    uint8_t broken[1 + sizeof(guarded)];
+    broken[0] = 0x06;
+    memcpy(broken + 1, guarded, sizeof(guarded));
+    x86lint_build_scan_function(b, broken, sizeof(broken));
+    assert(x86lint_build_count(b, X86LINT_BUILD_CANARY) == 1);
+    x86lint_build_destroy(b);
+
+    // NULL is accepted everywhere, and an out-of-range property reads back
+    // as zero rather than off the end of the arrays.
+    x86lint_build_scan_function(NULL, guarded, sizeof(guarded));
+    x86lint_build_set_evidence(NULL, true);
+    x86lint_build_print(NULL, false);
+    assert(x86lint_build_functions(NULL) == 0);
+    assert(x86lint_build_count(NULL, X86LINT_BUILD_CANARY) == 0);
+    assert(x86lint_build_verdict(NULL, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_UNKNOWN);
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, guarded, sizeof(guarded));
+    assert(x86lint_build_count(b, (enum x86lint_build_prop) -1) == 0);
+    assert(x86lint_build_count(b,
+        (enum x86lint_build_prop) X86LINT_BUILD_PROPS) == 0);
+    assert(x86lint_build_verdict(b,
+        (enum x86lint_build_prop) X86LINT_BUILD_PROPS) ==
+        X86LINT_BUILD_UNKNOWN);
+    x86lint_build_destroy(b);
+    x86lint_build_destroy(NULL);
+}
+
 static void thunk_test(void)
 {
     // ret ; call *%rax ; jmp *%rcx ; call rel32 ; jmp rel32. The first three
@@ -8469,6 +8566,7 @@ int main(int argc, char *argv[])
     finding_callback_test();
     census_test();
     mask_relocated_test();
+    build_test();
     thunk_test();
     jcc_test();
 

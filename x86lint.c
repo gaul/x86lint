@@ -3869,6 +3869,181 @@ int x86lint_jcc_print(const x86lint_jcc *jcc, enum x86lint_target target,
     return findings;
 }
 
+// ==== per-function build properties ==================================
+//
+// See the block comment on x86lint_build in the header for why the function
+// symbols are part of this measurement and why it never sets the exit status.
+
+// The stack guard's home in the glibc x86-64 TLS block: tcbhead_t.stack_guard,
+// which every -fstack-protector prologue reads and every epilogue compares
+// against. Named rather than spelled inline because it is the one
+// ABI-dependent number here.
+#define STACK_GUARD_SEGMENT XED_REG_FS
+#define STACK_GUARD_DISPLACEMENT 0x28
+
+struct x86lint_build {
+    size_t functions;
+    size_t count[X86LINT_BUILD_PROPS];
+    bool chk_fail_named;
+};
+
+x86lint_build *x86lint_build_create(void)
+{
+    return calloc(1, sizeof(struct x86lint_build));
+}
+
+void x86lint_build_destroy(x86lint_build *build)
+{
+    free(build);
+}
+
+// Whether an instruction reads or writes the stack-guard slot. Asked of the
+// decoded operand rather than of the bytes, so the several encodings of the
+// same access -- with and without a SIB byte, at either operand size, through
+// any destination register -- all answer alike.
+static bool touches_stack_guard(const xed_decoded_inst_t *xedd)
+{
+    unsigned n = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (unsigned i = 0; i < n; ++i) {
+        if (xed_decoded_inst_get_seg_reg(xedd, i) == STACK_GUARD_SEGMENT &&
+            xed_decoded_inst_get_memory_displacement(xedd, i) ==
+                STACK_GUARD_DISPLACEMENT) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void x86lint_build_scan_function(x86lint_build *build, const uint8_t *inst,
+                                 size_t len)
+{
+    if (build == NULL) {
+        return;
+    }
+    build->functions++;
+    bool canary = false;
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            continue;
+        }
+        // Anywhere in the function, not in a window at its head. The guard
+        // load is scheduled wherever the register pressure allows, and
+        // measuring it against the first dozen instructions -- which looked
+        // reasonable enough to get written first -- undercounted bash by 35%.
+        if (!canary && touches_stack_guard(&xedd)) {
+            canary = true;
+            build->count[X86LINT_BUILD_CANARY]++;
+        }
+        i += xed_decoded_inst_get_length(&xedd);
+    }
+}
+
+void x86lint_build_set_evidence(x86lint_build *build, bool chk_fail_named)
+{
+    if (build != NULL) {
+        build->chk_fail_named = chk_fail_named;
+    }
+}
+
+size_t x86lint_build_functions(const x86lint_build *build)
+{
+    return build == NULL ? 0 : build->functions;
+}
+
+size_t x86lint_build_count(const x86lint_build *build,
+                           enum x86lint_build_prop prop)
+{
+    if (build == NULL || (int) prop < 0 ||
+        (int) prop >= X86LINT_BUILD_PROPS) {
+        return 0;
+    }
+    return build->count[prop];
+}
+
+enum x86lint_build_verdict x86lint_build_verdict(const x86lint_build *build,
+                                                 enum x86lint_build_prop prop)
+{
+    if (build == NULL || build->functions == 0 || (int) prop < 0 ||
+        (int) prop >= X86LINT_BUILD_PROPS) {
+        return X86LINT_BUILD_UNKNOWN;
+    }
+    size_t n = build->count[prop];
+    if (n == 0) {
+        return X86LINT_BUILD_ABSENT;
+    }
+    // Reading the guard is not being protected by it. A protected function
+    // must be able to fail, so with no __stack_chk_fail named anywhere in the
+    // image nothing here is protected however many functions touch the slot --
+    // and some do: ld.so reads it in exactly one function, being where the
+    // guard is set up for everyone else, and names no handler at all. Without
+    // this the audit called that binary -fstack-protector on the strength of
+    // one initializer.
+    if (prop == X86LINT_BUILD_CANARY && !build->chk_fail_named) {
+        return X86LINT_BUILD_ABSENT;
+    }
+    return n == build->functions ? X86LINT_BUILD_ALL : X86LINT_BUILD_PARTIAL;
+}
+
+static void build_print_prop(const x86lint_build *build,
+                             enum x86lint_build_prop prop, const char *name,
+                             const char *absent, const char *partial,
+                             const char *all)
+{
+    size_t n = build->count[prop];
+    printf("  %s: %zu of %zu function%s", name, n, build->functions,
+        build->functions == 1 ? "" : "s");
+    if (build->functions != 0) {
+        printf(" (%.1f%%)", 100.0 * (double) n / (double) build->functions);
+    }
+    switch (x86lint_build_verdict(build, prop)) {
+    case X86LINT_BUILD_ABSENT:
+        printf(" -- %s\n", absent);
+        break;
+    case X86LINT_BUILD_PARTIAL:
+        printf(" -- %s\n", partial);
+        break;
+    case X86LINT_BUILD_ALL:
+        printf(" -- %s\n", all);
+        break;
+    case X86LINT_BUILD_UNKNOWN:
+        printf("\n");
+        break;
+    }
+}
+
+void x86lint_build_print(const x86lint_build *build, bool verbose)
+{
+    if (build == NULL) {
+        return;
+    }
+    printf("build properties: %zu function%s examined\n", build->functions,
+        build->functions == 1 ? "" : "s");
+    if (build->functions == 0) {
+        // The denominator is the measurement here, so its absence is the
+        // whole report rather than a footnote on a zero.
+        printf("  no sized function symbols: a fraction of the functions is "
+            "not measurable from a stripped image\n");
+        return;
+    }
+    build_print_prop(build, X86LINT_BUILD_CANARY, "stack protector",
+        build->count[X86LINT_BUILD_CANARY] == 0
+            ? "no stack protector"
+            : "no stack protector (the guard is read but no handler is named, "
+              "so this is where it gets set up)",
+        "-fstack-protector or -strong", "-fstack-protector-all");
+    if (verbose) {
+        // The corroborating signal, which the verdict above already rests on.
+        // Which functions -strong protects is not decidable from the bytes --
+        // it turns on having a local array or an address-taken local -- so the
+        // partial verdict names both flags and does not choose.
+        printf("    __stack_chk_fail %s in the symbol table\n",
+            build->chk_fail_named ? "named" : "absent");
+    }
+}
+
 // ==== the speculation-thunk audit ====================================
 //
 // See the block comment on x86lint_thunk in the header for what the thunks

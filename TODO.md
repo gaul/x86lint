@@ -729,7 +729,7 @@ bash:
 
 | armlint check | x86 spelling | shape | realized |
 | --- | --- | --- | --- |
-| compare whose flags are overwritten unread | delete the `CMP`/`TEST` | 2,327,914 | 396 |
+| ~~compare whose flags are overwritten unread~~ | ~~delete the `CMP`/`TEST`~~ | 2,327,914 | **Done: "dead compare", 386** (libxul 352, go 34, and 0 in glibc, ld.so, bash, libstdc++ and libcrypto). The 396 this row carried was a stale shapescan figure; the shipped check and shapescan now agree at 386, which is the number two independent counts give. See the note below |
 | ~~`neg` + `add`/`sub`~~ | ~~`neg r ; add r2, r` -> `sub r2, r`~~ | **Done: "NEG foldable into ADD/SUB", 16** |
 | ~~redundant zero-extension by producer threshold~~ | ~~generalized past extension-after-extension~~ | **Done: "redundant zero-extension", 54** (libxul 48, go 6) |
 | `shift` foldable into shifted-register form | `shl r, k<=3 ; add r2, r` -> `lea` | 17 | 0 |
@@ -739,6 +739,43 @@ bash:
 | vector self-op identity | `pand`/`por`/`psub` with one source | 0 | 0 |
 | `and xd, xn, #0xffffffff` | `and r64, 0xffffffff` -> `mov r32, r32` | 0 | 0 |
 | widening extend + `scvtf` | `movsxd` + `cvtsi2sd` -> 32-bit convert | 0 | 0 |
+
+**The dead compare shipped on the smallest predicate in the table and the
+largest shape in this file.** 2.3M register-only `CMP`/`TEST` instructions
+across the corpus, 386 of them dead -- a 6,000x collapse that is the gate being
+right rather than a defect, and the refusal breakdown says so in one line
+(`the flags are live afterward`, all of it). The check function is nine lines;
+the claim lives entirely in the dispatcher's existing `flag_concerns` gate,
+declared `FLAG_ARITH` because deleting a compare stops it producing all five.
+That is "suboptimal MOV zero"'s composition read backwards -- there the flags
+are what the rewrite would newly clobber -- and it is the first row here to
+need no new machinery at all.
+
+*Two things the build turned up that the sizing had not.*
+
+**Deletion supersedes narrowing, and the interaction is real even though the
+corpus has none of it.** A dead `CMP reg, 0` is also a "suboptimal CMP zero"
+(use `TEST`), and reporting both is the "two shipped checks fighting over one
+instruction" this file warns about. Measured first: **zero of the 386 sites
+share an address with any other finding**, so the conflict is structurally
+possible and empirically absent. It still got a rule -- a `deletes_instruction`
+row stops the table, and the three redundant-compare checks consult
+`dead_compare_reported` -- because the alternative is shipping a known
+contradiction that nothing would catch until a user hit it. Confirmed free:
+"redundant TEST after flags" stays at 540 on libxul and 7 on glibc.
+
+**The unit suite found the interaction before the corpus could**, and that is
+the argument for fixtures that assert a total rather than a category. Seven
+existing assertions moved, every one because a fixture ended in
+`test reg, reg ; ret` -- which is a dead compare, exactly as three of those
+fixtures' own comments had already said in prose ("no consumer, so the flags
+are unread and the site is a dead test rather than a decided condition"). The
+sharper consequence is for `flags_test_redundant`'s arithmetic-producer arm:
+its CF/OF divergence needs those flags provably dead, and a bare `RET` tail was
+the only fixture shape that gave it that -- so its own tests were all sites the
+new check now owns. Rewritten to end `test ; setz cl ; ret`, which keeps ZF
+live for the arm under test while CF and OF still die at the RET, and is a
+better fixture for having a reason to exist.
 
 **The vector self-op row is zero, and was 3 for an unsound reason.** All
 three of libxul's sites were `subps xmm1, xmm1`, and the floating-point
@@ -788,7 +825,7 @@ rather than merely missing.
 | --- | --- |
 | ~~Linker import glue scanned as if it were compiler output~~ | **Done, 2026-09-15 (833a433).** The `.plt`, `.iplt` and `.plt.*` sections were linted, contributing a constant 135 unfixable findings per stripped binary: a lazy-binding entry pushes its relocation index with the 5-byte `push imm32`, so every entry whose index fits a signed imm8 draws an oversized-immediate finding and the count saturates at exactly 128, plus 7 from the resolver jumps. Identical in libstdc++ (1,105 PLT entries), bash (236) and libcrypto (161), and enough on their own to fail the non-zero exit a compiler test suite gates on. Excluded by section rather than by symbol, because the symbol restriction already hid it wherever `.symtab` survived and could not where it did not, so the noise appeared only on stripped binaries. `-a` still scans the glue; `-e` is untouched, PLT entries being real IBT targets. The fix also had to read the section-name table for every run rather than only under `-v`, `-e`, `-i` and `--json` -- a first version left that alone and silently did nothing in exactly the plain invocation it exists for |
 | Mach-O and universal-binary support | The driver reads ELF only: `main.c` contains no Mach-O or PE constant at all. armlint reads ELF, thin Mach-O and fat binaries, walking every ARM64-family slice. The direct gain is macOS Intel binaries, but the larger one is that **every cross-project figure in this file compares a Linux ELF corpus against armlint's macOS Mach-O one** and has to caveat it; a shared format would let the two tools measure the same binaries for the first time. What it needs: the `LC_SEGMENT_64`/`LC_SYMTAB` parse, `LC_FUNCTION_STARTS` for the scan restriction on stripped binaries (ELF has no equivalent and simply gives up there), the fat-header walk, and the `__stubs`/`__stub_helper`/`__objc_stubs` exclusion that pairs with the PLT row above. Most of this is architecture-independent and already written in armlint's `main.c`, the cputype filter aside |
-| ~~Durable candidate sizing~~ | **Done, 2026-09-15: `tools/shapescan`.** Sizes a named candidate with the rewrite's own conditions applied and reports which gate refused the rest. Candidates are C predicates rather than a data description, because every one measured this session needed operand-role matching, branch arithmetic, encodability through XED or a liveness walk; the file includes `x86lint.c` so a shipped candidate is measured by the code that realizes it, and an unshipped one is a draft check that moves into the linter rather than being rewritten. It mirrors the driver's corpus byte for byte -- same masking, same branch-target prepass, same decode and resync -- so the three shipped candidates reproduce x86lint's own counts exactly (19, 583 and 10 on libxul), which is the tool's regression test. **The refusal breakdown is the point**, and it already said something no ad-hoc census had: of the vector fold's 18,236 libxul sites, 5,743 fail *encodability* rather than liveness, a third of the shape that every throwaway script had pre-filtered away and so never counted. What does not port from armlint's `shapescan.py` is `--selftest`'s mask verification, which exists because armlint hand-writes encoding masks; XED removes that failure mode |
+| ~~Durable candidate sizing~~ | **Done, 2026-09-15: `tools/shapescan`.** Sizes a named candidate with the rewrite's own conditions applied and reports which gate refused the rest. Candidates are C predicates rather than a data description, because every one measured this session needed operand-role matching, branch arithmetic, encodability through XED or a liveness walk; the file includes `x86lint.c` so a shipped candidate is measured by the code that realizes it, and an unshipped one is a draft check that moves into the linter rather than being rewritten. It mirrors the driver's corpus byte for byte -- same masking, same branch-target prepass, same decode and resync -- so the four shipped candidates reproduce x86lint's own counts exactly (19, 583, 10 and 352 on libxul), which is the tool's regression test. **The refusal breakdown is the point**, and it already said something no ad-hoc census had: of the vector fold's 18,236 libxul sites, 5,743 fail *encodability* rather than liveness, a third of the shape that every throwaway script had pre-filtered away and so never counted. What does not port from armlint's `shapescan.py` is `--selftest`'s mask verification, which exists because armlint hand-writes encoding masks; XED removes that failure mode |
 | ~~A target-core axis (`-t`)~~ | **Done, 2026-09-15: [#28](https://github.com/gaul/x86lint/issues/28).** Four behaviours whose worth is per-core became gates rather than prose: the slow-LEA exclusion, POPCNT's phantom destination, the length-changing prefix stall's MOV half and the SUB zeroing idiom. A check declares `target_requires` the way it declares `ext_required`, and `generic` sets every bit so the default scan is what it was. On libxul `-t icelake` takes "ADD foldable into LEA" from **2,678 to 28,064** and silences 6,431 POPCNT findings; the residue this file recorded as 37,037 was measured without every gate applied and the real figure is 25,386. The LCP split is the one that improves existing output rather than adding to it: MOV is 92% of that check's findings on rustc and pays nothing from Sandy Bridge through Skylake |
 | ~~An audit or advisory finding class~~ | **Done, 2026-09-15: `-c`.** Three kinds, and the hard half was deciding what the class means rather than adding the flag. A check states a verified rewrite (the default, and what makes a non-zero exit meaningful), advice whose fix the tool cannot check, or a review item that is not a rewrite at all. Membership is the checks that already described themselves that way: the SETcc zero-extension and the length-changing prefix stall are advisory, the IBT-bypassing NOTRACK call is security. The naming collision was real -- `-a` already means scan every byte -- so the flag is `-c`. Enabling a class makes its findings count like any other, matching how `-e` findings already behave |
 | ~~Snapshot/integration suite~~ | **Done, 2026-09-15: `snapshots/`, 19 files.** Added as a layer over `driver_test.sh` rather than as a migration, because armlint's shape does not transfer: its `.expected` files replace assertions, and x86lint's 115 `expect`/`reject` lines each state *why* a fixture exists, which a snapshot cannot. So the assertions stay and the snapshots pin everything they do not name -- column widths, ordering, a count on a line nobody wrote a grep for -- across all 19 report surfaces (default, `-a`, `-v`, `--json`, `-f`, `-i`, `-i -v`, `-e`, `-m`, `-c`, `-t`, the PLT skip and the usage text). The work that made them portable was deciding what belongs to the linker rather than the tool: section index, section load address, `--json`'s absolute vaddr, the census's sample addresses, an unpadded target's address, and whether the host's `ld` synthesizes an empty `ISA_1_USED` word or emits no note at all -- the last is why the existing assertion had accepted two spellings. Section-relative offsets, symbol names, byte spellings and every count stay. `make snapshots` regenerates; a missing snapshot is a failure, not a silent create; mismatches print a labelled diff and the run continues, so one invocation shows every changed report. The same commit deleted the suite's own skip: no C compiler now exits 2, because a skip that exits 0 is indistinguishable from a pass to `make` and to CI |

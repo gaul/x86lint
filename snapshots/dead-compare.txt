@@ -1,0 +1,16 @@
+== section N .text: vaddr 0xADDR, 18 bytes ==
+dead compare at offset: 0x0 (_start+0x0): cmp eax, ecx
+  39 c8
+
+dead compare at offset: 0xe (_start+0xe): cmp edi, 0x0
+  83 ff 00
+
+Optimization opportunities by type:
+       2  dead compare
+
+Optimization opportunities by function:
+       2  _start
+
+scan restricted to 1 function symbols (-a scans every byte)
+2 optimization opportunities in 8 instructions
+exit status: 1

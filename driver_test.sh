@@ -609,6 +609,28 @@ fn3:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# deadcmp: a compare exists only for the flags it sets, so one whose flags are
+# overwritten unread is dead. Four shapes in one function: reported, kept alive
+# by a Jcc, excluded for reading memory, and superseded -- the last is a
+# cmp reg, 0 that "suboptimal CMP zero" would narrow to a test, where deleting
+# it outright is the stronger claim and the only finding.
+cat >"$dir/deadcmp.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x39, 0xc8                    # 0x00 cmp eax, ecx   (dead: the add overwrites)
+    .byte 0x83, 0xc1, 0x02              # 0x02 add ecx, 2
+    .byte 0x85, 0xc9                    # 0x05 test ecx, ecx  (live: the je reads ZF)
+    .byte 0x74, 0x02                    # 0x07 je 0x0b
+    .byte 0x31, 0xc0                    # 0x09 xor eax, eax
+    .byte 0x83, 0x3f, 0x02              # 0x0b cmp dword ptr [rdi], 2 (memory: excluded)
+    .byte 0x83, 0xff, 0x00              # 0x0e cmp edi, 0     (dead; supersedes the CMP-zero rewrite)
+    .byte 0xc3                          # 0x11 ret
+    .size _start, . - _start
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # Fixtures for the speculation-thunk audit (-s), which asks whether returns
 # and indirect branches were routed through the Spectre-v2 and Retbleed
 # thunks. Hand-written, because the shape is a symbol name plus a relocation
@@ -771,7 +793,7 @@ _start:
 EOF
 
 for f in finding clean bmi notrack census isanote perfunc target advisory \
-         jccpad jccraw jccmixed canary canarysetup frameptr; do
+         jccpad jccraw jccmixed canary canarysetup frameptr deadcmp; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -1177,6 +1199,18 @@ run 0 -p -t skylake "$dir/canarysetup"
 run 2 --json -p "$dir/canary"
 expect 'cannot be combined with'
 
+# Dead compares. Two of the four are reported: the one the following ADD
+# overwrites unread, and the cmp reg, 0 before the RET.
+run 1 "$dir/deadcmp"
+expect '^ +2 +dead compare$'
+reject 'suboptimal CMP zero' \
+    "a narrowing finding on an instruction that should be deleted"
+run 1 -v "$dir/deadcmp"
+expect '^dead compare at offset: 0x0 \(_start\+0x0\): cmp eax, ecx$'
+expect '^dead compare at offset: 0xe \(_start\+0xe\): cmp edi, 0x0$'
+reject 'offset: 0x5' "the test a Jcc below still reads"
+reject 'offset: 0xb' "a compare that reads memory, whose load may be the point"
+
 # The speculation-thunk audit (-s). Routed: the image names both thunks and
 # holds neither the RET nor the indirect branch they replace.
 run 0 -s "$dir/thunkfull.o"
@@ -1323,6 +1357,7 @@ snapshot thunk-routed -s "$dir/thunkfull.o"
 snapshot thunk-hole -s "$dir/thunkhole.o"
 snapshot thunk-local -s "$dir/thunklocal.o"
 snapshot thunk-none -s -v "$dir/census"
+snapshot dead-compare -v "$dir/deadcmp"
 snapshot relocatable -v "$dir/finding.o"
 snapshot reloc-excluded -v "$dir/reloc.o"
 snapshot reloc-unmarked -v "$dir/noreloc.o"

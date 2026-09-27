@@ -189,6 +189,7 @@ with the corpus populations that argue for or against each, live in
 | [CAS loop foldable into LOCK op](analyses.md#cas-loop-foldable-into-lock-op) | `LOCK OR`/`AND`/`XOR` |
 | [constant condition after immediate](analyses.md#constant-condition-after-immediate) | delete the compare; the `Jcc`/`CMOVcc`/`SETcc` reading it has one outcome |
 | [constant condition after zeroing](analyses.md#constant-condition-after-zeroing) | same, the tested register being provably zero at any width |
+| [dead compare](analyses.md#dead-compare) | delete it; nothing reads the flags it sets |
 | [IBT-bypassing NOTRACK call](analyses.md#ibt-bypassing-notrack-call) | review item: a deliberately untracked forward edge, not a rewrite |
 | [LEA foldable into memory](analyses.md#lea-foldable-into-memory) | fold the address into the consumer's memory operand |
 | [length-changing prefix stall](analyses.md#length-changing-prefix-stall) | 32-bit operands; advisory, and the imm8 narrowing removes it by itself |

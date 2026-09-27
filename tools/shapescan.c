@@ -194,14 +194,16 @@ static bool decode_at(const uint8_t *inst, size_t len, size_t off,
 // /bin/ls). A memory operand is excluded rather than gated: deleting the
 // access removes a fault that may be the point, which is what go's
 // `test BYTE PTR [rax], al` nil check is. Measured at 291 in libxul.
+// Now shipped; measured through the check itself and the gate the dispatcher
+// applies to it, so this row is a regression test on the realized count rather
+// than an estimate of it. The table checks return true when there is nothing
+// to report, so the sense inverts.
 static bool c_dead_compare(const uint8_t *inst, size_t len,
                            const uint8_t *targets, size_t offset, size_t next,
                            const xed_decoded_inst_t *d, const char **why)
 {
     (void) targets; (void) offset;
-    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(d);
-    if ((ic != XED_ICLASS_CMP && ic != XED_ICLASS_TEST) ||
-        xed_decoded_inst_number_of_memory_operands(d) != 0) {
+    if (check_dead_compare(d)) {
         return false;
     }
     if (flags_live_after(inst, len, next, FLAG_ARITH)) {
@@ -743,11 +745,11 @@ static const struct candidate candidates[] = {
       NULL, zero_store_runs },
     { "constant already in a register", "MOV rD, rS",
       NULL, remat_constant_any },
+    { "dead compare", "delete the CMP/TEST", c_dead_compare, NULL },
 
     // TODO rows, not yet shipped. The figure in the comment on each
     // predicate is what an earlier throwaway script reported, where there
     // was one.
-    { "dead compare", "delete the CMP/TEST", c_dead_compare, NULL },
     { "same-register CMOVcc", "remove", c_cmov_self, NULL },
     { "vector self-op identity", "MOVAPS, or the zero idiom",
       c_vec_self_op, NULL },

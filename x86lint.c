@@ -622,6 +622,45 @@ bool check_cmp_zero(const xed_decoded_inst_t *xedd)
     return xed_decoded_inst_get_unsigned_immediate(xedd) != 0;
 }
 
+// A CMP or TEST computes nothing: it exists only for the flags it sets, so one
+// whose flags are every one overwritten before anything reads them is dead
+// outright and wants deleting rather than shortening. Unusually for this table
+// the predicate is nearly trivial and the whole claim lives in the gate: the
+// row declares FLAG_ARITH, and the dispatcher reports the finding only where
+// flags_live_after proves all five dead down every path it can follow. That is
+// the same composition suboptimal MOV zero uses, read in the other direction --
+// there the flags are what the rewrite would newly clobber, here they are what
+// it would stop producing.
+//
+// AF is outside the flag model (see "Soundness over recall" in README.md) and
+// deleting the compare destroys it too, which costs nothing here: the only way
+// 64-bit code observes AF is LAHF or PUSHF, and both read the five modelled
+// flags as well, so the walk reports LIVE and the finding is suppressed before
+// AF can matter.
+//
+// A compare that reads memory is excluded, and not for encoding reasons.
+// Deleting it would remove the load, which may be the entire point: Go spells
+// a nil check as `TESTB AL, (AX)`, whose flags nothing reads and whose fault is
+// the check. The same rule keeps the tool off MMIO reads and stack-probe
+// compares, and it is the standing line that no finding changes the set of
+// memory accesses (cf. check_shift_zero, issues #29 and #30).
+bool check_dead_compare(const xed_decoded_inst_t *xedd)
+{
+    switch (xed_decoded_inst_get_iclass(xedd)) {
+    case XED_ICLASS_CMP:
+    case XED_ICLASS_TEST:
+        break;
+    default:
+        return true;
+    }
+
+    if (xed_decoded_inst_number_of_memory_operands(xedd) > 0) {
+        return true;
+    }
+
+    return false;
+}
+
 // TODO: could have false positives for sequences preserving flags
 bool check_mov_zero(const xed_decoded_inst_t *xedd)
 {
@@ -2412,6 +2451,24 @@ static bool flags_live_after(const uint8_t *inst, size_t len, size_t offset,
                              uint32_t concerns)
 {
     return flags_live_after_ext(inst, len, offset, concerns, false);
+}
+
+// True when the "dead compare" row will report `cmp` at `offset` on its own
+// pass over that instruction. A window check that also advises deleting the
+// same compare consults this and stands down: both findings ask for one
+// deletion, and the dead-compare claim needs nothing said about what the
+// producer set. This mirrors the dead-compare row's own condition exactly, so
+// deferring to it can never lose a site -- in particular a compare that reads
+// memory is refused there and stays the window check's to report.
+static bool dead_compare_reported(const uint8_t *inst, size_t len,
+                                  const xed_decoded_inst_t *cmp, size_t offset)
+{
+    if (check_dead_compare(cmp)) {
+        return false;
+    }
+    return !flags_live_after(inst, len,
+                             offset + xed_decoded_inst_get_length(cmp),
+                             FLAG_ARITH);
 }
 
 // Instruction classes that unconditionally overwrite bits 32-63 of a GPR when
@@ -4566,11 +4623,23 @@ struct check_entry {
     // 0 reads as X86LINT_CLASS_REWRITE, so every row that does not say
     // otherwise is a verified rewrite.
     uint32_t klass;
+    // True for a row whose advice is to delete the instruction outright rather
+    // than spell it differently. Every later row is then reporting how to
+    // encode an instruction that should not be there at all, so the dispatcher
+    // stops after emitting this one: one site, one finding, and the stronger
+    // claim, the rule the constant-condition rows already follow against
+    // "redundant TEST after flags". A row that sets this must come before the
+    // encoding rows it supersedes.
+    bool deletes_instruction;
 };
 
 // check_suboptimal_nops is not in the table: it takes the raw byte stream
 // (not a decoded instruction) and reports a 2-instruction window.
 static const struct check_entry checks[] = {
+    // First, and deliberately: a compare nothing reads wants deleting, which
+    // makes every encoding finding below moot on the same instruction.
+    {check_dead_compare,               "dead compare",                    FLAG_ARITH,
+                                       NULL, false, 0, 0, 0, true},
     {check_oversized_immediate,        "oversized immediate",             0},
     {check_oversized_test_immediate,   "oversized TEST immediate",        0},
     {check_test_minus_one,             "redundant TEST immediate",        0},
@@ -10274,6 +10343,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             }
             emit_finding(&sink, checks[i].name, offset, &xedd, inst + offset);
             ++errors;
+            if (checks[i].deletes_instruction) {
+                break;   // nothing below can improve on deleting it
+            }
         }
 
         // Multi-instruction peephole: a flag-setting ALU write followed by
@@ -10319,7 +10391,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (flags_test_redundant(inst, len, branch_targets, next, &xedd,
                                  &redundant_test, &redundant_test_offset) &&
             !(zeroed_condition &&
-              zeroed_test_offset == redundant_test_offset)) {
+              zeroed_test_offset == redundant_test_offset) &&
+            !dead_compare_reported(inst, len, &redundant_test,
+                                   redundant_test_offset)) {
             emit_finding(&sink, "redundant TEST after flags",
                 redundant_test_offset, &redundant_test,
                 inst + redundant_test_offset);
@@ -10332,7 +10406,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // by scanning both successors. Reported at the test's offset, the
         // removable instruction. See shift_test_redundant.
         if (shift_test_redundant(inst, len, branch_targets, next, &xedd,
-                                 &redundant_test, &redundant_test_offset)) {
+                                 &redundant_test, &redundant_test_offset) &&
+            !dead_compare_reported(inst, len, &redundant_test,
+                                   redundant_test_offset)) {
             emit_finding(&sink, "redundant TEST after shift",
                 redundant_test_offset, &redundant_test,
                 inst + redundant_test_offset);

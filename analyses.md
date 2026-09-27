@@ -230,6 +230,50 @@ argue for or against each, live in [TODO.md](TODO.md).
   5 in http3server, against 0 in glibc, ld.so, bash, libstdc++, libcrypto
   and go
 
+## dead compare
+
+* `39C8 83C102` (CMP EAX, ECX; ADD ECX, 2) -- a compare computes nothing and
+  exists only for the flags it sets, so one whose flags are every one
+  overwritten before anything reads them is dead outright, and wants deleting
+  rather than shortening. The predicate matches any register-only `CMP` or
+  `TEST`; the whole claim is the flag-liveness gate, which is the same
+  composition "suboptimal MOV zero" uses, read in the other direction -- there
+  the flags are what the rewrite would newly clobber, here what it would stop
+  producing. A `RET` counts as flag death, since neither the SysV nor the
+  Win64 ABI preserves flags across a call, and roughly a quarter of the
+  population is that tail.
+
+  A compare that reads memory is excluded, and not for encoding reasons:
+  deleting it would remove the load, which may be the entire point. Go spells
+  a nil check as `TESTB AL, (AX)`, whose flags nothing reads and whose fault
+  *is* the check, and the same rule keeps the tool off MMIO reads and
+  stack-probe compares. AF is outside the flag model and deleting the compare
+  destroys it too, which costs nothing here: the only way 64-bit code observes
+  AF is `LAHF` or `PUSHF`, and both read the five modelled flags as well, so
+  the walk reports live and the finding is suppressed before AF can matter.
+
+  Deletion supersedes every encoding finding on the same instruction, so a
+  dead `CMP reg, 0` is reported once rather than also as a "suboptimal CMP
+  zero" -- one site, one finding, and the stronger claim. The three
+  redundant-compare checks defer for the same reason where their flags are
+  dead as well: their claim is that the producer already set what the compare
+  sets, which is beside the point when nothing reads the result. Measured to
+  cost them nothing on real code (libxul stays at 540 and glibc at 7).
+
+  Real sites, one per binary, both with the flags overwritten a few
+  instructions later:
+
+  ```
+  test r15, rdx ; cmp r12, r11 ; jne     (go, internal/strconv.genericFtoa)
+  cmp r12d, 0x7e ; je L ; cmp r12d, 0x1b ; L: lea rax, ... (libxul)
+  ```
+
+  The second is the shape: `if (c == 0x7e || c == 0x1b)` where both arms reach
+  the same block, so the second comparison's *result* became dead code while
+  the compare itself survived. 386 findings, and a language split as sharp as
+  any in this table: libxul 352 and go 34, against 0 in glibc, ld.so, bash,
+  libstdc++ and libcrypto
+
 ## IBT-bypassing NOTRACK call
 
 *Security class: reported only under `-c security` or `-c all`.*

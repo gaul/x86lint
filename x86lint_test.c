@@ -444,10 +444,13 @@ static void check_test_minus_one_test(void)
     CHECK_BYTES( check_test_minus_one, 0x90);                                      // nop
 
     // Dispatcher wiring: flag-exact, so unconditional. Bit 7 is set in the
-    // all-ones mask, keeping check_oversized_test_immediate quiet.
+    // all-ones mask, keeping check_oversized_test_immediate quiet. The JE
+    // keeps the flags live: with a RET here the compare would be dead
+    // outright, and "dead compare" supersedes this narrowing.
     static const uint8_t test_allones[] = {
         0xA9, 0xFF, 0xFF, 0xFF, 0xFF,  // test eax, -1
-        0xC3,                          // ret
+        0x74, 0x01,                    // je +1
+        0x90,                          // nop
     };
     ASSERT_FINDINGS(test_allones, "redundant TEST immediate", 1);
 }
@@ -596,12 +599,103 @@ static void check_cmp_zero_test(void)
     CHECK_BYTES(!check_cmp_zero, 0x80, 0xfb, 0x00);  // cmp bl, 0 (no AL short form; test bl, bl is smaller)
 
     // Dispatcher wiring: test edi, edi is flag-exact for cmp edi, 0 (AF is
-    // unobservable in 64-bit mode), so the finding is unconditional.
-    static const uint8_t cmp0_ret[] = {
+    // unobservable in 64-bit mode), so the finding is unconditional. The JE
+    // keeps the flags live; ending in a RET instead would make the compare
+    // dead outright, and "dead compare" supersedes this narrowing (see
+    // check_dead_compare_test).
+    static const uint8_t cmp0_je[] = {
+        0x83, 0xFF, 0x00,  // cmp edi, 0
+        0x74, 0x01,        // je +1
+        0x90,              // nop
+    };
+    ASSERT_FINDINGS(cmp0_je, "suboptimal CMP zero", 1);
+}
+
+static void check_dead_compare_test(void)
+{
+    // The predicate alone: any register-only CMP or TEST is a candidate, and
+    // the flag gate in the dispatcher decides. Memory operands are out.
+    CHECK_BYTES(!check_dead_compare, 0x39, 0xc8);        // cmp eax, ecx
+    CHECK_BYTES(!check_dead_compare, 0x85, 0xc8);        // test eax, ecx
+    CHECK_BYTES(!check_dead_compare, 0x83, 0xf8, 0x02);  // cmp eax, 2
+    CHECK_BYTES( check_dead_compare, 0x83, 0x3f, 0x02);  // cmp dword ptr [rdi], 2 (memory)
+    CHECK_BYTES( check_dead_compare, 0x84, 0x00);        // test byte ptr [rax], al (memory)
+    CHECK_BYTES( check_dead_compare, 0x01, 0xc8);        // add eax, ecx (not a compare)
+
+    // A RET ends the walk as flag death, so the compare is dead.
+    static const uint8_t cmp_ret[] = {
+        0x39, 0xc8,  // cmp eax, ecx
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(cmp_ret, "dead compare", 1);
+
+    static const uint8_t test_ret[] = {
+        0x85, 0xc8,  // test eax, ecx
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(test_ret, "dead compare", 1);
+
+    // An intervening ALU write overwrites every arithmetic flag first, which
+    // is the shape the corpus is made of.
+    static const uint8_t cmp_add_ret[] = {
+        0x39, 0xc8,        // cmp eax, ecx
+        0x83, 0xc1, 0x02,  // add ecx, 2
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(cmp_add_ret, "dead compare", 1);
+
+    // A conditional branch reads the flags: suppressed. (The trailing NOP
+    // keeps the branch off a zero displacement, which is its own finding.)
+    static const uint8_t cmp_je[] = {
+        0x39, 0xc8,  // cmp eax, ecx
+        0x74, 0x01,  // je +1
+        0x90,        // nop
+    };
+    ASSERT_FINDINGS(cmp_je, "dead compare", 0);
+
+    // A flag-transparent gap does not save it: MOV writes no flags, so the
+    // JE below still reads what the compare set.
+    static const uint8_t cmp_mov_je[] = {
+        0x39, 0xc8,  // cmp eax, ecx
+        0x89, 0xd8,  // mov eax, ebx
+        0x74, 0x01,  // je +1
+        0x90,        // nop
+    };
+    ASSERT_FINDINGS(cmp_mov_je, "dead compare", 0);
+
+    // AF is outside the flag model, and PUSHF/LAHF are the only way 64-bit
+    // code observes it. Both read the five modelled flags too, so the walk
+    // reports LIVE and AF never gets a chance to matter.
+    static const uint8_t cmp_pushf[] = {
+        0x39, 0xc8,  // cmp eax, ecx
+        0x9C,        // pushfq
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(cmp_pushf, "dead compare", 0);
+
+    static const uint8_t cmp_lahf[] = {
+        0x39, 0xc8,  // cmp eax, ecx
+        0x9F,        // lahf
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(cmp_lahf, "dead compare", 0);
+
+    // A compare that reads memory is never reported, however dead its flags:
+    // deleting it would remove the load. This is Go's nil check.
+    static const uint8_t test_mem_ret[] = {
+        0x84, 0x00,  // test byte ptr [rax], al
+        0xC3,        // ret
+    };
+    ASSERT_FINDINGS(test_mem_ret, "dead compare", 0);
+
+    // Deletion supersedes the encoding rows on the same instruction: cmp edi,
+    // 0 is both a "suboptimal CMP zero" (use test) and dead here, and only
+    // the stronger claim is reported.
+    static const uint8_t cmp_zero_ret[] = {
         0x83, 0xFF, 0x00,  // cmp edi, 0
         0xC3,              // ret
     };
-    ASSERT_FINDINGS(cmp0_ret, "suboptimal CMP zero", 1);
+    ASSERT_FINDINGS(cmp_zero_ret, "dead compare", 1);
 }
 
 static void check_implicit_register_test(void)
@@ -2510,24 +2604,39 @@ static void check_redundant_flags_test(void)
     };
     ASSERT_FINDINGS(and_test_jb, "redundant TEST after flags", 1);
 
-    // add eax, ebx ; test eax, eax ; ret -- an arithmetic producer diverges on
-    // CF/OF, but RET makes them dead (no ABI preserves flags across a call), so
-    // it fires.
+    // add eax, ebx ; test eax, eax ; setz cl ; ret -- an arithmetic producer
+    // diverges on CF/OF, and the SETcc reads ZF alone, so CF and OF are dead at
+    // the RET while ZF is not. That is the shape this arm needs: a bare RET
+    // tail would make the test dead outright and "dead compare" would take the
+    // site (asserted below).
+    static const uint8_t add_test_setz[] = {
+        0x01, 0xD8,        // add eax, ebx
+        0x85, 0xC0,        // test eax, eax
+        0x0F, 0x94, 0xC1,  // setz cl
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(add_test_setz, "redundant TEST after flags", 1);
+
+    // dec ecx ; test ecx, ecx ; setz al ; ret -- dec sets SF/ZF/PF (and OF) and
+    // leaves CF; both are dead past the SETcc, so the test is redundant.
+    static const uint8_t dec_test_setz[] = {
+        0xFF, 0xC9,        // dec ecx
+        0x85, 0xC9,        // test ecx, ecx
+        0x0F, 0x94, 0xC0,  // setz al
+        0xC3,              // ret
+    };
+    ASSERT_FINDINGS(dec_test_setz, "redundant TEST after flags", 1);
+
+    // The division of labour with "dead compare", pinned on the shape that used
+    // to be this arm's: with nothing reading the test's flags at all, one
+    // deletion draws one finding, and it is the claim that needs nothing said
+    // about the producer.
     static const uint8_t add_test_ret[] = {
         0x01, 0xD8,        // add eax, ebx
         0x85, 0xC0,        // test eax, eax
         0xC3,              // ret
     };
-    ASSERT_FINDINGS(add_test_ret, "redundant TEST after flags", 1);
-
-    // dec ecx ; test ecx, ecx ; ret -- dec sets SF/ZF/PF (and OF) and leaves
-    // CF; both are dead at ret, so the test is redundant.
-    static const uint8_t dec_test_ret[] = {
-        0xFF, 0xC9,        // dec ecx
-        0x85, 0xC9,        // test ecx, ecx
-        0xC3,              // ret
-    };
-    ASSERT_FINDINGS(dec_test_ret, "redundant TEST after flags", 1);
+    ASSERT_FINDINGS(add_test_ret, "dead compare", 1);
 
     // add eax, ebx ; test eax, eax ; jz -- an arithmetic producer whose test
     // feeds a Jcc: the flag-liveness walk is conservative at any branch, so
@@ -2692,12 +2801,13 @@ static void check_redundant_flags_test(void)
     ASSERT_FINDINGS(gap_endbr, "redundant TEST after flags", 0);
 
     // The divergence gate evaluates at the test wherever the window found it:
-    // an arithmetic producer fires through a gap when CF/OF die at the RET,
-    // and stays suppressed when a later reader keeps them live.
+    // an arithmetic producer fires through a gap when CF/OF die past the SETcc
+    // that reads ZF, and stays suppressed when a later reader keeps them live.
     static const uint8_t gap_add_ret[] = {
         0x01, 0xD8,        // add eax, ebx
         0x90,              // nop
         0x85, 0xC0,        // test eax, eax
+        0x0F, 0x94, 0xC1,  // setz cl (keeps ZF live, so this is not a dead compare)
         0xC3,              // ret
     };
     ASSERT_FINDINGS(gap_add_ret, "redundant TEST after flags", one_gap);
@@ -2832,13 +2942,15 @@ static void check_zeroed_condition_test(void)
     ASSERT_FINDINGS(xor_test_other, "constant condition after zeroing", 0);
 
     // xor ecx, ecx ; test rcx, rcx ; ret -- no consumer, so the flags are
-    // unread and the site is a dead test rather than a decided condition.
+    // unread and the site is a dead test rather than a decided condition. That
+    // is exactly what "dead compare" reports, and it is the only finding here.
     static const uint8_t xor_test_ret[] = {
         0x31, 0xC9,              // xor ecx, ecx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(xor_test_ret, "constant condition after zeroing", 0);
+    ASSERT_FINDINGS_AMONG(xor_test_ret, "constant condition after zeroing", 0, 1);
+    ASSERT_FINDINGS(xor_test_ret, "dead compare", 1);
 
     // xor ecx, ecx ; test rcx, rcx ; adc eax, ebx -- ADC reads CF, which is
     // constant here too, but rewriting it is a different fold: left alone.
@@ -2860,8 +2972,13 @@ static void check_zeroed_condition_test(void)
         0x74, 0x01,              // je +1
         0x90,              // skipped: a zero displacement is its own finding
     };
-    ASSERT_FINDINGS(xor_flag_gap, "constant condition after zeroing",
-                    APX_NDD_WINDOW >= 3 ? 1 : 0);
+    // The gap instruction draws a correct second finding of its own: nothing
+    // reads what cmp eax, ebx set, since the test redefines every flag.
+    ASSERT_FINDINGS_AMONG(xor_flag_gap, "constant condition after zeroing",
+                          APX_NDD_WINDOW >= 3 ? 1 : 0,
+                          APX_NDD_WINDOW >= 3 ? 2 : 1);
+    ASSERT_FINDINGS_AMONG(xor_flag_gap, "dead compare", 1,
+                          APX_NDD_WINDOW >= 3 ? 2 : 1);
 
     // xor ecx, ecx ; mov ecx, ebx ; test rcx, rcx ; je -- a gap that writes
     // the tested register destroys the zero: no match.
@@ -3022,13 +3139,14 @@ static void check_movimm_condition_test(void)
     ASSERT_FINDINGS(test_other, "constant condition after immediate", 0);
 
     // No consumer: the flags are unread, so the site is a dead compare rather
-    // than a decided condition.
+    // than a decided condition -- and that is now the finding it draws.
     static const uint8_t no_consumer[] = {
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x85, 0xC9,                    // test ecx, ecx
         0xC3,                          // ret
     };
-    ASSERT_FINDINGS(no_consumer, "constant condition after immediate", 0);
+    ASSERT_FINDINGS_AMONG(no_consumer, "constant condition after immediate", 0, 1);
+    ASSERT_FINDINGS(no_consumer, "dead compare", 1);
 
     // A gap that writes the flags is fine -- the compare redefines every flag
     // the branch reads.
@@ -3039,8 +3157,13 @@ static void check_movimm_condition_test(void)
         0x74, 0x01,                    // je +1
         0x90,                    // skipped: a zero displacement is its own finding
     };
-    ASSERT_FINDINGS(flag_gap, "constant condition after immediate",
-                    APX_NDD_WINDOW >= 3 ? 1 : 0);
+    // As in the zeroing arm, the gap instruction draws its own correct finding:
+    // the test redefines every flag cmp eax, ebx set, so nothing reads it.
+    ASSERT_FINDINGS_AMONG(flag_gap, "constant condition after immediate",
+                          APX_NDD_WINDOW >= 3 ? 1 : 0,
+                          APX_NDD_WINDOW >= 3 ? 2 : 1);
+    ASSERT_FINDINGS_AMONG(flag_gap, "dead compare", 1,
+                          APX_NDD_WINDOW >= 3 ? 2 : 1);
 
     // A gap that writes the loaded register destroys the known value.
     static const uint8_t reg_gap[] = {
@@ -3121,14 +3244,24 @@ static void check_redundant_shift_test(void)
     };
     ASSERT_FINDINGS(shr_imm_test_jz, "redundant TEST after shift", 1);
 
-    // sar rax, 3 ; test rax, rax ; ret -- no branch: the straight-line walk,
-    // where RET makes CF/OF dead.
+    // sar rax, 3 ; test rax, rax ; setz cl ; ret -- no branch: the
+    // straight-line walk, where RET makes CF/OF dead. The SETcc keeps ZF live;
+    // with a bare RET tail nothing would read the test's flags at all and
+    // "dead compare" would take the site (asserted below).
     static const uint8_t sar_test_ret[] = {
+        0x48, 0xC1, 0xF8, 0x03,  // sar rax, 3
+        0x48, 0x85, 0xC0,        // test rax, rax
+        0x0F, 0x94, 0xC1,        // setz cl
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(sar_test_ret, "redundant TEST after shift", 1);
+
+    static const uint8_t sar_test_dead[] = {
         0x48, 0xC1, 0xF8, 0x03,  // sar rax, 3
         0x48, 0x85, 0xC0,        // test rax, rax
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(sar_test_ret, "redundant TEST after shift", 1);
+    ASSERT_FINDINGS(sar_test_dead, "dead compare", 1);
 
     // The shared window: the test may sit past instructions that write
     // neither the flags nor the tested register (flags_gap_transparent).
@@ -3137,6 +3270,7 @@ static void check_redundant_shift_test(void)
         0x48, 0xC1, 0xE8, 0x05,  // shr rax, 5
         0x48, 0x89, 0xCB,        // mov rbx, rcx
         0x48, 0x85, 0xC0,        // test rax, rax
+        0x0F, 0x94, 0xC1,        // setz cl (keeps ZF live, so not a dead compare)
         0xC3,                    // ret
     };
     ASSERT_FINDINGS(shr_gap_test, "redundant TEST after shift", one_gap);
@@ -3148,7 +3282,9 @@ static void check_redundant_shift_test(void)
         0x48, 0x85, 0xC0,  // test rax, rax
         0xC3,              // ret
     };
-    ASSERT_FINDINGS(shl_cl_test, "redundant TEST after shift", 0);
+    // The test itself is a correct "dead compare": nothing reads the flags
+    // it sets, which is a second finding here and not this check's.
+    ASSERT_FINDINGS_AMONG(shl_cl_test, "redundant TEST after shift", 0, 1);
 
     // shl rax, 64 -- the hardware masks the count to zero: no flags written.
     static const uint8_t shl_masked_zero_test[] = {
@@ -3156,7 +3292,8 @@ static void check_redundant_shift_test(void)
         0x48, 0x85, 0xC0,        // test rax, rax
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(shl_masked_zero_test, "redundant TEST after shift", 0);
+    ASSERT_FINDINGS_AMONG(shl_masked_zero_test, "redundant TEST after shift",
+                          0, 1);   // the dead test again
 
     // rol rax, 1 -- rotates write only CF/OF, never SF/ZF/PF: the test
     // computes flags the rotate did not.
@@ -3165,7 +3302,7 @@ static void check_redundant_shift_test(void)
         0x48, 0x85, 0xC0,  // test rax, rax
         0xC3,              // ret
     };
-    ASSERT_FINDINGS(rol_test, "redundant TEST after shift", 0);
+    ASSERT_FINDINGS_AMONG(rol_test, "redundant TEST after shift", 0, 1);
 
     // shl rax, 2 ; test ; jb -- the branch reads CF, which the test cleared
     // and the shift left as the last bit shifted out: suppress. (Count 2
@@ -3197,7 +3334,7 @@ static void check_redundant_shift_test(void)
         0x85, 0xC0,              // test eax, eax
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(shl_test_narrow, "redundant TEST after shift", 0);
+    ASSERT_FINDINGS_AMONG(shl_test_narrow, "redundant TEST after shift", 0, 1);
 
     // An incoming direct edge onto the test reaches it without the shift:
     // suppress (shared window guard).
@@ -5094,7 +5231,9 @@ static void check_mov_add_lea_test(void)
         0x01, 0xFA,        // add edx, edi
         0xC3,              // ret
     };
-    ASSERT_FINDINGS(gap_reads_dest, "MOV+ADD foldable to LEA", 0);
+    // The test itself is a correct "dead compare": nothing reads the flags
+    // it sets, which is a second finding here and not this check's.
+    ASSERT_FINDINGS_AMONG(gap_reads_dest, "MOV+ADD foldable to LEA", 0, 1);
     static const uint8_t gap_writes_src[] = {
         0x89, 0xF2,        // mov edx, esi
         0x89, 0xFE,        // mov esi, edi
@@ -7412,8 +7551,10 @@ static void check_missing_apx_ndd_test(void)
         0x29, 0xF1,        // sub ecx, esi
         0xC3,              // ret
     };
-    ASSERT_FINDINGS_EXT(gap_reads_copy, "missing APX NDD", 0,
-                        X86LINT_EXT_APX);
+    // The test itself is a correct "dead compare": nothing reads the flags
+    // it sets, which is a second finding here and not this check's.
+    ASSERT_FINDINGS_AMONG_EXT(gap_reads_copy, "missing APX NDD", 0, 1,
+                              X86LINT_EXT_APX);
 
     // Writing the copy stops the scan for the first mov, whose copy dies
     // unread -- and the second mov IS the pair: exactly one finding at
@@ -8571,6 +8712,7 @@ int main(int argc, char *argv[])
     check_lcp_imm16_test();
     check_unneeded_rex_test();
     check_cmp_zero_test();
+    check_dead_compare_test();
     check_mov_zero_test();
     check_implicit_register_test();
     check_implicit_immediate_test();
@@ -8672,7 +8814,7 @@ int main(int argc, char *argv[])
         0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0 (imm64 fits imm32; mov_zero flags only the composed imm32 form)
         0x05, 0x80, 0x00, 0x00, 0x00,  // add eax, 0x80 (-> sub eax, -128; CF dies at the cmp below)
         0x40, 0xc9,  // rex leave (the prefix does nothing)
-        0x83, 0xff, 0x00,  // cmp edi, 0 (-> test edi, edi)
+        0x83, 0xff, 0x00,  // cmp edi, 0 (dead: the add below overwrites the flags unread, and deletion supersedes the test edi, edi rewrite)
         0x81, 0xC0, 0x00, 0x01, 0x00, 0x00,  // add eax, 0x100 (modrm -> accumulator form)
         0x05, 0x01, 0x00, 0x00, 0x00,  // add eax, 1 (imm32 -> imm8; the inc rewrite stays gated: rcl reads CF)
         0xc1, 0xd0, 0x01,  // rcl eax, 1 (C1 ib -> D1)
@@ -8693,7 +8835,7 @@ int main(int argc, char *argv[])
         {"oversized immediate",         2},  // mov rax, 0 and add eax, 1
         {"oversized ADD/SUB 128",       1},
         {"unneeded REX prefix",         1},
-        {"suboptimal CMP zero",         1},
+        {"dead compare",                1},  // cmp edi, 0, whose flags nobody reads
         {"unneeded explicit register",  1},
         {"unneeded explicit immediate", 1},
         {"redundant AND immediate",     1},

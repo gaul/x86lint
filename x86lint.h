@@ -56,6 +56,12 @@ bool check_unneeded_rex(const xed_decoded_inst_t *xedd);
 // return false if instruction uses CMP 0 instead of TEST
 bool check_cmp_zero(const xed_decoded_inst_t *xedd);
 
+// return false for a register-only CMP or TEST, which exists only for the
+// flags it sets. The dispatcher's FLAG_ARITH gate does the rest of the work:
+// the finding stands only where those flags are overwritten unread, which
+// makes the compare dead outright. See x86lint.c.
+bool check_dead_compare(const xed_decoded_inst_t *xedd);
+
 // return false if instruction zeros a register with mov instead of xor
 bool check_mov_zero(const xed_decoded_inst_t *xedd);
 

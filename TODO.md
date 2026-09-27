@@ -1115,6 +1115,49 @@ partial verdict names both flags and does not choose.
 TLS layout's `tcbhead_t.stack_guard`; musl and the rest are unverified here,
 and a libc placing the guard elsewhere would read as unprotected.
 
+**Frame pointers are the second property**, and both halves of the detection
+earned their place by being wrong first:
+
+| image | functions keeping a frame pointer |
+| --- | --- |
+| /bin/bash | 811 of 1,763 exported (46.0%) |
+| libcrypto | 2,490 of 5,867 exported (42.4%) |
+| glibc | 2,220 of 6,943 (32.0%) |
+| ld.so | 123 of 474 (25.9%) |
+| **/bin/go** | 12,490 of 14,862 (**84.0%**) |
+| `-O2`, no flag | 0 of 4 (0.0%) |
+| `-fno-omit-frame-pointer` | 1 of 4 (25.0%) |
+
+**Requiring the pair is most of the accuracy.** Counted together over one
+disassembly of bash, 1,031 functions open with `push rbp` and only 753 follow
+it with `mov rbp, rsp`; the other 278 use rbp as an ordinary callee-saved
+register, so counting the push alone would overstate by 37%. (That pair of
+numbers shares a denominator with itself and not with the table above, which
+the tool measures over the symbols it can see.)
+
+**Allowing a prologue prefix is the other half, and Go is why.** The first
+probe required the pair at the function's first instruction and reported
+**0%** frame pointers on every Fedora binary, because CET puts `endbr64`
+first; fixed to allow one instruction, it then reported /bin/go at 4.8%, which
+is wrong in the opposite direction -- Go's runtime maintains frame pointers
+throughout, but opens most functions with a two- or three-instruction
+stack-growth check (`cmp rsp, [r14+0x10] ; jbe <morestack>`) before the
+identical pair. A window of four instructions takes Go to 84.0% and moves the
+saturated C binaries by at most a point, and an `-O2` object stays at 0.0% at
+every window. An assignment to rbp before the pair disqualifies it, so the
+window cannot promote an unrelated pair into a prologue.
+
+**The internal payoff.** This file records libxul's 34,930 `mov rbp, rsp`
+writes killed by a later `pop rbp` as a frame-pointer build artifact rather
+than a dead-write population. That was prose; now the tool states the build
+property that explains its own finding counts.
+
+**Not covered: other frame idioms.** A prologue that establishes the frame
+some other way -- `lea rbp, [rsp+N]` after pushes, which some hand-written
+assembly and other ABIs use -- is not recognized. Go was the case that
+mattered and it turned out to use the SysV pair, so nothing measured here
+needs a second shape.
+
 ## Speculation thunk audit (2026-09-26)
 
 **Shipped as `-s`**, the second verdict mode, and the one with proven demand:

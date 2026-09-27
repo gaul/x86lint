@@ -8150,6 +8150,77 @@ static void build_test(void)
     assert(x86lint_build_count(b, X86LINT_BUILD_CANARY) == 1);
     x86lint_build_destroy(b);
 
+    // Frame pointers: the pair, and only the pair. A `push rbp` that no
+    // `mov rbp, rsp` follows is rbp used as a callee-saved register, which is
+    // 278 of bash's functions.
+    static const uint8_t frame[] = {0x55, 0x48, 0x89, 0xe5, 0xc3};
+    static const uint8_t push_only[] = {0x55, 0x31, 0xc0, 0x5d, 0xc3};
+    // An endbr64 ahead of the pair, as every address-taken function in a CET
+    // binary has, and Go's stack-growth check, which is what a window of zero
+    // would have missed on 79% of /bin/go.
+    static const uint8_t cet_frame[] = {
+        0xf3, 0x0f, 0x1e, 0xfa, 0x55, 0x48, 0x89, 0xe5, 0xc3,
+    };
+    static const uint8_t go_frame[] = {
+        0x49, 0x3b, 0x66, 0x10,         // cmp rsp, [r14+0x10]
+        0x76, 0x04,                     // jbe .+4
+        0x55, 0x48, 0x89, 0xe5,         // push rbp ; mov rbp, rsp
+        0xc3,
+    };
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, frame, sizeof(frame));
+    x86lint_build_scan_function(b, cet_frame, sizeof(cet_frame));
+    x86lint_build_scan_function(b, go_frame, sizeof(go_frame));
+    x86lint_build_scan_function(b, push_only, sizeof(push_only));
+    assert(x86lint_build_functions(b) == 4);
+    assert(x86lint_build_count(b, X86LINT_BUILD_FRAME_PTR) == 3);
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_FRAME_PTR) ==
+        X86LINT_BUILD_PARTIAL);
+    // The frame-pointer verdict does not consult the canary's handler
+    // evidence, which is the canary's alone.
+    assert(x86lint_build_count(b, X86LINT_BUILD_CANARY) == 0);
+    x86lint_build_destroy(b);
+
+    // The window, pinned from both sides: the pair is a prologue three
+    // instructions in and no longer is at four.
+    for (int pad = 3; pad <= 4; ++pad) {
+        uint8_t buf[4 + sizeof(frame)];
+        for (int k = 0; k < pad; ++k) {
+            buf[k] = 0x90;              // nop
+        }
+        memcpy(buf + pad, frame, sizeof(frame));
+        b = x86lint_build_create();
+        assert(b != NULL);
+        x86lint_build_scan_function(b, buf, (size_t) pad + sizeof(frame));
+        assert(x86lint_build_count(b, X86LINT_BUILD_FRAME_PTR) ==
+            (pad == 3 ? 1u : 0u));
+        x86lint_build_destroy(b);
+    }
+
+    // An assignment to rbp before the pair means the pair is not establishing
+    // the frame, whatever it looks like.
+    static const uint8_t clobbered[] = {
+        0x48, 0x89, 0xc5,               // mov rbp, rax
+        0x55, 0x48, 0x89, 0xe5,         // push rbp ; mov rbp, rsp
+        0xc3,
+    };
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, clobbered, sizeof(clobbered));
+    assert(x86lint_build_count(b, X86LINT_BUILD_FRAME_PTR) == 0);
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_FRAME_PTR) ==
+        X86LINT_BUILD_ABSENT);
+    x86lint_build_destroy(b);
+
+    // Every function, which only a hand-written or tiny image reaches.
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, frame, sizeof(frame));
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_FRAME_PTR) ==
+        X86LINT_BUILD_ALL);
+    x86lint_build_destroy(b);
+
     // NULL is accepted everywhere, and an out-of-range property reads back
     // as zero rather than off the end of the arrays.
     x86lint_build_scan_function(NULL, guarded, sizeof(guarded));

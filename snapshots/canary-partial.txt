@@ -1,5 +1,6 @@
 build properties: 4 functions examined
   stack protector: 2 of 4 functions (50.0%) -- -fstack-protector or -strong
+  frame pointers: 0 of 4 functions (0.0%) -- omitted (-fomit-frame-pointer, the default at -O2)
     __stack_chk_fail named in the symbol table
   measured over the function symbols in .symtab
 exit status: 0

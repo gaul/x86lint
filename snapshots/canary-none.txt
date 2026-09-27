@@ -1,4 +1,5 @@
 build properties: 1 function examined
   stack protector: 0 of 1 function (0.0%) -- no stack protector
+  frame pointers: 0 of 1 function (0.0%) -- omitted (-fomit-frame-pointer, the default at -O2)
   measured over the function symbols in .symtab
 exit status: 0

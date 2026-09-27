@@ -3914,6 +3914,50 @@ static bool touches_stack_guard(const xed_decoded_inst_t *xedd)
     return false;
 }
 
+// How many instructions into a function the frame-pointer prologue may begin.
+// Zero would be the naive reading and is wrong twice over: a CET binary opens
+// every address-taken function with `endbr64`, and Go opens most functions with
+// a two- or three-instruction stack-growth check. Measured across bash, glibc,
+// libcrypto and go, the share found saturates by the fourth instruction and
+// moves by at most a point after it; an -O2 object with no frame pointers
+// reports none at any window.
+#define FRAME_PROLOGUE_WINDOW 4
+
+static bool is_push_rbp(const xed_decoded_inst_t *xedd)
+{
+    return xed_decoded_inst_get_iclass(xedd) == XED_ICLASS_PUSH &&
+        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_RBP;
+}
+
+static bool is_mov_rbp_rsp(const xed_decoded_inst_t *xedd)
+{
+    return xed_decoded_inst_get_iclass(xedd) == XED_ICLASS_MOV &&
+        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0) == XED_REG_RBP &&
+        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1) == XED_REG_RSP;
+}
+
+// Whether an instruction writes RBP at any width, which disqualifies anything
+// after it from being the frame establishment: a `push rbp ; mov rbp, rsp`
+// that follows some other assignment to rbp is not a prologue. PUSH reads the
+// register and does not write it, so the pair itself is never caught by this.
+static bool writes_rbp(const xed_decoded_inst_t *xedd)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned n = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < n; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+            continue;
+        }
+        if (xed_get_largest_enclosing_register(
+                xed_decoded_inst_get_reg(xedd, name)) == XED_REG_RBP) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void x86lint_build_scan_function(x86lint_build *build, const uint8_t *inst,
                                  size_t len)
 {
@@ -3922,6 +3966,13 @@ void x86lint_build_scan_function(x86lint_build *build, const uint8_t *inst,
     }
     build->functions++;
     bool canary = false;
+    // Frame-pointer prologue state: how many instructions in we are, whether
+    // the one before this was the `push`, and whether anything has already
+    // written rbp -- after which no later pair is the frame establishment.
+    size_t index = 0;
+    bool prev_push_rbp = false;
+    bool rbp_clobbered = false;
+    bool frame = false;
     for (size_t i = 0; i < len; ) {
         xed_decoded_inst_t xedd;
         decode_init(&xedd);
@@ -3929,6 +3980,19 @@ void x86lint_build_scan_function(x86lint_build *build, const uint8_t *inst,
             ++i;
             continue;
         }
+        if (!frame && !rbp_clobbered && index <= FRAME_PROLOGUE_WINDOW) {
+            if (prev_push_rbp && is_mov_rbp_rsp(&xedd)) {
+                frame = true;
+                build->count[X86LINT_BUILD_FRAME_PTR]++;
+            } else {
+                prev_push_rbp = index < FRAME_PROLOGUE_WINDOW &&
+                    is_push_rbp(&xedd);
+                if (!prev_push_rbp && writes_rbp(&xedd)) {
+                    rbp_clobbered = true;
+                }
+            }
+        }
+        ++index;
         // Anywhere in the function, not in a window at its head. The guard
         // load is scheduled wherever the register pressure allows, and
         // measuring it against the first dozen instructions -- which looked
@@ -4034,6 +4098,14 @@ void x86lint_build_print(const x86lint_build *build, bool verbose)
             : "no stack protector (the guard is read but no handler is named, "
               "so this is where it gets set up)",
         "-fstack-protector or -strong", "-fstack-protector-all");
+    // A frame-pointer build cannot reach every function -- a leaf needing no
+    // frame does not get one even under -fno-omit-frame-pointer -- so the
+    // reading is a nonzero share against a zero one, and "all" is a shape
+    // only a hand-written or tiny image takes.
+    build_print_prop(build, X86LINT_BUILD_FRAME_PTR, "frame pointers",
+        "omitted (-fomit-frame-pointer, the default at -O2)",
+        "kept (-fno-omit-frame-pointer; leaves that need no frame have none)",
+        "kept in every function");
     if (verbose) {
         // The corroborating signal, which the verdict above already rests on.
         // Which functions -strong protects is not decidable from the bytes --

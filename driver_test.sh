@@ -574,6 +574,41 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# framePtr: three functions, of which one establishes a frame pointer the way a
+# compiler does, one opens with Go's stack-growth check before the same pair
+# (which a window of zero instructions would miss, as it missed 79% of
+# /bin/go), and one pushes rbp without the mov -- rbp as an ordinary
+# callee-saved register, which 278 of bash's functions do and which must not
+# count.
+cat >"$dir/frameptr.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x55                          # push rbp
+    .byte 0x48, 0x89, 0xe5              # mov rbp, rsp
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .globl fn2
+    .type fn2, @function
+fn2:
+    .byte 0x49, 0x3b, 0x66, 0x10        # cmp rsp, [r14+0x10] (Go's check)
+    .byte 0x76, 0x04                    # jbe .+4
+    .byte 0x55                          # push rbp
+    .byte 0x48, 0x89, 0xe5              # mov rbp, rsp
+    .byte 0xc3                          # ret
+    .size fn2, . - fn2
+    .globl fn3
+    .type fn3, @function
+fn3:
+    .byte 0x55                          # push rbp: callee-saved, not a frame
+    .byte 0x31, 0xc0                    # xor eax, eax
+    .byte 0x5d                          # pop rbp
+    .byte 0xc3                          # ret
+    .size fn3, . - fn3
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # Fixtures for the speculation-thunk audit (-s), which asks whether returns
 # and indirect branches were routed through the Spectre-v2 and Retbleed
 # thunks. Hand-written, because the shape is a symbol name plus a relocation
@@ -736,7 +771,7 @@ _start:
 EOF
 
 for f in finding clean bmi notrack census isanote perfunc target advisory \
-         jccpad jccraw jccmixed canary canarysetup; do
+         jccpad jccraw jccmixed canary canarysetup frameptr; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -1109,6 +1144,17 @@ expect '^build properties: 4 functions examined$'
 expect '^  stack protector: 2 of 4 functions \(50\.0%\) -- -fstack-protector or -strong$'
 expect '^  measured over the function symbols in \.symtab$'
 
+# Frame pointers: the pair and only the pair, and a prologue the Go check
+# precedes still counts. The third function pushes rbp without the mov.
+run 0 -p "$dir/frameptr"
+expect '^  frame pointers: 2 of 3 functions \(66\.7%\) -- kept \(-fno-omit-frame-pointer'
+# Nothing here reads the stack guard, so the two properties are independent.
+expect '^  stack protector: 0 of 3 functions \(0\.0%\) -- no stack protector$'
+
+# A binary built the ordinary way at -O2 keeps no frame pointer at all.
+run 0 -p "$dir/clean"
+expect '^  frame pointers: 0 of 1 function \(0\.0%\) -- omitted \(-fomit-frame-pointer'
+
 # -v names the corroborating symbol the verdict rests on.
 run 0 -p -v "$dir/canary"
 expect '^    __stack_chk_fail named in the symbol table$'
@@ -1270,6 +1316,7 @@ snapshot jcc-present -j "$dir/jccpad"
 snapshot jcc-partial -j -v "$dir/jccmixed"
 snapshot jcc-unplaced -j "$dir/clean.o"
 snapshot canary-partial -p -v "$dir/canary"
+snapshot frameptr -p "$dir/frameptr"
 snapshot canary-setup -p -v "$dir/canarysetup"
 snapshot canary-none -p "$dir/clean"
 snapshot thunk-routed -s "$dir/thunkfull.o"

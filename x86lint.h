@@ -810,9 +810,25 @@ enum x86lint_build_prop {
     // would not be recognized; that is measured against glibc, musl and the
     // rest being unverified here.
     X86LINT_BUILD_CANARY,
+    // The function establishes a frame pointer: a `push rbp` immediately
+    // followed by `mov rbp, rsp`, near enough its entry to be the prologue.
+    // Both halves are required -- 1,031 of bash's functions start with
+    // `push rbp` and only 753 follow it with the `mov`, the rest using rbp as
+    // an ordinary callee-saved register -- and "near enough" is four
+    // instructions rather than zero, because a prologue can be preceded by
+    // things that do not touch rbp: a CET `endbr64`, or Go's stack-growth
+    // check, which is two or three instructions and moved /bin/go's measured
+    // share from 4.8% to 84.0% once allowed for.
+    //
+    // A frame-pointer build never reaches every function, since a leaf that
+    // needs no frame does not get one even under -fno-omit-frame-pointer, so
+    // this property's useful reading is a nonzero share against a zero one:
+    // Fedora's binaries report 26-46% and /bin/go 84% where an ordinary -O2
+    // object reports none at all.
+    X86LINT_BUILD_FRAME_PTR,
 };
 
-#define X86LINT_BUILD_PROPS (X86LINT_BUILD_CANARY + 1)
+#define X86LINT_BUILD_PROPS (X86LINT_BUILD_FRAME_PTR + 1)
 
 enum x86lint_build_verdict {
     X86LINT_BUILD_UNKNOWN,   // no function symbols: no denominator

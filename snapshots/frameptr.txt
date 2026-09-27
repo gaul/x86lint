@@ -1,0 +1,5 @@
+build properties: 3 functions examined
+  stack protector: 0 of 3 functions (0.0%) -- no stack protector
+  frame pointers: 2 of 3 functions (66.7%) -- kept (-fno-omit-frame-pointer; leaves that need no frame have none)
+  measured over the function symbols in .symtab
+exit status: 0

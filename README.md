@@ -938,8 +938,19 @@ symbol table part of the measurement rather than an optimization: a stripped
 binary has no denominator, which is the one contract this shares with nothing
 else here.
 
-So far it answers one question -- what fraction of functions carry a stack
-canary -- and the fraction is the point. `checksec` and `hardening-check` read
+It answers two questions so far: what fraction of functions carry a stack
+canary, and what fraction keep a frame pointer.
+
+```console
+$ ./x86lint -p /bin/go | sed -n '2,4p'
+  stack protector: 0 of 14862 functions (0.0%) -- no stack protector
+  frame pointers: 12490 of 14862 functions (84.0%) -- kept (-fno-omit-frame-pointer; leaves that need no frame have none)
+  measured over the function symbols in .symtab
+```
+
+### Stack protector
+
+The fraction is the point. `checksec` and `hardening-check` read
 the symbol table and report whether `__stack_chk_fail` is *present*, which is
 a yes or no; counting the functions that actually load the guard separates
 *none* from *some* from *every one*, which is what distinguishes the three
@@ -978,6 +989,31 @@ answers nothing. And the guard load is not a prologue-only phenomenon: GCC
 schedules it wherever the register pressure allows, and the first version of
 this measured only the first dozen instructions of each function, which
 undercounted `/bin/bash` by 35%.
+
+### Frame pointers
+
+A `push rbp` immediately followed by `mov rbp, rsp`, near enough the entry to
+be the prologue. Both halves are required and the pairing is most of the work:
+1,031 of bash's functions open with `push rbp` and only 753 follow it with the
+`mov` (counted together over one disassembly), the other 278 using `rbp` as an
+ordinary callee-saved register.
+
+"Near enough" is four instructions rather than zero, which is the other half of
+the work. A CET binary opens every address-taken function with `endbr64`, and
+Go opens most functions with a two- or three-instruction stack-growth check
+before the identical pair -- allowing for that moved `/bin/go` from 4.8% to
+84.0%, so a window of zero would have reported a language whose runtime
+maintains frame pointers throughout as having none. An assignment to `rbp`
+before the pair disqualifies it, since a pair following one is not establishing
+a frame.
+
+The reading is a nonzero share against a zero one, not a high one: a leaf that
+needs no frame does not get one even under `-fno-omit-frame-pointer`, so no
+real build reaches 100%. Fedora's binaries report 26-46%, `/bin/go` 84%, and an
+ordinary `-O2` object none at all. This is why the finding population x86lint
+reports on libxul includes 34,930 `mov rbp, rsp` writes killed by a later
+`pop rbp`: that is a build-flag artifact rather than dead code, and this line
+is what says so.
 
 ## Mining tools
 

@@ -1308,6 +1308,117 @@ than concrete registers and the width test admits every vector write. Omitting
 an iclass costs findings and never soundness, so a list that size is not worth
 filtering into something reviewable.
 
+## Suboptimal NOP runs (2026-09-26)
+
+**Measured and reduced 23x, not built.** [#9](https://github.com/gaul/x86lint/issues/9)
+asks for the padding rule every assembler already knows: a run of NOPs covering
+B bytes wants `ceil(B/9)` instructions, nine bytes being the longest form
+needing no prefix beyond the `66` already in it. Counting maximal runs by
+address arithmetic -- objdump's raw-byte column wraps at eight bytes and
+undercounts, which cost one wrong measurement -- the shape is **2,527 sites**,
+with a negative control clean enough to look decisive:
+
+| binary | NOP runs | suboptimal | instructions deleted |
+| --- | --- | --- | --- |
+| bash | 10,466 | 1 | 1 |
+| libc | 14,096 | 2 | 2 |
+| libstdc++ | 15,663 | 1 | 1 |
+| ld.so | 1,437 | 1 | 1 |
+| libcrypto | 28,605 | 185 | 185 |
+| libxul | 100,511 | 204 | 1,189 |
+| **/bin/go** | 54,798 | **2,133** | **2,411** |
+
+Five sites across four gas-built binaries against 2,133 in one Go binary reads
+as a toolchain that forgot the table. It is not, and the shape collapses for two
+*independent* reasons, one per population -- which is what makes this row worth
+reading rather than just recording.
+
+**Go's are not padding at all.** `fillnop`
+(`src/cmd/internal/obj/x86/asm6.go`) walks a table up to the 9-byte form and
+takes the longest fit greedily, and all three padding call sites -- `padJump` ->
+`noppad`, the loop-align path, and `PCALIGN` -- go through it. The `0x90`s come
+from `ginsnop` (`src/cmd/compile/internal/amd64/ggen.go`), which is a **fixed
+one-byte NOP on purpose**, spelled `XCHGL AX, AX` with a comment explaining
+why it is not gas's `xchg %eax,%eax` (that form zeroes the high 32 bits). Its
+four callers all need the NOP to *have a PC*: inline marks, an empty infinite
+loop ("so that debuggers are less confused"), a nop after a non-returning call
+("we need the return address of a panic call to still be inside the function in
+question"), and a frameless leaf whose first instruction came from an inlined
+callee, for `FuncForPC` (Go issue 58300). The constraint is stated outright in
+`ssagen/ssa.go`: *"Don't use 0-sized instructions as inline marks, because we
+need to identify inline mark instructions by pc offset."* Unmatched marks each
+emit their own `ginsnop`, so adjacent marks are `90 90` -- 1,618 of the 2,133.
+
+**Settled by a control build rather than by reading the source.** Same program,
+same toolchain, inlining the only variable:
+
+| build | instructions | suboptimal runs |
+| --- | --- | --- |
+| default | 177,349 | **884** |
+| `-gcflags=all=-l` | 202,544 | **0** |
+
+Not fewer -- none, in a binary with *more* instructions, so it is not a size
+effect. `go tool objdump` then shows the marks carrying distinct positions,
+which no byte-level view could:
+
+```
+ftoadbox.go:269   0x406d0c   90   NOPL      <- two adjacent 1-byte nops,
+ftoadbox.go:241   0x406d0d   90   NOPL         two different source lines
+ftoadbox.go:242   0x406d0e   4c01ca  ADDQ R9, DX
+```
+
+One site carries four in a row at lines 141, 259, 203 and 204. Merging `90 90`
+into `66 90` would put the second mark's PC inside an instruction and destroy
+the attribution it exists to provide, so **Go's whole population is the shape
+selecting for the intentional case** -- the fourth instance in this file, after
+the stack-clash probe, the JIT patch sentinels and the atomics behind the
+reload row.
+
+**The second collapse takes almost everything else**, and it is a question the
+shape count cannot ask: a NOP run nothing decodes costs nothing however it is
+spelled. Classifying each run by whether its predecessor is a terminator:
+
+| binary | suboptimal | on a fall-through path | dead bytes | sound to merge |
+| --- | --- | --- | --- | --- |
+| /bin/go | 2,171 | 2,030 | 141 | **no**, every `ginsnop` is PC-load-bearing |
+| libcrypto | 185 | **0** | 185 | yes, and worth nothing |
+| libxul | 204 | 104 | 100 | yes |
+| libc | 6 | 4 | 2 | yes |
+| bash / libstdc++ / ld.so | 3 | 2 | 1 | yes |
+
+All 185 libcrypto sites sit after a terminator -- perlasm's
+`repz ret ; nop ; nopl (%rax)` inter-block fill -- and by the symbol table 199
+of libxul's 204 are function-entry alignment, reached only by falling out of the
+previous function. (Counts here are without the branch-target gate the check
+would apply, which removes another 38 in go and 4 in libc; the predecessor test
+is an approximation, since an indirect jump or a call to a `noreturn` function
+reads as fall-through.)
+
+**What is actually left is about 110**, executed and sound, and it lands in
+exactly the population the shipped "branch to the next instruction" check
+reports -- hand-written NASM, not compiler output:
+
+```
+325619a: 6 bytes in 6 nops; prev je ...; next movdqa %xmm9,(%r14)       libjpeg-turbo
+33544f7: 9 bytes in 2 nops; prev lea ...; next call dav1d_idct_4x4_...  dav1d
+```
+
+So the honest sizing is **110 with a named 2,171-site Go exclusion**, which is
+below the dead-compare row's 396 and not obviously worth a check. Two things to
+keep if it is ever built: the run must be on a fall-through path, since merging
+dead bytes buys nothing; and a branch into the run's interior refuses it, which
+already costs 38 sites in go and 4 in libc, so the gate is not theoretical.
+
+**The transferable part is that this row was ranked first on its shape.** A
+survey of the backlog put it at the top on the strength of 2,527 sites and a
+clean negative control, and the negative control was the misleading part: gas
+being optimal did not mean the other emitters were wrong, it meant they were
+emitting something other than padding. Two measurements an hour apart took the
+population to 4% of the shape. Neither was a liveness proof or an encodability
+test -- the two conditions every earlier row in this file collapsed on -- but
+"is this instruction there for a reason the bytes do not show" and "is this code
+ever decoded", which nothing here had needed before.
+
 ## Relocation placeholders (2026-09-26)
 
 **A false positive in the default scan on relocatable input, now fixed**

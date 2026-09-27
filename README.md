@@ -267,7 +267,7 @@ with the corpus populations that argue for or against each, live in
 | [unneeded REX prefix](analyses.md#unneeded-rex-prefix) | drop the prefix |
 | [unneeded SIB byte](analyses.md#unneeded-sib-byte) | the plain modrm form |
 | [unneeded zero displacement](analyses.md#unneeded-zero-displacement) | drop the displacement |
-| ~~suboptimal NOP sequence~~ | multiple `90` instead of a single `66 90`; never implemented, see [#9](https://github.com/gaul/x86lint/issues/9) |
+| ~~suboptimal NOP sequence~~ | multiple `90` instead of a single `66 90`; never implemented, and sized at about 110 sites rather than the 2,527 the shape suggests -- Go's 2,133 are `ginsnop` inline marks that the runtime identifies by PC, and every population where merging is sound turns out to be bytes nothing decodes. See [#9](https://github.com/gaul/x86lint/issues/9) and "Suboptimal NOP runs" in [TODO.md](TODO.md) |
 
 ## Compilation
 

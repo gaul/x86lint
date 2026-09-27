@@ -685,6 +685,105 @@ size_t x86lint_jcc_skipped(const x86lint_jcc *jcc);
 // by 100 so the caller needs no floating point.
 uint64_t x86lint_jcc_expected_centi(const x86lint_jcc *jcc);
 
+// A tally of how a binary's returns and indirect branches leave, for auditing
+// whether it was built to route them through the Spectre-v2 and Retbleed
+// thunks (the driver's -s). Opaque; NULL is accepted everywhere.
+//
+// A retpoline replaces an indirect branch with a call to a thunk that returns
+// to the intended target, so the branch predictor never sees an indirect
+// transfer to mistrain. A return thunk does the same for RET, which is what
+// Retbleed and SRSO attack. Both are whole-build decisions --
+// -mindirect-branch=thunk[-extern] and -mfunction-return=thunk[-extern] in
+// GCC, -mretpoline in clang -- and both are verdicts here for the same
+// reasons the JCC audit is: the transformation is not an encoding a peephole
+// could suggest, no single unrouted return is at fault, and reported per site
+// it would be one finding per return in the binary.
+//
+// The signal is as close to binary as this tool gets, and it is positive on
+// both sides rather than inferred from absence. A routed build names the thunk
+// -- in its relocations while it is still an object, in its symbol table once
+// linked -- and contains none of the instruction the thunk replaces. Measured
+// on Fedora's own kernel: amt.ko has **zero** RET in 150 functions, every exit
+// a relocated `jmp __x86_return_thunk`, where /bin/bash has 3,032 RET and
+// names no thunk at all.
+//
+// So the two errors are not alike here either, and the verdicts say so. A
+// bare RET in an image that names a return thunk is a hole in a mitigation
+// the build asked for -- hand-written assembly the conversion missed is
+// exactly how that happens -- and is the only thing this audit reports as a
+// finding. A binary that names no thunk never opted in, and saying so is
+// describing a build rather than judging one: userspace does not use these,
+// and there is no -t value that would change that, because what decides is
+// what the binary *is* and not which CPU runs it.
+typedef struct x86lint_thunk x86lint_thunk;
+
+// Which transfer a tally counts, and whether it goes through a thunk.
+enum x86lint_thunk_kind {
+    X86LINT_THUNK_RET_BARE,         // a RET instruction
+    X86LINT_THUNK_RET_ROUTED,       // a branch relocated against a return thunk
+    X86LINT_THUNK_INDIRECT_BARE,    // an indirect CALL or JMP
+    X86LINT_THUNK_INDIRECT_ROUTED,  // a branch relocated against an indirect thunk
+};
+
+#define X86LINT_THUNK_KINDS (X86LINT_THUNK_INDIRECT_ROUTED + 1)
+
+// The two independent halves: a build can route its indirect branches and not
+// its returns, which is what -mindirect-branch=thunk alone produces.
+enum x86lint_thunk_axis {
+    X86LINT_THUNK_RETURNS,
+    X86LINT_THUNK_INDIRECT,
+};
+
+enum x86lint_thunk_verdict {
+    X86LINT_THUNK_NONE,     // no transfer of the kind: nothing to judge
+    X86LINT_THUNK_ROUTED,   // the image names a thunk and no bare transfer is left
+    X86LINT_THUNK_PARTIAL,  // it names one and bare transfers remain: a hole
+    X86LINT_THUNK_BARE,     // it names none; this build did not opt in
+};
+
+x86lint_thunk *x86lint_thunk_create(void);
+void x86lint_thunk_destroy(x86lint_thunk *thunk);
+
+// Linear-sweep decode of `len` bytes, counting the RETs and the indirect
+// CALLs and JMPs -- the instructions a routed build does not contain. An
+// undecodable byte is skipped and the sweep resyncs.
+//
+// `thunk_bodies`, when non-NULL, is one byte per byte of `inst`, nonzero
+// inside a thunk's own code, and instructions there are decoded but not
+// counted. That exclusion is not a refinement, it is required for the audit
+// to mean anything: a thunk necessarily contains the instruction it exists to
+// replace -- a retpoline ends in `jmp *%rax`, and a return trampoline in a
+// RET -- so an image that defines its thunks rather than importing them would
+// otherwise always report a hole, and the one it reported would be the
+// mitigation itself. Only the container can say where they are.
+void x86lint_thunk_scan(x86lint_thunk *thunk, const uint8_t *inst, size_t len,
+                        const uint8_t *thunk_bodies);
+
+// The evidence the bytes cannot carry, since a thunk is named rather than
+// spelled: how many branches a relocation routes to each family, and whether
+// the image names a thunk of each at all. The counts are exact only while the
+// object is relocatable; a linked image has resolved them into ordinary
+// direct branches, and the presence flags carry the verdict there.
+void x86lint_thunk_set_evidence(x86lint_thunk *thunk, size_t routed_returns,
+                                size_t routed_indirects, bool returns_named,
+                                bool indirects_named);
+
+// Print the audit: each axis's counts, its verdict, and what the verdict
+// rests on. Returns what x86lint_thunk_findings would.
+int x86lint_thunk_print(const x86lint_thunk *thunk, bool verbose);
+
+// 1 when either axis is PARTIAL -- a mitigation the build asked for with a
+// hole left in it -- and 0 otherwise. A BARE verdict is never a finding: see
+// the block comment above.
+int x86lint_thunk_findings(const x86lint_thunk *thunk);
+
+enum x86lint_thunk_verdict x86lint_thunk_verdict(const x86lint_thunk *thunk,
+                                                 enum x86lint_thunk_axis axis);
+
+size_t x86lint_thunk_count(const x86lint_thunk *thunk,
+                           enum x86lint_thunk_kind kind);
+size_t x86lint_thunk_instructions(const x86lint_thunk *thunk);
+
 // How many instructions the copy folds -- missing APX NDD and MOV+ADD
 // foldable to LEA, which divide the same pairs by flag liveness -- may
 // examine, counting the copy and its consumer: 2 matches only adjacent

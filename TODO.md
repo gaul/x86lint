@@ -1061,6 +1061,71 @@ Nothing in the table flags them today, and the finding count barely moved
 (432 → 435), but a future "useless prefix" check would light up on every
 mitigated binary. It needs to know about this.
 
+## Speculation thunk audit (2026-09-26)
+
+**Shipped as `-s`**, the second verdict mode, and the one with proven demand:
+Fedora's own kernel ships the mitigation, so unlike the JCC audit this had a
+positive control before a line was written. A retpoline replaces an indirect
+branch with a thunk call and a return thunk does the same for `RET`, which is
+what Retbleed and SRSO attack; both are whole-build decisions and neither is
+an encoding a peephole could suggest.
+
+**The signal is positive on both sides**, which is what makes it sharper than
+the JCC audit's statistical one. A routed build names the thunk -- in its
+relocations while it is still an object, in its symbol table once linked -- and
+holds none of the instruction the thunk replaces:
+
+| image | bare returns | routed | bare indirect | verdict |
+| --- | --- | --- | --- | --- |
+| amt.ko (Fedora module) | **0** | 75 | 0 | routed |
+| /bin/bash | 3,032 | 0 | 239 | not routed (names no thunk) |
+| 60 Fedora modules | -- | -- | -- | 59 routed, 1 with no returns |
+
+Zero holes across 60 real modules is the calibration that matters: a verdict
+firing spuriously on shipped input would be useless for the audit it exists
+for. The 75 routed returns were cross-checked against `objdump -dr` and
+`readelf -r`, which agree exactly.
+
+**A hole is the finding; an absence is not.** A bare `RET` in an image that
+names a return thunk means the build asked for the mitigation and something
+escaped it -- hand-written assembly the conversion missed, which is how this
+actually goes wrong -- and that exits 1. A binary naming no thunk never opted
+in, and unlike the JCC erratum there is **no `-t` value that would make it a
+finding**, because what decides is what the binary *is* rather than which CPU
+runs it. That asymmetry is the whole reason the audit is worth having: it
+reports incomplete opt-ins, which nothing checks on a shipped module from
+outside its build.
+
+**The bug the linked case exposed, which the module case could never have.**
+A thunk's own body holds the instruction it replaces -- GCC's return
+trampoline ends in a `RET`, and its retpoline ends in a `RET` that jumps to
+the target it pushed -- so the first working version reported a fully routed
+program as `INCOMPLETE` on both axes, and the holes it named were the
+mitigation itself. Kernel modules hid this completely, being `thunk-extern`
+builds that import the thunks and define none. Fixed by excluding the thunks'
+bodies, which then needed a second fix: GCC emits both symbols with
+`st_size` 0, so the extent comes from the next symbol in the section, the same
+rule `mask_non_function_bytes` applies to an unsized assembly label.
+
+**Limits, both stated in the report rather than papered over.** The routed
+*count* is exact only while the object is relocatable, since a linked image
+resolved those branches into ordinary direct ones; there the symbol's presence
+carries the verdict alone, which the `thunklocal` fixture exercises inside an
+ET_REL object by defining the thunk in the scanned section. And a linked image
+is judged whole: a retpoline-built program linked against an ordinary libc
+reports `INCOMPLETE` because libc's returns really are unrouted -- accurate,
+but saying more about the link than the code. Left as a finding rather than
+suppressed, since suppressing it would hide real holes; a kernel module has no
+passengers, which is why it is the case with clean semantics.
+
+**Not attempted: the indirect half on its own.** "Zero bare indirect branches"
+is unremarkable in ordinary code, so that axis rests entirely on the thunk
+being named, and a build using `-mindirect-branch=thunk` without
+`-mfunction-return` is reported per axis rather than as one verdict. Also not
+attempted: matching the kernel's runtime-patched return thunks by
+enumeration -- `thunk_family` matches the shared `return_thunk` ending, so
+`srso_return_thunk` and its siblings count, and any future spelling will too.
+
 ## Relocation placeholders (2026-09-26)
 
 **A false positive in the default scan on relocatable input, now fixed**

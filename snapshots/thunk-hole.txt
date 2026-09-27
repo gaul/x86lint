@@ -1,0 +1,5 @@
+speculation thunk audit: 4 instructions, 0 undecodable bytes skipped
+  returns: 1 bare, 1 routed through a thunk -- INCOMPLETE: the image names a return thunk, so the build asked for this and 1 RET escaped it
+  indirect branches: 0 bare -- none in this image
+  counted as a finding: a hole in a mitigation this build asked for
+exit status: 1

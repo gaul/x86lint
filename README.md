@@ -549,19 +549,21 @@ Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
 than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
-`-e` and `-j` are separate reports whose output would interleave with it, and
-the driver refuses the combination rather than choosing for the caller.
+`-e`, `-j` and `-s` are separate reports whose output would interleave with it,
+and the driver refuses the combination rather than choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
-pads, `-i` to replace the lint scan with an ISA census of the binary, and `-j`
-to replace it with a JCC-erratum verdict; see the next sections.
+pads, `-i` to replace the lint scan with an ISA census of the binary, `-j` to
+replace it with a JCC-erratum verdict, and `-s` with a speculation-thunk
+verdict; see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
 broken run. `-e` findings set the exit status like any other; the `-i` census
-never sets it, and the `-j` audit sets it only under `-t skylake`, the one
-target that has the erratum.
+never sets it, the `-j` audit sets it only under `-t skylake` (the one target
+that has the erratum), and the `-s` audit only for a mitigation left
+incomplete.
 
 ## ENDBR64 (CET IBT) verification
 
@@ -866,6 +868,66 @@ nothing, but V8's is gated on the host CPU actually having the erratum, so a
 dump's verdict describes the machine that produced it and not the engine: on
 an AMD host a V8 corpus reports `mitigation absent`, correctly, because
 nothing there needed padding.
+
+## Speculation thunk audit (`-s`)
+
+A retpoline replaces an indirect branch with a call to a thunk that returns to
+the intended target, so the branch predictor never sees an indirect transfer to
+mistrain; a return thunk does the same for `RET`, which is what Retbleed and
+SRSO attack. `x86lint -s` reports whether a binary was built that way --
+`-mindirect-branch=thunk[-extern]` and `-mfunction-return=thunk[-extern]` in
+GCC, `-mretpoline` in clang.
+
+Like the JCC audit this is a verdict: the transformation is not an encoding a
+peephole could suggest, no one unrouted return is at fault, and per site it
+would be one finding per return in the binary. The signal is about as close to
+binary as this tool gets, and it is positive on both sides rather than inferred
+from absence -- a routed build *names* the thunk, in its relocations while it
+is still an object and in its symbol table once linked, and contains none of
+the instruction the thunk replaces.
+
+```console
+$ xzcat /lib/modules/$(uname -r)/kernel/drivers/net/amt.ko.xz > amt.ko
+$ ./x86lint -s amt.ko
+speculation thunk audit: 8441 instructions, 0 undecodable bytes skipped
+  returns: 0 bare, 75 routed through a thunk -- routed (the image names a return thunk and holds no RET)
+  indirect branches: 0 bare -- none in this image
+
+$ ./x86lint -s /bin/bash | sed -n '2,3p'
+  returns: 3032 bare -- not routed (the image names no return thunk)
+  indirect branches: 239 bare -- not routed (the image names no indirect thunk)
+```
+
+Fedora's own kernel is the proof that this is worth checking: across 60 shipped
+modules, 59 report `routed` and one has no returns at all to judge. Not one
+reports a hole, which is the calibration -- a verdict that fired spuriously on
+real input would be useless for the audit it exists for.
+
+**The one thing reported as a finding is a hole, not an absence.** A bare `RET`
+in an image that names a return thunk means the build asked for the mitigation
+and something escaped it -- hand-written assembly the conversion missed is
+exactly how that happens -- so that exits 1. A binary that names no thunk never
+opted in, and saying so is describing a build rather than judging one: these
+are kernel and hypervisor mitigations, userspace does not use them, and unlike
+the JCC erratum there is no `-t` value that would change the answer, because
+what decides is what the binary *is* and not which CPU runs it.
+
+**A thunk's own body is excluded, and it has to be.** The trampoline GCC emits
+ends in the very `RET` it exists to replace, and a retpoline's ends in a `RET`
+that jumps to the target it pushed. Without excluding those bodies, an image
+that defines its thunks rather than importing them would always report a hole,
+and the hole it reported would be the mitigation itself. GCC also emits both
+symbols with `st_size` 0, so the extent comes from the next symbol in the
+section -- the same rule the scan applies to an unsized assembly label.
+
+Two limits worth stating. The routed *count* is exact only while the object is
+relocatable, since a linked image has resolved those branches into ordinary
+direct ones; there the symbol's presence carries the verdict and the count
+reads zero. And a linked image is judged whole, passengers included: a
+retpoline-built program linked against an ordinary libc reports `INCOMPLETE`
+because libc's returns really are unrouted, which is accurate but says more
+about the link than about the code. A kernel module has no such passengers,
+which is why it is the case with clean semantics.
 
 ## Mining tools
 

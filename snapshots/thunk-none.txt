@@ -1,0 +1,5 @@
+speculation thunk audit: 4 instructions, 0 undecodable bytes skipped
+  returns: 1 bare -- not routed (the image names no return thunk)
+  indirect branches: 0 bare -- none in this image
+    these are kernel and hypervisor mitigations (-mindirect-branch, -mfunction-return, -mretpoline); userspace is built without them
+exit status: 0

@@ -3869,6 +3869,200 @@ int x86lint_jcc_print(const x86lint_jcc *jcc, enum x86lint_target target,
     return findings;
 }
 
+// ==== the speculation-thunk audit ====================================
+//
+// See the block comment on x86lint_thunk in the header for what the thunks
+// are, why this is a verdict, and why a build that never opted in is not a
+// finding.
+
+struct x86lint_thunk {
+    size_t count[X86LINT_THUNK_KINDS];
+    bool named[2];              // indexed by enum x86lint_thunk_axis
+    size_t instructions;
+    size_t skipped;
+};
+
+x86lint_thunk *x86lint_thunk_create(void)
+{
+    return calloc(1, sizeof(struct x86lint_thunk));
+}
+
+void x86lint_thunk_destroy(x86lint_thunk *thunk)
+{
+    free(thunk);
+}
+
+void x86lint_thunk_scan(x86lint_thunk *thunk, const uint8_t *inst, size_t len,
+                        const uint8_t *thunk_bodies)
+{
+    if (thunk == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            ++thunk->skipped;
+            continue;
+        }
+        // A thunk's own body holds the instruction it replaces, so counting
+        // one there would report the mitigation as the hole in itself. Still
+        // decoded, so the instruction total describes the whole image.
+        if (thunk_bodies == NULL || thunk_bodies[i] == 0) {
+            switch (xed_decoded_inst_get_category(&xedd)) {
+            case XED_CATEGORY_RET:
+                thunk->count[X86LINT_THUNK_RET_BARE]++;
+                break;
+            case XED_CATEGORY_CALL:
+            case XED_CATEGORY_UNCOND_BR:
+                // A nonzero branch-displacement width is what marks a direct
+                // relative transfer, so its absence is the indirect form --
+                // the same test collect_branch_targets uses rather than a
+                // second spelling of it. A direct branch to a thunk is not
+                // counted here at all: the bytes cannot say where it goes,
+                // and the container names it (x86lint_thunk_set_evidence).
+                if (xed_decoded_inst_get_branch_displacement_width_bits(&xedd)
+                        == 0) {
+                    thunk->count[X86LINT_THUNK_INDIRECT_BARE]++;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        thunk->instructions++;
+        i += xed_decoded_inst_get_length(&xedd);
+    }
+}
+
+void x86lint_thunk_set_evidence(x86lint_thunk *thunk, size_t routed_returns,
+                                size_t routed_indirects, bool returns_named,
+                                bool indirects_named)
+{
+    if (thunk == NULL) {
+        return;
+    }
+    thunk->count[X86LINT_THUNK_RET_ROUTED] = routed_returns;
+    thunk->count[X86LINT_THUNK_INDIRECT_ROUTED] = routed_indirects;
+    // A routed branch is itself proof the thunk is named, so the flags only
+    // ever widen what the counts already established -- which is what carries
+    // a linked image, where the relocations are gone and the symbol remains.
+    thunk->named[X86LINT_THUNK_RETURNS] =
+        returns_named || routed_returns != 0;
+    thunk->named[X86LINT_THUNK_INDIRECT] =
+        indirects_named || routed_indirects != 0;
+}
+
+size_t x86lint_thunk_count(const x86lint_thunk *thunk,
+                           enum x86lint_thunk_kind kind)
+{
+    if (thunk == NULL || (int) kind < 0 ||
+        (int) kind >= X86LINT_THUNK_KINDS) {
+        return 0;
+    }
+    return thunk->count[kind];
+}
+
+size_t x86lint_thunk_instructions(const x86lint_thunk *thunk)
+{
+    return thunk == NULL ? 0 : thunk->instructions;
+}
+
+enum x86lint_thunk_verdict x86lint_thunk_verdict(const x86lint_thunk *thunk,
+                                                 enum x86lint_thunk_axis axis)
+{
+    if (thunk == NULL ||
+        (axis != X86LINT_THUNK_RETURNS && axis != X86LINT_THUNK_INDIRECT)) {
+        return X86LINT_THUNK_NONE;
+    }
+    bool returns = axis == X86LINT_THUNK_RETURNS;
+    size_t bare = thunk->count[returns
+        ? X86LINT_THUNK_RET_BARE : X86LINT_THUNK_INDIRECT_BARE];
+    size_t routed = thunk->count[returns
+        ? X86LINT_THUNK_RET_ROUTED : X86LINT_THUNK_INDIRECT_ROUTED];
+    if (bare == 0 && routed == 0 && !thunk->named[axis]) {
+        return X86LINT_THUNK_NONE;
+    }
+    if (!thunk->named[axis]) {
+        return X86LINT_THUNK_BARE;
+    }
+    return bare == 0 ? X86LINT_THUNK_ROUTED : X86LINT_THUNK_PARTIAL;
+}
+
+int x86lint_thunk_findings(const x86lint_thunk *thunk)
+{
+    return x86lint_thunk_verdict(thunk, X86LINT_THUNK_RETURNS)
+            == X86LINT_THUNK_PARTIAL ||
+        x86lint_thunk_verdict(thunk, X86LINT_THUNK_INDIRECT)
+            == X86LINT_THUNK_PARTIAL ? 1 : 0;
+}
+
+static void thunk_print_axis(const x86lint_thunk *thunk,
+                             enum x86lint_thunk_axis axis)
+{
+    bool returns = axis == X86LINT_THUNK_RETURNS;
+    size_t bare = thunk->count[returns
+        ? X86LINT_THUNK_RET_BARE : X86LINT_THUNK_INDIRECT_BARE];
+    size_t routed = thunk->count[returns
+        ? X86LINT_THUNK_RET_ROUTED : X86LINT_THUNK_INDIRECT_ROUTED];
+
+    printf("  %s: %zu bare", returns ? "returns" : "indirect branches", bare);
+    if (routed != 0) {
+        printf(", %zu routed through a thunk", routed);
+    }
+    printf(" -- ");
+    switch (x86lint_thunk_verdict(thunk, axis)) {
+    case X86LINT_THUNK_ROUTED:
+        printf("routed (the image names %s and holds no %s)\n",
+            returns ? "a return thunk" : "an indirect thunk",
+            returns ? "RET" : "indirect CALL or JMP");
+        break;
+    case X86LINT_THUNK_PARTIAL:
+        printf("INCOMPLETE: the image names %s, so the build asked for this "
+            "and %zu %s escaped it\n",
+            returns ? "a return thunk" : "an indirect thunk", bare,
+            returns ? "RET" : "indirect branches");
+        break;
+    case X86LINT_THUNK_BARE:
+        printf("not routed (the image names no %s)\n",
+            returns ? "return thunk" : "indirect thunk");
+        break;
+    case X86LINT_THUNK_NONE:
+        printf("none in this image\n");
+        break;
+    }
+}
+
+int x86lint_thunk_print(const x86lint_thunk *thunk, bool verbose)
+{
+    if (thunk == NULL) {
+        return 0;
+    }
+    printf("speculation thunk audit: %zu instructions, %zu undecodable bytes "
+        "skipped\n", thunk->instructions, thunk->skipped);
+    thunk_print_axis(thunk, X86LINT_THUNK_RETURNS);
+    thunk_print_axis(thunk, X86LINT_THUNK_INDIRECT);
+
+    int findings = x86lint_thunk_findings(thunk);
+    if (findings != 0) {
+        printf("  counted as a finding: a hole in a mitigation this build "
+            "asked for\n");
+    } else if (verbose &&
+               (x86lint_thunk_verdict(thunk, X86LINT_THUNK_RETURNS)
+                    == X86LINT_THUNK_BARE ||
+                x86lint_thunk_verdict(thunk, X86LINT_THUNK_INDIRECT)
+                    == X86LINT_THUNK_BARE)) {
+        // Said only under -v, and only when nothing was routed: on the
+        // ordinary userspace binary this describes, it is the expected
+        // configuration rather than an observation worth a line every run.
+        printf("    these are kernel and hypervisor mitigations "
+            "(-mindirect-branch, -mfunction-return, -mretpoline); userspace "
+            "is built without them\n");
+    }
+    return findings;
+}
+
 // In verbose mode print a finding as a one-line summary -- the offending
 // instruction disassembled at its address, suffixed with the containing
 // function when the summary carries a table -- followed by the raw

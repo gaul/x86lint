@@ -1,0 +1,4 @@
+speculation thunk audit: 4 instructions, 0 undecodable bytes skipped
+  returns: 0 bare, 1 routed through a thunk -- routed (the image names a return thunk and holds no RET)
+  indirect branches: 0 bare, 1 routed through a thunk -- routed (the image names an indirect thunk and holds no indirect CALL or JMP)
+exit status: 0

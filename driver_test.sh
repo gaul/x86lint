@@ -524,6 +524,74 @@ fn_bad:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Fixtures for the speculation-thunk audit (-s), which asks whether returns
+# and indirect branches were routed through the Spectre-v2 and Retbleed
+# thunks. Hand-written, because the shape is a symbol name plus a relocation
+# against it, which is what a compiler's -mfunction-return=thunk-extern
+# produces and what no .byte sequence can imitate.
+#
+# thunkfull: routed. Two functions whose returns are relocated branches to an
+# undefined __x86_return_thunk, and one indirect call routed to an
+# __x86_indirect_thunk_rax; no RET and no indirect branch remains.
+cat >"$dir/thunkfull.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x31, 0xff                    # xor edi, edi
+    jmp __x86_return_thunk              # the return, routed
+    .size _start, . - _start
+    .globl fn2
+    .type fn2, @function
+fn2:
+    .byte 0x48, 0x8b, 0x07              # mov rax, [rdi]
+    jmp __x86_indirect_thunk_rax        # the indirect call, routed
+    .size fn2, . - fn2
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# thunkhole: the same build with one bare RET left in it, which is how this
+# really goes wrong -- hand-written assembly that the conversion missed. The
+# image still names the thunk, so the build asked for the mitigation, and the
+# escaped RET is the finding.
+cat >"$dir/thunkhole.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x31, 0xff                    # xor edi, edi
+    jmp __x86_return_thunk              # routed
+    .size _start, . - _start
+    .globl fn2
+    .type fn2, @function
+fn2:
+    .byte 0x31, 0xc0                    # xor eax, eax
+    .byte 0xc3                          # ret: never converted
+    .size fn2, . - fn2
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# thunklocal: the thunk defined here rather than imported, which is the case
+# the body exclusion exists for. The trampoline ends in the very RET it
+# replaces, so without excluding its body the verdict would report the
+# mitigation as the hole in itself. Its symbol is deliberately unsized, the
+# way GCC emits it.
+cat >"$dir/thunklocal.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x31, 0xff                    # xor edi, edi
+    jmp __x86_return_thunk              # routed
+    .size _start, . - _start
+    .globl __x86_return_thunk
+    .type __x86_return_thunk, @function
+__x86_return_thunk:                     # no .size, as GCC leaves it
+    .byte 0x48, 0x8d, 0x64, 0x24, 0x08  # lea rsp, [rsp+8]
+    .byte 0xc3                          # the trampoline's own ret
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # Relocation fixtures, a matched pair. Both assemble to byte-identical .text;
 # the only difference is whether a relocation covers the two placeholder
 # fields, so the scan's disagreement between them is entirely the exclusion
@@ -653,6 +721,9 @@ if ! cc -nostdlib -pie -Wl,--build-id=none \
    ! cc -c -o "$dir/clean.o" "$dir/clean.s" ||
    ! cc -c -o "$dir/jccpad.o" "$dir/jccpad.s" ||
    ! cc -c -o "$dir/reloc.o" "$dir/reloc.s" ||
+   ! cc -c -o "$dir/thunkfull.o" "$dir/thunkfull.s" ||
+   ! cc -c -o "$dir/thunkhole.o" "$dir/thunkhole.s" ||
+   ! cc -c -o "$dir/thunklocal.o" "$dir/thunklocal.s" ||
    ! cc -c -o "$dir/noreloc.o" "$dir/noreloc.s" ||
    ! cc -c -o "$dir/finding.o" "$dir/finding.s"; then
     echo "driver_test.sh: fixture build failed" >&2
@@ -980,6 +1051,43 @@ expect '^3 optimization opportunities in 3 instructions$'
 run 0 "$dir/clean.o"
 reject 'instructions were excluded' "an exclusion on a relocation-free object"
 
+# The speculation-thunk audit (-s). Routed: the image names both thunks and
+# holds neither the RET nor the indirect branch they replace.
+run 0 -s "$dir/thunkfull.o"
+expect '^speculation thunk audit: 4 instructions, 0 undecodable bytes skipped$'
+expect '^  returns: 0 bare, 1 routed through a thunk -- routed '
+expect '^  indirect branches: 0 bare, 1 routed through a thunk -- routed '
+reject 'counted as a finding' "a finding on a fully routed image"
+
+# A hole is the one thing this reports as a finding: the image names the thunk,
+# so the build asked for the mitigation, and a RET escaped it anyway.
+run 1 -s "$dir/thunkhole.o"
+expect '^  returns: 1 bare, 1 routed through a thunk -- INCOMPLETE'
+expect '^  counted as a finding: a hole in a mitigation this build asked for$'
+
+# A locally defined thunk must not be reported as the hole in itself: the
+# trampoline ends in the RET it replaces, and its body is excluded. The symbol
+# is unsized, so its extent comes from the next symbol or the section end.
+# The branch to it needs no relocation, the definition being in the same
+# section, so this is also the shape a linked image has: no routed count, and
+# the symbol carrying the verdict alone.
+run 0 -s "$dir/thunklocal.o"
+expect '^  returns: 0 bare -- routed \(the image names a return thunk'
+reject 'routed through a thunk' "a routed count where no relocation exists"
+reject 'INCOMPLETE' "the trampoline's own RET counted against it"
+
+# A build that never opted in is described, not judged: there is no -t value
+# that would change it, because what decides is what the binary is.
+run 0 -s "$dir/census"
+expect '^  returns: 1 bare -- not routed \(the image names no return thunk\)$'
+reject 'counted as a finding' "a finding for never opting in"
+run 0 -s -v "$dir/census"
+expect 'kernel and hypervisor mitigations'
+
+# The audit is its own report, like -e and -j, and --json describes none.
+run 2 --json -s "$dir/census"
+expect 'cannot be combined with'
+
 # The JCC-erratum audit (-j). A verdict about the whole binary, so the three
 # fixtures differ only in where their jumps sit relative to a 32-byte
 # boundary; see their comments for the arithmetic each one realizes.
@@ -1081,6 +1189,10 @@ snapshot jcc-absent -j -t skylake "$dir/jccraw"
 snapshot jcc-present -j "$dir/jccpad"
 snapshot jcc-partial -j -v "$dir/jccmixed"
 snapshot jcc-unplaced -j "$dir/clean.o"
+snapshot thunk-routed -s "$dir/thunkfull.o"
+snapshot thunk-hole -s "$dir/thunkhole.o"
+snapshot thunk-local -s "$dir/thunklocal.o"
+snapshot thunk-none -s -v "$dir/census"
 snapshot relocatable -v "$dir/finding.o"
 snapshot reloc-excluded -v "$dir/reloc.o"
 snapshot reloc-unmarked -v "$dir/noreloc.o"

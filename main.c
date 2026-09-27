@@ -330,6 +330,277 @@ static uint8_t *relocated_field_starts(FILE *f, const Elf64_Ehdr *ehdr,
     return map;
 }
 
+// Which speculation-thunk family a symbol name belongs to: 1 a return thunk,
+// 2 an indirect-branch thunk, 0 neither. The names are the compilers' own --
+// GCC's -mindirect-branch=thunk[-extern] emits __x86_indirect_thunk_<reg> and
+// -mfunction-return=thunk[-extern] emits __x86_return_thunk, clang's
+// -mretpoline emits __llvm_retpoline_<reg>. The return side matches on the
+// shared "return_thunk" ending rather than that one spelling, because the
+// kernel defines several it patches in at run time (srso_return_thunk,
+// srso_alias_return_thunk) and a build using one is still a build that
+// routed its returns.
+static int thunk_family(const char *name)
+{
+    if (strncmp(name, "__x86_indirect_thunk", 20) == 0 ||
+        strncmp(name, "__llvm_retpoline", 16) == 0) {
+        return 2;
+    }
+    size_t n = strlen(name);
+    const size_t tail = sizeof("return_thunk") - 1;
+    if (n >= tail && strcmp(name + n - tail, "return_thunk") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+// Whether the image names a thunk of each family anywhere in its symbol
+// tables, which is the evidence that survives linking: a relocatable object
+// names an undefined thunk it will be linked against, and a linked one has
+// the definition. Both tables are read -- .symtab where it survived, .dynsym
+// otherwise -- since either can hold the name.
+static void find_thunk_symbols(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
+                               uint64_t file_size, bool *returns_named,
+                               bool *indirects_named)
+{
+    *returns_named = false;
+    *indirects_named = false;
+    for (uint64_t i = 0; i < shnum; ++i) {
+        Elf64_Shdr sh;
+        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
+                     sizeof(sh))) {
+            return;
+        }
+        if ((sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM) ||
+            sh.sh_entsize != sizeof(Elf64_Sym) || sh.sh_link >= shnum) {
+            continue;
+        }
+        Elf64_Shdr strh;
+        if (!read_at(f, (long) (ehdr->e_shoff + sh.sh_link * sizeof(strh)),
+                     &strh, sizeof(strh))) {
+            continue;
+        }
+        uint8_t *syms = load_section(f, &sh, file_size);
+        char *str = (char *) load_section(f, &strh, file_size);
+        if (syms != NULL && str != NULL && strh.sh_size > 0) {
+            str[strh.sh_size - 1] = '\0';
+            size_t n = sh.sh_size / sizeof(Elf64_Sym);
+            for (size_t s = 0; s < n; ++s) {
+                Elf64_Sym sym;
+                memcpy(&sym, syms + s * sizeof(sym), sizeof(sym));
+                if (sym.st_name == 0 || sym.st_name >= strh.sh_size) {
+                    continue;
+                }
+                switch (thunk_family(str + sym.st_name)) {
+                case 1:
+                    *returns_named = true;
+                    break;
+                case 2:
+                    *indirects_named = true;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+        free(syms);
+        free(str);
+    }
+}
+
+// One byte per byte of section `shndx`, nonzero inside the body of a thunk
+// the image defines there, for x86lint_thunk_scan. Required rather than
+// optional: a thunk contains the instruction it replaces, so without this an
+// image that defines its own thunks reports them as the hole (see the header).
+// NULL when the section defines none, which is the common case -- a
+// thunk-extern build imports them, and a thunk build gives each its own
+// section.
+//
+// GCC emits both thunks as size-0 function symbols, so an unsized body extends
+// to the next symbol defined in the section, or to the section's end: the same
+// rule mask_non_function_bytes applies to an unsized assembly label. That is
+// why every symbol start is collected and not only the thunks'.
+struct thunk_span {
+    uint64_t start;
+    uint64_t size;      // 0 for the unsized symbols GCC actually emits
+};
+
+static uint8_t *thunk_body_map(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
+                               uint64_t shndx, uint64_t sec_addr,
+                               uint64_t sec_size, uint64_t file_size)
+{
+    uint64_t *starts = NULL;            // every symbol start in the section
+    size_t nstarts = 0;
+    struct thunk_span *spans = NULL;    // the thunks among them
+    size_t nspans = 0;
+    bool oom = false;
+
+    for (uint64_t i = 0; i < shnum && !oom; ++i) {
+        Elf64_Shdr sh;
+        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
+                     sizeof(sh))) {
+            break;
+        }
+        if ((sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM) ||
+            sh.sh_entsize != sizeof(Elf64_Sym) || sh.sh_link >= shnum) {
+            continue;
+        }
+        Elf64_Shdr strh;
+        if (!read_at(f, (long) (ehdr->e_shoff + sh.sh_link * sizeof(strh)),
+                     &strh, sizeof(strh))) {
+            continue;
+        }
+        uint8_t *syms = load_section(f, &sh, file_size);
+        char *str = (char *) load_section(f, &strh, file_size);
+        if (syms != NULL && str != NULL && strh.sh_size > 0) {
+            str[strh.sh_size - 1] = '\0';
+            size_t n = sh.sh_size / sizeof(Elf64_Sym);
+            for (size_t s = 0; s < n; ++s) {
+                Elf64_Sym sym;
+                memcpy(&sym, syms + s * sizeof(sym), sizeof(sym));
+                if (sym.st_name == 0 || sym.st_name >= strh.sh_size) {
+                    continue;
+                }
+                // A relocatable object's symbol is an offset into its own
+                // section; a linked one's is an address to subtract the
+                // section's from. Either way only a definition placed in THIS
+                // section says anything about these bytes.
+                uint64_t start;
+                if (ehdr->e_type == ET_REL) {
+                    if (sym.st_shndx != shndx) {
+                        continue;
+                    }
+                    start = sym.st_value;
+                } else {
+                    if (sym.st_value < sec_addr ||
+                        sym.st_value - sec_addr >= sec_size) {
+                        continue;
+                    }
+                    start = sym.st_value - sec_addr;
+                }
+                if (start >= sec_size) {
+                    continue;
+                }
+                uint64_t *grown = realloc(starts,
+                    (nstarts + 1) * sizeof(*starts));
+                if (grown == NULL) {
+                    oom = true;
+                    break;
+                }
+                starts = grown;
+                starts[nstarts++] = start;
+                if (thunk_family(str + sym.st_name) == 0) {
+                    continue;
+                }
+                struct thunk_span *more = realloc(spans,
+                    (nspans + 1) * sizeof(*spans));
+                if (more == NULL) {
+                    oom = true;
+                    break;
+                }
+                spans = more;
+                spans[nspans].start = start;
+                spans[nspans].size = sym.st_size;
+                ++nspans;
+            }
+        }
+        free(syms);
+        free(str);
+    }
+
+    uint8_t *map = NULL;
+    if (nspans != 0 && !oom) {
+        map = calloc(sec_size, 1);
+    }
+    for (size_t t = 0; map != NULL && t < nspans; ++t) {
+        uint64_t start = spans[t].start;
+        uint64_t end;
+        if (spans[t].size != 0) {
+            end = spans[t].size > sec_size - start
+                ? sec_size : start + spans[t].size;
+        } else {
+            // The nearest start above this one, which is where the body must
+            // stop; no ordering is needed to find a minimum.
+            end = sec_size;
+            for (size_t k = 0; k < nstarts; ++k) {
+                if (starts[k] > start && starts[k] < end) {
+                    end = starts[k];
+                }
+            }
+        }
+        memset(map + start, 1, end - start);
+    }
+    free(starts);
+    free(spans);
+    return map;
+}
+
+// Count the branches that a relocation routes to a thunk, over every RELA
+// section targeting section `shndx`. Exact while the object is relocatable;
+// a linked image resolved these into ordinary direct branches and reports
+// zero here, which is why the presence of the symbol carries its verdict.
+static void count_thunk_relocations(FILE *f, const Elf64_Ehdr *ehdr,
+                                    uint64_t shnum, uint64_t shndx,
+                                    uint64_t file_size, size_t *returns,
+                                    size_t *indirects)
+{
+    for (uint64_t i = 0; i < shnum; ++i) {
+        Elf64_Shdr sh;
+        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
+                     sizeof(sh))) {
+            return;
+        }
+        if (sh.sh_type != SHT_RELA || sh.sh_info != shndx ||
+            sh.sh_entsize != sizeof(Elf64_Rela) || sh.sh_link >= shnum) {
+            continue;
+        }
+        Elf64_Shdr symh;
+        if (!read_at(f, (long) (ehdr->e_shoff + sh.sh_link * sizeof(symh)),
+                     &symh, sizeof(symh)) ||
+            symh.sh_entsize != sizeof(Elf64_Sym) || symh.sh_link >= shnum) {
+            continue;
+        }
+        Elf64_Shdr strh;
+        if (!read_at(f, (long) (ehdr->e_shoff + symh.sh_link * sizeof(strh)),
+                     &strh, sizeof(strh))) {
+            continue;
+        }
+        uint8_t *rels = load_section(f, &sh, file_size);
+        uint8_t *syms = load_section(f, &symh, file_size);
+        char *str = (char *) load_section(f, &strh, file_size);
+        if (rels != NULL && syms != NULL && str != NULL && strh.sh_size > 0) {
+            str[strh.sh_size - 1] = '\0';
+            size_t nsym = symh.sh_size / sizeof(Elf64_Sym);
+            size_t n = sh.sh_size / sizeof(Elf64_Rela);
+            for (size_t r = 0; r < n; ++r) {
+                Elf64_Rela rela;
+                memcpy(&rela, rels + r * sizeof(rela), sizeof(rela));
+                uint32_t si = ELF64_R_SYM(rela.r_info);
+                if (si == 0 || si >= nsym) {
+                    continue;
+                }
+                Elf64_Sym sym;
+                memcpy(&sym, syms + si * sizeof(sym), sizeof(sym));
+                if (sym.st_name == 0 || sym.st_name >= strh.sh_size) {
+                    continue;
+                }
+                switch (thunk_family(str + sym.st_name)) {
+                case 1:
+                    ++*returns;
+                    break;
+                case 2:
+                    ++*indirects;
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+        free(rels);
+        free(syms);
+        free(str);
+    }
+}
+
 // One word from the GNU property note (an NT_GNU_PROPERTY_TYPE_0 note named
 // "GNU"): pr_type selects which -- GNU_PROPERTY_X86_FEATURE_1_AND holds the
 // CET bits the loader enables enforcement from, GNU_PROPERTY_X86_ISA_1_NEEDED
@@ -1794,6 +2065,7 @@ int main(int argc, char **argv)
     bool endbr = false;
     bool census = false;
     bool jcc_audit = false;
+    bool thunk_audit = false;
     bool json = false;
     uint32_t extensions = 0;
     enum x86lint_target target = X86LINT_TARGET_GENERIC;
@@ -1813,6 +2085,8 @@ int main(int argc, char **argv)
             census = true;
         } else if (strcmp(argv[i], "-j") == 0) {
             jcc_audit = true;
+        } else if (strcmp(argv[i], "-s") == 0) {
+            thunk_audit = true;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = true;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -1855,7 +2129,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [--json] "
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -1866,7 +2140,7 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [--json] "
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -1876,7 +2150,7 @@ int main(int argc, char **argv)
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [--json] "
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -1890,12 +2164,13 @@ int main(int argc, char **argv)
         return 2;
     }
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i, -e and -j are separate reports whose
-    // shapes this schema does not describe. Refused rather than resolved,
-    // since either choice would surprise half the callers.
-    if (json && (verbose || census || endbr || jcc_audit)) {
+    // prose with the document, and -i, -e, -j and -s are separate reports
+    // whose shapes this schema does not describe. Refused rather than
+    // resolved, since either choice would surprise half the callers.
+    if (json && (verbose || census || endbr || jcc_audit || thunk_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -e or -j\n", argv[0]);
+            "%s: --json cannot be combined with -v, -i, -e, -j or -s\n",
+            argv[0]);
         return 2;
     }
 
@@ -1912,6 +2187,9 @@ int main(int argc, char **argv)
     x86lint_census *census_data = NULL;
     x86lint_jcc *jcc_data = NULL;
     uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
+    x86lint_thunk *thunk_data = NULL;
+    size_t thunk_ret_relocs = 0;    // branches a relocation routes to a thunk
+    size_t thunk_ind_relocs = 0;
     uint64_t relocated_insts = 0;   // instructions a relocation will rewrite
     uint64_t relocated_bytes = 0;   // and the bytes they hold
     struct evidence_build evidence = {NULL, 0, 0};
@@ -2011,7 +2289,8 @@ int main(int argc, char **argv)
     // its point, so it loads always and draws on .dynsym too. Names ride
     // along for -f matching and finding attribution; their string tables
     // stay live in strtabs[].
-    if ((!scan_all && !census && !jcc_audit) || fname != NULL) {
+    if ((!scan_all && !census && !jcc_audit && !thunk_audit) ||
+        fname != NULL) {
         // An ET_REL symbol's value is an offset into its own section, so
         // placing it needs that section's address; remember them all while
         // the headers are being read anyway. Only ET_REL asks.
@@ -2280,6 +2559,14 @@ int main(int argc, char **argv)
         }
     }
 
+    if (thunk_audit) {
+        thunk_data = x86lint_thunk_create();
+        if (thunk_data == NULL) {
+            fprintf(stderr, "%s: failed to allocate the thunk audit\n", path);
+            goto out;
+        }
+    }
+
     // The census, by contrast, IS the whole report of a -i run, so failing
     // to allocate it degrades to printing zeros; fail hard instead.
     if (census) {
@@ -2466,13 +2753,27 @@ int main(int argc, char **argv)
             }
         }
 
+        // The thunk audit counts the instructions a routed build does not
+        // contain, so like the JCC audit it wants every executable byte and
+        // the buffer before any masking. Its other half -- which branches a
+        // relocation routes to a thunk -- is ELF knowledge, gathered here per
+        // section and handed over once after the loop.
+        if (thunk_audit) {
+            uint8_t *bodies = thunk_body_map(f, &ehdr, shnum, i, shdr.sh_addr,
+                shdr.sh_size, file_size);
+            x86lint_thunk_scan(thunk_data, buf, shdr.sh_size, bodies);
+            free(bodies);
+            count_thunk_relocations(f, &ehdr, shnum, i, file_size,
+                &thunk_ret_relocs, &thunk_ind_relocs);
+        }
+
         // The glue was loaded for the audit alone; nothing else looks at it.
-        // Neither does anything else when -j is the whole request: the audit
-        // replaces the lint scan for the same reason the census does -- it
-        // asks a different question about the file rather than adding
-        // findings to it -- and a -j run over a large binary should not pay
-        // for a peephole sweep nobody asked for.
-        if (stub_section || (jcc_audit && !census)) {
+        // Neither does anything else when -j or -s is the whole request: an
+        // audit replaces the lint scan for the same reason the census does --
+        // it asks a different question about the file rather than adding
+        // findings to it -- and a run over a large binary should not pay for a
+        // peephole sweep nobody asked for.
+        if (stub_section || ((jcc_audit || thunk_audit) && !census)) {
             free(buf);
             buf = NULL;
             continue;
@@ -2640,7 +2941,7 @@ int main(int argc, char **argv)
         }
         printf("  IFUNC resolvers defined: %ld%s\n", ifuncs,
             ifuncs > 0 ? " (runtime CPU dispatch present)" : "");
-    } else if (!json && !jcc_audit) {
+    } else if (!json && !jcc_audit && !thunk_audit) {
         x86lint_summary_print(summary);
     }
 
@@ -2671,6 +2972,19 @@ int main(int argc, char **argv)
         }
     }
 
+    // The thunk audit: its byte-level half is counted, and the symbol
+    // evidence that the bytes cannot carry is read now, once for the file.
+    int thunk_errors = 0;
+    if (thunk_audit) {
+        bool returns_named = false;
+        bool indirects_named = false;
+        find_thunk_symbols(f, &ehdr, shnum, file_size, &returns_named,
+            &indirects_named);
+        x86lint_thunk_set_evidence(thunk_data, thunk_ret_relocs,
+            thunk_ind_relocs, returns_named, indirects_named);
+        thunk_errors = x86lint_thunk_print(thunk_data, verbose);
+    }
+
     uint64_t fbytes = 0;
     if (fname != NULL) {
         for (size_t s = 0; s < nfuncs; ++s) {
@@ -2697,10 +3011,11 @@ int main(int argc, char **argv)
                "  \"opportunities\": %d\n}\n",
             x86lint_summary_instructions(summary),
             x86lint_summary_skipped(summary), errors);
-    } else if (!jcc_audit) {
-        // Nothing of this belongs under -j: the audit is that run's whole
-        // report and it covered every executable byte, so both a restriction
-        // line and an opportunity count would describe a scan that never ran.
+    } else if (!jcc_audit && !thunk_audit) {
+        // Nothing of this belongs under -j or -s: the audit is that run's
+        // whole report and it covered every executable byte, so both a
+        // restriction line and an opportunity count would describe a scan
+        // that never ran.
         if (fname != NULL) {
             printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
                 fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
@@ -2722,9 +3037,11 @@ int main(int argc, char **argv)
                 errors, x86lint_summary_instructions(summary));
         }
     }
-    rc = errors != 0 || endbr_errors != 0 || jcc_errors != 0;
+    rc = errors != 0 || endbr_errors != 0 || jcc_errors != 0 ||
+        thunk_errors != 0;
 
 out:
+    x86lint_thunk_destroy(thunk_data);
     x86lint_jcc_destroy(jcc_data);
     x86lint_census_destroy(census_data);
     free(evidence.r);

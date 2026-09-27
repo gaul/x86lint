@@ -8075,6 +8075,125 @@ static void mask_relocated_test(void)
     assert(memcmp(buf, code, sizeof(code)) == 0);
 }
 
+static void thunk_test(void)
+{
+    // ret ; call *%rax ; jmp *%rcx ; call rel32 ; jmp rel32. The first three
+    // are what a routed build does not contain; the last two are direct, and
+    // whether they reach a thunk is not in the bytes.
+    static const uint8_t code[] = {
+        0xc3,                            // ret
+        0xff, 0xd0,                      // call *%rax
+        0xff, 0xe1,                      // jmp *%rcx
+        0xe8, 0x00, 0x00, 0x00, 0x00,    // call .+0
+        0xe9, 0x00, 0x00, 0x00, 0x00,    // jmp .+0
+    };
+    x86lint_thunk *t = x86lint_thunk_create();
+    assert(t != NULL);
+    x86lint_thunk_scan(t, code, sizeof(code), NULL);
+    assert(x86lint_thunk_instructions(t) == 5);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_RET_BARE) == 1);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_INDIRECT_BARE) == 2);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_RET_ROUTED) == 0);
+    // Without evidence from the container nothing names a thunk, so a build
+    // that never opted in is what this is -- not a hole in one.
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_RETURNS) ==
+        X86LINT_THUNK_BARE);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_INDIRECT) ==
+        X86LINT_THUNK_BARE);
+    assert(x86lint_thunk_findings(t) == 0);
+    x86lint_thunk_destroy(t);
+
+    // The same bytes with the thunk named: now the bare transfers are a hole
+    // in a mitigation the build asked for, on both axes, and a finding.
+    t = x86lint_thunk_create();
+    assert(t != NULL);
+    x86lint_thunk_scan(t, code, sizeof(code), NULL);
+    x86lint_thunk_set_evidence(t, 4, 2, false, false);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_RET_ROUTED) == 4);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_RETURNS) ==
+        X86LINT_THUNK_PARTIAL);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_INDIRECT) ==
+        X86LINT_THUNK_PARTIAL);
+    assert(x86lint_thunk_findings(t) == 1);
+    x86lint_thunk_destroy(t);
+
+    // A routed count of zero with the symbol present is the linked case: the
+    // relocations are gone and the name carries the verdict.
+    t = x86lint_thunk_create();
+    assert(t != NULL);
+    x86lint_thunk_scan(t, code, sizeof(code), NULL);
+    x86lint_thunk_set_evidence(t, 0, 0, true, false);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_RETURNS) ==
+        X86LINT_THUNK_PARTIAL);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_INDIRECT) ==
+        X86LINT_THUNK_BARE);
+    x86lint_thunk_destroy(t);
+
+    // A thunk's own body is excluded, and it has to be: the return
+    // trampoline GCC emits ends in the very RET it exists to replace, so
+    // counting it would report the mitigation as the hole. Here the whole
+    // buffer is thunk body, which leaves nothing bare -- the fully routed
+    // verdict an image that defines its own thunks must be able to reach.
+    uint8_t bodies[sizeof(code)];
+    memset(bodies, 1, sizeof(bodies));
+    t = x86lint_thunk_create();
+    assert(t != NULL);
+    x86lint_thunk_scan(t, code, sizeof(code), bodies);
+    assert(x86lint_thunk_instructions(t) == 5);   // still decoded
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_RET_BARE) == 0);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_INDIRECT_BARE) == 0);
+    x86lint_thunk_set_evidence(t, 3, 1, false, false);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_RETURNS) ==
+        X86LINT_THUNK_ROUTED);
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_INDIRECT) ==
+        X86LINT_THUNK_ROUTED);
+    assert(x86lint_thunk_findings(t) == 0);
+    x86lint_thunk_destroy(t);
+
+    // Marking only the RET leaves the two indirect branches counted, which
+    // pins that the exclusion is per byte and not per buffer.
+    memset(bodies, 0, sizeof(bodies));
+    bodies[0] = 1;
+    t = x86lint_thunk_create();
+    assert(t != NULL);
+    x86lint_thunk_scan(t, code, sizeof(code), bodies);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_RET_BARE) == 0);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_INDIRECT_BARE) == 2);
+    // Nothing of the kind and nothing named: there is no verdict to give.
+    assert(x86lint_thunk_verdict(t, X86LINT_THUNK_RETURNS) ==
+        X86LINT_THUNK_NONE);
+    x86lint_thunk_destroy(t);
+
+    // An undecodable byte resyncs and is tallied, as everywhere else.
+    t = x86lint_thunk_create();
+    assert(t != NULL);
+    static const uint8_t broken[] = {0x06, 0xc3};
+    x86lint_thunk_scan(t, broken, sizeof(broken), NULL);
+    assert(x86lint_thunk_count(t, X86LINT_THUNK_RET_BARE) == 1);
+    assert(x86lint_thunk_instructions(t) == 1);
+    x86lint_thunk_destroy(t);
+
+    // NULL is accepted everywhere, and an out-of-range kind or axis reads
+    // back as zero rather than off the end of the arrays.
+    x86lint_thunk_scan(NULL, code, sizeof(code), NULL);
+    x86lint_thunk_set_evidence(NULL, 1, 1, true, true);
+    assert(x86lint_thunk_count(NULL, X86LINT_THUNK_RET_BARE) == 0);
+    assert(x86lint_thunk_instructions(NULL) == 0);
+    assert(x86lint_thunk_findings(NULL) == 0);
+    assert(x86lint_thunk_verdict(NULL, X86LINT_THUNK_RETURNS) ==
+        X86LINT_THUNK_NONE);
+    assert(x86lint_thunk_print(NULL, false) == 0);
+    t = x86lint_thunk_create();
+    assert(t != NULL);
+    assert(x86lint_thunk_count(t, (enum x86lint_thunk_kind) -1) == 0);
+    assert(x86lint_thunk_count(t,
+        (enum x86lint_thunk_kind) X86LINT_THUNK_KINDS) == 0);
+    assert(x86lint_thunk_verdict(t, (enum x86lint_thunk_axis) 7) ==
+        X86LINT_THUNK_NONE);
+    x86lint_thunk_destroy(t);
+    x86lint_thunk_destroy(NULL);
+}
+
 static void jcc_test(void)
 {
     // The boundary condition, one two-byte Jcc placed three ways. The scan
@@ -8350,6 +8469,7 @@ int main(int argc, char *argv[])
     finding_callback_test();
     census_test();
     mask_relocated_test();
+    thunk_test();
     jcc_test();
 
     // Integration sweep: one buffer through check_instructions, asserted per

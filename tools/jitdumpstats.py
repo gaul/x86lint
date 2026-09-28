@@ -212,11 +212,12 @@ def count_branch_encodings(elf):
     return rel8, rel32
 
 
-# x86lint's cost per image is quadratic in its section count: on the tab's
-# Baseline tier 2,500 sections scanned at 1.35 MB/s and 20,000 at 0.65 MB/s
-# (2026-09-27), and that tier has 122,847. Every blob is its own section and
-# nothing is judged across sections, so the split changes no result, only the
-# time; the census and branch counts are summed back over the parts.
+# Every blob is its own section and nothing is judged across sections, so
+# splitting a tier into several images changes no result; the census and
+# branch counts are summed back over the parts. The split dates from when
+# x86lint's cost per image was quadratic in its section count (fixed in
+# main.c on 2026-09-27); it stays because it costs nothing and keeps each
+# image's -v stream and memory bounded.
 SECTIONS_PER_IMAGE = 4000
 
 

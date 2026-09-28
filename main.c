@@ -68,6 +68,113 @@ static int attr_range_cmp(const void *a, const void *b)
     return strcmp(ra->name, rb->name);
 }
 
+// Order for the section walk: an ET_REL symbol by holding section then
+// offset, a linked image's by address. Sorted once, the symbols a section
+// holds are one contiguous run that funcs_in_section finds by binary search,
+// where each consumer used to pass over the whole table for every section --
+// quadratic in the section count, which a JIT image (tools/*2elf.py, one
+// section per code blob) takes into the tens of thousands.
+static int func_sym_cmp_rel(const void *a, const void *b)
+{
+    const struct func_sym *fa = a, *fb = b;
+    if (fa->shndx != fb->shndx) {
+        return fa->shndx < fb->shndx ? -1 : 1;
+    }
+    if (fa->value != fb->value) {
+        return fa->value < fb->value ? -1 : 1;
+    }
+    return 0;
+}
+
+static int func_sym_cmp_addr(const void *a, const void *b)
+{
+    const struct func_sym *fa = a, *fb = b;
+    if (fa->value != fb->value) {
+        return fa->value < fb->value ? -1 : 1;
+    }
+    return 0;
+}
+
+static void sort_func_syms(struct func_sym *syms, size_t n, bool by_shndx)
+{
+    qsort(syms, n, sizeof(*syms),
+          by_shndx ? func_sym_cmp_rel : func_sym_cmp_addr);
+}
+
+// The run of a sorted table that section `shndx` holds: every symbol with
+// that section index in an ET_REL object, every symbol whose address lies
+// inside the section otherwise. Returns where the run starts and stores its
+// length; an ET_REL symbol whose offset overruns its section is in the run
+// and is the caller's to skip, as before.
+static size_t funcs_in_section(const struct func_sym *syms, size_t n,
+                               const Elf64_Shdr *shdr, uint64_t shndx,
+                               bool by_shndx, size_t *count)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        bool below = by_shndx ? syms[mid].shndx < shndx
+                              : syms[mid].value < shdr->sh_addr;
+        if (below) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    size_t first = lo;
+    hi = n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        // Past `first` every address is at or above the section's, so the
+        // subtraction cannot wrap.
+        bool inside = by_shndx ? syms[mid].shndx == shndx
+                               : syms[mid].value - shdr->sh_addr < shdr->sh_size;
+        if (inside) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    *count = lo - first;
+    return first;
+}
+
+// Which RELA sections target each section, from the header table read once.
+// relocated_field_starts used to find them by walking every header from the
+// file for every section it was asked about: on a 5,000-section JIT image
+// that was 25 million seeks and 97% of the run (2026-09-27), quadratic in
+// the section count, for a file that holds no relocations at all.
+struct rela_index {
+    uint32_t *head;     // per section: the first RELA section targeting it
+    uint32_t *next;     // per RELA section: the next one targeting the same
+};
+
+#define RELA_NONE UINT32_MAX
+
+static bool rela_index_build(struct rela_index *ix, const Elf64_Shdr *shdrs,
+                             uint64_t shnum)
+{
+    ix->head = malloc(shnum * sizeof(*ix->head));
+    ix->next = malloc(shnum * sizeof(*ix->next));
+    if (ix->head == NULL || ix->next == NULL) {
+        free(ix->head);
+        free(ix->next);
+        ix->head = ix->next = NULL;
+        return false;
+    }
+    for (uint64_t i = 0; i < shnum; ++i) {
+        ix->head[i] = ix->next[i] = RELA_NONE;
+    }
+    for (uint64_t i = 0; i < shnum; ++i) {
+        if (shdrs[i].sh_type != SHT_RELA || shdrs[i].sh_info >= shnum) {
+            continue;
+        }
+        ix->next[i] = ix->head[shdrs[i].sh_info];
+        ix->head[shdrs[i].sh_info] = (uint32_t) i;
+    }
+    return true;
+}
+
 // Overwrite every byte of a section's copy that lies outside the symbol
 // table's function ranges with 0x06, an opcode invalid in 64-bit mode: the
 // scan's decode-and-resync loop then skips those bytes and tallies them as
@@ -82,10 +189,17 @@ static int attr_range_cmp(const void *a, const void *b)
 // toward keeping bytes, so code is excluded only where a sized symbol table
 // positively places the functions. ET_REL objects locate symbols by section
 // index and offset; executables and shared objects by virtual address.
+// `funcs` is this section's run of the table, as funcs_in_section returns
+// it; a section that holds no function symbol at all is masked whole, since
+// the table positively placed every function elsewhere.
 static void mask_non_function_bytes(uint8_t *buf, const Elf64_Shdr *shdr,
                                     uint64_t shndx, bool by_shndx,
                                     const struct func_sym *funcs, size_t nfuncs)
 {
+    if (nfuncs == 0) {
+        memset(buf, 0x06, shdr->sh_size);
+        return;
+    }
     struct func_range *r = malloc(nfuncs * sizeof(*r));
     if (r == NULL) {
         return;     // keep the unmasked full sweep on allocation failure
@@ -113,7 +227,16 @@ static void mask_non_function_bytes(uint8_t *buf, const Elf64_Shdr *shdr,
     qsort(r, n, sizeof(*r), func_range_cmp);
     for (size_t i = 0; i < n; ++i) {
         if (r[i].end == r[i].start) {
-            r[i].end = i + 1 < n ? r[i + 1].start : shdr->sh_size;
+            // To the next function's start -- the next GREATER one, so that
+            // a sized alias at the same address neither cuts the label to
+            // nothing nor, depending on which of the two sorted first,
+            // extends it to the section's end. The table's order no longer
+            // reaches here, so the rule has to be order-independent.
+            size_t k = i + 1;
+            while (k < n && r[k].start == r[i].start) {
+                ++k;
+            }
+            r[i].end = k < n ? r[k].start : shdr->sh_size;
         }
     }
     uint64_t pos = 0;
@@ -285,25 +408,21 @@ static uint8_t *load_section(FILE *f, const Elf64_Shdr *shdr,
 // the fields found, and *oom distinguishes "no relocations" from "could not
 // tell", which the caller must not treat alike: unmasked relocated bytes are
 // findings that would corrupt a relocation if applied.
-static uint8_t *relocated_field_starts(FILE *f, const Elf64_Ehdr *ehdr,
-                                       uint64_t shnum, uint64_t shndx,
-                                       uint64_t sec_size, uint64_t file_size,
-                                       size_t *nrelocs, bool *oom)
+static uint8_t *relocated_field_starts(FILE *f, const Elf64_Shdr *shdrs,
+                                       const struct rela_index *ix,
+                                       uint64_t shndx, uint64_t sec_size,
+                                       uint64_t file_size, size_t *nrelocs,
+                                       bool *oom)
 {
     uint8_t *map = NULL;
     *nrelocs = 0;
     *oom = false;
-    for (uint64_t i = 0; i < shnum; ++i) {
-        Elf64_Shdr sh;
-        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
-                     sizeof(sh))) {
-            break;
-        }
-        if (sh.sh_type != SHT_RELA || sh.sh_info != shndx ||
-            sh.sh_entsize != sizeof(Elf64_Rela) || sh.sh_size == 0) {
+    for (uint32_t i = ix->head[shndx]; i != RELA_NONE; i = ix->next[i]) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if (sh->sh_entsize != sizeof(Elf64_Rela) || sh->sh_size == 0) {
             continue;
         }
-        uint8_t *buf = load_section(f, &sh, file_size);
+        uint8_t *buf = load_section(f, sh, file_size);
         if (buf == NULL) {
             *oom = true;
             break;
@@ -313,7 +432,7 @@ static uint8_t *relocated_field_starts(FILE *f, const Elf64_Ehdr *ehdr,
             *oom = true;
             break;
         }
-        size_t n = sh.sh_size / sizeof(Elf64_Rela);
+        size_t n = sh->sh_size / sizeof(Elf64_Rela);
         for (size_t r = 0; r < n; ++r) {
             Elf64_Rela rela;
             memcpy(&rela, buf + r * sizeof(rela), sizeof(rela));
@@ -427,93 +546,43 @@ static void find_named_symbols(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
 // GCC emits both thunks as size-0 function symbols, so an unsized body extends
 // to the next symbol defined in the section, or to the section's end: the same
 // rule mask_non_function_bytes applies to an unsized assembly label. That is
-// why every symbol start is collected and not only the thunks'.
+// why every symbol start is collected and not only the thunks' -- `syms` is
+// this section's run of every named symbol in the image (load_named_symbols,
+// sorted like the function table), not of the functions alone.
 struct thunk_span {
     uint64_t start;
     uint64_t size;      // 0 for the unsized symbols GCC actually emits
 };
 
-static uint8_t *thunk_body_map(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
-                               uint64_t shndx, uint64_t sec_addr,
-                               uint64_t sec_size, uint64_t file_size)
+static uint8_t *thunk_body_map(const struct func_sym *syms, size_t nsyms,
+                               const Elf64_Shdr *shdr, bool by_shndx)
 {
-    uint64_t *starts = NULL;            // every symbol start in the section
+    uint64_t sec_size = shdr->sh_size;
+    if (nsyms == 0) {
+        return NULL;
+    }
+    uint64_t *starts = malloc(nsyms * sizeof(*starts));    // every start
+    struct thunk_span *spans = malloc(nsyms * sizeof(*spans)); // the thunks
     size_t nstarts = 0;
-    struct thunk_span *spans = NULL;    // the thunks among them
     size_t nspans = 0;
-    bool oom = false;
+    bool oom = starts == NULL || spans == NULL;
 
-    for (uint64_t i = 0; i < shnum && !oom; ++i) {
-        Elf64_Shdr sh;
-        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
-                     sizeof(sh))) {
-            break;
-        }
-        if ((sh.sh_type != SHT_SYMTAB && sh.sh_type != SHT_DYNSYM) ||
-            sh.sh_entsize != sizeof(Elf64_Sym) || sh.sh_link >= shnum) {
+    for (size_t s = 0; !oom && s < nsyms; ++s) {
+        // A relocatable object's symbol is an offset into its own section;
+        // a linked one's is an address to subtract the section's from. The
+        // run holds only definitions placed in THIS section.
+        uint64_t start = by_shndx ? syms[s].value
+                                  : syms[s].value - shdr->sh_addr;
+        if (start >= sec_size) {
             continue;
         }
-        Elf64_Shdr strh;
-        if (!read_at(f, (long) (ehdr->e_shoff + sh.sh_link * sizeof(strh)),
-                     &strh, sizeof(strh))) {
+        starts[nstarts++] = start;
+        if (syms[s].name == NULL || thunk_family(syms[s].name) == 0) {
             continue;
         }
-        uint8_t *syms = load_section(f, &sh, file_size);
-        char *str = (char *) load_section(f, &strh, file_size);
-        if (syms != NULL && str != NULL && strh.sh_size > 0) {
-            str[strh.sh_size - 1] = '\0';
-            size_t n = sh.sh_size / sizeof(Elf64_Sym);
-            for (size_t s = 0; s < n; ++s) {
-                Elf64_Sym sym;
-                memcpy(&sym, syms + s * sizeof(sym), sizeof(sym));
-                if (sym.st_name == 0 || sym.st_name >= strh.sh_size) {
-                    continue;
-                }
-                // A relocatable object's symbol is an offset into its own
-                // section; a linked one's is an address to subtract the
-                // section's from. Either way only a definition placed in THIS
-                // section says anything about these bytes.
-                uint64_t start;
-                if (ehdr->e_type == ET_REL) {
-                    if (sym.st_shndx != shndx) {
-                        continue;
-                    }
-                    start = sym.st_value;
-                } else {
-                    if (sym.st_value < sec_addr ||
-                        sym.st_value - sec_addr >= sec_size) {
-                        continue;
-                    }
-                    start = sym.st_value - sec_addr;
-                }
-                if (start >= sec_size) {
-                    continue;
-                }
-                uint64_t *grown = realloc(starts,
-                    (nstarts + 1) * sizeof(*starts));
-                if (grown == NULL) {
-                    oom = true;
-                    break;
-                }
-                starts = grown;
-                starts[nstarts++] = start;
-                if (thunk_family(str + sym.st_name) == 0) {
-                    continue;
-                }
-                struct thunk_span *more = realloc(spans,
-                    (nspans + 1) * sizeof(*spans));
-                if (more == NULL) {
-                    oom = true;
-                    break;
-                }
-                spans = more;
-                spans[nspans].start = start;
-                spans[nspans].size = sym.st_size;
-                ++nspans;
-            }
-        }
-        free(syms);
-        free(str);
+        spans[nspans].start = start;
+        spans[nspans].size = syms[s].size;
+        ++nspans;
     }
 
     uint8_t *map = NULL;
@@ -547,39 +616,28 @@ static uint8_t *thunk_body_map(FILE *f, const Elf64_Ehdr *ehdr, uint64_t shnum,
 // section targeting section `shndx`. Exact while the object is relocatable;
 // a linked image resolved these into ordinary direct branches and reports
 // zero here, which is why the presence of the symbol carries its verdict.
-static void count_thunk_relocations(FILE *f, const Elf64_Ehdr *ehdr,
-                                    uint64_t shnum, uint64_t shndx,
-                                    uint64_t file_size, size_t *returns,
-                                    size_t *indirects)
+static void count_thunk_relocations(FILE *f, const Elf64_Shdr *shdrs,
+                                    uint64_t shnum, const struct rela_index *ix,
+                                    uint64_t shndx, uint64_t file_size,
+                                    size_t *returns, size_t *indirects)
 {
-    for (uint64_t i = 0; i < shnum; ++i) {
-        Elf64_Shdr sh;
-        if (!read_at(f, (long) (ehdr->e_shoff + i * sizeof(sh)), &sh,
-                     sizeof(sh))) {
-            return;
-        }
-        if (sh.sh_type != SHT_RELA || sh.sh_info != shndx ||
-            sh.sh_entsize != sizeof(Elf64_Rela) || sh.sh_link >= shnum) {
+    for (uint32_t i = ix->head[shndx]; i != RELA_NONE; i = ix->next[i]) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if (sh->sh_entsize != sizeof(Elf64_Rela) || sh->sh_link >= shnum) {
             continue;
         }
-        Elf64_Shdr symh;
-        if (!read_at(f, (long) (ehdr->e_shoff + sh.sh_link * sizeof(symh)),
-                     &symh, sizeof(symh)) ||
-            symh.sh_entsize != sizeof(Elf64_Sym) || symh.sh_link >= shnum) {
+        const Elf64_Shdr *symh = &shdrs[sh->sh_link];
+        if (symh->sh_entsize != sizeof(Elf64_Sym) || symh->sh_link >= shnum) {
             continue;
         }
-        Elf64_Shdr strh;
-        if (!read_at(f, (long) (ehdr->e_shoff + symh.sh_link * sizeof(strh)),
-                     &strh, sizeof(strh))) {
-            continue;
-        }
-        uint8_t *rels = load_section(f, &sh, file_size);
-        uint8_t *syms = load_section(f, &symh, file_size);
-        char *str = (char *) load_section(f, &strh, file_size);
-        if (rels != NULL && syms != NULL && str != NULL && strh.sh_size > 0) {
-            str[strh.sh_size - 1] = '\0';
-            size_t nsym = symh.sh_size / sizeof(Elf64_Sym);
-            size_t n = sh.sh_size / sizeof(Elf64_Rela);
+        const Elf64_Shdr *strh = &shdrs[symh->sh_link];
+        uint8_t *rels = load_section(f, sh, file_size);
+        uint8_t *syms = load_section(f, symh, file_size);
+        char *str = (char *) load_section(f, strh, file_size);
+        if (rels != NULL && syms != NULL && str != NULL && strh->sh_size > 0) {
+            str[strh->sh_size - 1] = '\0';
+            size_t nsym = symh->sh_size / sizeof(Elf64_Sym);
+            size_t n = sh->sh_size / sizeof(Elf64_Rela);
             for (size_t r = 0; r < n; ++r) {
                 Elf64_Rela rela;
                 memcpy(&rela, rels + r * sizeof(rela), sizeof(rela));
@@ -589,7 +647,7 @@ static void count_thunk_relocations(FILE *f, const Elf64_Ehdr *ehdr,
                 }
                 Elf64_Sym sym;
                 memcpy(&sym, syms + si * sizeof(sym), sizeof(sym));
-                if (sym.st_name == 0 || sym.st_name >= strh.sh_size) {
+                if (sym.st_name == 0 || sym.st_name >= strh->sh_size) {
                     continue;
                 }
                 switch (thunk_family(str + sym.st_name)) {
@@ -608,6 +666,66 @@ static void count_thunk_relocations(FILE *f, const Elf64_Ehdr *ehdr,
         free(syms);
         free(str);
     }
+}
+
+// Every named symbol of every symbol table -- functions, objects, labels --
+// for the thunk audit's body map, which needs the thunks' names to know
+// which spans are thunks and every other start to know where an unsized one
+// ends. The names point into string tables appended to `strtabs`, which the
+// caller owns. A table that cannot be loaded contributes nothing, as before.
+static bool load_named_symbols(FILE *f, const Elf64_Shdr *shdrs,
+                               uint64_t shnum, uint64_t file_size,
+                               struct func_sym **out, size_t *nout,
+                               char ***strtabs, size_t *nstrtabs)
+{
+    for (uint64_t i = 0; i < shnum; ++i) {
+        const Elf64_Shdr *sh = &shdrs[i];
+        if ((sh->sh_type != SHT_SYMTAB && sh->sh_type != SHT_DYNSYM) ||
+            sh->sh_entsize != sizeof(Elf64_Sym) || sh->sh_link >= shnum) {
+            continue;
+        }
+        const Elf64_Shdr *strh = &shdrs[sh->sh_link];
+        if (strh->sh_size == 0) {
+            continue;
+        }
+        uint8_t *syms = load_section(f, sh, file_size);
+        char *str = (char *) load_section(f, strh, file_size);
+        if (syms == NULL || str == NULL) {
+            free(syms);
+            free(str);
+            continue;
+        }
+        str[strh->sh_size - 1] = '\0';
+        char **g = realloc(*strtabs, (*nstrtabs + 1) * sizeof(**strtabs));
+        if (g == NULL) {
+            free(syms);
+            free(str);
+            return false;
+        }
+        *strtabs = g;
+        (*strtabs)[(*nstrtabs)++] = str;
+        size_t n = sh->sh_size / sizeof(Elf64_Sym);
+        struct func_sym *grown = realloc(*out, (*nout + n) * sizeof(**out));
+        if (grown == NULL) {
+            free(syms);
+            return false;
+        }
+        *out = grown;
+        for (size_t s = 0; s < n; ++s) {
+            Elf64_Sym sym;
+            memcpy(&sym, syms + s * sizeof(sym), sizeof(sym));
+            if (sym.st_name == 0 || sym.st_name >= strh->sh_size) {
+                continue;
+            }
+            (*out)[*nout].value = sym.st_value;
+            (*out)[*nout].size = sym.st_size;
+            (*out)[*nout].shndx = sym.st_shndx;
+            (*out)[*nout].name = str + sym.st_name;
+            ++*nout;
+        }
+        free(syms);
+    }
+    return true;
 }
 
 // One word from the GNU property note (an NT_GNU_PROPERTY_TYPE_0 note named
@@ -2221,6 +2339,10 @@ int main(int argc, char **argv)
     uint64_t *sec_addr = NULL;  // section addresses, for placing ET_REL symbols
     char *shstrtab = NULL;
     uint64_t shstrtab_size = 0;
+    Elf64_Shdr *shdrs = NULL;   // the section header table, read once
+    struct rela_index rela = {NULL, NULL};
+    struct func_sym *all_syms = NULL;   // every named symbol, for -s
+    size_t nall_syms = 0;
 
     if (fseek(f, 0, SEEK_END) != 0) {
         fprintf(stderr, "%s: failed to seek to end of file\n", path);
@@ -2286,6 +2408,23 @@ int main(int argc, char **argv)
                 path, (unsigned long) shnum);
             goto out;
         }
+        // The whole table, once: the scan loop and the per-section helpers
+        // index it rather than seek back to the file for every header.
+        if (shnum != 0) {
+            shdrs = malloc(shnum * sizeof(*shdrs));
+            if (shdrs == NULL ||
+                !read_at(f, (long) ehdr.e_shoff, shdrs,
+                         shnum * sizeof(*shdrs))) {
+                fprintf(stderr, "%s: failed to read the section header "
+                    "table\n", path);
+                goto out;
+            }
+            if (!rela_index_build(&rela, shdrs, shnum)) {
+                fprintf(stderr, "%s: failed to index the relocation "
+                    "sections\n", path);
+                goto out;
+            }
+        }
     }
 
     // Load the function ranges from the symbol table, if the binary kept
@@ -2331,13 +2470,7 @@ int main(int argc, char **argv)
             sec_addr = calloc(shnum, sizeof(*sec_addr));
         }
         for (uint64_t i = 0; i < shnum; ++i) {
-            Elf64_Shdr shdr;
-            if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)), &shdr,
-                         sizeof(shdr))) {
-                fprintf(stderr, "%s: failed to read section header %lu\n",
-                    path, (unsigned long) i);
-                goto out;
-            }
+            Elf64_Shdr shdr = shdrs[i];
             if (sec_addr != NULL) {
                 sec_addr[i] = shdr.sh_addr;
             }
@@ -2467,6 +2600,20 @@ int main(int argc, char **argv)
             goto out;
         }
         nfuncs = kept;
+    }
+
+    // Into section order, once, for the per-section runs below.
+    if (funcs != NULL) {
+        sort_func_syms(funcs, nfuncs, ehdr.e_type == ET_REL);
+    }
+    if (thunk_audit && shnum != 0) {
+        if (!load_named_symbols(f, shdrs, shnum, file_size, &all_syms,
+                                &nall_syms, &strtabs, &nstrtabs)) {
+            fprintf(stderr, "%s: failed to load the symbol tables for the "
+                "thunk audit\n", path);
+            goto out;
+        }
+        sort_func_syms(all_syms, nall_syms, ehdr.e_type == ET_REL);
     }
 
     // Attribution: hand the summary the named function ranges, sorted and
@@ -2717,13 +2864,9 @@ int main(int argc, char **argv)
     }
 
     int errors = 0;
+    const bool by_shndx = ehdr.e_type == ET_REL;
     for (uint64_t i = 0; i < shnum; ++i) {
-        Elf64_Shdr shdr;
-        if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(shdr)), &shdr, sizeof(shdr))) {
-            fprintf(stderr, "%s: failed to read section header %lu\n", path,
-                (unsigned long) i);
-            goto out;
-        }
+        Elf64_Shdr shdr = shdrs[i];
 
         if (shdr.sh_type != SHT_PROGBITS || !(shdr.sh_flags & SHF_EXECINSTR) || shdr.sh_size == 0) {
             continue;
@@ -2801,19 +2944,17 @@ int main(int argc, char **argv)
         // and from its own entry, so the counts and the denominator move
         // together.
         if (prop_audit) {
-            for (size_t s = 0; s < nfuncs; ++s) {
+            size_t count;
+            size_t first = funcs_in_section(funcs, nfuncs, &shdr, i,
+                by_shndx, &count);
+            for (size_t s = first; s < first + count; ++s) {
                 uint64_t off;
-                if (ehdr.e_type == ET_REL) {
-                    if (funcs[s].shndx != i ||
-                        funcs[s].value >= shdr.sh_size) {
+                if (by_shndx) {
+                    if (funcs[s].value >= shdr.sh_size) {
                         continue;
                     }
                     off = funcs[s].value;
                 } else {
-                    if (funcs[s].value < shdr.sh_addr ||
-                        funcs[s].value - shdr.sh_addr >= shdr.sh_size) {
-                        continue;
-                    }
                     off = funcs[s].value - shdr.sh_addr;
                 }
                 if (funcs[s].size == 0) {
@@ -2831,11 +2972,14 @@ int main(int argc, char **argv)
         // relocation routes to a thunk -- is ELF knowledge, gathered here per
         // section and handed over once after the loop.
         if (thunk_audit) {
-            uint8_t *bodies = thunk_body_map(f, &ehdr, shnum, i, shdr.sh_addr,
-                shdr.sh_size, file_size);
+            size_t count;
+            size_t first = funcs_in_section(all_syms, nall_syms, &shdr, i,
+                by_shndx, &count);
+            uint8_t *bodies = thunk_body_map(all_syms + first, count, &shdr,
+                by_shndx);
             x86lint_thunk_scan(thunk_data, buf, shdr.sh_size, bodies);
             free(bodies);
-            count_thunk_relocations(f, &ehdr, shnum, i, file_size,
+            count_thunk_relocations(f, shdrs, shnum, &rela, i, file_size,
                 &thunk_ret_relocs, &thunk_ind_relocs);
         }
 
@@ -2858,11 +3002,11 @@ int main(int argc, char **argv)
             // function's slices are scanned -- the per-function census
             // that answers "what level is this one IFUNC target".
             if (fname != NULL) {
-                for (size_t s = 0; s < nfuncs; ++s) {
-                    if (funcs[s].value < shdr.sh_addr ||
-                        funcs[s].value - shdr.sh_addr >= shdr.sh_size) {
-                        continue;
-                    }
+                // -f refused ET_REL above, so the run is by address.
+                size_t count;
+                size_t first = funcs_in_section(funcs, nfuncs, &shdr, i,
+                    false, &count);
+                for (size_t s = first; s < first + count; ++s) {
                     uint64_t off = funcs[s].value - shdr.sh_addr;
                     uint64_t len = funcs[s].size > shdr.sh_size - off
                         ? shdr.sh_size - off : funcs[s].size;
@@ -2890,7 +3034,7 @@ int main(int argc, char **argv)
         // this tool must not choose.
         size_t sec_relocs = 0;
         bool reloc_oom = false;
-        uint8_t *reloc_map = relocated_field_starts(f, &ehdr, shnum, i,
+        uint8_t *reloc_map = relocated_field_starts(f, shdrs, &rela, i,
             shdr.sh_size, file_size, &sec_relocs, &reloc_oom);
         if (reloc_oom) {
             fprintf(stderr, "%s: failed to read the relocations of section "
@@ -2908,8 +3052,11 @@ int main(int argc, char **argv)
         }
 
         if (funcs != NULL) {
-            mask_non_function_bytes(buf, &shdr, i, ehdr.e_type == ET_REL,
-                funcs, nfuncs);
+            size_t count;
+            size_t first = funcs_in_section(funcs, nfuncs, &shdr, i,
+                by_shndx, &count);
+            mask_non_function_bytes(buf, &shdr, i, by_shndx, funcs + first,
+                count);
         }
 
         // Name the section the following findings belong to, and give the
@@ -3143,6 +3290,10 @@ out:
     free(strtabs);
     free(shstrtab);
     free(funcs);
+    free(all_syms);
+    free(rela.head);
+    free(rela.next);
+    free(shdrs);
     free(buf);
     fclose(f);
     return rc;

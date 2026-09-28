@@ -1210,12 +1210,22 @@ The five AVX-512F and single FMA4 and CLDEMOTE instructions the shell
 census lists are what residual phantoms look like: SpiderMonkey emits
 none of them.
 
-**Tool notes.** x86lint's cost per image is quadratic in its section
-count -- on the tab's Baseline tier 2,500 sections scanned at 1.35 MB/s
-and 20,000 at 0.65 -- because the per-section symbol scan in `main.c`
-walks every symbol; `jitdumpstats.py` splits each tier into 4,000-section
-images and sums, which changes no result. And `--json` cannot carry a
-corpus this size: the tab's findings would be gigabytes, so the analysis
+**Tool notes.** x86lint's cost per image was quadratic in its section
+count -- on the tab's Baseline tier 2,500 sections scanned at 1.28 MB/s,
+20,000 at 0.63 and 60,000 at 0.19 -- and the cause was not where this
+write-up first put it. The per-section symbol walk was real but second
+order; 97% of the time was `lseek`: the relocation lookup re-read every
+section header from the file for every section it was asked about, 25
+million seeks on a 5,000-section image that holds no relocations at
+all. Fixed the same day: `main.c` reads the header table once and
+indexes which RELA sections target each section, and the symbol table is
+sorted once so each section's run is a binary search (the thunk audit's
+own symbol walk included). 1.73 MB/s at 2,500 sections and 1.87 at
+60,000, 5,009 seeks where there were 25 million, and every output byte
+identical over an executable, a JIT image and two kernel modules in
+every mode. `jitdumpstats.py` still splits a tier into 4,000-section
+images; nothing depends on it now. And `--json` cannot carry a corpus
+this size: the tab's findings would be gigabytes, so the analysis
 streams `-v` text and checks its own count against the tool's trailer
 for every image. The candidate this leaves is a JIT-aware suppression
 for the three engine-intent classes above, each recognisable from bytes

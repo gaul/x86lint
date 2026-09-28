@@ -1149,11 +1149,28 @@ check table applies to JIT output:
   `"X86J" | u64 address | u32 code size | u32 name size | name | code`,
   concatenated with no file header, so a dump from a process that was killed
   still parses up to its truncation. `tools/spidermonkey-jitdump.patch` adds
-  the eighty lines to `jit::Linker::newCode` that write it, covering Ion,
-  Baseline, RegExp and the trampolines; JavaScriptCore's `LinkBuffer` takes
-  the same few lines, and the record is the whole interface. `--raw` reads a
-  bare blob, which is what SpiderMonkey's `disnative(f, "file")` writes for
-  one function with nothing patched at all.
+  the writer to `jit::Linker::newCode`, which every JS blob passes through --
+  Ion, Baseline, RegExp and the trampolines -- and a second call in
+  `wasm::CodeBlock::initialize`, which every wasm block reaches once it is
+  linked, so both wasm tiers and their stubs are recorded too. Each process
+  writes `<path>.<pid>`, which is what lets a whole Firefox be dumped rather
+  than only a shell: the parent and every content process link JIT code, and
+  one shared file would be truncated by each of them. JavaScriptCore's
+  `LinkBuffer` takes the same few lines, and the record is the whole
+  interface. `--raw` reads a bare blob, which is what SpiderMonkey's
+  `disnative(f, "file")` writes for one function with nothing patched at all.
+  Both converters leave a blob's inline pointers -- its switch tables and
+  the targets of its extended jump table -- outside the symbol ranges
+  x86lint scans, because eight bytes of code pointer decode into whatever
+  the heap address spells and none of it shows in the undecodable-byte
+  count; in a browser that was 17.5% of the raw figure.
+* `tools/jetstream3/run-browser.sh` runs JetStream 3 in a headless Firefox
+  built with the patch, serving the checkout on loopback and taking the
+  driver's own `POST /report` as the end, and leaves one dump per process;
+  `run-shell.sh` does the same in the `js` shell. `tools/jitdumpstats.py`
+  turns the dumps into the per-process, per-tier and per-check tables the
+  write-up below is made of, streaming `-v` text because a browser tab's
+  findings do not fit in `--json`.
 
 Both write one section per code object at the address the engine compiled it
 to, so a finding cross-references straight back into the dump, and separate
@@ -1173,7 +1190,14 @@ branch and none is backward, because both assemblers shorten a jump to an
 already-bound label and neither can know the distance to one that is not yet
 bound. Take that class out and JIT and AOT code are within a factor of two
 of each other, which is the reassuring half: the check table needs no JIT
-dialect.
+dialect. A whole headless Firefox on JetStream 3 -- 383 MB of code in the
+benchmark tab, both wasm tiers included -- gave the same picture at 35
+times the size ("JetStream 3 in Firefox" in [TODO.md](TODO.md)), and two
+things a shell cannot show: a tab is 2,082 copies of the runtime's
+trampolines, one per Worker, and the three classes the engine writes on
+purpose and a linter reads as waste -- `movabs` patch placeholders,
+`or r14, 0` slow-call markers and `jmp -1` far-jump slots -- are 6-7% of
+the findings and account for every "backward" branch.
 
 ## References
 

@@ -2,19 +2,32 @@ x86lint JIT dump hook for SpiderMonkey.
 
 On x86-64 no SpiderMonkey spew channel prints encoding bytes: IONFLAGS=codegen
 is AT&T assembly with offsets, and the shell's disnative() reaches one function
-at a time from JS. This adds a few lines to jit::Linker::newCode -- the one
-place every JIT code blob passes through, Ion, Baseline, RegExp and the
-trampolines alike -- which append each linked blob to the file named by
-X86LINT_JITDUMP, as the record tools/jitdump2elf.py reads. Nothing happens
-unless the variable is set.
+at a time from JS. This adds a writer to jit::Linker::newCode -- the one place
+every JS JIT blob passes through, Ion, Baseline, RegExp and the trampolines
+alike -- and a second call in wasm::CodeBlock::initialize, which every wasm
+block reaches once its bytes are copied, linked and final: both compiler tiers
+(recorded as WasmBaseline and WasmIon), a module's shared stubs and the lazy
+entry stubs. The process-wide wasm builtin thunks are the one piece of
+generated code not covered. Each process that links code appends its blobs to
+the file named by X86LINT_JITDUMP plus ".<pid>", as the record
+tools/jitdump2elf.py reads. Nothing happens unless the variable is set.
 
     cd /path/to/gecko
-    patch -p1 < /path/to/x86lint/tools/spidermonkey-jitdump.patch
+    git apply /path/to/x86lint/tools/spidermonkey-jitdump.patch
     ./mach build            # or make -C js/src in a JS-shell objdir
 
     X86LINT_JITDUMP=sm.jitdump dist/bin/js workload.js
-    python3 /path/to/x86lint/tools/jitdump2elf.py sm.jitdump -o sm.elf
+    python3 /path/to/x86lint/tools/jitdump2elf.py sm.jitdump.<pid> -o sm.elf
     /path/to/x86lint/x86lint sm.elf
+
+The pid suffix is what makes a browser dumpable: Firefox links JIT code in its
+parent process and in every content process, and with one shared file name
+they would truncate one another's output. A shell run leaves exactly one file.
+For the browser, run headless with the content-process sandbox off
+(MOZ_DISABLE_CONTENT_SANDBOX=1, or security.sandbox.content.level=0), since
+the sandbox refuses the dump file's open(2); each process's file is then
+converted on its own, which is also what keeps the parent's chrome JS apart
+from the page's.
 
 Verified against SpiderMonkey's own IONFLAGS=codegen listing: the dumped bytes
 disassemble to the same instructions at the same offsets, with the patch
@@ -22,22 +35,27 @@ placeholders (movabsq $0x0) carrying their linked values, which is what a
 linter should see.
 
 diff --git a/js/src/jit/Linker.cpp b/js/src/jit/Linker.cpp
-index 2598cc9d73e8..2809270111b5 100644
+index 2598cc9d73e8..37b8a04a74ae 100644
 --- a/js/src/jit/Linker.cpp
 +++ b/js/src/jit/Linker.cpp
-@@ -4,6 +4,11 @@
+@@ -4,7 +4,16 @@
  
  #include "jit/Linker.h"
  
++#include <mutex>
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#include <sys/types.h>
++#include <unistd.h>
 +
  #include "jit/JitZone.h"
++#include "jit/X86lintJitDump.h"
  #include "util/Memory.h"
  
-@@ -12,6 +17,84 @@
+ #include "gc/StoreBuffer-inl.h"
+@@ -12,6 +21,99 @@
  namespace js {
  namespace jit {
  
@@ -46,58 +64,60 @@ index 2598cc9d73e8..2809270111b5 100644
 +// On x86-64 no SpiderMonkey spew channel prints encoding bytes: IONFLAGS=
 +// codegen is AT&T assembly with offsets, and disnative() reaches one function
 +// at a time from JS. So a linter that decodes machine code has to be handed
-+// the bytes, and this is the one place every JIT code blob passes through --
-+// Ion, Baseline, RegExp and the trampolines alike.
++// the bytes, from the two places every blob passes through once it is final:
++// Linker::newCode below for Ion, Baseline, RegExp and the trampolines, and
++// wasm::CodeBlock::initialize for both wasm tiers and their stubs.
 +//
-+// When X86LINT_JITDUMP names a file, each linked blob is appended as one
-+// self-describing record,
++// When X86LINT_JITDUMP names a path, each process that links code writes
++// <path>.<pid>, appending one self-describing record per blob,
 +//
 +//   "X86J" | u64 address | u32 code size | u32 name size | name | code
 +//
 +// which x86lint's tools/jitdump2elf.py reassembles into an ELF object. There
 +// is no file header and no index, so a dump from a process that was killed
-+// rather than exited still parses up to its truncation.
++// rather than exited still parses up to its truncation. The pid suffix is
++// what lets a browser be dumped: Firefox links JIT code in its parent and in
++// every content process, and with one shared name they would truncate one
++// another's output. A JS shell run leaves exactly one file.
 +//
-+// The record is assembled in one buffer and written with a single fwrite, so
-+// concurrent linking on helper threads interleaves whole records rather than
-+// halves of two. Nothing happens unless the variable is set.
-+static void X86lintDumpCode(JitCode* code, CodeKind kind) {
++// Blobs are linked on helper threads as well as the main thread, so the
++// whole record is assembled first and written under a lock. Nothing happens
++// unless the variable is set.
++void X86lintDumpCode(const char* kindName, const uint8_t* code, size_t size) {
++  static std::mutex lock;
 +  static FILE* out = nullptr;
-+  static bool opened = false;
-+  if (!opened) {
-+    opened = true;
-+    if (const char* path = getenv("X86LINT_JITDUMP")) {
-+      out = fopen(path, "wb");
-+      if (!out) {
-+        fprintf(stderr, "X86LINT_JITDUMP: cannot write %s\n", path);
-+      }
++  static pid_t owner = 0;
++
++  const char* path = getenv("X86LINT_JITDUMP");
++  if (!path) {
++    return;
++  }
++
++  std::lock_guard<std::mutex> guard(lock);
++  pid_t self = getpid();
++  if (owner != self) {
++    // The first blob in this process, or the first since a fork. A child
++    // that kept the inherited stream would write into its parent's file;
++    // it is dropped rather than closed, since closing would flush whatever
++    // the parent had buffered a second time.
++    out = nullptr;
++    owner = self;
++    char name[4096];
++    snprintf(name, sizeof(name), "%s.%d", path, (int)self);
++    out = fopen(name, "wb");
++    if (!out) {
++      fprintf(stderr, "X86LINT_JITDUMP: cannot write %s\n", name);
 +    }
 +  }
 +  if (!out) {
 +    return;
 +  }
 +
-+  const char* kindName;
-+  switch (kind) {
-+    case CodeKind::Ion:
-+      kindName = "Ion";
-+      break;
-+    case CodeKind::Baseline:
-+      kindName = "Baseline";
-+      break;
-+    case CodeKind::RegExp:
-+      kindName = "RegExp";
-+      break;
-+    default:
-+      kindName = "Other";
-+      break;
-+  }
-+
-+  uint64_t addr = (uint64_t)(uintptr_t)code->raw();
-+  uint32_t size = (uint32_t)code->instructionsSize();
-+  uint32_t namelen = (uint32_t)strlen(kindName);
-+  size_t total = 4 + sizeof(addr) + sizeof(size) + sizeof(namelen) + namelen +
-+                 size;
++  uint64_t addr = (uint64_t)(uintptr_t)code;
++  uint32_t codeSize = (uint32_t)size;
++  uint32_t nameSize = (uint32_t)strlen(kindName);
++  size_t total = 4 + sizeof(addr) + sizeof(codeSize) + sizeof(nameSize) +
++                 nameSize + codeSize;
 +  char* rec = (char*)malloc(total);
 +  if (!rec) {
 +    return;
@@ -107,26 +127,113 @@ index 2598cc9d73e8..2809270111b5 100644
 +  at += 4;
 +  memcpy(rec + at, &addr, sizeof(addr));
 +  at += sizeof(addr);
-+  memcpy(rec + at, &size, sizeof(size));
-+  at += sizeof(size);
-+  memcpy(rec + at, &namelen, sizeof(namelen));
-+  at += sizeof(namelen);
-+  memcpy(rec + at, kindName, namelen);
-+  at += namelen;
-+  memcpy(rec + at, code->raw(), size);
++  memcpy(rec + at, &codeSize, sizeof(codeSize));
++  at += sizeof(codeSize);
++  memcpy(rec + at, &nameSize, sizeof(nameSize));
++  at += sizeof(nameSize);
++  memcpy(rec + at, kindName, nameSize);
++  at += nameSize;
++  memcpy(rec + at, code, codeSize);
 +  fwrite(rec, 1, total, out);
 +  fflush(out);
 +  free(rec);
 +}
 +
++static const char* X86lintCodeKindName(CodeKind kind) {
++  switch (kind) {
++    case CodeKind::Ion:
++      return "Ion";
++    case CodeKind::Baseline:
++      return "Baseline";
++    case CodeKind::RegExp:
++      return "RegExp";
++    default:
++      return "Other";
++  }
++}
++
  JitCode* Linker::newCode(JSContext* cx, CodeKind kind) {
    JS::AutoAssertNoGC nogc(cx);
    if (masm.oom()) {
-@@ -70,6 +153,7 @@ JitCode* Linker::newCode(JSContext* cx, CodeKind kind) {
+@@ -70,6 +172,8 @@ JitCode* Linker::newCode(JSContext* cx, CodeKind kind) {
    if (masm.embedsNurseryPointers()) {
      cx->runtime()->gc.storeBuffer().putWholeCell(code);
    }
-+  X86lintDumpCode(code, kind);
++  X86lintDumpCode(X86lintCodeKindName(kind), code->raw(),
++                  code->instructionsSize());
    return code;
  }
  
+diff --git a/js/src/jit/X86lintJitDump.h b/js/src/jit/X86lintJitDump.h
+new file mode 100644
+index 000000000000..b076b6f4cfbd
+--- /dev/null
++++ b/js/src/jit/X86lintJitDump.h
+@@ -0,0 +1,25 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*-
++ * vim: set ts=8 sts=2 et sw=2 tw=80:
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// x86lint JIT dump hook (https://github.com/gaul/x86lint); see Linker.cpp.
++
++#ifndef jit_X86lintJitDump_h
++#define jit_X86lintJitDump_h
++
++#include <stddef.h>
++#include <stdint.h>
++
++namespace js {
++namespace jit {
++
++// Append one linked, final code blob to the dump file named by the
++// X86LINT_JITDUMP environment variable. Does nothing unless it is set.
++void X86lintDumpCode(const char* kindName, const uint8_t* code, size_t size);
++
++}  // namespace jit
++}  // namespace js
++
++#endif /* jit_X86lintJitDump_h */
+diff --git a/js/src/wasm/WasmCode.cpp b/js/src/wasm/WasmCode.cpp
+index 59a2e1824e35..b699677f634e 100644
+--- a/js/src/wasm/WasmCode.cpp
++++ b/js/src/wasm/WasmCode.cpp
+@@ -29,6 +29,7 @@
+ #include "jit/FlushICache.h"  // for FlushExecutionContextForAllThreads
+ #include "jit/MacroAssembler.h"
+ #include "jit/PerfSpewer.h"
++#include "jit/X86lintJitDump.h"
+ #include "util/Poison.h"
+ #include "vm/HelperThreadState.h"  // PartialTier2CompileTask
+ #ifdef MOZ_VTUNE
+@@ -911,6 +912,29 @@ bool CodeBlock::initialize(const Code& code, size_t codeBlockIndex) {
+   this->codeBlockIndex = codeBlockIndex;
+   segment->setCode(code);
+ 
++  // x86lint JIT dump: whichever path built this block -- a module tier, a
++  // lazily tiered function, entry stubs -- its bytes are copied, linked and
++  // final by the time it is registered here. Named for the tier so the dump
++  // keeps the two wasm compilers apart.
++  {
++    const char* kindName = "Wasm";
++    switch (kind) {
++      case CodeBlockKind::SharedStubs:
++        kindName = "WasmStubs";
++        break;
++      case CodeBlockKind::BaselineTier:
++        kindName = "WasmBaseline";
++        break;
++      case CodeBlockKind::OptimizedTier:
++        kindName = "WasmIon";
++        break;
++      case CodeBlockKind::LazyStubs:
++        kindName = "WasmLazyStubs";
++        break;
++    }
++    jit::X86lintDumpCode(kindName, codeBase, codeLength);
++  }
++
+   // In the case of tiering, RegisterCodeBlock() immediately makes this code
+   // block live to access from other threads executing the containing
+   // module. So only call once the CodeBlock is fully initialized.

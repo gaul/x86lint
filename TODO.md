@@ -1078,6 +1078,151 @@ for the word "code", so 1,883 Maglev objects arrived unnamed and the
 tier split read 51,676 "unknown" against 24,145 TurboFan. Fixed, and
 pinned in `jit_test.sh`.
 
+## JetStream 3 in Firefox (2026-09-27)
+
+The first JIT corpus taken from a **browser** rather than a shell: a
+headless Firefox built from this tree's HEAD (`28b2b22405d9`) with
+`tools/spidermonkey-jitdump.patch`, running JetStream 3 at `3967678`, the
+revision Mozilla's own raptor harness pins, served on loopback with
+`?startAutomatically=true&report=true` so the driver's `POST /report`
+marks the end. All 77 workloads ran (geometric mean 192.8). The same
+build's `js` shell ran the suite's CLI driver as the control: 75 workloads
+(the two Worker ones are browser-only), 188.9. Reproduce with
+`tools/jetstream3/run-browser.sh`, `run-shell.sh` and
+`tools/jitdumpstats.py`. Two extensions to the hook were needed and are
+now shipped: a second call in `wasm::CodeBlock::initialize`, since a
+third of JetStream 3 is wasm and `Linker::newCode` never sees it, and one
+dump file per process, since the browser links JIT code in its parent and
+every content process and a fork server is in use.
+
+| corpus | blobs | code | instructions | findings | per 1k | branch displacement per 1k | everything else per 1k |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Firefox tab, JetStream 3 | 185,940 | 383.1 MB | 96,296,677 | 6,914,917 | 71.8 | 55.6 | 16.2 |
+| same, without the 2,082 Worker trampoline copies | 175,985 | 272.8 MB | 65,450,621 | 6,209,471 | 94.9 | 72.5 | 22.3 |
+| `js` shell, JetStream 3 CLI | 74,731 | 279.0 MB | 65,465,384 | 5,330,153 | 81.4 | 63.1 | 18.3 |
+| Firefox parent (chrome JS) | 2,449 | 1.8 MB | 438,658 | 37,034 | 84.4 | 68.6 | 15.9 |
+| SpiderMonkey Octane, 2026-09-15 | 6,984 | 12.4 MB | 2,729,950 | 193,700 | 71.0 | 59.2 | 11.8 |
+
+**The 2026-09-15 picture holds at 35 times the size**: one check is
+most of it and the rest is within a factor of two of AOT code. Per tier
+in the tab, findings per thousand instructions and the branch class's
+share of the tier's rel32 branches: Ion 87.1 (36%), Baseline 88.4 (83%),
+RegExp 122.3 (43%), wasm Ion 99.0 (54%), wasm baseline 102.1 (64%), wasm
+stubs 102.3 (73%). Baseline's 83% is the one-pass assembler's forward
+reservation at its purest; Ion's 36% is what a compiler that knows its
+block layout still cannot shorten. The two wasm tiers are new: rabaldr's
+code outweighs wasm Ion's 12.3 to 1 (108.6 MB against 8.8 MB) because
+lazy tiering compiles every function with the baseline compiler and only
+the hot ones again.
+
+**A browser's raw figure was 17.5% phantom.** The tab reported 8,383,262
+findings before this was understood and 6,914,917 after; the shell went
+from 5,332,109 to 5,330,153, a difference of 0.04%. The cause is two
+kinds of pointer a SpiderMonkey blob keeps in its code stream. Every far
+jump to other code goes through a 16-byte entry of the blob's *extended
+jump table* -- `jmp qword ptr [rip+2] ; ud2 ; <8-byte absolute target>`
+-- and switch dispatch is a table of absolute code pointers written
+inline by `writeCodePointer` (Ion's and Baseline's `tableswitch`, wasm's
+`br_table`, and the Baseline Interpreter's 239-entry opcode table). Read
+as instructions, eight bytes of pointer decode into whatever the heap
+address spells: in the browser the top bytes of a `0x7f00...` libxul
+address are `add byte ptr [r15], r15b` (an "unneeded zero
+displacement"), `jg $+2` (a "branch to the next instruction") and `cmp
+eax, 0x7f004f` (an "oversized immediate"), so 598,139 zero-displacement
+and 131,087 branch-to-next findings appeared from nowhere; in the shell
+the same tables sit at `0x39a4...` and decode into shapes no check fires
+on. **The undecodable-byte count, which the 2026-09-15 write-up used as
+its data-in-text control, is blind to this**: a pointer is valid
+instruction bytes. The tab held 1,288,278 such words (774,299 extended
+jump targets, 513,979 table entries, 9.8 MB); the shell 79,970.
+`jitelf.py` now leaves both outside the symbol ranges x86lint scans: a
+pointer-aligned word whose value lies inside its own blob is a table
+entry unless the two bytes before it spell `MOV r64, imm64`, which is how
+a table's address reaches a register, and the extended jump entry is
+found by its own signature. `--keep-code-pointers` reproduces the raw
+figures; `jit_test.sh` pins both rules. After masking, "unneeded zero
+displacement" and "branch to the next instruction" leave the tab's top
+25 entirely, and its `Other` tier's everything-else rate drops from 41.5
+to 3.2 per thousand.
+
+**A tab is 2,082 copies of the runtime's trampolines.** The tab's largest
+tier by bytes was `Other` at 110.3 MB, 28.8% of its code, and it is
+2,082 copies of the same four blobs: the 34,304-byte JitRuntime
+trampoline blob, the 18,272-byte Baseline Interpreter, and two small
+ones. The shell has one of each. Every Worker gets a JSRuntime, and
+`bomb-workers` and `segmentation` create 2,082 of them over a run. The
+copies are the same code with the same findings -- 14,816 instructions
+and 339 findings each -- so a browser figure that counts them weights one
+code object 2,082 times; the second row of the table above leaves them
+out, and that is the row comparable with the shell. The same multiplicity
+explains the tab's 122,847 Baseline blobs against the shell's 34,112:
+each runtime compiles its own IC stubs, which is why the tab's Baseline
+blobs average 655 bytes to the shell's 3,197 and carry 87.8 rel32
+branches per thousand instructions to the shell's 50.7 -- the tier is
+CacheIR guards in the browser and code-load bodies in the shell.
+
+**Three engine-intent classes, now counted instead of named.** Each is a
+site the check reads correctly and the engine needs as written:
+
+* **`movabs` patch placeholders** (2026-09-15's class): 100,845 of the
+  shell's 177,607 oversized immediates, 136,308 of the tab's 215,202.
+* **Slow-call markers.** `or r14, 0x0` after an indirect call is
+  `MacroAssembler::wasmMarkCallAsSlow` -- `SlowCallMarker = 0x00ce8349`
+  -- which the frame iterator reads back to classify the call site.
+  87,485 of the shell's 90,015 "redundant OR/XOR zero" (wasm baseline
+  82,945, wasm Ion 3,463, stubs 1,077); the 2,530 left are `or rsi, 0`
+  and `or rbx, 0` in JS Baseline and unexplained.
+* **Far-jump island slots.** Every one of the 177,797 "backward" branch
+  findings is `e9 ff ff ff ff`, a `jmp` whose target is its own last
+  byte, sitting between `ud2`s in rabaldr's out-of-line far-jump islands
+  (`farJumpWithPatch` in `WasmGenerator.cpp`, patched when a callee
+  tiers up). No direct call or jump in the dump reaches one: 43 and 551
+  address coincidences among 177,797. So the 2026-09-15 result that
+  every real branch finding is forward still stands, with the slots
+  named.
+
+Together 6.9% of the shell's findings and 5.8% of the tab's. With them
+out, the everything-else rate is 15.5 per thousand in the shell and 13.9
+in the tab, and the branch class 60.4 in the shell -- 3,951,479 forward
+branches, 15.5 MB of rel32 that rel8 would have covered, 5.3% of the
+code, the same 3-5% as the 2026-09-15 corpora.
+
+**rabaldr's profile is real and specific.** With the markers out, the
+wasm baseline tier's everything-else is 26.7 per thousand, the highest
+of any tier, and it is a handful of shapes. `mov eax, eax` -- 115,399
+"redundant MOV reg, reg" -- is the zero-extension rabaldr emits for the
+i32 result of every call and every 32-bit load, and in every sampled
+context the value is then spilled as 32 bits or overwritten
+(`call ; lea rsp, [rbp-0x40] ; mov eax, eax ; mov [rsp+0x3c], eax`), so
+the finding is sound and the extension dead. `mov rax, rsp ; add rax,
+imm` (85,299 "MOV+ADD foldable to LEA") is how it takes a stack slot's
+address. `mov eax, [rsp+0x3c] ; cmp eax, ...` (119,355 "load foldable
+into compare" and 39,499 "into ALU") is its stack-machine register
+discipline. `add rax, 0xffffffffffffffa0` as `48 05 a0 ff ff ff` (76,663
+"oversized immediate") is the imm32 form where imm8 fits. The rest is
+`add reg, 1` (86,400), `test` after a flag-setting instruction (53,040)
+and the SSE zero idiom (29,081). Wasm Ion shares none of these at scale.
+
+**The census reads a browser too.** In the tab's 96.3M instructions AVX
+is 1.6% (1,513,891), with BMI2 32,021, BMI1 4,780, AVX2 3,906 and LZCNT
+1,239, plus SSE4.1 17,437 and POPCNT 573; the shell's AVX share is 1.0%.
+The five AVX-512F and single FMA4 and CLDEMOTE instructions the shell
+census lists are what residual phantoms look like: SpiderMonkey emits
+none of them.
+
+**Tool notes.** x86lint's cost per image is quadratic in its section
+count -- on the tab's Baseline tier 2,500 sections scanned at 1.35 MB/s
+and 20,000 at 0.65 -- because the per-section symbol scan in `main.c`
+walks every symbol; `jitdumpstats.py` splits each tier into 4,000-section
+images and sums, which changes no result. And `--json` cannot carry a
+corpus this size: the tab's findings would be gigabytes, so the analysis
+streams `-v` text and checks its own count against the tool's trailer
+for every image. The candidate this leaves is a JIT-aware suppression
+for the three engine-intent classes above, each recognisable from bytes
+alone: a 10-byte `movabs` of 0 or -1 whose destination is immediately
+pushed or called, `or r14, 0` after a call, and a `jmp` whose rel32 is
+-1.
+
 ## JCC erratum audit (2026-09-26)
 
 **Shipped as `-j`, a verdict mode rather than a check**, and the shape was

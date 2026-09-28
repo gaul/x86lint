@@ -50,14 +50,113 @@ SANITIZE_RE = re.compile(r'[^A-Za-z0-9_.@:<>/-]')
 
 
 class Chunk:
-    """One contiguous run of machine code at a known address."""
+    """One contiguous run of machine code at a known address.
 
-    __slots__ = ('name', 'addr', 'data')
+    `ranges` lists the (start, end) offsets that hold instructions; None means
+    all of it.  A chunk with ranges is still written as one section, so its
+    bytes and addresses stay exactly what the engine had, but it gets one
+    STT_FUNC symbol per range and x86lint's default scan -- restricted to
+    function symbols -- never decodes the bytes between them.
+    """
 
-    def __init__(self, name, addr, data=b''):
+    __slots__ = ('name', 'addr', 'data', 'ranges')
+
+    def __init__(self, name, addr, data=b'', ranges=None):
         self.name = name
         self.addr = addr
         self.data = bytearray(data)
+        self.ranges = ranges
+
+    def code_ranges(self):
+        return self.ranges if self.ranges is not None else [(0, len(self.data))]
+
+
+def code_pointer_words(chunk):
+    """Offsets of the 8-byte words in a chunk that hold an address inside it.
+
+    A JIT's switch dispatch is a table of absolute code pointers written into
+    the code stream itself: SpiderMonkey's writeCodePointer does it for Ion,
+    Baseline and both wasm tiers, and the Baseline Interpreter's opcode table
+    is the same thing 239 entries long.  A decoder reads those eight bytes as
+    instructions, and which instructions depends on the heap address -- the
+    top bytes of a 0x7f00... pointer decode as `add byte ptr [r15], r15b`
+    with a zero displacement, a different browser or shell mapping decodes as
+    something else -- so the same table yields different phantom findings in
+    different runs, and none of it shows in the undecodable-byte count.
+
+    A word pointing into its own blob is such an entry.  The one legitimate
+    instruction that carries one is `MOV r64, imm64` (REX.W B8+r), which is
+    how the table's base address gets into a register, so a word whose two
+    preceding bytes spell that opcode is kept.  Tables are pointer-aligned by
+    the engine (haltingAlign(sizeof(void*))) and blobs are at least as
+    aligned, so only aligned words are considered.
+
+    The other pointer a SpiderMonkey blob carries in its code stream points
+    the other way, out of the blob: every far jump to other code goes through
+    a 16-byte entry of the blob's extended jump table, `jmp qword ptr
+    [rip+2] ; ud2 ; <8-byte absolute target>` (Assembler-x64's
+    SizeOfExtendedJump), and the target bytes decode as instructions too.
+    Those are found by the entry's own signature, FF 25 02 00 00 00 0F 0B,
+    whatever their alignment.
+    """
+    data = chunk.data
+    lo = chunk.addr
+    hi = lo + len(data)
+    words = []
+    for off in range(0, len(data) - 7, 8):
+        value = int.from_bytes(data[off:off + 8], 'little')
+        if not lo <= value < hi:
+            continue
+        if off >= 2 and data[off - 2] in (0x48, 0x49) and 0xb8 <= data[off - 1] <= 0xbf:
+            continue
+        words.append(off)
+    start = 0
+    while True:
+        at = data.find(EXTENDED_JUMP, start)
+        if at < 0 or at + 16 > len(data):
+            break
+        words.append(at + 8)
+        start = at + 16
+    words.sort()
+    return words
+
+
+# jmp qword ptr [rip+2] ; ud2 -- the head of an extended jump table entry,
+# whose tail is the absolute address the jump reads.
+EXTENDED_JUMP = bytes.fromhex('ff25020000000f0b')
+
+
+def mask_code_pointers(chunk):
+    """Restrict a chunk's code ranges to the bytes between its pointer
+    tables.  Returns how many table words were masked."""
+    words = code_pointer_words(chunk)
+    if not words:
+        return 0
+    ranges = []
+    start = 0
+    for off in words:
+        if off > start:
+            ranges.append((start, off))
+        start = max(start, off + 8)
+    if start < len(chunk.data):
+        ranges.append((start, len(chunk.data)))
+    chunk.ranges = ranges
+    return len(words)
+
+
+def explode(chunks):
+    """One chunk per code range, at its own address: for a tool that reads
+    whole sections and knows nothing of symbols, such as objdump or the -i
+    census, which scans every byte of an executable section."""
+    out = []
+    for c in chunks:
+        ranges = c.code_ranges()
+        if len(ranges) == 1 and ranges[0] == (0, len(c.data)):
+            out.append(c)
+            continue
+        for start, end in ranges:
+            out.append(Chunk(c.name, c.addr + start, c.data[start:end]))
+    return out
 
 
 class NameTable:
@@ -110,12 +209,18 @@ def write_elf(chunks, path, machine=EM_X86_64):
 
     strtab = bytearray(b'\0')
     symtab = bytearray(b'\0' * 24)          # index 0: the null symbol
+    nsyms = 1
     for i, c in enumerate(chunks):
         st_name = len(strtab)
         strtab.extend(c.name.encode() + b'\0')
         st_info = (0 << 4) | 2              # STB_LOCAL, STT_FUNC
-        symtab += struct.pack('<IBBHQQ', st_name, st_info, 0,
-                              1 + i, 0, len(c.data))
+        # One symbol per code range, section-relative; a chunk with pointer
+        # tables gets several under the same name, and the table bytes fall
+        # under none of them.
+        for start, end in c.code_ranges():
+            symtab += struct.pack('<IBBHQQ', st_name, st_info, 0,
+                                  1 + i, start, end - start)
+            nsyms += 1
 
     nsections = 1 + len(chunks) + 3         # null, chunks, symtab/strtab/shstrtab
     symtab_idx = 1 + len(chunks)
@@ -140,7 +245,7 @@ def write_elf(chunks, path, machine=EM_X86_64):
     # sh_info is one past the last local symbol, and every symbol here is
     # local; sh_link names the string table the symbol names live in.
     shdrs.append(shdr(symtab_name, SHT_SYMTAB, 0, 0, symtab_off,
-                      len(symtab), strtab_idx, 1 + len(chunks), 8, 24))
+                      len(symtab), strtab_idx, nsyms, 8, 24))
     shdrs.append(shdr(strtab_name, SHT_STRTAB, 0, 0, strtab_off,
                       len(strtab), 0, 0, 1, 0))
     shdrs.append(shdr(shstrtab_name, SHT_STRTAB, 0, 0, shstrtab_off,
@@ -197,8 +302,13 @@ def emit(chunks, args):
             part = '%s.%d' % (args.output, len(outs) + 1)
             write_elf(chunks[i:i + args.max_sections], part)
             outs.append(part)
-    print('%d code blobs, %d code bytes -> %s' %
-          (len(chunks), total, ' '.join(outs)), file=sys.stderr)
+    masked = sum(len(c.data) - sum(e - s for s, e in c.ranges)
+                 for c in chunks if c.ranges is not None) // 8
+    in_blobs = sum(1 for c in chunks if c.ranges is not None)
+    print('%d code blobs, %d code bytes%s -> %s' %
+          (len(chunks), total,
+           ', %d code-pointer words masked in %d blobs' % (masked, in_blobs)
+           if masked else '', ' '.join(outs)), file=sys.stderr)
     return 0
 
 

@@ -211,6 +211,59 @@ if convert jitdump2elf.py "$dir/rec.jitdump" -o "$dir/min.elf" \
     reject "$dir/min.map" 'Baseline' "a blob under --min-bytes"
 fi
 
+# === Inline jump tables ===
+#
+# A JIT writes its switch dispatch -- a table of absolute code pointers --
+# into the code stream, and read as instructions those bytes decode into
+# whatever the heap address happens to spell: the top bytes of a 0x7f00...
+# pointer are `add byte ptr [rdi+0x0], bh`, a zero displacement. A word that
+# points into its own blob is such an entry and stays outside the symbol
+# ranges x86lint scans; the MOV r64, imm64 that loads a table's address is
+# the one instruction carrying such a word, and it must stay in. The blob
+# ends with an extended jump table entry, SpiderMonkey's far-jump thunk
+# `jmp qword ptr [rip+2] ; ud2 ; <absolute target>`, whose target points
+# out of the blob and is found by the thunk's signature instead.
+python3 - "$dir/table.bin" <<'PYEOF'
+import struct, sys
+base = 0x7f0000001000
+code = bytes.fromhex('87c8' 'c3' 'cccccc')                     # xchg; ret; pad
+code += bytes.fromhex('48b8') + struct.pack('<Q', base + 0x20)  # mov rax, table
+code += bytes.fromhex('c3' 'cccccccccccccc')                    # ret; pad to 24
+code += struct.pack('<Q', base + 0x20)                          # the table entry
+code += bytes.fromhex('87c8' 'c3' 'cccccccc')                   # xchg; ret; pad
+code += bytes.fromhex('ff25020000000f0b')                       # jmp [rip+2]; ud2
+code += struct.pack('<Q', 0x7f004f4e1234)                       # its target
+with open(sys.argv[1], 'wb') as f:
+    f.write(code)
+PYEOF
+
+if convert jitdump2elf.py --raw "$dir/table.bin" -o "$dir/table.elf" \
+        --addr 0x7f0000001000 --name table; then
+    expect "$dir/conv" '2 code-pointer words masked in 1 blobs'
+    "$X86LINT" "$dir/table.elf" >"$dir/out" 2>&1
+    expect "$dir/out" '^ +2 +oversized XCHG encoding$' \
+        "the code on both sides of the table"
+    reject "$dir/out" 'unneeded zero displacement' "a pointer decoded as code"
+    expect "$dir/out" '^2 optimization opportunities in '
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -Ws "$dir/table.elf" >"$dir/elf.txt" 2>&1
+        expect "$dir/elf.txt" '0000000000000000 +24 FUNC +LOCAL +DEFAULT +1 table' \
+            "the range before the table"
+        expect "$dir/elf.txt" '0000000000000020 +15 FUNC +LOCAL +DEFAULT +1 table' \
+            "the range after the table, through the thunk, under the same name"
+    fi
+fi
+
+# --keep-code-pointers scans the table anyway, which is how the effect of
+# the tables on a corpus is measured.
+if convert jitdump2elf.py --raw "$dir/table.bin" -o "$dir/table-raw.elf" \
+        --addr 0x7f0000001000 --name table --keep-code-pointers; then
+    reject "$dir/conv" 'masked'
+    "$X86LINT" "$dir/table-raw.elf" >"$dir/out" 2>&1
+    expect "$dir/out" 'unneeded zero displacement' \
+        "the phantom finding the table produces"
+fi
+
 # A file that is not records at all is refused at the first byte rather than
 # being read as a headerless blob.
 printf 'not a jit dump at all' >"$dir/junk.bin"

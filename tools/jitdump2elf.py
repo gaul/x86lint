@@ -18,9 +18,14 @@ truncated mid-record still parses up to the truncation, which is reported
 rather than treated as corruption.
 
   * SpiderMonkey: apply tools/spidermonkey-jitdump.patch to a Gecko tree,
-    build the JS shell, and run with X86LINT_JITDUMP=<file>.  Every blob
-    that passes through jit::Linker::newCode is recorded -- Ion, Baseline,
-    RegExp and the trampolines -- and named for its CodeKind.
+    build the JS shell or the browser, and run with X86LINT_JITDUMP=<path>.
+    Each process that links code writes <path>.<pid>: every blob through
+    jit::Linker::newCode -- Ion, Baseline, RegExp and the trampolines, named
+    for its CodeKind -- and every wasm code block through
+    wasm::CodeBlock::initialize, named WasmBaseline, WasmIon, WasmStubs or
+    WasmLazyStubs.  A shell run leaves one file; a Firefox run leaves one
+    per process that ran JS, which is what keeps the parent's chrome code
+    apart from the page's.
   * JavaScriptCore: the same record from LinkBuffer's
     finalizeCodeWithoutDisassemblyImpl, naming the blob for its
     LinkBuffer::Profile (Baseline, DFG, FTL, InlineCache, YarrJIT, ...).
@@ -29,6 +34,13 @@ rather than treated as corruption.
 Names are taken from the record; a repeated name gets a .2, .3 suffix, since
 a JIT recompiles the same function at several tiers and reuses addresses as
 code is discarded.
+
+A blob's inline jump tables -- 8-byte code pointers the engine writes into
+the code stream for switch dispatch, and in SpiderMonkey the Baseline
+Interpreter's whole opcode table -- are left out of the symbol ranges x86lint
+scans, since decoded as instructions they yield phantom findings that depend
+on nothing but the heap address (see jitelf.code_pointer_words).
+--keep-code-pointers scans them anyway, which is how to measure that effect.
 
 --raw reads a file that is nothing but machine code, which is what
 SpiderMonkey's disnative(f, "file") writes for one function's jitcode with no
@@ -91,18 +103,22 @@ def main():
                     help='load address for --raw (default 0x1000)')
     ap.add_argument('--name', default='jitcode',
                     help='symbol name for --raw (default jitcode)')
+    ap.add_argument('--keep-code-pointers', action='store_true',
+                    help='scan inline jump tables as if they were code')
     args = ap.parse_args()
 
     if args.raw:
         with open(args.dump, 'rb') as f:
             code = f.read()
         chunks = [jitelf.Chunk(args.name, int(args.addr, 0), code)]
-        return jitelf.emit(chunks, args)
-
-    chunks, truncated = parse_dump(args.dump)
-    if truncated:
-        print('%d trailing bytes were not a complete record and were '
-              'dropped' % truncated, file=sys.stderr)
+    else:
+        chunks, truncated = parse_dump(args.dump)
+        if truncated:
+            print('%d trailing bytes were not a complete record and were '
+                  'dropped' % truncated, file=sys.stderr)
+    if not args.keep_code_pointers:
+        for c in chunks:
+            jitelf.mask_code_pointers(c)
     return jitelf.emit(chunks, args)
 
 

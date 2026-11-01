@@ -1,0 +1,39 @@
+register census: 13 instructions, 0 undecodable bytes skipped
+  general-purpose registers: references by role, register operands by width
+    reg      insns   share   operand      base     index    hidden     64-bit    32-bit    16-bit     8-bit    high 8   sole REX    unevid.
+    rax          8   61.5%         9         0         0         0          3         3         0         2         1                     1
+    rcx          1    7.7%         1         0         0         0          0         1         0         0         0                     1
+    rdx          0    0.0%         0         0         0         0          0         0         0         0         0                     0
+    rbx          1    7.7%         1         0         0         0          1         0         0         0         0                     0
+    rsp          4   30.8%         0         1         0         3          3         0         0         0                               0
+    rbp          0    0.0%         0         0         0         0          0         0         0         0                               0
+    rsi          1    7.7%         1         0         0         0          0         0         0         1                               0
+    rdi          0    0.0%         0         0         0         0          0         0         0         0                               0
+    r8           0    0.0%         0         0         0         0          0         0         0         0                    0          0
+    r9           0    0.0%         0         0         0         0          0         0         0         0                    0          0
+    r10          0    0.0%         0         0         0         0          0         0         0         0                    0          0
+    r11          0    0.0%         0         0         0         0          0         0         0         0                    0          0
+    r12          3   23.1%         2         1         0         0          2         0         0         0                    2          0
+    r13          1    7.7%         0         1         0         0          0         0         0         0                    1          0
+    r14          0    0.0%         0         0         0         0          0         0         0         0                    0          0
+    r15          0    0.0%         0         0         0         0          0         0         0         0                    0          0
+  vector registers: references by width
+    reg      insns   share       xmm       ymm       zmm   sole REX    unevid.
+    0            2   15.4%         2         0         0                     0
+    1            2   15.4%         2         0         0                     0
+    2            1    7.7%         1         0         0                     0
+    9            1    7.7%         1         0         0          0          0
+  rarely used registers: high-byte register 1
+    high bytes: ah 1, ch 0, dh 0, bh 0
+  addressing: 1 RIP-relative, 0 FS-relative, 0 GS-relative
+  encoding cost of register numbering: 7 bytes
+    legacy REX: 7 (3 with REX.W, so no cost; 0 selecting nothing)
+    REX only for a register numbered 8-15: 3
+    REX only for SPL/BPL/SIL/DIL: 1
+    APX REX2 prefix: 0
+    three-byte VEX only for a high r/m or index register: 1
+    R12 base without an index (SIB byte): 1 (rsp, no alternative: 1)
+    R13 base with zero displacement (disp8): 1 (rbp, no alternative: 0)
+    VEX: 1 two-byte, 1 three-byte; EVEX: 0, 0 of them naming a vector register 16-31
+  code evidence: 1 function symbols + 0 .eh_frame FDEs + 0 Go pclntab functions covering 40 of 42 executable bytes
+exit status: 0

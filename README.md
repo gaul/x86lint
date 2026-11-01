@@ -597,22 +597,23 @@ Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
 than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
-`-e`, `-j`, `-s` and `-p` are separate reports whose output would interleave
-with it, and the driver refuses the combination rather than choosing for the
-caller.
+`-r`, `-e`, `-j`, `-s` and `-p` are separate reports whose output would
+interleave with it, and the driver refuses the combination rather than
+choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
-pads, `-i` to replace the lint scan with an ISA census of the binary, `-j` to
-replace it with a JCC-erratum verdict, `-s` with a speculation-thunk verdict,
-and `-p` with a per-function build-property audit; see the next sections.
+pads, `-i` to replace the lint scan with an ISA census of the binary, `-r`
+with a register census, `-j` with a JCC-erratum verdict, `-s` with a
+speculation-thunk verdict, and `-p` with a per-function build-property audit;
+see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
-broken run. `-e` findings set the exit status like any other; the `-i` census
-never sets it, the `-j` audit sets it only under `-t skylake` (the one target
-that has the erratum), the `-s` audit only for a mitigation left incomplete,
-and the `-p` audit never.
+broken run. `-e` findings set the exit status like any other; the `-i` and
+`-r` censuses never set it, the `-j` audit sets it only under `-t skylake`
+(the one target that has the erratum), the `-s` audit only for a mitigation
+left incomplete, and the `-p` audit never.
 
 ## ENDBR64 (CET IBT) verification
 
@@ -831,6 +832,98 @@ emits no FDEs for Haskell code, so a shellcheck census flags all 30864
 x87 hits (correctly: they are info tables), but real Haskell code is
 equally unlabeled there. Evidence quality varies by build; when a
 binary has none at all, nothing is labeled and the line says so.
+
+## Register census (`-r`)
+
+`x86lint -r` replaces the lint scan with a census of registers: which
+architectural registers the code names, in what role and at what width, and
+how many encoding bytes the choice of register number cost. It sweeps the
+same bytes as `-i`, carries the same evidence labels, and combines with it
+(`-i -r` prints both from one sweep) and with `-f`.
+
+```console
+$ ./x86lint -r /usr/lib64/libc.so.6
+register census: 355921 instructions, 0 undecodable bytes skipped
+  general-purpose registers: references by role, register operands by width
+    reg      insns   share   operand      base     index    hidden     64-bit    32-bit    16-bit     8-bit    high 8   sole REX    unevid.
+    rax      94641   26.6%     78262     25147     12443      1252      37308     37466       483      4111       146                  4075
+    ...
+    rsp      38425   10.8%      5456      1774         0     31201      36657         0         0         0                               0
+    ...
+    r12      14797    4.2%     12659      2803       235         0       9614      2869         7       169                 5135          0
+    r13      12086    3.4%     10529      2104       227         0       7883      2444         7       195                 3984          0
+    ...
+  vector registers: references by width
+    ...
+  rarely used registers: high-byte register 500, vector register 16-31 2697, mask register 1907, x87 stack register 394
+    high bytes: ah 146, ch 202, dh 176, bh 17
+    masks: k0 893, k1 576, k2 344, k3 79, k4 83, k5 98, k6 92, k7 0
+  addressing: 11688 RIP-relative, 4500 FS-relative, 0 GS-relative
+  encoding cost of register numbering: 34424 bytes
+    legacy REX: 160354 (129988 with REX.W, so no cost; 0 selecting nothing)
+    REX only for a register numbered 8-15: 29492
+    REX only for SPL/BPL/SIL/DIL: 874
+    APX REX2 prefix: 0
+    three-byte VEX only for a high r/m or index register: 886
+    R12 base without an index (SIB byte): 2447 (rsp, no alternative: 1704)
+    R13 base with zero displacement (disp8): 725 (rbp, no alternative: 32)
+    VEX: 5987 two-byte, 1382 three-byte; EVEX: 2970, 2697 of them naming a vector register 16-31
+  code evidence: 9899 function symbols + 3791 .eh_frame FDEs + 0 Go pclntab functions covering 1481418 of 1512109 executable bytes
+```
+
+References are counted per operand, so `add rax, rax` names RAX twice; the
+`insns` column counts each instruction once. An *operand* is a register the
+disassembly shows, including one the opcode fixes (CL in `shl eax, cl`, EAX
+in `add eax, imm32`); *base* and *index* are a memory or LEA operand's
+address registers; *hidden* is a register the instruction uses without
+showing it -- RSP under PUSH, CALL and RET, RDX:RAX under MUL, RSI and RDI
+under the string instructions. Widths count register operands (not
+addresses), and `high 8` is AH, CH, DH and BH. Flags, RIP and XED's
+pseudo-registers are not counted, and neither is an EVEX write-mask of k0,
+which is the encoding of "no masking" rather than a use of k0. Vector rows
+and APX's R16-R31 print only when used.
+
+The cost section is the reason the census exists. x86-64 numbers registers
+with a three-bit ModRM field and takes the fourth bit from a prefix, so the
+upper half of each file costs more than the lower, and each line counts one
+way that cost was paid:
+
+* **REX only for a register numbered 8-15**: a legacy instruction whose REX
+  sets R, X or B but not W, so the byte exists for the register number
+  alone. With REX.W already present for a 64-bit operand, a high register
+  is free, and those REX bytes are counted apart. The `sole REX` column
+  attributes each such instruction to the high registers it names.
+* **REX only for SPL/BPL/SIL/DIL**: a bare REX, needed because without it
+  those byte-register encodings mean AH, CH, DH and BH.
+* **APX REX2**: two bytes, or one when W is set and a REX.W was due anyway.
+* **three-byte VEX only for a high r/m or index register**: opcode map 0F
+  with VEX.W clear fits the two-byte C5 form except for VEX.B and VEX.X, so
+  the third byte was spent on the number of the register in the r/m or
+  index field. For a commutative operation, swapping the two sources removes
+  it.
+* **R12 base without an index** takes a SIB byte, because R12 shares RSP's
+  r/m encoding, and **R13 base with zero displacement** takes a disp8 of 0,
+  because R13 shares RBP's. The RSP and RBP counts sit beside them because
+  they pay the same byte and have no alternative.
+
+The total is what register numbering cost, not what a better allocation
+would save: most high registers are in use because the low ones were
+occupied. Across the corpora measured on 2026-11-01 it is 2.2-2.9% of code
+bytes in compiled code (libxul 2.2%, librustc_driver 2.3%, the GCC-built
+libLLVM and libclang-cpp 2.8-2.9%), about 85% of it REX bytes for R8-R15.
+
+The rarely used registers -- high bytes, R16-R31, vector registers 16-31,
+mask, MMX, x87, control and debug registers, segment registers as operands
+-- are listed with their unevidenced share, and `-v` prints up to four
+sample sites for each and for each cost. Phantom decodes of data are
+likelier than a compiler to name an odd register: libxul's 37451
+instructions naming vector registers 16-31 are 84% unevidenced. The
+asymmetry from the ISA census holds as well. libLLVM's 740 such
+instructions are all unevidenced and all real -- LLVM's bundled BLAKE3
+AVX-512 assembly, which has no symbols or CFI -- while glibc's 2697 are all
+evidenced and all inside its `*_evex` and `*_avx512` string and memory
+functions, which use YMM16-YMM31 because those registers need no
+VZEROUPPER.
 
 ## JCC erratum audit (`-j`)
 

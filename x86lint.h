@@ -444,6 +444,119 @@ size_t x86lint_census_level_unevidenced(const x86lint_census *census,
 // Highest of levels 2..4 with a nonzero tally, else 1 (baseline).
 int x86lint_census_highest_level(const x86lint_census *census);
 
+// A register census: which architectural registers the code names, in what
+// role and at what width, and what the choice of register costs in encoding
+// bytes. The ISA census above answers "which extensions"; this answers
+// "which registers", for auditing register allocation the way that one
+// audits -march.
+//
+// The cost side is the point of it. x86-64 numbers its registers with a
+// three-bit ModRM field and borrows the fourth bit from a prefix, so the
+// upper half of each file is dearer than the lower: an instruction naming
+// R8-R15 or XMM8-XMM15 needs a REX byte it would otherwise not carry (when
+// REX.W is not already there for the operand size), a VEX instruction with
+// a high register in its r/m or index field needs the three-byte C4 form,
+// R16-R31 need APX's REX2 or EVEX, and XMM16-XMM31 need EVEX. Two
+// addressing forms cost a byte by register number alone: a base of R12 (like
+// RSP) takes a SIB byte even with no index, and a base of R13 (like RBP)
+// cannot omit a zero displacement. Each of those is counted where it was
+// spent, so the report can say how many bytes register numbering cost,
+// beside the tables of which registers were used.
+//
+// Counting is by operand reference: `add rax, rax` names RAX twice as an
+// operand. The per-register instruction count counts each instruction once.
+// Roles: an operand is a register the disassembly shows (explicit or fixed
+// by the opcode, such as CL in `shl eax, cl`); base and index are the
+// address registers of a memory or LEA operand; hidden is a register the
+// instruction reads or writes without showing it -- RSP of PUSH and CALL,
+// RDX:RAX of MUL, RSI/RDI of the string instructions. Flags, RIP and XED's
+// pseudo-registers are not counted.
+//
+// Same linear sweep and resync as the ISA census, so the same caution
+// applies: data decoded as code names registers too, and evidence labeling
+// (x86lint_census_set_evidence's ranges) is what tells a reader whether a
+// rare register's few uses are real. Opaque; NULL is accepted everywhere.
+typedef struct x86lint_regs x86lint_regs;
+
+x86lint_regs *x86lint_regs_create(void);
+void x86lint_regs_destroy(x86lint_regs *regs);
+
+// Install borrowed, sorted, non-overlapping code-evidence ranges, as for
+// the ISA census. Labeling happens at scan time.
+void x86lint_regs_set_evidence(x86lint_regs *regs,
+                               const x86lint_evidence_range *ranges,
+                               size_t count);
+
+// Linear-sweep decode of `len` bytes at virtual address `vaddr`.
+void x86lint_regs_scan(x86lint_regs *regs, const uint8_t *inst, size_t len,
+                       uint64_t vaddr);
+
+// Print the register tables and the encoding-cost section; verbose adds up
+// to four sample addresses for each rarely used register and each cost.
+void x86lint_regs_print(const x86lint_regs *regs, bool verbose);
+
+size_t x86lint_regs_instructions(const x86lint_regs *regs);
+size_t x86lint_regs_skipped(const x86lint_regs *regs);
+
+enum x86lint_reg_role {
+    X86LINT_REG_OPERAND,   // a register operand the disassembly shows
+    X86LINT_REG_BASE,      // base of a memory or LEA operand
+    X86LINT_REG_INDEX,     // index of a memory or LEA operand
+    X86LINT_REG_HIDDEN,    // read or written without being shown
+    X86LINT_REG_ROLES,
+};
+
+// References to general-purpose register `num` (0 = RAX ... 15 = R15,
+// 16..31 = APX R16..R31, in encoding order) in one role, at any width.
+size_t x86lint_regs_gpr_count(const x86lint_regs *regs, unsigned num,
+                              enum x86lint_reg_role role);
+
+// Instructions naming general-purpose register `num` in any role.
+size_t x86lint_regs_gpr_instructions(const x86lint_regs *regs, unsigned num);
+
+// References to vector register `num` (0..31) at one width: 128 = XMM,
+// 256 = YMM, 512 = ZMM. Any other width returns 0.
+size_t x86lint_regs_vector_count(const x86lint_regs *regs, unsigned num,
+                                 unsigned width);
+
+// References to mask register k`num` (0..7). An EVEX write-mask of k0 is
+// "no masking" and is not counted.
+size_t x86lint_regs_mask_count(const x86lint_regs *regs, unsigned num);
+
+// The encoding costs of register choice; see the comment above.
+enum x86lint_reg_cost {
+    // A legacy instruction whose REX prefix carries R, X or B but not W: the
+    // byte exists only because a register numbered 8-15 was named.
+    X86LINT_REG_COST_REX_FOR_HIGH,
+    // A bare REX (no W, R, X or B) selecting SPL, BPL, SIL or DIL, the byte
+    // registers that without it would mean AH, CH, DH and BH.
+    X86LINT_REG_COST_REX_FOR_BYTE,
+    // An APX REX2 prefix, needed only for R16-R31: two bytes over the
+    // low-register form, or one when REX2.W is set and a REX.W would have
+    // been there anyway.
+    X86LINT_REG_COST_REX2,
+    // A three-byte VEX that would be two bytes but for a high register in
+    // the r/m or index field: opcode map 0F and VEX.W clear, so B or X is
+    // the only field the two-byte form lacks. For a commutative operation
+    // swapping the sources is the fix (LLVM does it at emission).
+    X86LINT_REG_COST_VEX3_FOR_HIGH,
+    // A memory operand based on R12 with no index: R12 shares RSP's r/m
+    // encoding, which means "a SIB byte follows".
+    X86LINT_REG_COST_SIB_FOR_R12,
+    // A memory operand based on R13 with a zero displacement: R13 shares
+    // RBP's mod=00 encoding, which means RIP-relative, so a disp8 of 0 is
+    // spent.
+    X86LINT_REG_COST_DISP8_FOR_R13,
+    X86LINT_REG_COSTS,
+};
+
+// Instructions incurring one cost.
+size_t x86lint_regs_cost_count(const x86lint_regs *regs,
+                               enum x86lint_reg_cost cost);
+
+// Encoding bytes the costs above add up to.
+size_t x86lint_regs_cost_bytes(const x86lint_regs *regs);
+
 // Called once per finding, in the order findings are reported, when passed
 // to check_instructions. The summary answers "how many of each kind"; this
 // answers "which instruction, at what address" -- the form a consumer needs

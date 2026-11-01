@@ -262,6 +262,31 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Register-census fixture for -r: one site of each register-numbering cost,
+# a control beside each that pays nothing, and a trailing xchg outside the
+# sized _start for the evidence column.
+cat >"$dir/regs.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x41, 0x54                    # push r12: REX.B for the number
+    .byte 0x48, 0x89, 0xd8              # mov rax, rbx: REX.W, no cost
+    .byte 0x40, 0x88, 0xc6              # mov sil, al: bare REX for SIL
+    .byte 0x88, 0xe0                    # mov al, ah: a high byte
+    .byte 0xc4, 0xc1, 0x71, 0xfe, 0xc1  # vpaddd xmm0, xmm1, xmm9: C4 for B
+    .byte 0xc5, 0xf1, 0xfe, 0xc2        # vpaddd xmm0, xmm1, xmm2: C5
+    .byte 0x49, 0x8b, 0x04, 0x24        # mov rax, [r12]: SIB for R12
+    .byte 0x48, 0x8b, 0x04, 0x24        # mov rax, [rsp]: SIB, no choice
+    .byte 0x41, 0x8b, 0x45, 0x00        # mov eax, [r13+0]: disp8 for R13
+    .byte 0x8b, 0x05, 0, 0, 0, 0        # mov eax, [rip+0]
+    .byte 0x41, 0x5c                    # pop r12: REX.B again
+    .byte 0xc3                          # ret
+    .size _start, . - _start
+    .byte 0x87, 0xc8                    # xchg eax, ecx (outside _start)
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # A census fixture carrying the toolchain ISA accounting (-mneeded style):
 # ISA_1_NEEDED says baseline+v2, ISA_1_USED all four levels. Properties in
 # one note must be sorted by ascending pr_type: NEEDED (0xc0008002) before
@@ -793,7 +818,7 @@ _start:
 EOF
 
 for f in finding clean bmi notrack census isanote perfunc target advisory \
-         jccpad jccraw jccmixed canary canarysetup frameptr deadcmp; do
+         jccpad jccraw jccmixed canary canarysetup frameptr deadcmp regs; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -925,6 +950,8 @@ expect '"opportunities": 1'
 run 2 --json -v "$dir/finding"
 expect 'cannot be combined'
 run 2 --json -i "$dir/finding"
+expect 'cannot be combined'
+run 2 --json -r "$dir/finding"
 expect 'cannot be combined'
 run 2 --json -e "$dir/finding"
 expect 'cannot be combined'
@@ -1070,6 +1097,41 @@ reject 'scan restricted' "restricted-scan line in census mode"
 # -i -v adds per-extension sample addresses.
 run 0 -i -v "$dir/census"
 expect '^    AVX2 at 0x[0-9a-f]+$' "-v census sample line"
+
+# -r replaces the lint scan with the register census. Each cost is counted
+# at its one site and its control is not; RSP's and RBP's shares of the same
+# encodings are shown as having no alternative. The xchg outside _start
+# decodes, counts, and is the one unevidenced instruction (RAX and RCX).
+run 0 -r "$dir/regs"
+expect '^register census: 13 instructions, 0 undecodable bytes skipped$'
+expect '^    rcx +1 +7\.7% +1 +0 +0 +0 +0 +1 +0 +0 +0 +1$'
+expect '^    r12 +3 +23\.1% +2 +1 +0 +0 +2 +0 +0 +0 +2 +0$'
+expect '^  rarely used registers: high-byte register 1$'
+expect '^    high bytes: ah 1, ch 0, dh 0, bh 0$'
+expect '^  addressing: 1 RIP-relative, 0 FS-relative, 0 GS-relative$'
+expect '^  encoding cost of register numbering: 7 bytes$'
+expect '^    legacy REX: 7 \(3 with REX\.W, so no cost; 0 selecting nothing\)$'
+expect '^    REX only for a register numbered 8-15: 3$'
+expect '^    REX only for SPL/BPL/SIL/DIL: 1$'
+expect '^    three-byte VEX only for a high r/m or index register: 1$'
+expect '^    R12 base without an index \(SIB byte\): 1 \(rsp, no alternative: 1\)$'
+expect '^    R13 base with zero displacement \(disp8\): 1 \(rbp, no alternative: 0\)$'
+expect '^    VEX: 1 two-byte, 1 three-byte; EVEX: 0, 0 of them naming a vector register 16-31$'
+expect '^  code evidence: 1 function symbols \+ 0 \.eh_frame FDEs \+ 0 Go pclntab functions covering 40 of 42 executable bytes$'
+reject 'optimization opportunities' "lint tail in register-census mode"
+reject 'ISA census' "ISA census without -i"
+# -v adds sample sites for each cost and each rarely used register.
+run 0 -r -v "$dir/regs"
+expect '^    high-byte register at 0x[0-9a-f]+$' "-v rare-register sample line"
+expect '^    R12 base without an index \(SIB byte\) at 0x[0-9a-f]+$' \
+    "-v cost sample line"
+# -i and -r together print both reports from one sweep.
+run 0 -i -r "$dir/regs"
+expect '^register census: 13 instructions'
+expect '^ISA census: 13 instructions'
+# -f narrows the register census like the ISA census.
+run 0 -r -f _start "$dir/regs"
+expect '^register census: 12 instructions, 0 undecodable bytes skipped$'
 
 # -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
 run 0 "$dir/cetbad"
@@ -1344,6 +1406,8 @@ snapshot pltskip "$dir/pltskip"
 snapshot pltskip-all -a "$dir/pltskip"
 snapshot census -i "$dir/census"
 snapshot census-verbose -i -v "$dir/census"
+snapshot regs -r "$dir/regs"
+snapshot regs-verbose -r -v "$dir/regs"
 snapshot endbr-missing -e "$dir/cetbad"
 snapshot jcc-absent -j -t skylake "$dir/jccraw"
 snapshot jcc-present -j "$dir/jccpad"

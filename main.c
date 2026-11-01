@@ -2181,16 +2181,35 @@ static bool is_linker_stub_section(const char *name)
            strncmp(name, ".plt.", 5) == 0;    // .plt.sec, .plt.got
 }
 
+// The census reports' closing line: what the evidence labels rest on, or that
+// nothing backed them, in which case no instruction was labeled.
+static void print_code_evidence(size_t nranges, size_t funcs, size_t fdes,
+                                size_t gofuncs, uint64_t covered,
+                                uint64_t exec_bytes)
+{
+    if (nranges != 0) {
+        printf("  code evidence: %zu function symbols + %zu .eh_frame "
+            "FDEs + %zu Go pclntab functions covering %lu of %lu "
+            "executable bytes\n", funcs, fdes, gofuncs,
+            (unsigned long) covered, (unsigned long) exec_bytes);
+    } else {
+        printf("  code evidence: none (no sized function symbols, no "
+            "parsable .eh_frame, no Go pclntab)\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
     // dirty scan from a broken run: 0 = clean scan, 1 = opportunities
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
-    // The -i census is informational and never contributes findings.
+    // The -i and -r censuses are informational and never contribute
+    // findings.
     bool verbose = false;
     bool scan_all = false;
     bool endbr = false;
-    bool census = false;
+    bool isa_census = false;
+    bool reg_census = false;
     bool jcc_audit = false;
     bool thunk_audit = false;
     bool prop_audit = false;
@@ -2210,7 +2229,9 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             fname = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0) {
-            census = true;
+            isa_census = true;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            reg_census = true;
         } else if (strcmp(argv[i], "-j") == 0) {
             jcc_audit = true;
         } else if (strcmp(argv[i], "-s") == 0) {
@@ -2259,7 +2280,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] "
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2270,7 +2291,7 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] "
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2280,7 +2301,7 @@ int main(int argc, char **argv)
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-j] [-s] [-p] [--json] "
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2293,15 +2314,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: -a and -f are mutually exclusive\n", argv[0]);
         return 2;
     }
+    // The ISA (-i) and register (-r) censuses describe the same sweep of
+    // every executable byte, so from here on one flag drives that sweep and
+    // the two only decide which tallies it feeds and which reports print.
+    const bool census = isa_census || reg_census;
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i, -e, -j, -s and -p are separate reports
-    // whose shapes this schema does not describe. Refused rather than
+    // prose with the document, and -i, -r, -e, -j, -s and -p are separate
+    // reports whose shapes this schema does not describe. Refused rather than
     // resolved, since either choice would surprise half the callers.
     if (json && (verbose || census || endbr || jcc_audit || thunk_audit ||
                  prop_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -e, -j, -s or -p\n",
-            argv[0]);
+            "%s: --json cannot be combined with -v, -i, -r, -e, -j, -s or "
+            "-p\n", argv[0]);
         return 2;
     }
 
@@ -2316,6 +2341,7 @@ int main(int argc, char **argv)
     uint8_t *buf = NULL;
     x86lint_summary *summary = NULL;
     x86lint_census *census_data = NULL;
+    x86lint_regs *regs_data = NULL;
     x86lint_jcc *jcc_data = NULL;
     uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
     x86lint_build *prop_data = NULL;
@@ -2756,13 +2782,24 @@ int main(int argc, char **argv)
         }
     }
 
-    // The census, by contrast, IS the whole report of a -i run, so failing
-    // to allocate it degrades to printing zeros; fail hard instead.
+    // A census, by contrast, IS the whole report of a -i or -r run, so
+    // failing to allocate it degrades to printing zeros; fail hard instead.
     if (census) {
-        census_data = x86lint_census_create();
-        if (census_data == NULL) {
-            fprintf(stderr, "%s: failed to allocate the ISA census\n", path);
-            goto out;
+        if (isa_census) {
+            census_data = x86lint_census_create();
+            if (census_data == NULL) {
+                fprintf(stderr, "%s: failed to allocate the ISA census\n",
+                    path);
+                goto out;
+            }
+        }
+        if (reg_census) {
+            regs_data = x86lint_regs_create();
+            if (regs_data == NULL) {
+                fprintf(stderr, "%s: failed to allocate the register "
+                    "census\n", path);
+                goto out;
+            }
         }
 
         // Code evidence, gathered before the scan so every tally can be
@@ -2844,6 +2881,7 @@ int main(int argc, char **argv)
                 &evidence_covered);
             x86lint_census_set_evidence(census_data, evidence.r,
                 evidence.n);
+            x86lint_regs_set_evidence(regs_data, evidence.r, evidence.n);
         }
     }
 
@@ -3012,10 +3050,14 @@ int main(int argc, char **argv)
                         ? shdr.sh_size - off : funcs[s].size;
                     x86lint_census_scan(census_data, buf + off, len,
                         funcs[s].value);
+                    x86lint_regs_scan(regs_data, buf + off, len,
+                        funcs[s].value);
                     exec_bytes += len;
                 }
             } else {
                 x86lint_census_scan(census_data, buf, shdr.sh_size,
+                    shdr.sh_addr);
+                x86lint_regs_scan(regs_data, buf, shdr.sh_size,
                     shdr.sh_addr);
                 exec_bytes += shdr.sh_size;
             }
@@ -3082,8 +3124,6 @@ int main(int argc, char **argv)
     }
 
     if (census) {
-        x86lint_census_print(census_data, verbose);
-
         // What backed the unevidenced labels -- or that nothing did, in
         // which case no instruction was labeled and the whole census
         // carries the same "no toolchain claim" weight. Under -f only the
@@ -3105,17 +3145,18 @@ int main(int argc, char **argv)
             }
             evidence_covered = covered;
         }
-        if (evidence.n != 0) {
-            printf("  code evidence: %zu function symbols + %zu .eh_frame "
-                "FDEs + %zu Go pclntab functions covering %lu of %lu "
-                "executable bytes\n",
-                evidence_funcs, evidence_fdes, evidence_gofuncs,
-                (unsigned long) evidence_covered,
-                (unsigned long) exec_bytes);
-        } else {
-            printf("  code evidence: none (no sized function symbols, no "
-                "parsable .eh_frame, no Go pclntab)\n");
+        // Each census prints its own copy of the evidence line, so that
+        // either report read alone says what its labels rest on.
+        if (reg_census) {
+            x86lint_regs_print(regs_data, verbose);
+            print_code_evidence(evidence.n, evidence_funcs, evidence_fdes,
+                evidence_gofuncs, evidence_covered, exec_bytes);
         }
+    }
+    if (isa_census) {
+        x86lint_census_print(census_data, verbose);
+        print_code_evidence(evidence.n, evidence_funcs, evidence_fdes,
+            evidence_gofuncs, evidence_covered, exec_bytes);
 
         // The toolchain's own ISA accounting, when it recorded one:
         // ISA_1_NEEDED is the authoritative baseline requirement (the loader
@@ -3161,7 +3202,8 @@ int main(int argc, char **argv)
         }
         printf("  IFUNC resolvers defined: %ld%s\n", ifuncs,
             ifuncs > 0 ? " (runtime CPU dispatch present)" : "");
-    } else if (!json && !jcc_audit && !thunk_audit && !prop_audit) {
+    } else if (!census && !json && !jcc_audit && !thunk_audit &&
+               !prop_audit) {
         x86lint_summary_print(summary);
     }
 
@@ -3280,6 +3322,7 @@ out:
     x86lint_thunk_destroy(thunk_data);
     x86lint_jcc_destroy(jcc_data);
     x86lint_census_destroy(census_data);
+    x86lint_regs_destroy(regs_data);
     free(evidence.r);
     x86lint_summary_destroy(summary);
     free(attr);

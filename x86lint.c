@@ -3194,21 +3194,28 @@ void x86lint_census_set_evidence(x86lint_census *census,
     census->nevidence = count;
 }
 
-static bool evidence_contains(const x86lint_census *census, uint64_t vaddr)
+// Whether `vaddr` lies in one of `n` sorted, non-overlapping ranges.
+static bool ranges_contain(const x86lint_evidence_range *ranges, size_t n,
+                           uint64_t vaddr)
 {
     size_t lo = 0;
-    size_t hi = census->nevidence;
+    size_t hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (vaddr < census->evidence[mid].start) {
+        if (vaddr < ranges[mid].start) {
             hi = mid;
-        } else if (vaddr >= census->evidence[mid].end) {
+        } else if (vaddr >= ranges[mid].end) {
             lo = mid + 1;
         } else {
             return true;
         }
     }
     return false;
+}
+
+static bool evidence_contains(const x86lint_census *census, uint64_t vaddr)
+{
+    return ranges_contain(census->evidence, census->nevidence, vaddr);
 }
 
 x86lint_census *x86lint_census_create(void)
@@ -3633,6 +3640,694 @@ void x86lint_census_print(const x86lint_census *census, bool verbose)
                 census->x87[X86LINT_X87_OTHER] - census->x87_other_nsamples);
         }
         printf("\n");
+    }
+}
+
+// ==== the register census ============================================
+//
+// See the block comment on x86lint_regs in the header for what is counted
+// and why the encoding costs are the point.
+
+#define REGS_GPRS 32
+#define REGS_VECTORS 32
+#define REGS_SAMPLES 4
+
+// Register-operand widths, per general-purpose register: the low byte and
+// the legacy high byte (AH..BH) are separate columns because only the
+// second is unusual.
+enum regs_width { RW_64, RW_32, RW_16, RW_8, RW_8H, RW_WIDTHS };
+
+// Registers rare enough that a reader wants to know where they are -- the
+// same reason the ISA census keeps sample sites per extension. Each also
+// counts instructions and their unevidenced share, since a phantom decode
+// is likelier to name an odd register than a real compiler is.
+enum regs_rare {
+    RARE_HIGH_BYTE,     // AH, CH, DH, BH
+    RARE_EGPR,          // APX R16-R31
+    RARE_VECTOR_HIGH,   // XMM/YMM/ZMM 16-31
+    RARE_MASK,          // AVX-512 k0-k7
+    RARE_MMX,
+    RARE_X87,           // the x87 register stack
+    RARE_SYSTEM,        // control and debug registers
+    RARE_SEGMENT,       // a segment register as an operand, not an override
+    RARE_KINDS,
+};
+
+static const char *const regs_rare_names[RARE_KINDS] = {
+    "high-byte register", "APX R16-R31", "vector register 16-31",
+    "mask register", "MMX register", "x87 stack register",
+    "control/debug register", "segment register operand",
+};
+
+static const char *const regs_cost_names[X86LINT_REG_COSTS] = {
+    "REX only for a register numbered 8-15",
+    "REX only for SPL/BPL/SIL/DIL",
+    "APX REX2 prefix",
+    "three-byte VEX only for a high r/m or index register",
+    "R12 base without an index (SIB byte)",
+    "R13 base with zero displacement (disp8)",
+};
+
+static const char *const regs_gpr_names[REGS_GPRS] = {
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23",
+    "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31",
+};
+
+struct regs_samples {
+    uint64_t at[REGS_SAMPLES];
+    uint8_t n;
+};
+
+struct x86lint_regs {
+    size_t instructions;
+    size_t skipped;
+
+    size_t gpr[REGS_GPRS][X86LINT_REG_ROLES];
+    size_t gpr_width[REGS_GPRS][RW_WIDTHS];  // operand and hidden roles
+    size_t gpr_insns[REGS_GPRS];
+    // Instructions whose REX byte exists only to number registers 8-15 and
+    // that name this register among them (an instruction naming two high
+    // registers counts under both).
+    size_t gpr_rex[REGS_GPRS];
+    size_t gpr_unevidenced[REGS_GPRS];
+    size_t high_byte[4];                     // AH, CH, DH, BH
+
+    size_t vec[REGS_VECTORS][3];             // XMM, YMM, ZMM references
+    size_t vec_insns[REGS_VECTORS];
+    size_t vec_rex[REGS_VECTORS];
+    size_t vec_unevidenced[REGS_VECTORS];
+
+    size_t mask[8];
+    size_t rare[RARE_KINDS];                 // instructions
+    size_t rare_unevidenced[RARE_KINDS];
+    struct regs_samples rare_samples[RARE_KINDS];
+
+    size_t rip_relative;
+    size_t seg_fs;
+    size_t seg_gs;
+
+    // Prefix and addressing encodings. rex counts every legacy REX; rex_w
+    // the ones that set W (and so cost nothing for register choice);
+    // rex_idle a bare REX that selects nothing (check_unneeded_rex's
+    // territory, reported here only to close the sum).
+    size_t rex;
+    size_t rex_w;
+    size_t rex_idle;
+    size_t rex2_w;
+    size_t vex2;
+    size_t vex3;
+    size_t evex;
+    size_t evex_upper;
+    // The addressing costs' counterparts on RSP and RBP, which share the
+    // encodings but are fixed by the stack and frame and so not a choice.
+    size_t sib_rsp;
+    size_t disp8_rbp;
+    size_t cost[X86LINT_REG_COSTS];
+    size_t cost_unevidenced[X86LINT_REG_COSTS];
+    struct regs_samples cost_samples[X86LINT_REG_COSTS];
+
+    const x86lint_evidence_range *evidence;
+    size_t nevidence;
+};
+
+// Which registers one instruction named, so that per-instruction counts and
+// the REX attribution count each register once however many roles it fills.
+struct regs_seen {
+    uint32_t gpr;
+    uint32_t vec;
+    uint32_t rare;
+    bool uniform_byte;  // SPL, BPL, SIL or DIL
+};
+
+x86lint_regs *x86lint_regs_create(void)
+{
+    return calloc(1, sizeof(struct x86lint_regs));
+}
+
+void x86lint_regs_destroy(x86lint_regs *regs)
+{
+    free(regs);
+}
+
+void x86lint_regs_set_evidence(x86lint_regs *regs,
+                               const x86lint_evidence_range *ranges,
+                               size_t count)
+{
+    if (regs == NULL) {
+        return;
+    }
+    regs->evidence = ranges;
+    regs->nevidence = count;
+}
+
+size_t x86lint_regs_instructions(const x86lint_regs *regs)
+{
+    return regs == NULL ? 0 : regs->instructions;
+}
+
+size_t x86lint_regs_skipped(const x86lint_regs *regs)
+{
+    return regs == NULL ? 0 : regs->skipped;
+}
+
+size_t x86lint_regs_gpr_count(const x86lint_regs *regs, unsigned num,
+                              enum x86lint_reg_role role)
+{
+    if (regs == NULL || num >= REGS_GPRS || role >= X86LINT_REG_ROLES) {
+        return 0;
+    }
+    return regs->gpr[num][role];
+}
+
+size_t x86lint_regs_gpr_instructions(const x86lint_regs *regs, unsigned num)
+{
+    if (regs == NULL || num >= REGS_GPRS) {
+        return 0;
+    }
+    return regs->gpr_insns[num];
+}
+
+size_t x86lint_regs_vector_count(const x86lint_regs *regs, unsigned num,
+                                 unsigned width)
+{
+    if (regs == NULL || num >= REGS_VECTORS) {
+        return 0;
+    }
+    switch (width) {
+    case 128: return regs->vec[num][0];
+    case 256: return regs->vec[num][1];
+    case 512: return regs->vec[num][2];
+    default: return 0;
+    }
+}
+
+size_t x86lint_regs_mask_count(const x86lint_regs *regs, unsigned num)
+{
+    if (regs == NULL || num >= 8) {
+        return 0;
+    }
+    return regs->mask[num];
+}
+
+size_t x86lint_regs_cost_count(const x86lint_regs *regs,
+                               enum x86lint_reg_cost cost)
+{
+    if (regs == NULL || cost >= X86LINT_REG_COSTS) {
+        return 0;
+    }
+    return regs->cost[cost];
+}
+
+size_t x86lint_regs_cost_bytes(const x86lint_regs *regs)
+{
+    if (regs == NULL) {
+        return 0;
+    }
+    size_t bytes = 0;
+    for (int c = 0; c < X86LINT_REG_COSTS; ++c) {
+        bytes += regs->cost[c];
+    }
+    // REX2 is two bytes, of which one is owed to REX.W when W is set.
+    return bytes + regs->cost[X86LINT_REG_COST_REX2] - regs->rex2_w;
+}
+
+static void regs_sample(struct regs_samples *s, uint64_t at)
+{
+    if (s->n < REGS_SAMPLES) {
+        s->at[s->n++] = at;
+    }
+}
+
+// Tally one register reference. INVALID and the registers the census does
+// not count (flags, RIP, XED's pseudo-registers) fall through untallied.
+static void regs_note(x86lint_regs *regs, xed_reg_enum_t r,
+                      enum x86lint_reg_role role, struct regs_seen *seen)
+{
+    if (r == XED_REG_INVALID) {
+        return;
+    }
+    switch (xed_reg_class(r)) {
+    case XED_REG_CLASS_GPR: {
+        xed_reg_enum_t big = xed_get_largest_enclosing_register(r);
+        if (big < XED_REG_RAX || big > XED_REG_R31) {
+            return;
+        }
+        unsigned num = (unsigned) (big - XED_REG_RAX);
+        regs->gpr[num][role]++;
+        seen->gpr |= 1u << num;
+        if (num >= 16) {
+            seen->rare |= 1u << RARE_EGPR;
+        }
+        if (role == X86LINT_REG_BASE || role == X86LINT_REG_INDEX) {
+            return;  // an address register's width is the address size
+        }
+        enum regs_width w;
+        switch (xed_gpr_reg_class(r)) {
+        case XED_REG_CLASS_GPR64: w = RW_64; break;
+        case XED_REG_CLASS_GPR32: w = RW_32; break;
+        case XED_REG_CLASS_GPR16: w = RW_16; break;
+        default:
+            if (r >= XED_REG_AH && r <= XED_REG_BH) {
+                w = RW_8H;
+                regs->high_byte[r - XED_REG_AH]++;
+                seen->rare |= 1u << RARE_HIGH_BYTE;
+            } else {
+                w = RW_8;
+                if (r == XED_REG_SPL || r == XED_REG_BPL ||
+                    r == XED_REG_SIL || r == XED_REG_DIL) {
+                    seen->uniform_byte = true;
+                }
+            }
+            break;
+        }
+        regs->gpr_width[num][w]++;
+        return;
+    }
+    case XED_REG_CLASS_XMM:
+    case XED_REG_CLASS_YMM:
+    case XED_REG_CLASS_ZMM: {
+        unsigned num;
+        unsigned w;
+        if (r >= XED_REG_XMM0 && r <= XED_REG_XMM31) {
+            num = (unsigned) (r - XED_REG_XMM0);
+            w = 0;
+        } else if (r >= XED_REG_YMM0 && r <= XED_REG_YMM31) {
+            num = (unsigned) (r - XED_REG_YMM0);
+            w = 1;
+        } else if (r >= XED_REG_ZMM0 && r <= XED_REG_ZMM31) {
+            num = (unsigned) (r - XED_REG_ZMM0);
+            w = 2;
+        } else {
+            return;
+        }
+        regs->vec[num][w]++;
+        seen->vec |= 1u << num;
+        if (num >= 16) {
+            seen->rare |= 1u << RARE_VECTOR_HIGH;
+        }
+        return;
+    }
+    case XED_REG_CLASS_MASK:
+        if (r >= XED_REG_K0 && r <= XED_REG_K7) {
+            regs->mask[r - XED_REG_K0]++;
+            seen->rare |= 1u << RARE_MASK;
+        }
+        return;
+    case XED_REG_CLASS_MMX:
+        seen->rare |= 1u << RARE_MMX;
+        return;
+    case XED_REG_CLASS_X87:
+        seen->rare |= 1u << RARE_X87;
+        return;
+    case XED_REG_CLASS_CR:
+    case XED_REG_CLASS_DR:
+        seen->rare |= 1u << RARE_SYSTEM;
+        return;
+    case XED_REG_CLASS_SR:
+        seen->rare |= 1u << RARE_SEGMENT;
+        return;
+    default:
+        return;
+    }
+}
+
+static void regs_cost(x86lint_regs *regs, enum x86lint_reg_cost cost,
+                      bool unevidenced, uint64_t at)
+{
+    regs->cost[cost]++;
+    if (unevidenced) {
+        regs->cost_unevidenced[cost]++;
+    }
+    regs_sample(&regs->cost_samples[cost], at);
+}
+
+static void regs_tally(x86lint_regs *regs, const xed_decoded_inst_t *xedd,
+                       uint64_t at)
+{
+    bool unevidenced = regs->nevidence != 0 &&
+        !ranges_contain(regs->evidence, regs->nevidence, at);
+    struct regs_seen seen = {0, 0, 0, false};
+
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned k = 0; k < nops; ++k) {
+        const xed_operand_t *op = xed_inst_operand(xi, k);
+        xed_operand_enum_t name = xed_operand_name(op);
+        bool hidden =
+            xed_operand_operand_visibility(op) == XED_OPVIS_SUPPRESSED;
+        if (xed_operand_is_register(name)) {
+            xed_reg_enum_t r = xed_decoded_inst_get_reg(xedd, name);
+            // An EVEX write-mask field of zero means "no masking", which
+            // XED spells as a K0 operand; it is not a use of k0. Real k0
+            // operands (a compare's destination, KMOV) come through other
+            // nonterminals.
+            if (r == XED_REG_K0 &&
+                xed_operand_nonterminal_name(op) == XED_NONTERMINAL_MASK1) {
+                continue;
+            }
+            regs_note(regs, r,
+                hidden ? X86LINT_REG_HIDDEN : X86LINT_REG_OPERAND, &seen);
+            continue;
+        }
+        // BASE0/BASE1 restate the base of MEM0/MEM1 (PUSH lists RSP both
+        // ways), so only the memory operand is read.
+        if (name != XED_OPERAND_MEM0 && name != XED_OPERAND_MEM1 &&
+            name != XED_OPERAND_AGEN) {
+            continue;
+        }
+        unsigned m = name == XED_OPERAND_MEM1 ? 1 : 0;
+        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, m);
+        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(xedd, m);
+        if (base == XED_REG_RIP || base == XED_REG_EIP) {
+            regs->rip_relative++;
+        } else {
+            regs_note(regs, base,
+                hidden ? X86LINT_REG_HIDDEN : X86LINT_REG_BASE, &seen);
+        }
+        regs_note(regs, index,
+            hidden ? X86LINT_REG_HIDDEN : X86LINT_REG_INDEX, &seen);
+        if (name != XED_OPERAND_AGEN) {
+            xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(xedd, m);
+            if (seg == XED_REG_FS) {
+                regs->seg_fs++;
+            } else if (seg == XED_REG_GS) {
+                regs->seg_gs++;
+            }
+        }
+        if (hidden || base == XED_REG_INVALID || base == XED_REG_RIP ||
+            base == XED_REG_EIP) {
+            continue;
+        }
+        // The two addressing forms whose cost is a register number. Under a
+        // 67 prefix R12D and R13D share the encodings, so the 64-bit name
+        // decides.
+        xed_reg_enum_t big = xed_get_largest_enclosing_register(base);
+        if (index == XED_REG_INVALID) {
+            if (big == XED_REG_R12) {
+                regs_cost(regs, X86LINT_REG_COST_SIB_FOR_R12, unevidenced,
+                    at);
+            } else if (big == XED_REG_RSP) {
+                regs->sib_rsp++;
+            }
+        }
+        if (xed_decoded_inst_get_memory_displacement(xedd, m) == 0) {
+            if (big == XED_REG_R13) {
+                regs_cost(regs, X86LINT_REG_COST_DISP8_FOR_R13, unevidenced,
+                    at);
+            } else if (big == XED_REG_RBP) {
+                regs->disp8_rbp++;
+            }
+        }
+    }
+
+    // Prefix costs. vexvalid: 0 = legacy, 1 = VEX, 2 = EVEX.
+    bool w = xed3_operand_get_rexw(xedd) != 0;
+    switch (xed3_operand_get_vexvalid(xedd)) {
+    case 0:
+        if (xed3_operand_get_rex2(xedd)) {
+            regs_cost(regs, X86LINT_REG_COST_REX2, unevidenced, at);
+            if (w) {
+                regs->rex2_w++;
+            }
+        } else if (xed3_operand_get_rex(xedd)) {
+            regs->rex++;
+            if (w) {
+                regs->rex_w++;
+            } else if (xed3_operand_get_rexr(xedd) ||
+                       xed3_operand_get_rexx(xedd) ||
+                       xed3_operand_get_rexb(xedd)) {
+                regs_cost(regs, X86LINT_REG_COST_REX_FOR_HIGH, unevidenced,
+                    at);
+                for (unsigned n = 8; n < 16; ++n) {
+                    if (seen.gpr & (1u << n)) {
+                        regs->gpr_rex[n]++;
+                    }
+                    if (seen.vec & (1u << n)) {
+                        regs->vec_rex[n]++;
+                    }
+                }
+            } else if (seen.uniform_byte) {
+                regs_cost(regs, X86LINT_REG_COST_REX_FOR_BYTE, unevidenced,
+                    at);
+            } else {
+                regs->rex_idle++;
+            }
+        }
+        break;
+    case 1:
+        // The prefix length is the nominal opcode's offset less any legacy
+        // prefixes ahead of it, as in check_oversized_vex: 2 is C5, 3 is
+        // C4. Map 0F with W clear is exactly what C5 can carry except B
+        // and X, so a C4 there was paid for by a register number.
+        if (xed3_operand_get_pos_nominal_opcode(xedd) -
+            xed3_operand_get_nprefixes(xedd) == 2) {
+            regs->vex2++;
+        } else {
+            regs->vex3++;
+            if (xed3_operand_get_map(xedd) == 1 && !w &&
+                (xed3_operand_get_rexb(xedd) ||
+                 xed3_operand_get_rexx(xedd))) {
+                regs_cost(regs, X86LINT_REG_COST_VEX3_FOR_HIGH, unevidenced,
+                    at);
+            }
+        }
+        break;
+    case 2:
+        regs->evex++;
+        if (seen.vec & 0xffff0000u) {
+            regs->evex_upper++;
+        }
+        break;
+    default:
+        break;
+    }
+
+    for (unsigned n = 0; n < REGS_GPRS; ++n) {
+        if (seen.gpr & (1u << n)) {
+            regs->gpr_insns[n]++;
+            if (unevidenced) {
+                regs->gpr_unevidenced[n]++;
+            }
+        }
+    }
+    for (unsigned n = 0; n < REGS_VECTORS; ++n) {
+        if (seen.vec & (1u << n)) {
+            regs->vec_insns[n]++;
+            if (unevidenced) {
+                regs->vec_unevidenced[n]++;
+            }
+        }
+    }
+    for (int k = 0; k < RARE_KINDS; ++k) {
+        if (seen.rare & (1u << k)) {
+            regs->rare[k]++;
+            if (unevidenced) {
+                regs->rare_unevidenced[k]++;
+            }
+            regs_sample(&regs->rare_samples[k], at);
+        }
+    }
+}
+
+void x86lint_regs_scan(x86lint_regs *regs, const uint8_t *inst, size_t len,
+                       uint64_t vaddr)
+{
+    if (regs == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            ++regs->skipped;
+            continue;
+        }
+        regs_tally(regs, &xedd, vaddr + i);
+        regs->instructions++;
+        i += xed_decoded_inst_get_length(&xedd);
+    }
+}
+
+// Share of the instruction count, in tenths of a percent, rounded.
+static void regs_print_share(size_t n, size_t total)
+{
+    if (total == 0) {
+        printf("%6s", "-");
+        return;
+    }
+    unsigned long permille =
+        (unsigned long) ((n * 1000 + total / 2) / total);
+    printf("%4lu.%lu%%", permille / 10, permille % 10);
+}
+
+static void regs_print_samples(const char *label,
+                               const struct regs_samples *s, size_t count)
+{
+    if (s->n == 0) {
+        return;
+    }
+    printf("    %s at", label);
+    for (uint8_t k = 0; k < s->n; ++k) {
+        printf("%s 0x%" PRIx64, k == 0 ? "" : ",", s->at[k]);
+    }
+    if (count > s->n) {
+        printf(" (+%zu more)", count - s->n);
+    }
+    printf("\n");
+}
+
+void x86lint_regs_print(const x86lint_regs *regs, bool verbose)
+{
+    if (regs == NULL) {
+        return;
+    }
+    const bool ev = regs->nevidence != 0;
+    const size_t total = regs->instructions;
+
+    printf("register census: %zu instructions, %zu undecodable bytes "
+        "skipped\n", total, regs->skipped);
+
+    // General-purpose registers. R16-R31 print only when used, so a
+    // pre-APX binary's table stays sixteen rows.
+    printf("  general-purpose registers: references by role, register "
+        "operands by width\n");
+    printf("    %-4s %9s %7s %9s %9s %9s %9s  %9s %9s %9s %9s "
+        "%9s  %9s%s\n", "reg", "insns", "share", "operand", "base",
+        "index", "hidden", "64-bit", "32-bit", "16-bit", "8-bit",
+        "high 8", "sole REX", ev ? "    unevid." : "");
+    for (unsigned n = 0; n < REGS_GPRS; ++n) {
+        if (n >= 16 && regs->gpr_insns[n] == 0) {
+            continue;
+        }
+        printf("    %-4s %9zu ", regs_gpr_names[n], regs->gpr_insns[n]);
+        regs_print_share(regs->gpr_insns[n], total);
+        for (int role = 0; role < X86LINT_REG_ROLES; ++role) {
+            printf(" %9zu", regs->gpr[n][role]);
+        }
+        printf(" ");
+        for (int w = 0; w < RW_WIDTHS; ++w) {
+            if (w == RW_8H && n >= 4) {
+                printf(" %9s", "");
+            } else {
+                printf(" %9zu", regs->gpr_width[n][w]);
+            }
+        }
+        printf("  ");
+        if (n >= 8 && n < 16) {
+            printf("%9zu", regs->gpr_rex[n]);
+        } else {
+            printf("%9s", "");
+        }
+        if (ev) {
+            printf("  %9zu", regs->gpr_unevidenced[n]);
+        }
+        printf("\n");
+    }
+
+    // Vector registers: one row per number, used rows only.
+    size_t vec_rows = 0;
+    for (unsigned n = 0; n < REGS_VECTORS; ++n) {
+        vec_rows += regs->vec_insns[n] != 0;
+    }
+    if (vec_rows == 0) {
+        printf("  vector registers: none\n");
+    } else {
+        printf("  vector registers: references by width\n");
+        printf("    %-4s %9s %7s %9s %9s %9s  %9s%s\n", "reg", "insns",
+            "share", "xmm", "ymm", "zmm", "sole REX",
+            ev ? "    unevid." : "");
+        for (unsigned n = 0; n < REGS_VECTORS; ++n) {
+            if (regs->vec_insns[n] == 0) {
+                continue;
+            }
+            char name[8];
+            snprintf(name, sizeof(name), "%u", n);
+            printf("    %-4s %9zu ", name, regs->vec_insns[n]);
+            regs_print_share(regs->vec_insns[n], total);
+            printf(" %9zu %9zu %9zu  ", regs->vec[n][0], regs->vec[n][1],
+                regs->vec[n][2]);
+            if (n >= 8 && n < 16) {
+                printf("%9zu", regs->vec_rex[n]);
+            } else {
+                printf("%9s", "");
+            }
+            if (ev) {
+                printf("  %9zu", regs->vec_unevidenced[n]);
+            }
+            printf("\n");
+        }
+    }
+
+    // The rare registers, as instruction counts, then the detail the two
+    // with internal structure carry.
+    printf("  rarely used registers:");
+    bool any = false;
+    for (int k = 0; k < RARE_KINDS; ++k) {
+        if (regs->rare[k] == 0) {
+            continue;
+        }
+        printf("%s %s %zu", any ? "," : "", regs_rare_names[k],
+            regs->rare[k]);
+        if (regs->rare_unevidenced[k] != 0) {
+            printf(" (%zu unevidenced)", regs->rare_unevidenced[k]);
+        }
+        any = true;
+    }
+    printf("%s\n", any ? "" : " none");
+    if (regs->rare[RARE_HIGH_BYTE] != 0) {
+        printf("    high bytes: ah %zu, ch %zu, dh %zu, bh %zu\n",
+            regs->high_byte[0], regs->high_byte[1], regs->high_byte[2],
+            regs->high_byte[3]);
+    }
+    if (regs->rare[RARE_MASK] != 0) {
+        printf("    masks:");
+        for (int k = 0; k < 8; ++k) {
+            printf("%s k%d %zu", k == 0 ? "" : ",", k, regs->mask[k]);
+        }
+        printf("\n");
+    }
+    printf("  addressing: %zu RIP-relative, %zu FS-relative, %zu "
+        "GS-relative\n", regs->rip_relative, regs->seg_fs, regs->seg_gs);
+
+    // The cost of register numbering. Each line says what the instruction
+    // would have saved naming a register from the lower half instead; the
+    // RSP and RBP counterparts are shown beside the R12 and R13 rows
+    // because they pay the same byte and have no alternative.
+    printf("  encoding cost of register numbering: %zu bytes\n",
+        x86lint_regs_cost_bytes(regs));
+    printf("    legacy REX: %zu (%zu with REX.W, so no cost; %zu selecting "
+        "nothing)\n", regs->rex, regs->rex_w, regs->rex_idle);
+    for (int c = 0; c < X86LINT_REG_COSTS; ++c) {
+        printf("    %s: %zu", regs_cost_names[c], regs->cost[c]);
+        if (c == X86LINT_REG_COST_REX2 && regs->rex2_w != 0) {
+            printf(" (%zu with REX2.W, one byte each)", regs->rex2_w);
+        } else if (c == X86LINT_REG_COST_SIB_FOR_R12) {
+            printf(" (rsp, no alternative: %zu)", regs->sib_rsp);
+        } else if (c == X86LINT_REG_COST_DISP8_FOR_R13) {
+            printf(" (rbp, no alternative: %zu)", regs->disp8_rbp);
+        }
+        if (regs->cost_unevidenced[c] != 0) {
+            printf(" (%zu unevidenced)", regs->cost_unevidenced[c]);
+        }
+        printf("\n");
+    }
+    printf("    VEX: %zu two-byte, %zu three-byte; EVEX: %zu, %zu of them "
+        "naming a vector register 16-31\n", regs->vex2, regs->vex3,
+        regs->evex, regs->evex_upper);
+
+    if (!verbose) {
+        return;
+    }
+    for (int k = 0; k < RARE_KINDS; ++k) {
+        regs_print_samples(regs_rare_names[k], &regs->rare_samples[k],
+            regs->rare[k]);
+    }
+    for (int c = 0; c < X86LINT_REG_COSTS; ++c) {
+        regs_print_samples(regs_cost_names[c], &regs->cost_samples[c],
+            regs->cost[c]);
     }
 }
 

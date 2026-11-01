@@ -8157,6 +8157,132 @@ static void census_test(void)
     x86lint_census_destroy(NULL);
 }
 
+// Register numbers in XED's encoding order, as x86lint_regs_gpr_count takes.
+enum { RAX = 0, RCX = 1, RDX = 2, RSP = 4, RSI = 6, R8 = 8, R9 = 9,
+       R12 = 12, R13 = 13, R16 = 16 };
+
+static void regs_test(void)
+{
+    // Roles. MUL shows its source and hides RDX:RAX; PUSH hides RSP, which
+    // XED lists twice (memory base and BASE0) and is counted once; LEA's
+    // address registers are base and index, not operands.
+    x86lint_regs *regs = x86lint_regs_create();
+    assert(regs != NULL);
+    static const uint8_t roles[] = {
+        0xf7, 0xe1,                     // mul ecx
+        0x41, 0x54,                     // push r12
+        0x48, 0x8d, 0x04, 0x0a,         // lea rax, [rdx+rcx]
+        0xd3, 0xe0,                     // shl eax, cl (CL shown, so an operand)
+    };
+    x86lint_regs_scan(regs, roles, sizeof(roles), 0x1000);
+    assert(x86lint_regs_instructions(regs) == 4);
+    assert(x86lint_regs_skipped(regs) == 0);
+    assert(x86lint_regs_gpr_count(regs, RCX, X86LINT_REG_OPERAND) == 2);
+    assert(x86lint_regs_gpr_count(regs, RCX, X86LINT_REG_INDEX) == 1);
+    assert(x86lint_regs_gpr_instructions(regs, RCX) == 3);
+    assert(x86lint_regs_gpr_count(regs, RAX, X86LINT_REG_HIDDEN) == 1);
+    assert(x86lint_regs_gpr_count(regs, RAX, X86LINT_REG_OPERAND) == 2);
+    assert(x86lint_regs_gpr_count(regs, RDX, X86LINT_REG_HIDDEN) == 1);
+    assert(x86lint_regs_gpr_count(regs, RDX, X86LINT_REG_BASE) == 1);
+    assert(x86lint_regs_gpr_count(regs, RSP, X86LINT_REG_HIDDEN) == 1);
+    assert(x86lint_regs_gpr_count(regs, RSP, X86LINT_REG_BASE) == 0);
+    assert(x86lint_regs_gpr_count(regs, R12, X86LINT_REG_OPERAND) == 1);
+    // push r12's REX.B exists only for the register number; LEA's REX.W is
+    // the operand size and costs nothing.
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_REX_FOR_HIGH) == 1);
+    assert(x86lint_regs_cost_bytes(regs) == 1);
+    x86lint_regs_destroy(regs);
+
+    // One site per cost, and a control beside each that pays nothing.
+    regs = x86lint_regs_create();
+    assert(regs != NULL);
+    static const uint8_t costs[] = {
+        0x44, 0x0f, 0x28, 0xc1,         // movaps xmm8, xmm1: REX.R only
+        0x4d, 0x89, 0xc8,               // mov r8, r9: REX.W, no cost
+        0x40, 0x88, 0xc6,               // mov sil, al: bare REX for SIL
+        0x88, 0xc4,                     // mov ah, al: no REX, a high byte
+        0xc4, 0xc1, 0x71, 0xfe, 0xc1,   // vpaddd xmm0, xmm1, xmm9: C4 for B
+        0xc5, 0xf1, 0xfe, 0xc2,         // vpaddd xmm0, xmm1, xmm2: C5
+        0x49, 0x8d, 0x04, 0x24,         // lea rax, [r12]: SIB for R12
+        0x48, 0x8b, 0x04, 0x24,         // mov rax, [rsp]: SIB, no choice
+        0x4a, 0x8d, 0x04, 0x20,         // lea rax, [rax+r12]: SIB anyway
+        0x41, 0x8b, 0x45, 0x00,         // mov eax, [r13+0]: disp8, REX.B
+        0x41, 0x8b, 0x45, 0x08,         // mov eax, [r13+8]: disp8 anyway
+        0xd5, 0x18, 0x01, 0xc8,         // add r16, rcx: REX2 with W
+        0x62, 0xe1, 0x7c, 0x48, 0x58, 0xc8,  // vaddps zmm17, zmm0, zmm0
+    };
+    x86lint_regs_scan(regs, costs, sizeof(costs), 0x2000);
+    assert(x86lint_regs_instructions(regs) == 13);
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_REX_FOR_HIGH) == 3);
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_REX_FOR_BYTE) == 1);
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_VEX3_FOR_HIGH) == 1);
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_SIB_FOR_R12) == 1);
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_DISP8_FOR_R13) == 1);
+    assert(x86lint_regs_cost_count(regs, X86LINT_REG_COST_REX2) == 1);
+    // Three REX-for-high, one REX-for-byte, the C4, the SIB, the disp8, and
+    // REX2's one byte beyond the REX.W it replaces.
+    assert(x86lint_regs_cost_bytes(regs) == 3 + 1 + 1 + 1 + 1 + 1);
+    assert(x86lint_regs_gpr_count(regs, R16, X86LINT_REG_OPERAND) == 1);
+    assert(x86lint_regs_gpr_count(regs, R13, X86LINT_REG_BASE) == 2);
+    assert(x86lint_regs_gpr_count(regs, R12, X86LINT_REG_INDEX) == 1);
+    assert(x86lint_regs_gpr_count(regs, RSI, X86LINT_REG_OPERAND) == 1);
+    assert(x86lint_regs_gpr_count(regs, R8, X86LINT_REG_OPERAND) == 1);
+    assert(x86lint_regs_gpr_count(regs, R9, X86LINT_REG_OPERAND) == 1);
+    assert(x86lint_regs_vector_count(regs, 8, 128) == 1);
+    assert(x86lint_regs_vector_count(regs, 9, 128) == 1);
+    assert(x86lint_regs_vector_count(regs, 17, 512) == 1);
+    assert(x86lint_regs_vector_count(regs, 0, 512) == 2);
+    assert(x86lint_regs_vector_count(regs, 0, 128) == 2);
+    assert(x86lint_regs_vector_count(regs, 0, 64) == 0);
+    // vaddps's EVEX write-mask is k0, "no masking": not a use of k0.
+    assert(x86lint_regs_mask_count(regs, 0) == 0);
+    x86lint_regs_destroy(regs);
+
+    // Real mask operands count, k0 included; a write-mask other than k0
+    // counts as a use of that mask.
+    regs = x86lint_regs_create();
+    assert(regs != NULL);
+    static const uint8_t masks[] = {
+        0xc5, 0xf8, 0x92, 0xc0,                 // kmovw k0, eax
+        0x62, 0xf1, 0x7d, 0x48, 0x76, 0xc1,     // vpcmpeqd k0, zmm0, zmm1
+        0x62, 0xf1, 0x7c, 0x49, 0x58, 0xc8,     // vaddps zmm1{k1}, zmm0, zmm0
+    };
+    x86lint_regs_scan(regs, masks, sizeof(masks), 0x5000);
+    assert(x86lint_regs_instructions(regs) == 3);
+    assert(x86lint_regs_mask_count(regs, 0) == 2);
+    assert(x86lint_regs_mask_count(regs, 1) == 1);
+    assert(x86lint_regs_mask_count(regs, 8) == 0);
+    x86lint_regs_destroy(regs);
+
+    // Evidence labels at scan time and changes no count; the report prints
+    // with it installed. Undecodable bytes resync one at a time.
+    regs = x86lint_regs_create();
+    assert(regs != NULL);
+    static const x86lint_evidence_range evidence[] = {{0x3000, 0x3002}};
+    x86lint_regs_set_evidence(regs, evidence, 1);
+    x86lint_regs_scan(regs, roles, sizeof(roles), 0x3000);
+    static const uint8_t junk[] = {0x62, 0x00};  // truncated EVEX prefix
+    x86lint_regs_scan(regs, junk, sizeof(junk), 0x4000);
+    assert(x86lint_regs_instructions(regs) == 4);
+    assert(x86lint_regs_skipped(regs) == 2);
+    assert(x86lint_regs_gpr_instructions(regs, RCX) == 3);
+    x86lint_regs_destroy(regs);
+
+    // NULL is accepted everywhere, and out-of-range queries return 0.
+    x86lint_regs_scan(NULL, roles, sizeof(roles), 0);
+    x86lint_regs_set_evidence(NULL, NULL, 0);
+    x86lint_regs_print(NULL, true);
+    assert(x86lint_regs_instructions(NULL) == 0);
+    assert(x86lint_regs_skipped(NULL) == 0);
+    assert(x86lint_regs_gpr_count(NULL, RAX, X86LINT_REG_OPERAND) == 0);
+    assert(x86lint_regs_gpr_instructions(NULL, RAX) == 0);
+    assert(x86lint_regs_vector_count(NULL, 0, 128) == 0);
+    assert(x86lint_regs_mask_count(NULL, 0) == 0);
+    assert(x86lint_regs_cost_count(NULL, X86LINT_REG_COST_REX2) == 0);
+    assert(x86lint_regs_cost_bytes(NULL) == 0);
+    x86lint_regs_destroy(NULL);
+}
+
 static void mask_relocated_test(void)
 {
     // mov rdi, imm32 (7 bytes) ; jmp rel32 (5) ; xchg eax, ecx (2). The first
@@ -8798,6 +8924,7 @@ int main(int argc, char *argv[])
     summary_functions_test();
     finding_callback_test();
     census_test();
+    regs_test();
     mask_relocated_test();
     build_test();
     thunk_test();

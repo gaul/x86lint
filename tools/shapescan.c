@@ -64,7 +64,8 @@
 // Usage: shapescan [-a] [-e NAME] [-n MAX] <binary>...
 //   -a  scan every byte, not just the symbol table's function ranges
 //   -e  print example sites for the candidate whose name contains NAME
-//   -n  cap the examples printed (default 8)
+//       (an empty NAME matches every candidate)
+//   -n  cap the examples printed, per candidate and file (default 8)
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -612,8 +613,8 @@ static void remat_constant_any(const uint8_t *inst, size_t len,
                 char text[128];
                 xed_format_context(XED_SYNTAX_INTEL, &xedd, text,
                     sizeof(text), vaddr + offset, NULL, NULL);
-                printf("  %s+0x%" PRIx64 ": %s\n", path, vaddr + offset,
-                    text);
+                printf("  [constant already in a register] %s+0x%" PRIx64
+                    ": %s\n", path, vaddr + offset, text);
                 --*left;
             }
             break;
@@ -735,9 +736,9 @@ static void zero_store_runs(const uint8_t *inst, size_t len,
                 } else {
                     ++t->realized;
                     if (example != NULL && *left > 0) {
-                        printf("  %s+0x%" PRIx64 ": %zu zero stores, %"
-                            PRId64 " bytes\n", path, vaddr + run_start, n,
-                            span);
+                        printf("  [adjacent zero-store run] %s+0x%" PRIx64
+                            ": %zu zero stores, %" PRId64 " bytes\n", path,
+                            vaddr + run_start, n, span);
                         --*left;
                     }
                 }
@@ -755,6 +756,685 @@ static void zero_store_runs(const uint8_t *inst, size_t len,
         }
         offset = next;
     }
+}
+
+// === window candidates: the 2026-09-27 four-toolchain sweep ===
+//
+// Surfaced by pairscan over libxul (clang 22 C++ + rustc), the Fedora
+// libLLVM/libclang-cpp (GCC 16), librustc_driver and uutils coreutils (rustc
+// 1.97 / LLVM 22). Each is written against the gates a shipped check would
+// use, so the realized count is the finding count and the refusals say where
+// the shape went.
+
+// Direct relative branch target of `d` (whose bytes end at `next`), or -1 when
+// the branch is indirect or the target leaves the section.
+static int64_t direct_target(const xed_decoded_inst_t *d, size_t next,
+                             size_t len)
+{
+    if (xed_decoded_inst_get_branch_displacement_width(d) == 0) {
+        return -1;
+    }
+    int64_t t = (int64_t) next + xed_decoded_inst_get_branch_displacement(d);
+    if (t < 0 || (uint64_t) t >= (uint64_t) len) {
+        return -1;
+    }
+    return t;
+}
+
+// A Jcc proper: the condition-code family, not the RCX-reading JRCXZ/LOOP.
+static bool is_jcc(const xed_decoded_inst_t *d)
+{
+    if (xed_decoded_inst_get_category(d) != XED_CATEGORY_COND_BR) {
+        return false;
+    }
+    switch (xed_decoded_inst_get_iclass(d)) {
+    case XED_ICLASS_JRCXZ: case XED_ICLASS_JECXZ: case XED_ICLASS_JCXZ:
+    case XED_ICLASS_LOOP: case XED_ICLASS_LOOPE: case XED_ICLASS_LOOPNE:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool is_direct_jmp(const xed_decoded_inst_t *d)
+{
+    return xed_decoded_inst_get_iclass(d) == XED_ICLASS_JMP &&
+        xed_decoded_inst_get_branch_displacement_width(d) != 0;
+}
+
+static bool is_ret(const xed_decoded_inst_t *d)
+{
+    return xed_decoded_inst_get_category(d) == XED_CATEGORY_RET &&
+        !xed_operand_values_has_immediate(xed_decoded_inst_operands_const(d));
+}
+
+static bool fits_rel8(int64_t disp)
+{
+    return disp >= -128 && disp <= 127;
+}
+
+// A flag walk that, like reg_live_after_branch, follows both successors of a
+// conditional branch at `offset`; anything else is the plain walk.
+static bool flags_live_after_branch(const uint8_t *inst, size_t len,
+                                    size_t offset, uint32_t concerns)
+{
+    xed_decoded_inst_t j;
+    if (decode_at(inst, len, offset, &j) && is_jcc(&j)) {
+        size_t fall = offset + xed_decoded_inst_get_length(&j);
+        int64_t t = direct_target(&j, fall, len);
+        if (t < 0) {
+            return true;
+        }
+        return flags_live_after(inst, len, fall, concerns) ||
+            flags_live_after(inst, len, (size_t) t, concerns);
+    }
+    return flags_live_after(inst, len, offset, concerns);
+}
+
+// 1. A direct branch whose target is itself an unconditional direct jump:
+// retarget the first to where the second goes. One taken branch fewer on
+// every traversal and no register or flag is involved; the only gate is that
+// the new displacement still fits the branch's current width.
+static bool c_branch_chain(const uint8_t *inst, size_t len,
+                           const uint8_t *targets, size_t offset, size_t next,
+                           const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets;
+    if (!is_direct_jmp(d) && !is_jcc(d)) {
+        return false;
+    }
+    int64_t t = direct_target(d, next, len);
+    xed_decoded_inst_t hop;
+    if (t < 0 || !decode_at(inst, len, (size_t) t, &hop) ||
+        !is_direct_jmp(&hop)) {
+        return false;
+    }
+    int64_t t2 = direct_target(&hop, (size_t) t +
+        xed_decoded_inst_get_length(&hop), len);
+    if (t2 < 0) {
+        REFUSE("the second hop leaves the section");
+    }
+    if ((size_t) t2 == offset) {
+        REFUSE("a two-jump loop");
+    }
+    if (xed_decoded_inst_get_branch_displacement_width(d) == 1 &&
+        !fits_rel8(t2 - (int64_t) next)) {
+        REFUSE("the retargeted rel8 branch would need rel32");
+    }
+    return true;
+}
+
+// 2. `Jcc L1 ; JMP L2 ; L1:` -- the conditional branch hops over the jump.
+// Inverting the condition to `JNcc L2` deletes the jump. Gated on nothing
+// entering the jump from elsewhere and on the inverted branch still reaching.
+static bool c_jcc_over_jmp(const uint8_t *inst, size_t len,
+                           const uint8_t *targets, size_t offset, size_t next,
+                           const xed_decoded_inst_t *d, const char **why)
+{
+    (void) offset;
+    if (!is_jcc(d)) {
+        return false;
+    }
+    xed_decoded_inst_t jmp;
+    if (!decode_at(inst, len, next, &jmp) || !is_direct_jmp(&jmp)) {
+        return false;
+    }
+    size_t after_jmp = next + xed_decoded_inst_get_length(&jmp);
+    int64_t t = direct_target(d, next, len);
+    if (t < 0 || (size_t) t != after_jmp) {
+        return false;
+    }
+    int64_t t2 = direct_target(&jmp, after_jmp, len);
+    if (t2 < 0) {
+        REFUSE("the jump leaves the section");
+    }
+    if (branch_target_in(targets, next, after_jmp)) {
+        REFUSE("a branch targets the jump");
+    }
+    // The inverted branch replaces both instructions: rel8 if it reaches,
+    // else the 6-byte rel32 form, which still wins unless both originals
+    // were rel8 (2 + 2 bytes).
+    if (!fits_rel8(t2 - (int64_t) next) &&
+        xed_decoded_inst_get_length(d) + xed_decoded_inst_get_length(&jmp) < 6) {
+        REFUSE("a rel32 inversion would outgrow the rel8 pair");
+    }
+    return true;
+}
+
+// 3. `JMP L` where L is a bare RET: a RET in place is one byte for two or
+// five, and the return predictor sees the return where it happens. No gate:
+// the jump is replaced in place, so a branch onto it still works.
+static bool c_jmp_to_ret(const uint8_t *inst, size_t len,
+                         const uint8_t *targets, size_t offset, size_t next,
+                         const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets; (void) offset; (void) why;
+    if (!is_direct_jmp(d)) {
+        return false;
+    }
+    int64_t t = direct_target(d, next, len);
+    xed_decoded_inst_t x;
+    return t >= 0 && decode_at(inst, len, (size_t) t, &x) && is_ret(&x);
+}
+
+// 4. `JMP L` where L is a short epilogue -- POPs and an ADD RSP, then RET.
+// Duplicating it in place of the jump removes a taken branch; it is a size
+// win or neutral only while the epilogue is no longer than the jump.
+static bool c_jmp_to_epilogue(const uint8_t *inst, size_t len,
+                              const uint8_t *targets, size_t offset,
+                              size_t next, const xed_decoded_inst_t *d,
+                              const char **why)
+{
+    (void) targets; (void) offset;
+    if (!is_direct_jmp(d)) {
+        return false;
+    }
+    int64_t t = direct_target(d, next, len);
+    if (t < 0) {
+        return false;
+    }
+    size_t off = (size_t) t, bytes = 0;
+    for (int n = 0; n < 6; ++n) {
+        xed_decoded_inst_t x;
+        if (!decode_at(inst, len, off, &x)) {
+            return false;
+        }
+        bytes += xed_decoded_inst_get_length(&x);
+        if (is_ret(&x)) {
+            if (n == 0) {
+                return false;           // the bare-RET candidate's
+            }
+            if (bytes > xed_decoded_inst_get_length(d)) {
+                REFUSE("the epilogue is longer than the jump");
+            }
+            return true;
+        }
+        xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(&x);
+        if (ic == XED_ICLASS_POP && explicit_reg(&x, XED_OPERAND_REG0) !=
+                XED_REG_INVALID) {
+            // fine
+        } else if ((ic == XED_ICLASS_ADD || ic == XED_ICLASS_LEAVE) &&
+                   (ic == XED_ICLASS_LEAVE ||
+                    explicit_reg(&x, XED_OPERAND_REG0) == XED_REG_RSP)) {
+            // fine
+        } else {
+            return false;
+        }
+        off += xed_decoded_inst_get_length(&x);
+    }
+    return false;
+}
+
+// 5. `MOV RSP, RBP ; POP RBP` is LEAVE by definition: one byte for four. The
+// `ADD RSP, imm ; POP RBP` spelling is LEAVE only when RBP was set from RSP
+// before exactly that allocation, which needs the prologue; counted, refused.
+static bool c_leave(const uint8_t *inst, size_t len, const uint8_t *targets,
+                    size_t offset, size_t next, const xed_decoded_inst_t *d,
+                    const char **why)
+{
+    (void) targets; (void) offset;
+    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(d);
+    if (xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        explicit_reg(d, XED_OPERAND_REG0) != XED_REG_RSP) {
+        return false;
+    }
+    bool exact;
+    if (ic == XED_ICLASS_MOV && explicit_reg(d, XED_OPERAND_REG1) == XED_REG_RBP) {
+        exact = true;
+    } else if (ic == XED_ICLASS_ADD && xed_operand_values_has_immediate(
+                   xed_decoded_inst_operands_const(d))) {
+        exact = false;
+    } else {
+        return false;
+    }
+    xed_decoded_inst_t pop;
+    if (!decode_at(inst, len, next, &pop) ||
+        xed_decoded_inst_get_iclass(&pop) != XED_ICLASS_POP ||
+        explicit_reg(&pop, XED_OPERAND_REG0) != XED_REG_RBP) {
+        return false;
+    }
+    if (!exact) {
+        REFUSE("ADD form: the frame relation needs the prologue");
+    }
+    return true;
+}
+
+// 6. A slot-sized stack adjustment. `SUB RSP, 8` is `PUSH RAX` (one byte for
+// four) while the flags are dead; `ADD RSP, 8` before an epilogue's POPs and
+// RET is `POP RCX`, RCX being no return register. LLVM emits the push/pop
+// forms (X86FrameLowering::emitSPUpdate); GCC does not.
+static bool slot_adjust(const uint8_t *inst, size_t len, size_t next,
+                        const xed_decoded_inst_t *d, const char **why,
+                        xed_iclass_enum_t want)
+{
+    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(d);
+    if (ic != want ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0 ||
+        explicit_reg(d, XED_OPERAND_REG0) != XED_REG_RSP ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d)) ||
+        xed_decoded_inst_get_signed_immediate(d) != 8) {
+        return false;
+    }
+    if (ic == XED_ICLASS_SUB) {
+        if (flags_live_after(inst, len, next, FLAG_ARITH)) {
+            REFUSE("the flags are live afterward");
+        }
+        return true;
+    }
+    size_t off = next;
+    for (int n = 0; n < 8; ++n) {
+        xed_decoded_inst_t x;
+        if (!decode_at(inst, len, off, &x)) {
+            REFUSE("undecodable epilogue");
+        }
+        if (is_ret(&x)) {
+            return true;
+        }
+        if (xed_decoded_inst_get_iclass(&x) == XED_ICLASS_POP) {
+            off += xed_decoded_inst_get_length(&x);
+            continue;
+        }
+        if (xed_decoded_inst_get_category(&x) == XED_CATEGORY_UNCOND_BR) {
+            REFUSE("a tail call follows: RCX may carry an argument");
+        }
+        REFUSE("not followed by POPs and RET");
+    }
+    REFUSE("not followed by POPs and RET");
+}
+
+static bool c_slot_sub(const uint8_t *inst, size_t len, const uint8_t *targets,
+                       size_t offset, size_t next, const xed_decoded_inst_t *d,
+                       const char **why)
+{
+    (void) targets; (void) offset;
+    return slot_adjust(inst, len, next, d, why, XED_ICLASS_SUB);
+}
+
+static bool c_slot_add(const uint8_t *inst, size_t len, const uint8_t *targets,
+                       size_t offset, size_t next, const xed_decoded_inst_t *d,
+                       const char **why)
+{
+    (void) targets; (void) offset;
+    return slot_adjust(inst, len, next, d, why, XED_ICLASS_ADD);
+}
+
+static bool cc_is_zero_test(xed_iclass_enum_t ic)
+{
+    switch (ic) {
+    case XED_ICLASS_JZ: case XED_ICLASS_JNZ:
+    case XED_ICLASS_SETZ: case XED_ICLASS_SETNZ:
+    case XED_ICLASS_CMOVZ: case XED_ICLASS_CMOVNZ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool cc_is_unsigned(xed_iclass_enum_t ic)
+{
+    switch (ic) {
+    case XED_ICLASS_JB: case XED_ICLASS_JNB: case XED_ICLASS_JBE:
+    case XED_ICLASS_JNBE:
+    case XED_ICLASS_SETB: case XED_ICLASS_SETNB: case XED_ICLASS_SETBE:
+    case XED_ICLASS_SETNBE:
+    case XED_ICLASS_CMOVB: case XED_ICLASS_CMOVNB: case XED_ICLASS_CMOVBE:
+    case XED_ICLASS_CMOVNBE:
+        return true;
+    default:
+        return cc_is_zero_test(ic);
+    }
+}
+
+// 7. `PMOVMSKB r32, xmm ; TEST r32, r32 ; JZ/JNZ` is `PTEST xmm, xmm ; JZ/JNZ`
+// (SSE4.1): ZF is set exactly when the vector is all zero, so the mask never
+// needs to exist. PTEST clears SF/PF/OF and sets CF where TEST does the
+// reverse, so those must be dead on both paths, and the mask register too.
+static bool c_ptest(const uint8_t *inst, size_t len, const uint8_t *targets,
+                    size_t offset, size_t next, const xed_decoded_inst_t *d,
+                    const char **why)
+{
+    (void) targets; (void) offset;
+    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(d);
+    if (ic != XED_ICLASS_PMOVMSKB && ic != XED_ICLASS_VPMOVMSKB) {
+        return false;
+    }
+    xed_reg_enum_t mask = explicit_reg(d, XED_OPERAND_REG0);
+    xed_reg_enum_t vec = explicit_reg(d, XED_OPERAND_REG1);
+    if (mask == XED_REG_INVALID || vec == XED_REG_INVALID ||
+        xed_reg_class(vec) == XED_REG_CLASS_MMX) {
+        return false;
+    }
+    xed_decoded_inst_t test;
+    if (!decode_at(inst, len, next, &test) ||
+        xed_decoded_inst_get_iclass(&test) != XED_ICLASS_TEST ||
+        xed_decoded_inst_number_of_memory_operands(&test) != 0 ||
+        explicit_reg(&test, XED_OPERAND_REG0) != mask ||
+        explicit_reg(&test, XED_OPERAND_REG1) != mask) {
+        return false;
+    }
+    size_t after_test = next + xed_decoded_inst_get_length(&test);
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, after_test, &use)) {
+        return false;
+    }
+    if (branch_target_in(targets, next, after_test)) {
+        REFUSE("a branch targets the test");
+    }
+    if (!cc_is_zero_test(xed_decoded_inst_get_iclass(&use))) {
+        REFUSE("the consumer reads a flag PTEST sets differently");
+    }
+    if (reg_live_after_branch(inst, len, after_test,
+            xed_get_largest_enclosing_register(mask))) {
+        REFUSE("the mask is live afterward");
+    }
+    size_t after_use = after_test + xed_decoded_inst_get_length(&use);
+    bool live = is_jcc(&use)
+        ? flags_live_after_branch(inst, len, after_test,
+              FLAG_CF | FLAG_SF | FLAG_PF | FLAG_OF)
+        : flags_live_after(inst, len, after_use,
+              FLAG_CF | FLAG_SF | FLAG_PF | FLAG_OF);
+    if (live) {
+        REFUSE("CF/SF/PF/OF are live afterward");
+    }
+    return true;
+}
+
+// 8. `MOV rD, rS ; SHR/SHL rD, n` followed by a consumer that discards the
+// bits a rotate would bring in is `RORX rD, rS, n'` (BMI2): non-destructive,
+// so the copy goes, and flag-silent, which the masking AND makes moot.
+static bool c_rorx(const uint8_t *inst, size_t len, const uint8_t *targets,
+                   size_t offset, size_t next, const xed_decoded_inst_t *d,
+                   const char **why)
+{
+    (void) targets; (void) offset;
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(d) != 0) {
+        return false;
+    }
+    xed_reg_enum_t dst = explicit_reg(d, XED_OPERAND_REG0);
+    xed_reg_enum_t src = explicit_reg(d, XED_OPERAND_REG1);
+    unsigned w = xed_decoded_inst_get_operand_width(d);
+    if (dst == XED_REG_INVALID || src == XED_REG_INVALID ||
+        xed_reg_class(dst) != XED_REG_CLASS_GPR || (w != 32 && w != 64)) {
+        return false;
+    }
+    xed_decoded_inst_t sh;
+    if (!decode_at(inst, len, next, &sh)) {
+        return false;
+    }
+    xed_iclass_enum_t sic = xed_decoded_inst_get_iclass(&sh);
+    if ((sic != XED_ICLASS_SHR && sic != XED_ICLASS_SHL) ||
+        xed_decoded_inst_number_of_memory_operands(&sh) != 0 ||
+        !xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&sh)) ||
+        explicit_reg(&sh, XED_OPERAND_REG0) != dst ||
+        xed_decoded_inst_get_operand_width(&sh) != w) {
+        return false;
+    }
+    uint64_t n = xed_decoded_inst_get_unsigned_immediate(&sh) & (w - 1);
+    if (n == 0) {
+        return false;
+    }
+    size_t after_sh = next + xed_decoded_inst_get_length(&sh);
+    if (branch_target_in(targets, next, after_sh)) {
+        REFUSE("a branch targets the shift");
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, after_sh, &use)) {
+        return false;
+    }
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if (uic == XED_ICLASS_AND &&
+        xed_decoded_inst_number_of_memory_operands(&use) == 0 &&
+        explicit_reg(&use, XED_OPERAND_REG0) == dst &&
+        xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&use))) {
+        int64_t m = xed_decoded_inst_get_signed_immediate(&use);
+        if (m < 0) {
+            REFUSE("the mask keeps rotated-in bits");
+        }
+        uint64_t um = (uint64_t) m;
+        bool ok = sic == XED_ICLASS_SHR
+            ? (w - n >= 63 || um < ((uint64_t) 1 << (w - n)))
+            : ((um & (((uint64_t) 1 << n) - 1)) == 0);
+        if (!ok) {
+            REFUSE("the mask keeps rotated-in bits");
+        }
+        return true;                    // AND rewrites every flag anyway
+    }
+    if (uic == XED_ICLASS_MOVZX && sic == XED_ICLASS_SHR &&
+        xed_decoded_inst_number_of_memory_operands(&use) == 0) {
+        xed_reg_enum_t s = explicit_reg(&use, XED_OPERAND_REG1);
+        unsigned sw = s == XED_REG_INVALID ? 0 :
+            xed_get_register_width_bits64(s);
+        if (s == XED_REG_INVALID || xed_get_largest_enclosing_register(s) !=
+                xed_get_largest_enclosing_register(dst) || sw == 0 ||
+            n > w - sw) {
+            REFUSE("the mask keeps rotated-in bits");
+        }
+        if (flags_live_after(inst, len, after_sh, FLAG_ARITH)) {
+            REFUSE("the shift's flags are live");
+        }
+        return true;
+    }
+    REFUSE("no masking consumer follows");
+}
+
+// 9. `MOVZX r32, r8 ; CMP r32, imm8u` (or TEST r32, r32) feeding an equality
+// or unsigned condition is `CMP r8, imm8` (TEST r8, r8): the extension exists
+// only to widen an operand the byte form compares identically. The extended
+// register must die with the consumer. With a memory source it is
+// `CMP BYTE PTR [mem], imm8`, the arm "load foldable into compare" does not
+// reach because its producer is a plain MOV.
+static bool movzx_cmp(const uint8_t *inst, size_t len, const uint8_t *targets,
+                      size_t next, const xed_decoded_inst_t *d,
+                      const char **why, bool want_mem)
+{
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOVZX ||
+        (xed_decoded_inst_number_of_memory_operands(d) != 0) != want_mem) {
+        return false;
+    }
+    xed_reg_enum_t dst = explicit_reg(d, XED_OPERAND_REG0);
+    if (dst == XED_REG_INVALID) {
+        return false;
+    }
+    unsigned srcw = want_mem ? xed_decoded_inst_get_memory_operand_length(d, 0) * 8
+        : (explicit_reg(d, XED_OPERAND_REG1) == XED_REG_INVALID ? 0 :
+           xed_get_register_width_bits64(explicit_reg(d, XED_OPERAND_REG1)));
+    if (srcw != 8) {
+        return false;
+    }
+    xed_decoded_inst_t cmp;
+    if (!decode_at(inst, len, next, &cmp)) {
+        return false;
+    }
+    xed_iclass_enum_t cic = xed_decoded_inst_get_iclass(&cmp);
+    bool is_test;
+    if (cic == XED_ICLASS_CMP &&
+        xed_decoded_inst_number_of_memory_operands(&cmp) == 0 &&
+        explicit_reg(&cmp, XED_OPERAND_REG0) == dst &&
+        xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(&cmp))) {
+        int64_t v = xed_decoded_inst_get_signed_immediate(&cmp);
+        if (v < 0 || v > 255) {
+            return false;
+        }
+        is_test = false;
+    } else if (cic == XED_ICLASS_TEST &&
+               xed_decoded_inst_number_of_memory_operands(&cmp) == 0 &&
+               explicit_reg(&cmp, XED_OPERAND_REG0) == dst &&
+               explicit_reg(&cmp, XED_OPERAND_REG1) == dst) {
+        is_test = true;
+    } else {
+        return false;
+    }
+    size_t after_cmp = next + xed_decoded_inst_get_length(&cmp);
+    if (branch_target_in(targets, next, after_cmp)) {
+        REFUSE("a branch targets the compare");
+    }
+    xed_decoded_inst_t use;
+    if (!decode_at(inst, len, after_cmp, &use)) {
+        return false;
+    }
+    xed_iclass_enum_t uic = xed_decoded_inst_get_iclass(&use);
+    if (!(is_test ? cc_is_zero_test(uic) : cc_is_unsigned(uic))) {
+        REFUSE("a signed condition (or no condition) reads the compare");
+    }
+    xed_reg_enum_t dst64 = xed_get_largest_enclosing_register(dst);
+    bool live = is_jcc(&use)
+        ? reg_live_after_branch(inst, len, after_cmp, dst64)
+        : reg_live_after(inst, len, after_cmp +
+              xed_decoded_inst_get_length(&use), dst64);
+    if (live) {
+        REFUSE("the extended value is live afterward");
+    }
+    return true;
+}
+
+static bool c_movzx_cmp_reg(const uint8_t *inst, size_t len,
+                            const uint8_t *targets, size_t offset,
+                            size_t next, const xed_decoded_inst_t *d,
+                            const char **why)
+{
+    (void) offset;
+    return movzx_cmp(inst, len, targets, next, d, why, false);
+}
+
+static bool c_movzx_cmp_mem(const uint8_t *inst, size_t len,
+                            const uint8_t *targets, size_t offset,
+                            size_t next, const xed_decoded_inst_t *d,
+                            const char **why)
+{
+    (void) offset;
+    return movzx_cmp(inst, len, targets, next, d, why, true);
+}
+
+// 10. `CALL f ; RET` -- a call in tail position that was not made a jump.
+// Counted as a shape; the bytes cannot show what refused the sibcall (a
+// landing pad in the LSDA, stack-argument mismatch).
+static bool c_call_ret(const uint8_t *inst, size_t len,
+                       const uint8_t *targets, size_t offset, size_t next,
+                       const xed_decoded_inst_t *d, const char **why)
+{
+    (void) targets; (void) offset;
+    if (xed_decoded_inst_get_category(d) != XED_CATEGORY_CALL ||
+        xed_decoded_inst_get_branch_displacement_width(d) == 0) {
+        return false;
+    }
+    xed_decoded_inst_t x;
+    if (!decode_at(inst, len, next, &x)) {
+        return false;
+    }
+    if (is_ret(&x)) {
+        return true;
+    }
+    if (xed_decoded_inst_get_iclass(&x) == XED_ICLASS_POP) {
+        xed_decoded_inst_t y;
+        if (decode_at(inst, len, next + xed_decoded_inst_get_length(&x), &y) &&
+            is_ret(&y)) {
+            REFUSE("one POP intervenes (POP ; JMP f)");
+        }
+    }
+    return false;
+}
+
+// A frame-slot MOV: base RSP or RBP, no index. Returns the GPR moved and
+// fills the slot's address; `store` says which direction.
+static xed_reg_enum_t frame_slot_mov(const xed_decoded_inst_t *x, bool store,
+                                     xed_reg_enum_t *base, int64_t *disp,
+                                     unsigned *width)
+{
+    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(x);
+    bool vec = ic == XED_ICLASS_MOVUPS || ic == XED_ICLASS_MOVAPS ||
+        ic == XED_ICLASS_MOVDQU || ic == XED_ICLASS_MOVDQA;
+    if ((ic != XED_ICLASS_MOV && !vec) ||
+        xed_decoded_inst_number_of_memory_operands(x) != 1 ||
+        xed_decoded_inst_mem_written(x, 0) != store ||
+        xed_decoded_inst_get_index_reg(x, 0) != XED_REG_INVALID ||
+        xed_decoded_inst_get_seg_reg(x, 0) != XED_REG_INVALID) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t b = xed_decoded_inst_get_base_reg(x, 0);
+    if (b != XED_REG_RSP && b != XED_REG_RBP) {
+        return XED_REG_INVALID;
+    }
+    xed_reg_enum_t r = explicit_reg(x, XED_OPERAND_REG0);
+    if (r == XED_REG_INVALID || (ic == XED_ICLASS_MOV &&
+            xed_reg_class(r) != XED_REG_CLASS_GPR)) {
+        return XED_REG_INVALID;
+    }
+    *base = b;
+    *disp = xed_decoded_inst_get_memory_displacement(x, 0);
+    *width = xed_decoded_inst_get_memory_operand_length(x, 0);
+    return r;
+}
+
+// 11. A store to a frame slot followed at once by a load of the identical
+// slot: the value is still in the store's source register, so the load is a
+// register copy, or nothing when it targets that register (#29's sibling
+// shape; the "Forward a spill slot to the reload of it" LLVM change).
+static bool c_store_reload(const uint8_t *inst, size_t len,
+                           const uint8_t *targets, size_t offset, size_t next,
+                           const xed_decoded_inst_t *d, const char **why)
+{
+    (void) offset;
+    xed_reg_enum_t b1, b2; int64_t d1, d2; unsigned w1, w2;
+    xed_reg_enum_t src = frame_slot_mov(d, true, &b1, &d1, &w1);
+    if (src == XED_REG_INVALID) {
+        return false;
+    }
+    xed_decoded_inst_t ld;
+    if (!decode_at(inst, len, next, &ld)) {
+        return false;
+    }
+    xed_reg_enum_t dst = frame_slot_mov(&ld, false, &b2, &d2, &w2);
+    if (dst == XED_REG_INVALID || b1 != b2 || d1 != d2 || w1 != w2) {
+        return false;
+    }
+    if (branch_target_in(targets, next, next + xed_decoded_inst_get_length(&ld))) {
+        REFUSE("a branch targets the reload");
+    }
+    if (dst != src) {
+        REFUSE("into another register (a copy, not a deletion)");
+    }
+    return true;
+}
+
+// 12. A frame slot loaded into a register that is immediately stored to
+// another frame slot and then dies: an aggregate copied stack-to-stack
+// through a register. No instruction-level rewrite exists; this is the
+// advisory class "copy the compiler failed to elide", sized so the LLVM
+// question (memcpy/move elision, Rust in particular) has a number.
+static bool c_stack_copy(const uint8_t *inst, size_t len,
+                         const uint8_t *targets, size_t offset, size_t next,
+                         const xed_decoded_inst_t *d, const char **why)
+{
+    (void) offset;
+    xed_reg_enum_t b1, b2; int64_t d1, d2; unsigned w1, w2;
+    xed_reg_enum_t r = frame_slot_mov(d, false, &b1, &d1, &w1);
+    if (r == XED_REG_INVALID) {
+        return false;
+    }
+    xed_decoded_inst_t st;
+    if (!decode_at(inst, len, next, &st)) {
+        return false;
+    }
+    if (frame_slot_mov(&st, true, &b2, &d2, &w2) != r || w1 != w2) {
+        return false;
+    }
+    size_t after = next + xed_decoded_inst_get_length(&st);
+    if (branch_target_in(targets, next, after)) {
+        REFUSE("a branch targets the store");
+    }
+    if (xed_reg_class(r) != XED_REG_CLASS_GPR) {
+        REFUSE("vector copy (liveness not modeled)");
+    }
+    if (reg_live_after_branch(inst, len, after,
+            xed_get_largest_enclosing_register(r))) {
+        REFUSE("the register is live afterward (load and spill)");
+    }
+    return true;
 }
 
 static const struct candidate candidates[] = {
@@ -792,6 +1472,31 @@ static const struct candidate candidates[] = {
       c_bitscan_default, NULL },
     { "reloaded frame slot (#29)", "reuse the first value",
       c_stack_reload, NULL },
+
+    // 2026-09-27 four-toolchain sweep (libxul, libLLVM, libclang-cpp,
+    // librustc_driver, uutils coreutils). See "Four-toolchain corpus" in
+    // TODO.md for the figures and the reading of each.
+    { "branch to a jump (chain)", "retarget to the final destination",
+      c_branch_chain, NULL },
+    { "Jcc over a JMP", "invert the condition, delete the jump",
+      c_jcc_over_jmp, NULL },
+    { "jump to a RET", "RET in place", c_jmp_to_ret, NULL },
+    { "jump to a short epilogue", "duplicate the epilogue in place",
+      c_jmp_to_epilogue, NULL },
+    { "epilogue foldable into LEAVE", "LEAVE", c_leave, NULL },
+    { "slot-sized SUB RSP in a prologue", "PUSH RAX", c_slot_sub, NULL },
+    { "slot-sized ADD RSP before POPs and RET", "POP RCX", c_slot_add, NULL },
+    { "missing PTEST (-m sse4.1)", "PTEST xmm, xmm", c_ptest, NULL },
+    { "missing RORX (-m bmi2)", "RORX rD, rS, n", c_rorx, NULL },
+    { "MOVZX feeding a narrow-safe compare", "CMP r8, imm8",
+      c_movzx_cmp_reg, NULL },
+    { "MOVZX load feeding a compare", "CMP BYTE PTR [mem], imm8",
+      c_movzx_cmp_mem, NULL },
+    { "CALL then RET (sibcall miss)", "JMP f", c_call_ret, NULL },
+    { "frame slot stored then reloaded (#29)", "delete the reload",
+      c_store_reload, NULL },
+    { "stack-to-stack copy through a register", "advisory: elide the copy",
+      c_stack_copy, NULL },
 };
 
 #define NCAND (sizeof(candidates) / sizeof(candidates[0]))
@@ -805,7 +1510,7 @@ struct file_result {
 struct scan_ctx {
     struct file_result *fr;
     const char *example;        // candidate name substring, or NULL
-    long left;                  // examples still to print
+    long left[NCAND];           // examples still to print, per candidate
 };
 
 // Mirror the driver's own scan over one section: mask the bytes outside the
@@ -834,7 +1539,7 @@ static void scan_section(const corpus_section *sec, void *vctx)
         bool want = ctx->example != NULL &&
             strstr(candidates[i].name, ctx->example) != NULL;
         candidates[i].run(buf, sec->size, targets, &ctx->fr->t[i], sec->path,
-            sec->vaddr, want ? ctx->example : NULL, &ctx->left);
+            sec->vaddr, want ? ctx->example : NULL, &ctx->left[i]);
     }
 
     for (size_t offset = 0; offset < sec->size;) {
@@ -861,14 +1566,15 @@ static void scan_section(const corpus_section *sec, void *vctx)
             ++ctx->fr->t[i].shape;
             if (hit) {
                 ++ctx->fr->t[i].realized;
-                if (ctx->example != NULL && ctx->left > 0 &&
+                if (ctx->example != NULL && ctx->left[i] > 0 &&
                     strstr(candidates[i].name, ctx->example) != NULL) {
                     char text[128];
                     xed_format_context(XED_SYNTAX_INTEL, &xedd, text,
                         sizeof(text), sec->vaddr + offset, NULL, NULL);
-                    printf("  %s+0x%" PRIx64 ": %s\n", sec->path,
-                        sec->vaddr + offset, text);
-                    --ctx->left;
+                    printf("  [%s] %s+0x%" PRIx64 ": %s\n",
+                        candidates[i].name, sec->path, sec->vaddr + offset,
+                        text);
+                    --ctx->left[i];
                 }
             } else {
                 tally_refusal(&ctx->fr->t[i], why);
@@ -984,11 +1690,13 @@ int main(int argc, char **argv)
     int rc = 0;
     for (size_t f = 0; f < nfr; ++f) {
         fr[f].path = argv[argi + (int) f];
-        struct scan_ctx ctx = { &fr[f], example, nexamples };
+        struct scan_ctx ctx = { &fr[f], example, { 0 } };
+        for (size_t i = 0; i < NCAND; ++i) {
+            ctx.left[i] = nexamples;
+        }
         if (corpus_scan_file(fr[f].path, scan_all, scan_section, &ctx) != 0) {
             rc = 2;
         }
-        nexamples = ctx.left;
     }
 
     if (example == NULL) {

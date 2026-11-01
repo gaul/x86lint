@@ -1735,6 +1735,296 @@ this fix cannot reach them -- a JIT-aware suppression would have to
 recognize the shape (`movabs` of 0 or -1 whose destination is immediately
 pushed or called) rather than read a table.
 
+## Four-toolchain corpus (2026-09-27)
+
+Five binaries, three compilers, one machine. The 2026-08 and 2026-09 sweeps
+were LLVM output plus glibc/bash/go; this one adds GCC's, so a check can be
+read as a *compiler habit* rather than an x86 fact. Instruction counts are
+the driver's symbol- or FDE-restricted scans.
+
+| binary | compiler | instructions | findings | per 1k | per 1k without the SSE spellings |
+| --- | --- | --- | --- | --- | --- |
+| Fedora Firefox `libxul.so` | clang 22 + rustc (PGO, hot/cold split; C++ and Rust) | 25,467,313 | 250,155 | 9.82 | 3.22 |
+| `librustc_driver.so` (`.bolt.org.text`) | rustc 1.97.1 / LLVM 22.1.6, PGO + BOLT | 14,585,090 | 253,876 | 17.41 | 3.94 |
+| uutils `coreutils` | rustc 1.97.1 / LLVM 22.1.6 | 1,670,580 | 24,265 | 14.52 | 2.75 |
+| Fedora `libLLVM.so.22.1` | **GCC 16** | 18,191,008 | 72,756 | 4.00 | 2.22 |
+| Fedora `libclang-cpp.so.22.1` | **GCC 16** | 10,920,736 | 29,148 | 2.67 | 1.93 |
+
+**Fedora's LLVM is GCC-built, and the bytes had to say so** -- `.comment`
+is stripped from every Fedora binary. The fingerprint that settled it is
+INC/DEC: LLVM's generic tuning never emits them (`TuningSlowIncDec`) and
+GCC's does, so libLLVM has 135k `inc r32` against 357 `add r32, 1` where
+libxul has 95k against 22k, and "oversized ADD/SUB one" reports 29,033 on
+libxul and **0** on libLLVM. `.plt.sec` (GNU ld's IBT PLT) and 43% of
+functions carrying a stack-protector guard agree. Byte fingerprints beat
+finding counts for this: the counts are what is being attributed.
+
+### Which checks are compiler habits
+
+Per million instructions, libxul / rustc / coreutils / libLLVM / libclang-cpp:
+
+| check | libxul | rustc | coreutils | libLLVM (GCC) | libclang-cpp (GCC) | reading |
+| --- | --- | --- | --- | --- | --- | --- |
+| suboptimal SSE MOV opcode | 5,315 | 13,187 | 11,020 | 1,467 | 650 | universal; GCC 4-10x lower but not zero |
+| suboptimal SSE zero idiom | 1,286 | 280 | 758 | 314 | 92 | universal |
+| missing SSE dependency break | 408 | 3 | 53 | 7 | 2 | **clang C++**: `cvtsi2sd` with no `xorps`; GCC inserts the break, rustc rarely converts |
+| oversized ADD/SUB one | 1,140 | 58 | 160 | 0 | 0 | **LLVM only** (generic tuning) |
+| suboptimal SHL one | 125 | 12 | 149 | 0 | 1 | LLVM only, fixed on main (#217508) |
+| redundant TEST after shift | 127 | 24 | 165 | 3 | 20 | LLVM only, fixed on main (#220744) |
+| oversized TEST immediate | 87 | 0 | 0 | 1 | 0 | clang only |
+| load foldable into compare | 144 | 61 | 214 | 8 | 5 | LLVM (atomics; PR #221290) |
+| constant condition (both arms) | 25 | 21 | 174 | 0 | 1 | LLVM; Rust-heavy |
+| branch to the next instruction | 9 | 246 | 23 | 1 | 6 | **rustc**: empty landing pads, see below |
+| redundant TEST after flags | 4 | 3 | 10 | 170 | 58 | **GCC only** |
+| oversized LEA width | 8 | 0 | 1 | 129 | 2 | GCC only (REX.W on 32-bit address arithmetic) |
+| MOV constant foldable | 14 | 39 | 75 | 205 | 149 | GCC-leaning |
+| suboptimal MOV zero | 71 | 89 | 170 | 365 | 222 | GCC-leaning (`mov r, 0` while flags live) |
+| MOV+ADD foldable to LEA | 48 | 256 | 306 | 362 | 179 | universal; largest in GCC |
+| load foldable into ALU | 9 | 4 | 16 | 3 | 170 | libclang-cpp only (`mov al, [rsp+x]` then ALU) |
+| redundant ADD/SUB zero, unneeded zero displacement | 0 | 0 | 0 | 0 | 16 / 14 | GCC TLS access sequences (`add r, 0`, `cmp [fs:rax+0], 0`) |
+| oversized EVEX encoding | 0 | 0 | 0 | 28 | 0 | GCC's `vpxord ymm` in AVX-512 code paths |
+| merging narrow move | 270 | 645 | 10 | 257 | 430 | universal (both compilers keep byte loads at -O2) |
+| length-changing prefix stall (`-c all`) | 2,452 | 1,002 | 1,558 | 2,856 | 2,853 | universal, GCC slightly higher |
+
+Two things the table settles. GCC 16's code carries **fewer findings per
+instruction than clang 22's** once the SSE spellings are set aside
+(1.9-2.2 against 3.2), and the difference is four clang-only rows: INC/DEC
+avoidance, the SHL/TEST pair already fixed on main, the missing
+`cvtsi2sd` break, and `test r32, small-imm`. The GCC-only rows are the
+mirror image: a TEST after a flag-setting ALU op, REX.W on LEAs, and
+`mov r, 0`. Neither compiler is free of the LEA/ADD/MOV+ADD folds.
+
+### Build properties
+
+`-p`/`-e`/`-s`/`-j`/`-i` over the same five:
+
+| | libxul | rustc | coreutils | libLLVM | libclang-cpp |
+| --- | --- | --- | --- | --- | --- |
+| stack protector | (2 exported functions; 89,037 `sub %fs:0x28` compares in the bytes) | none (guard setup only) | none | 43.0% of 32,079 exported | 40.5% of 31,586 |
+| frame pointers | 42,346 `push rbp; mov rbp, rsp` in the bytes | 1.7% | 8.8% | 0% | 0% |
+| IBT | no note; 5 of 10 targets ENDBR (asm) | no | no note; 6 of 2,091 | note + all 30,987 targets | note + all 30,072 |
+| speculation thunks | none | none | none | none | none |
+| JCC erratum padding | absent | absent | absent | absent | absent |
+
+**`-p` cannot see libxul**: `.symtab` is stripped and `.dynsym` exports
+two functions, so the coverage fractions are meaningless there while
+`.eh_frame` describes 307,434 functions. The census already uses FDEs as
+code evidence; `-p` should take its denominator from them when the symbol
+table is gone.
+
+### Whole-image audits the instruction checks cannot make
+
+Three measurements made outside the decode loop, each a candidate for a
+`-p`-style row. Scripts: an ELF pass over `.rela.dyn`/`.rela.plt`, the
+PLT's `jmp *GOT` bodies and the code's `e8`/`ff 15`/rip-relative `8b`
+references, and an `.eh_frame` FDE walk for function bounds.
+
+**Interposable references to the object's own symbols.** A shared library
+built without `-fno-semantic-interposition`, `-Bsymbolic` or hidden
+visibility reaches its own default-visibility globals through the GOT and
+its own functions through the PLT, because the dynamic linker may
+interpose them.
+
+| binary | PLT slots -> own function | calls into them | GOT slots -> own symbol | rip-relative references to those |
+| --- | --- | --- | --- | --- |
+| libxul | 0 of 2,674 | 0 | 0 of 581 | 0 (hidden visibility throughout) |
+| coreutils | 0 of 13 | 0 | 0 of 196 | 0 |
+| libLLVM (GCC) | 0 of 374 | 0 | **1,746 of 1,809** (all data) | **20,455** loads (3,492 to imports) |
+| libclang-cpp (GCC) | 0 of 2,027 | 0 | **749 of 845** | **4,684** loads (`clang::Stmt::StatisticsEnabled` 715, vtables, function-local statics) |
+| librustc_driver | 1 of 382 | 2 | **568 of 1,140, 542 of them functions** | **179,198 `call *GOT`** and 10,421 loads in `.bolt.org.text` alone (260,991 calls counting BOLT's copies) |
+
+LLVM's own build adds `-fno-semantic-interposition` (HandleLLVMOptions.cmake,
+D117183), which is why no libLLVM *function* goes through the PLT; the flag
+does nothing for data, and vtables and `Statistic` globals still take a
+GOT load and a dependent load each. **The rustc figure is the finding of
+the sweep.** rustc is built with `-Zplt=no`, so every call is
+`call *sym@GOTPCREL(%rip)`; LLD relaxes that to a direct call only when
+the symbol is non-preemptible, and librustc_driver exports `core` and
+`alloc` with default visibility. The top targets are the panic entry
+points -- `core::panicking::panic_in_cleanup` 55,675, `panic` 27,476,
+`panic_bounds_check` 25,056, `Option::unwrap_failed` 20,385,
+`panic_fmt` 19,327, `handle_alloc_error` 18,124 -- each site a 6-byte
+memory-indirect call where a 5-byte direct one was available. A library
+loaded by exactly one driver has nothing to interpose; `-Bsymbolic-functions`
+(or hidden visibility for the std re-exports) would let the linker
+relax all 179,198. Not an x86lint check as such -- a build-property row,
+with the check being "a `call *GOT` whose slot's symbol this object defines".
+
+**Byte-identical function bodies**, a lower bound on what `--icf=all`
+folds (bodies that differ only in relocated `rel32` targets are not
+caught), and the padding between functions:
+
+| binary | functions (FDEs) | identical copies | bytes | of section | copies >= 32 B | inter-function padding |
+| --- | --- | --- | --- | --- | --- | --- |
+| libclang-cpp | 96,178 | 8,252 | 362,537 | 0.86% | 3,014 (320 KB) | 751,025 (1.79%) |
+| libLLVM | 121,606 | 12,460 | 432,188 | 0.60% | 2,560 (331 KB) | 902,928 (1.25%) |
+| libxul | 307,434 | 16,338 | 225,783 | 0.20% | 1,688 (106 KB) | 919,012 (0.83%) |
+| librustc_driver (`.bolt.org.text`) | 77,460 | 344 | 9,935 | 0.02% | 49 | 567,987 (0.87%) |
+| coreutils | 7,400 | 139 | 8,726 | 0.11% | 33 | 56,882 (0.74%) |
+
+GNU ld has no ICF, which is the whole GCC column; the largest libLLVM
+group is 222 copies of a 141-byte body. rustc and coreutils link with LLD
+and fold. **The first run reported 99% of `.bolt.org.text` as duplicates**:
+BOLT keeps both the original `.bolt.org.eh_frame` and its new `.eh_frame`,
+and both describe the original text, so every function was counted
+twice and matched itself. Deduplicating FDEs by `(start, length)` fixed
+it. A whole-image number that looks impossible usually is; this one was
+caught because 99% cannot be true of anything.
+
+### Candidates surfaced by pairscan, sized in `tools/shapescan`
+
+Thirteen new candidates written against the shipped gates (`tools/shapescan.c`,
+the "2026-09-27 four-toolchain sweep" block), so each realized count is
+what a check would report. Per binary, libxul / libLLVM / libclang-cpp /
+rustc / coreutils:
+
+| candidate | rewrite | shape | realized | refusals |
+| --- | --- | --- | --- | --- |
+| branch to a jump (chain) | retarget to the final destination | 22,189 / 826 / 1,804 / 3,565 / 172 | **15,650 / 738 / 1,752 / 2,438 / 129** | rel8 head cannot reach 6,436; second hop leaves the section 1,393 |
+| Jcc over a JMP | invert, delete the jump | 3,200 / 54 / 20 / 83 / 18 | **2,830 / 39 / 20 / 48 / 11** | a branch targets the jump 177; jump leaves the section 250 |
+| jump to a RET | RET in place | -- | **38 / 4,325 / 1,661 / 2,421 / 18** | none: no gate |
+| jump to a short epilogue | duplicate in place | 13,413 / 8,705 / 10,126 / 8,160 / 467 | **4,525 / 2,546 / 1,696 / 1,514 / 23** | epilogue longer than the jump 30,567 |
+| epilogue foldable into LEAVE | LEAVE | 4,129 / 5 / 0 / 321 / 51 | **34 / 5 / 0 / 8 / 4** | `add rsp, imm; pop rbp` needs the prologue 4,455 |
+| slot-sized SUB RSP in a prologue | PUSH RAX | 3,506 / 1,695 / 2,219 / 8,279 / 152 | **1,206 / 775 / 1,237 / 574 / 35** | flags live 12,024 |
+| slot-sized ADD RSP before POPs and RET | POP RCX | 11,596 / 20,517 / 22,648 / 15,033 / 968 | **8,270 / 13,956 / 12,458 / 8,487 / 720** | a tail call follows 25,747; no epilogue 1,124 |
+| missing PTEST (`-m sse4.1`) | PTEST xmm, xmm | 7,255 / 2 / 4 / 30,898 / 567 | **11 / 0 / 0 / 52 / 3** | the mask is live afterward 37,458 |
+| missing RORX (`-m bmi2`) | RORX rD, rS, n | 38,588 / 142,571 / 33,801 / 75,340 / 8,028 | **1,267 / 7,974 / 4,031 / 452 / 226** | no masking consumer 281,288 |
+| MOVZX feeding a narrow-safe compare | CMP r8, imm8 | 1,397 / 1,791 / 475 / 3,330 / 294 | **294 / 103 / 25 / 220 / 24** | extended value live 6,115; signed condition 464 |
+| MOVZX load feeding a compare | CMP BYTE PTR [mem], imm8 | 2,350 / 10,353 / 2,305 / 6,483 / 889 | **0 / 101 / 12 / 17 / 0** | extended value live 20,212 |
+| CALL then RET | JMP f | 790 / 151 / 54 / 173 / 71 | **404 / 0 / 0 / 0 / 1** | one POP intervenes 834 |
+| frame slot stored then reloaded (#29) | delete the reload | 3,500 / 759 / 487 / 3,376 / 171 | **550 / 302 / 213 / 1,416 / 91** | a branch targets the reload 3,971; into another register (a copy) 1,750 |
+| stack-to-stack copy through a register | advisory | 86,968 / 77,190 / 27,816 / 107,862 / 15,693 | **30,452 / 19,170 / 6,053 / 33,849 / 5,188** | register live afterward 101,780; vector copy 115,874 |
+
+Each row was spot-checked in the disassembly and, for the branch-shaped
+ones, classified against the binary's own FDEs, LSDA landing pads and
+direct-call targets (`classify.py` in the session scratchpad; the
+counts below come from it). What each one is:
+
+* **Branch chains are hot/cold-split residue.** Of libxul's 15,650,
+  13,520 have the intermediate jump in the head's own FDE and 14,942
+  have the second hop land in *another* FDE -- the function's cold split
+  part -- and the islands come in runs (`jmp 0x27fd28` seven times in a
+  row at 0x3a43c6a). The head is a `Jcc` 13,553 times. The mechanism is
+  the pass order: MachineFunctionSplitter runs after block placement,
+  `updateBranches` inserts a `jmp` into every block whose pre-layout
+  fall-through moved to the other section, and nothing forwards
+  branch-only blocks afterwards (BranchFolding's `IsBranchOnlyBlock`
+  logic ran long before). A further 1,687 second hops are direct-call
+  targets -- `jcc I; I: jmp F` with F a function, the exact shape
+  `canMakeTailCallConditional` folds, so those were refused for a reason
+  the bytes do not show. GCC's 738/1,752 and rustc's 1,494 are ordinary
+  same-FDE islands (rustc's 577 with a rel8 intermediate). The rewrite
+  saves one taken branch and 2-5 bytes, nearly all of it on cold paths.
+* **Jcc over a JMP is the missed conditional tail call.** libxul 2,830
+  realized; 2,793 have the jump land in another FDE and **2,218 of
+  those targets are also `call` targets** -- functions. The shape is
+  `jne .Lret ; jmp F ; .Lret: ...` where F is a sibling call:
+  BranchFolding.cpp:1668 declines this arrangement in a comment ("If the
+  predecessor is falling through to this block, we could reverse the
+  branch condition and fold the tail call into that. However ... there
+  is a high risk of regressing code size"). At these 2,830 sites the
+  other block already follows the tail call, so the inversion
+  (`je F`, fall into `.Lret`) is a pure win: the first version of this
+  candidate refused 2,576 of them for wanting a rel32 inversion, which
+  was the wrong arithmetic -- `Jcc rel32` is 6 bytes and replaces a
+  2 + 5 byte pair. The one refusal left is a branch onto the jump (147).
+  An LLVM patch to extend the conditional tail call fold to the
+  fall-through case, gated on the conditional target being the tail
+  call block's layout successor.
+* **Jump to a RET is a GCC policy and an unexplained rustc residue.**
+  GCC never duplicates a lone `ret`: 4,325 and 1,661, every one in the
+  head's own FDE, e.g. `xor eax, eax ; jmp .L2` with `.L2: ret` three
+  bytes back. LLVM does (`llc` on `jret4.ll` duplicates a shared `ret`
+  into three predecessors, including cold ones), and libxul shows 38,
+  coreutils 18 -- yet librustc_driver has **2,421**, 2,360 of them in
+  `.bolt.org.text` across 624 functions, 91% in functions BOLT did not
+  touch, so it is LLVM's output under rustc's PGO build. The site shape
+  is a `ret` that is the fall-through of a `Jcc` and is also the target
+  of `xor eax, eax ; jmp` from a block placed later; the hypothesis is
+  that the late TailDuplicate pass (before placement) skipped that
+  predecessor as a fall-through, and placement-time duplication only
+  covers still-unplaced predecessors. Not reproduced from hand IR; needs
+  a real rustc MIR dump. The rewrite has no gate and saves 1 or 4 bytes
+  and a taken branch.
+* **Jump to a short epilogue** -- 10,304 sites where the epilogue is no
+  longer than the jump. libxul's 4,525 include 2,504 that jump from the
+  hot part into a cold-part epilogue (`xor eax, eax ; jmp 0x2f4b0ad` to
+  `pop rbx ; ret`): tail duplication ran before splitting decided that
+  the epilogue was cold, and no pass reconsiders a cross-section jump to
+  two bytes of code.
+* **Slot-sized ADD RSP is an LLVM gap with the cause in hand.**
+  `X86FrameLowering::emitSPUpdate` uses `pop` for an 8-byte epilogue
+  adjustment, but `X86RegisterInfo::findDeadCallerSavedReg(MBB, MBBI)`
+  returns 0 unless `MBBI` is itself the `RET`/`TCRETURN`, and
+  `emitEpilogue` inserts the update at `FirstCSPop`, before the
+  callee-saved pops -- so any function that also restores a callee-saved
+  register gets `add rsp, 8` (clang 22: `addq $8, %rsp ; popq %rbx ;
+  popq %r14 ; retq`). Looking through the FrameDestroy pops to the
+  terminator would recover libxul's 8,270 and rustc's 8,487 (3 bytes
+  each, about 25 KB apiece); the 25,747 refusals are tail calls, where
+  RCX may carry an argument and LLVM is right. A second, separate gap:
+  with shrink-wrapping on, even a pop-free epilogue emits `add`
+  (`jret2.ll`: default gives `addq $8, %rsp ; retq`, `-enable-shrink-wrap=0`
+  gives `popq %rcx ; retq`), cause not yet located. GCC's 13,956/12,458
+  are policy (it never uses the push/pop form), as are its 775/1,237
+  prologue `sub rsp, 8`; LLVM's 1,206 prologue subs are the
+  stack-realignment path (`and rsp, -32 ; sub rsp, 8`), which builds its
+  adjustment without the push rule. The tool's own standard is the
+  obstacle here: `push`/`pop` add a memory access the `add` did not have
+  (see the reload row), so this would ship as advisory or with the
+  frame-slot carve-out #29 decides.
+* **PTEST is a dead end**: 38,726 `pmovmskb ; test` pairs, 66 with the
+  mask dead -- memchr and hashbrown feed the mask to `tzcnt` next, so the
+  shape selects for the case where the mask is the point.
+* **RORX** realizes 13,950 under `-m bmi2` (GCC 7,974/4,031, libxul
+  1,267), all `mov ; shr/shl imm ; and mask`; current `llc -mattr=+bmi2`
+  does not use RORX for a shift-and-mask with a live source (`rorx.ll`),
+  so it is real for both compilers. It saves a uop and the copy but is
+  size-neutral (6 bytes against 5-7), which puts it on the target axis
+  (#28) rather than the size ledger.
+* **MOVZX before a compare**: 666 + 130. The extension is nearly always
+  reused (6,115 + 20,212 live afterward); what remains is `movzx eax, al ;
+  cmp eax, 2 ; je` with EAX dead, a four-byte saving 294 times in libxul.
+* **CALL then RET** is not a sibcall population: libxul's 404 are
+  `call abort@plt ; ret` and kin, a return after a noreturn call, and
+  0-1 everywhere else.
+* **Frame slot stored then reloaded** is #29's store-to-load sibling
+  measured through the gates: 2,572 same-register pairs (delete the
+  reload) and 1,750 into another register (a copy), against the 3,328
+  the objdump count gave; 3,971 refused because a branch enters at the
+  reload. This is the population of the LLVM change "Forward a spill
+  slot to the reload of it" (branch `codegen-stack-slot-load-forwarding`):
+  libxul 550 + 1,239, rustc 1,416 + 298, and GCC has it too (302/213).
+* **Stack-to-stack copies through a register** -- 94,712 pure copies
+  (the register dies at the store), plus 115,874 vector-register copies
+  and 101,780 load-and-spill pairs. Per million instructions: rustc
+  2,321, coreutils 3,105, libxul 1,196, libLLVM 1,054, libclang-cpp 554
+  -- Rust moves aggregates between frame slots at two to three times the
+  C++ rate, in runs (`movups [rsp+0x70] -> [rsp+0xd0]`, `mov [rsp+0x80]
+  -> [rsp+0xe0]`, `movdqu [rsp+0x140] -> [rsp+0xe8]`). No instruction
+  rewrite exists; this is the advisory class "a copy the compiler did
+  not elide", sized so the memcpy-elision question has a number.
+
+**The rustc `jmp .+0` is an empty landing pad.** The shipped "branch to
+the next instruction" reports 3,589 on librustc_driver against 9 per
+million on libxul. Parsing the LSDA call-site tables: **2,971 of the
+3,589 are themselves landing pads and jump onto a landing pad at the
+next byte** (coreutils: 19 of 39). The shape is `.Ltmp_a: jmp L ;
+.Ltmp_b: ; L: ...` -- a landing pad whose only instruction is a jump to
+the shared cleanup, followed by a second landing pad that emits no bytes
+at all. BranchFolding excludes EH pads from empty-block forwarding
+(BranchFolding.cpp:1455, "the landing-pad table points to this block")
+and block placement sees the empty pad as the layout successor, so the
+jump over zero bytes is never removed. Sound fix in LLVM: treat a
+label-only EH pad as transparent when deciding whether an unconditional
+branch reaches its layout successor. The finding itself is real but the
+deletion must keep the pad's label, which is worth a sentence in that
+check's row.
+
+What this sweep changed in the tools: `tools/shapescan` gained the
+thirteen candidates above and per-candidate example caps, so `-e ""`
+prints examples for every candidate in one scan.
+
 ## Investigated and closed (2026-08 sweep)
 
 Candidates measured and set aside, recorded so they are not

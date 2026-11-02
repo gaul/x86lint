@@ -760,9 +760,9 @@ static void zero_store_runs(const uint8_t *inst, size_t len,
 
 // === window candidates: the 2026-09-27 four-toolchain sweep ===
 //
-// Surfaced by pairscan over libxul (clang 22 C++ + rustc), the Fedora
-// libLLVM/libclang-cpp (GCC 16), librustc_driver and uutils coreutils (rustc
-// 1.97 / LLVM 22). Each is written against the gates a shipped check would
+// Surfaced by pairscan over libxul (GCC C++ + rustc), the Fedora
+// libLLVM/libclang-cpp (clang 22, LLD), librustc_driver and uutils coreutils
+// (rustc 1.97 / LLVM 22). Each is written against the gates a shipped check would
 // use, so the realized count is the finding count and the refusals say where
 // the shape went.
 

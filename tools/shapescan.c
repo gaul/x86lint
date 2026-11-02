@@ -1484,7 +1484,7 @@ static const struct candidate candidates[] = {
     { "jump to a short epilogue", "duplicate the epilogue in place",
       c_jmp_to_epilogue, NULL },
     { "epilogue foldable into LEAVE", "LEAVE", c_leave, NULL },
-    { "slot-sized SUB RSP in a prologue", "PUSH RAX", c_slot_sub, NULL },
+    { "slot-sized SUB RSP", "PUSH RAX", c_slot_sub, NULL },
     { "slot-sized ADD RSP before POPs and RET", "POP RCX", c_slot_add, NULL },
     { "missing PTEST (-m sse4.1)", "PTEST xmm, xmm", c_ptest, NULL },
     { "missing RORX (-m bmi2)", "RORX rD, rS, n", c_rorx, NULL },

@@ -1925,7 +1925,7 @@ rustc / coreutils:
 | jump to a RET | RET in place | -- | **38 / 4,325 / 1,661 / 2,421 / 18** | none: no gate |
 | jump to a short epilogue | duplicate in place | 13,413 / 8,705 / 10,126 / 8,160 / 467 | **4,525 / 2,546 / 1,696 / 1,514 / 23** | epilogue longer than the jump 30,567 |
 | epilogue foldable into LEAVE | LEAVE | 4,129 / 5 / 0 / 321 / 51 | **34 / 5 / 0 / 8 / 4** | `add rsp, imm; pop rbp` needs the prologue 4,455 |
-| slot-sized SUB RSP in a prologue | PUSH RAX | 3,506 / 1,695 / 2,219 / 8,279 / 152 | **1,206 / 775 / 1,237 / 574 / 35** | flags live 12,024 |
+| slot-sized SUB RSP | PUSH RAX | 3,506 / 1,695 / 2,219 / 8,279 / 152 | **1,206 / 775 / 1,237 / 574 / 35** | flags live 12,024 |
 | slot-sized ADD RSP before POPs and RET | POP RCX | 11,596 / 20,517 / 22,648 / 15,033 / 968 | **8,270 / 13,956 / 12,458 / 8,487 / 720** | a tail call follows 25,747; no epilogue 1,124 |
 | missing PTEST (`-m sse4.1`) | PTEST xmm, xmm | 7,255 / 2 / 4 / 30,898 / 567 | **11 / 0 / 0 / 52 / 3** | the mask is live afterward 37,458 |
 | missing RORX (`-m bmi2`) | RORX rD, rS, n | 38,588 / 142,571 / 33,801 / 75,340 / 8,028 | **1,267 / 7,974 / 4,031 / 452 / 226** | no masking consumer 281,288 |
@@ -2021,8 +2021,8 @@ counts below come from it). What each one is:
   - **The "prologue" `sub rsp, 8` sites are mostly not prologues.** This
     was re-checked on 2026-11-01. Every realized site was classified by the
     instructions around it and by whether an FDE starts there. The
-    candidate's name says "prologue" but it matches any `sub rsp, 8` whose
-    flags are dead.
+    candidate matches any `sub rsp, 8` whose flags are dead, and is now
+    named "slot-sized SUB RSP" rather than "... in a prologue".
     - **Clang's 775/1,237 include none at a function entry.** 1,960 of
       the 2,012 pad a call's argument area. The sequence is `sub rsp, 8`,
       an odd number of pushed stack arguments, the call, then

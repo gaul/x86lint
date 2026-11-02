@@ -2018,11 +2018,29 @@ counts below come from it). What each one is:
   - **libxul's 8,270 are GCC policy, at least in its C++.** In a
     two-call control, gcc 16 adjusts with `sub`/`add rsp, 8` where clang
     uses `push rax`/`pop rax`, so no LLVM fix reaches them.
-  - **The prologue `sub rsp, 8` counts are unsettled.** They are libxul
-    1,206 and clang's 775/1,237, and were first read the other way round.
-    LLVM's stack-realignment path (`and rsp, -32 ; sub rsp, 8`), which
-    builds its adjustment without the push rule, was named as the source
-    of libxul's. Which binary that example came from needs re-checking.
+  - **The "prologue" `sub rsp, 8` sites are mostly not prologues.** This
+    was re-checked on 2026-11-01. Every realized site was classified by the
+    instructions around it and by whether an FDE starts there. The
+    candidate's name says "prologue" but it matches any `sub rsp, 8` whose
+    flags are dead.
+    - **Clang's 775/1,237 include none at a function entry.** 1,960 of
+      the 2,012 pad a call's argument area. The sequence is `sub rsp, 8`,
+      an odd number of pushed stack arguments, the call, then
+      `add rsp, 8*(pushes+1)`; 1,820 restore exactly that way. LLVM builds
+      this padding with `sub`, not with the push rule.
+    - **libxul: 288 of its 1,232 are at a function entry.** That is 1,232
+      with today's shapescan, against 1,206 when the table was made. These
+      entry sites are GCC's: no clang site is at an entry, and gcc's
+      control prologue adjusts with `sub`. 556 more are the same
+      argument-area padding, which libxul mostly undoes with POPs after
+      the call rather than an ADD. The rest sit in function bodies ahead
+      of a call or a branch.
+    - **The realignment example is libxul's, and rare.**
+      `and rsp, -32 ; sub rsp, 8` occurs 4 times, all in libxul, all in
+      frame-pointer prologues. One interleaves vector instructions between
+      `push rbp` and `mov rbp, rsp`, which LLVM's fixed prologue does not
+      do, so it is probably GCC's, but that is not proven. Either way it
+      never explained the 1,206.
 
   The tool's own standard is the
   obstacle here: `push`/`pop` add a memory access the `add` did not have

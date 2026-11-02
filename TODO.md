@@ -1859,16 +1859,22 @@ around them. So each unmangled function takes its neighbors' language. On
 the Rust side these are the `#[no_mangle]` exports, such as the
 `aa_stroke_*` C API of the Rust stroke rasterizer; on the C++ side they are
 C and assembly. Each finding goes to the function containing its address.
-The counts below are today's x86lint and shapescan, with instructions
-counted by objdump inside function symbols. 416k instructions (1.6%) sit
-outside any symbol and are left out.
+Where aliases share an address, the mangled name decides. The counts below
+are today's x86lint and shapescan, with instructions counted by objdump
+inside function symbols. 424k instructions (1.6%) sit outside any symbol and
+are left out. To reproduce:
+
+    tools/split.py --cold-below 2f789a1 libxul.so x86lint-v.txt shapescan.txt
+
+Here `x86lint-v.txt` is `x86lint -v -c all` output and `shapescan.txt` is
+`tools/shapescan -e "" -n 10000000` output.
 
 **Validation.** The fingerprints hold on each side:
 
 | side | instructions | canary `sub` / `mov` | `inc`/`dec` vs `add`/`sub 1` |
 | --- | --- | --- | --- |
-| C++ | 16,366,737 | 87,382 / 73,694 | 44,817 / 45,715 |
-| C, asm (unmangled, C++ side) | 1,080,896 | 3,610 / 3,180 | 9,040 / 1,689 |
+| C++ | 16,666,951 | 89,397 / 75,560 | 45,480 / 46,164 |
+| C, asm (unmangled, C++ side) | 780,743 | 1,596 / 1,315 | 8,378 / 1,240 |
 | Rust | 7,672,813 | 0 / 0 | 69,793 / 1,899 |
 | `#[no_mangle]` (unmangled, Rust side) | 487,719 | 0 / 0 | 4,058 / 21 |
 

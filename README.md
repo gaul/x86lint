@@ -1208,6 +1208,16 @@ built separately with `XED_PATH=/path/to/xed make tools`:
   FDEs. The tool's header records the measurements; the census's
   evidence labeling (the `unevidenced` annotations and `code evidence`
   line) is what they argued into existence.
+* `tools/split.py` splits a mixed C++/Rust binary's findings by language.
+  It takes `x86lint -v` or `tools/shapescan` output and attributes each
+  finding to the function containing it, and the function to C++ or Rust by
+  its mangling. Unmangled C and `#[no_mangle]` functions take their
+  neighbors' language in address order. A stripped binary's functions come
+  from its `.gnu_debugdata` MiniDebugInfo. It prints per-million rates for
+  each side, plus two compiler fingerprints that check the split.
+  `--cold-below` reports how much of each C++ count sits in GCC's
+  size-optimized cold partition. The libxul split in
+  [TODO.md](TODO.md) is its output.
 
 All of them restrict the scan to the symbol table's function ranges and skip
 the dynamic linker's import glue exactly as the driver does, so no pair or

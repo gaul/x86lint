@@ -1746,9 +1746,9 @@ FDE-restricted scans.
 It read Fedora's LLVM libraries as GCC-built and libxul's C++ as clang's.
 Compiled controls show the opposite, as the next paragraph explains. The
 compiler column, the readings and the mechanism notes below have been
-re-derived. Where a reading depends on how libxul's count divides between
-its GCC C++ and its LLVM-compiled Rust, it says so: nothing here has split
-the two.
+re-derived. libxul's findings have since been split between its GCC C++
+and its LLVM-compiled Rust, by function symbol; see "libxul split by
+language" below. The readings cite the split where it settles them.
 
 | binary | compiler | instructions | findings | per 1k | per 1k without the SSE spellings |
 | --- | --- | --- | --- | --- | --- |
@@ -1768,7 +1768,11 @@ control built here with gcc 16.2.1 and clang 22.1.8:
   `addl $1, (%rdi)` under gcc and to `incl (%rdi)` under clang.
   - libLLVM has 135k `inc r32` against 357 `add r32, 1`, which is clang's
     pattern.
-  - libxul has 95k against 22k, which is GCC C++ mixed with Rust.
+  - libxul has 95k against 22k. That is GCC C++ mixed with Rust, plus GCC
+    preferring INC wherever it optimizes for size: an
+    `__attribute__((cold))` function gets `incl`. In a PGO build that means
+    all profile-cold code, so INC is a reliable GCC-vs-LLVM fingerprint only
+    in hot code.
   - The 29,033 "oversized ADD/SUB one" findings on libxul, against **0**
     on libLLVM, are GCC's.
 * **The stack-protector epilogue.** GCC checks the canary with
@@ -1791,19 +1795,19 @@ a compiled control confirms it, which is the lesson of this correction.
 
 Per million instructions, libxul / rustc / coreutils / libLLVM / libclang-cpp:
 
-libxul is the only GCC column, and Rust is mixed into it. A libxul-heavy row
-is GCC's only when every LLVM binary is near zero; otherwise the reading
-says the libxul count is not split.
+libxul is the only GCC column, and Rust is mixed into it. The readings use
+the split in "libxul split by language" below to say which side a libxul
+count comes from.
 
 | check | libxul (GCC + Rust) | rustc | coreutils | libLLVM (clang) | libclang-cpp (clang) | reading |
 | --- | --- | --- | --- | --- | --- | --- |
 | suboptimal SSE MOV opcode | 5,315 | 13,187 | 11,020 | 1,467 | 650 | universal; clang's C++ 4-10x lower but not zero |
 | suboptimal SSE zero idiom | 1,286 | 280 | 758 | 314 | 92 | universal |
-| missing SSE dependency break | 408 | 3 | 53 | 7 | 2 | **libxul**, not split. gcc 16 puts `pxor` ahead of `cvtsi2sd` at -O2 and clang 22 does not, so GCC is the less likely source. But the clang libraries rarely convert, so a low count there says little |
+| missing SSE dependency break | 408 | 3 | 53 | 7 | 2 | **GCC's size-optimized code**: libxul's are 96% C++, and 93% of those are in its profile-cold partition. gcc 16 puts `pxor` ahead of `cvtsi2sd` in normal code but not in an `__attribute__((cold))` function; clang 22 omits it everywhere, but the clang libraries rarely convert |
 | oversized ADD/SUB one | 1,140 | 58 | 160 | 0 | 0 | **GCC** (generic tuning avoids INC/DEC); none in clang's C++, a small Rust residue |
-| suboptimal SHL one | 125 | 12 | 149 | 0 | 1 | LLVM, fixed on main (#217508). Absent from clang's C++; libxul's share not split |
-| redundant TEST after shift | 127 | 24 | 165 | 3 | 20 | LLVM, fixed on main (#220744); libxul's share not split |
-| oversized TEST immediate | 87 | 0 | 0 | 1 | 0 | **GCC** (libxul only; every LLVM binary near zero) |
+| suboptimal SHL one | 125 | 12 | 149 | 0 | 1 | LLVM, fixed on main (#217508). Absent from clang's C++; libxul's are Rust (3,306, and one outside any symbol) |
+| redundant TEST after shift | 127 | 24 | 165 | 3 | 20 | LLVM, fixed on main (#220744); libxul's are Rust (3,360 of 3,362) |
+| oversized TEST immediate | 87 | 0 | 0 | 1 | 0 | **GCC's size-optimized code** (libxul's all C++, 99% in the profile-cold partition) |
 | load foldable into compare | 144 | 61 | 214 | 8 | 5 | LLVM (atomics; PR #221290); Rust-heavy |
 | constant condition (both arms) | 25 | 21 | 174 | 0 | 1 | LLVM; Rust-heavy |
 | branch to the next instruction | 9 | 246 | 23 | 1 | 6 | **rustc**: empty landing pads, see below |
@@ -1815,7 +1819,7 @@ says the libxul count is not split.
 | load foldable into ALU | 9 | 4 | 16 | 3 | 170 | libclang-cpp only (`mov al, [rsp+x]` then ALU) |
 | redundant ADD/SUB zero, unneeded zero displacement | 0 | 0 | 0 | 0 | 16 / 14 | libclang-cpp's TLS access sequences (`add r, 0`, `cmp [fs:rax+0], 0`) |
 | oversized EVEX encoding | 0 | 0 | 0 | 28 | 0 | not compiler output: all 504 are `vpxord xmm/ymm` in BLAKE3's hand-written AVX-512 assembly in libLLVM |
-| merging narrow move | 270 | 645 | 10 | 257 | 430 | universal (both compilers keep byte loads at -O2) |
+| merging narrow move | 270 | 645 | 10 | 257 | 430 | universal (both compilers keep byte loads at -O2); libxul's are GCC's size-optimized code (99% C++, 99% of that in the cold partition) |
 | length-changing prefix stall (`-c all`) | 2,452 | 1,002 | 1,558 | 2,856 | 2,853 | universal, clang's C++ slightly higher |
 
 What the table settles, with libxul read as GCC C++ plus Rust:
@@ -1823,15 +1827,126 @@ What the table settles, with libxul read as GCC C++ plus Rust:
 * **Clang's C++ has fewer findings than libxul.** Set the SSE spellings
   aside and the clang libraries carry 1.9-2.2 findings per 1k instructions,
   against libxul's 3.2.
-* **The rows that set libxul apart are GCC's, plus some not yet split.**
-  GCC's are INC/DEC avoidance and `test r32, small-imm`. The SHL/TEST pair
-  fixed on LLVM main and the missing `cvtsi2sd` break are libxul-heavy, but
-  their count is not divided between its C++ and its Rust.
+* **The rows that set libxul apart are GCC's, and mostly its cold code.**
+  INC/DEC avoidance is GCC's normal-code tuning. `test r32, small-imm`, the
+  missing `cvtsi2sd` break and the merging byte loads come from the
+  profile-cold partition that GCC optimizes for size. That partition holds
+  69% of libxul's C++ instructions. The SHL/TEST pair fixed on LLVM main is
+  libxul's Rust.
 * **The clang-only rows** are a TEST after a flag-setting ALU op and REX.W
   on LEAs. The MOV-constant, MOV-zero and MOV+ADD folds run higher in every
-  LLVM binary than in libxul.
+  LLVM binary than in libxul, and inside libxul they are Rust's.
 
-A clean GCC column needs a GCC-built C++ binary with no Rust in it.
+A GCC-built C++ binary with no Rust in it would still make a cleaner GCC
+column, and one built without PGO would separate GCC's speed and size
+habits.
+
+### libxul split by language (2026-11-01)
+
+**Method.** libxul's `.symtab` is stripped, but Fedora's MiniDebugInfo
+(`.gnu_debugdata`, an xz-compressed ELF) still names 371,990 functions.
+Mangling identifies most of them:
+
+| class | functions | bytes |
+| --- | --- | --- |
+| C++ (`_Z`) | 312,202 | 74.9 MB |
+| Rust (`_R`, v0 mangling) | 40,653 | 34.2 MB |
+| unmangled | 19,135 | 6.8 MB |
+
+The language follows address order. Across all 352,855 mangled functions it
+changes only 6 times: two large Rust regions, a few small ones, and C++
+around them. So each unmangled function takes its neighbors' language. On
+the Rust side these are the `#[no_mangle]` exports, such as the
+`aa_stroke_*` C API of the Rust stroke rasterizer; on the C++ side they are
+C and assembly. Each finding goes to the function containing its address.
+The counts below are today's x86lint and shapescan, with instructions
+counted by objdump inside function symbols. 416k instructions (1.6%) sit
+outside any symbol and are left out.
+
+**Validation.** The fingerprints hold on each side:
+
+| side | instructions | canary `sub` / `mov` | `inc`/`dec` vs `add`/`sub 1` |
+| --- | --- | --- | --- |
+| C++ | 16,366,737 | 87,382 / 73,694 | 44,817 / 45,715 |
+| C, asm (unmangled, C++ side) | 1,080,896 | 3,610 / 3,180 | 9,040 / 1,689 |
+| Rust | 7,672,813 | 0 / 0 | 69,793 / 1,899 |
+| `#[no_mangle]` (unmangled, Rust side) | 487,719 | 0 / 0 | 4,058 / 21 |
+
+- **The Rust side** has no canary checks (Rust uses no stack protector)
+  and LLVM's INC preference.
+- **Every canary check on the C++ side** is GCC's `sub` form.
+- **The C++ side's INC split** separates by region. Below 0x2f789a1 sit
+  all 33,539 `.cold` functions and 12.0M instructions, with 53,616
+  `inc`/`dec` against 11,385 `add 1`. Above it are 5.5M instructions with
+  1,202 against 35,375.
+
+  The low region is GCC's profile-cold partition, optimized for size:
+  - Its canary checks are all `sub` (67,068), so it is not a second
+    compiler.
+  - GCC picks INC and drops the `cvtsi2sd` break in cold code, as the
+    controls show.
+
+**x86lint findings**, per million instructions of each side. "Cold share"
+is the fraction of the C++ count in the size-optimized partition.
+
+| check | C++ | Rust | C++ /M | Rust /M | cold share |
+| --- | --- | --- | --- | --- | --- |
+| suboptimal SSE MOV opcode | 42,684 | 77,672 | 2,446 | 9,518 | 18% |
+| length-changing prefix stall (`-c all`) | 41,358 | 22,176 | 2,370 | 2,717 | 67% |
+| suboptimal SSE zero idiom | 28,928 | 3,803 | 1,658 | 466 | 22% |
+| oversized ADD/SUB one | 28,133 | 0 | 1,612 | 0 | 18% |
+| missing SSE dependency break | 10,766 | 429 | 617 | 53 | 93% |
+| merging narrow move | 7,393 | 18 | 424 | 2 | 99% |
+| missing POPCNT dependency break | 7 | 6,023 | 0 | 738 | |
+| oversized branch displacement | 5,234 | 514 | 300 | 63 | 40% |
+| redundant TEST after shift | 2 | 3,360 | 0 | 412 | |
+| suboptimal SHL one | 0 | 3,306 | 0 | 405 | |
+| load foldable into compare | 878 | 2,560 | 50 | 314 | 50% |
+| oversized TEST immediate | 2,281 | 0 | 131 | 0 | 99% |
+| MOV+ADD foldable to LEA | 82 | 1,161 | 5 | 142 | |
+| ADD foldable into LEA | 0 | 1,147 | 0 | 141 | |
+| suboptimal MOV zero | 736 | 996 | 42 | 122 | 62% |
+| constant condition (both arms) | 12 | 734 | 1 | 90 | |
+| suboptimal VEX operand order | 523 | 0 | 30 | 0 | 87% |
+| MOV constant foldable | 20 | 347 | 1 | 43 | |
+| branch to the next instruction | 14 | 220 | 1 | 27 | |
+| oversized LEA width | 186 | 15 | 11 | 2 | 67% |
+| redundant TEST after flags | 42 | 55 | 2 | 7 | |
+
+**shapescan candidates**, realized counts:
+
+| candidate | C++ | Rust | C++ /M | Rust /M |
+| --- | --- | --- | --- | --- |
+| stack-to-stack copy through a register | 5,417 | 25,754 | 310 | 3,156 |
+| constant already in a register | 5,013 | 27,348 | 287 | 3,351 |
+| branch to a jump (chain) | 15,089 | 713 | 865 | 87 |
+| slot-sized ADD RSP before POPs and RET | 1,048 | 6,891 | 60 | 844 |
+| jump to a short epilogue | 4,408 | 99 | 253 | 12 |
+| Jcc over a JMP | 2,739 | 29 | 157 | 4 |
+| slot-sized SUB RSP | 1,109 | 119 | 64 | 15 |
+| missing RORX (`-m bmi2`) | 487 | 787 | 28 | 96 |
+| frame slot stored then reloaded (#29) | 360 | 201 | 21 | 25 |
+| CALL then RET | 413 | 0 | 24 | 0 |
+| MOVZX feeding a narrow-safe compare | 0 | 282 | 0 | 35 |
+| jump to a RET | 34 | 7 | 2 | 1 |
+
+What the split changes:
+
+* **GCC's normal code has few rows of its own.** They are INC/DEC
+  avoidance, the SSE spellings, oversized branch displacements and the
+  hot-to-cold branch islands. Its distinctive findings concentrate in the
+  size-optimized partition instead: the missing `cvtsi2sd` break,
+  `test r32, small-imm`, merging byte loads, and two thirds of the LCP
+  stalls. That code runs rarely by the profile's own account, so those
+  rows matter for size, not speed.
+* **libxul's Rust looks like rustc and coreutils.** That covers the
+  SHL/TEST pair, the LEA folds, the constant conditions, the stack copies
+  (3,156 per million, against 2,321 and 3,105) and the POPCNT break. It
+  also carries **most of libxul's `add rsp, 8` before the pops**: 6,891 of
+  7,941, which the LLVM gap below covers.
+* **The branch-shaped candidates are GCC's.** That means the chains, Jcc
+  over a JMP, jumps to short epilogues and CALL then RET. The hot/cold
+  islands are its partitioning.
 
 ### Build properties
 
@@ -1944,8 +2059,8 @@ counts below come from it). What each one is:
   13,520 have the intermediate jump in the head's own FDE and 14,942
   have the second hop land in *another* FDE -- the function's cold split
   part -- and the islands come in runs (`jmp 0x27fd28` seven times in a
-  row at 0x3a43c6a). The head is a `Jcc` 13,553 times. The split is
-  GCC's: `-freorder-blocks-and-partition`, on by default with profile
+  row at 0x3a43c6a). The head is a `Jcc` 13,553 times. Today's 15,802
+  divide 15,089 C++ to 713 Rust. The split is GCC's: `-freorder-blocks-and-partition`, on by default with profile
   feedback. An earlier version explained the islands by LLVM's
   MachineFunctionSplitter pass order (the splitter runs after block
   placement, and `updateBranches` adds a `jmp` that nothing forwards).
@@ -1964,8 +2079,9 @@ counts below come from it). What each one is:
   BranchFolding.cpp:1668: "If the predecessor is falling through to this
   block, we could reverse the branch condition and fold the tail call
   into that. However ... there is a high risk of regressing code size".
-  Its own output shows only 39/20/48/11, though, so libxul's 2,830 come
-  from its GCC C++ or its Rust, not yet split. At these 2,830 sites the
+  Its own output shows only 39/20/48/11, though, and libxul's are GCC's:
+  2,739 of today's 2,770 are in C++, 2,505 of those in the profile-cold
+  partition. At these 2,830 sites the
   other block already follows the tail call, so the inversion
   (`je F`, fall into `.Lret`) is a pure win: the first version of this
   candidate refused 2,576 of them for wanting a rel32 inversion, which
@@ -1980,8 +2096,8 @@ counts below come from it). What each one is:
   own FDE, e.g. `xor eax, eax ; jmp .L2` with `.L2: ret` three bytes
   back. librustc_driver has **2,421**: 2,360 of them in `.bolt.org.text`
   across 624 functions, 91% in functions BOLT did not touch, so they are
-  LLVM's output under rustc's PGO build. libxul, mostly GCC, shows 38 and
-  coreutils 18. This row first read the C++ libraries as GCC and called
+  LLVM's output under rustc's PGO build. libxul shows 38 (34 C++, 7 Rust
+  today) and coreutils 18. This row first read the C++ libraries as GCC and called
   their count "GCC never duplicates a lone `ret`". LLVM can duplicate:
   `llc` on `jret4.ll` copies a shared `ret` into three predecessors,
   cold ones included. The site shape is a `ret` that is the fall-through
@@ -1994,7 +2110,8 @@ counts below come from it). What each one is:
   dump. The rewrite has no gate and saves 1 or 4 bytes and a taken
   branch.
 * **Jump to a short epilogue** -- 10,304 sites where the epilogue is no
-  longer than the jump. libxul's 4,525 include 2,504 that jump from the
+  longer than the jump. libxul's 4,525 (today 4,408 C++, 99 Rust) include
+  2,504 that jump from the
   hot part into a cold-part epilogue (`xor eax, eax ; jmp 0x2f4b0ad` to
   `pop rbx ; ret`). The partition is GCC's. That tail duplication ran
   before partitioning decided the epilogue was cold is the likely
@@ -2008,16 +2125,24 @@ counts below come from it). What each one is:
   callee-saved pops -- so any function that also restores a callee-saved
   register gets `add rsp, 8` (clang 22: `addq $8, %rsp ; popq %rbx ;
   popq %r14 ; retq`). Looking through the FrameDestroy pops to the
-  terminator would recover clang's 13,956/12,458 and rustc's 8,487, 3
-  bytes each: about 42 KB, 37 KB and 25 KB. The 25,747 refusals are tail
+  terminator would recover 3 bytes at each of these sites:
+
+  | binary | sites | bytes |
+  | --- | --- | --- |
+  | libLLVM (clang) | 13,956 | about 42 KB |
+  | libclang-cpp (clang) | 12,458 | about 37 KB |
+  | rustc | 8,487 | about 25 KB |
+  | libxul's Rust | 6,891 | about 21 KB | The 25,747 refusals are tail
   calls, where RCX may carry an argument and LLVM is right. A second,
   separate gap: with shrink-wrapping on, even a pop-free epilogue emits
   `add` (`jret2.ll`: default gives `addq $8, %rsp ; retq`,
   `-enable-shrink-wrap=0` gives `popq %rcx ; retq`), cause not yet
   located.
-  - **libxul's 8,270 are GCC policy, at least in its C++.** In a
-    two-call control, gcc 16 adjusts with `sub`/`add rsp, 8` where clang
-    uses `push rax`/`pop rax`, so no LLVM fix reaches them.
+  - **libxul's are mostly Rust, so the LLVM fix reaches them.** Of
+    today's 7,941, 6,891 are in Rust functions. An earlier version of this
+    note called all 8,270 GCC policy. The 1,048 in C++ are GCC policy: in
+    a two-call control, gcc 16 adjusts with `sub`/`add rsp, 8` where clang
+    uses `push rax`/`pop rax`.
   - **The "prologue" `sub rsp, 8` sites are mostly not prologues.** This
     was re-checked on 2026-11-01. Every realized site was classified by the
     instructions around it and by whether an FDE starts there. The
@@ -2029,8 +2154,8 @@ counts below come from it). What each one is:
       `add rsp, 8*(pushes+1)`; 1,820 restore exactly that way. LLVM builds
       this padding with `sub`, not with the push rule.
     - **libxul: 288 of its 1,232 are at a function entry.** That is 1,232
-      with today's shapescan, against 1,206 when the table was made. These
-      entry sites are GCC's: no clang site is at an entry, and gcc's
+      with today's shapescan, against 1,206 when the table was made, and
+      1,109 of the 1,232 are in C++. The entry sites are GCC's: no clang site is at an entry, and gcc's
       control prologue adjusts with `sub`. 556 more are the same
       argument-area padding, which libxul mostly undoes with POPs after
       the call rather than an ADD. The rest sit in function bodies ahead
@@ -2050,7 +2175,7 @@ counts below come from it). What each one is:
   mask dead -- memchr and hashbrown feed the mask to `tzcnt` next, so the
   shape selects for the case where the mask is the point.
 * **RORX** realizes 13,950 under `-m bmi2` (clang's C++ 7,974/4,031,
-  libxul 1,267), all `mov ; shr/shl imm ; and mask`; current `llc -mattr=+bmi2`
+  libxul 1,267, which today is 487 C++ and 787 Rust), all `mov ; shr/shl imm ; and mask`; current `llc -mattr=+bmi2`
   does not use RORX for a shift-and-mask with a live source (`rorx.ll`),
   so it is real for both compilers. It saves a uop and the copy but is
   size-neutral (6 bytes against 5-7), which puts it on the target axis
@@ -2058,9 +2183,10 @@ counts below come from it). What each one is:
 * **MOVZX before a compare**: 666 + 130. The extension is nearly always
   reused (6,115 + 20,212 live afterward); what remains is `movzx eax, al ;
   cmp eax, 2 ; je` with EAX dead, a four-byte saving 294 times in libxul.
+  They are its Rust: all 282 of today's count, none in C++.
 * **CALL then RET** is not a sibcall population: libxul's 404 are
   `call abort@plt ; ret` and kin, a return after a noreturn call, and
-  0-1 everywhere else.
+  0-1 everywhere else. All of them are GCC's C++ (413 today, none in Rust).
 * **Frame slot stored then reloaded** is #29's store-to-load sibling
   measured through the gates: 2,572 same-register pairs (delete the
   reload) and 1,750 into another register (a copy), against the 3,328
@@ -2068,14 +2194,16 @@ counts below come from it). What each one is:
   reload. This is the population of the LLVM change "Forward a spill
   slot to the reload of it" (branch `codegen-stack-slot-load-forwarding`):
   rustc 1,416 + 298, and clang's C++ 302 / 213 same-register reloads.
-  libxul has 550 + 1,239, not split between its GCC C++ and its Rust, so
-  whether GCC has the gap too is open.
+  libxul had 550 + 1,239. Its same-register reloads, 561 today, divide 360
+  C++ to 201 Rust, at 21 and 25 per million. So GCC has the gap too, at
+  about the rate LLVM does.
 * **Stack-to-stack copies through a register** -- 94,712 pure copies
   (the register dies at the store), plus 115,874 vector-register copies
   and 101,780 load-and-spill pairs. Per million instructions: rustc
   2,321, coreutils 3,105, libxul 1,196, libLLVM 1,054, libclang-cpp 554
   -- Rust moves aggregates between frame slots at two to three times the
-  C++ rate, in runs (`movups [rsp+0x70] -> [rsp+0xd0]`, `mov [rsp+0x80]
+  C++ rate. Inside libxul the gap is tenfold: its Rust runs at 3,156 per
+  million and its GCC C++ at 310. The copies come in runs (`movups [rsp+0x70] -> [rsp+0xd0]`, `mov [rsp+0x80]
   -> [rsp+0xe0]`, `movdqu [rsp+0x140] -> [rsp+0xe8]`). No instruction
   rewrite exists; this is the advisory class "a copy the compiler did
   not elide", sized so the memcpy-elision question has a number.

@@ -1613,6 +1613,200 @@ bool check_oversized_vex(const xed_decoded_inst_t *xedd)
             xed3_operand_get_nprefixes(xedd)) != 3;
 }
 
+// The register-to-register VEX operations of map 0F whose two sources commute
+// exactly: integer arithmetic, compares for equality, min/max, averages and
+// the bitwise logic of both domains. FP addition and multiplication are left
+// out although compilers treat them as commutative: with two NaN sources the
+// first one's payload is the result, so the swap is not bit-identical.
+static bool vex_sources_commute(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_VPADDB: case XED_ICLASS_VPADDW: case XED_ICLASS_VPADDD:
+    case XED_ICLASS_VPADDQ: case XED_ICLASS_VPADDSB: case XED_ICLASS_VPADDSW:
+    case XED_ICLASS_VPADDUSB: case XED_ICLASS_VPADDUSW:
+    case XED_ICLASS_VPMULLW: case XED_ICLASS_VPMULHW: case XED_ICLASS_VPMULHUW:
+    case XED_ICLASS_VPMULUDQ: case XED_ICLASS_VPMADDWD:
+    case XED_ICLASS_VPAVGB: case XED_ICLASS_VPAVGW: case XED_ICLASS_VPSADBW:
+    case XED_ICLASS_VPCMPEQB: case XED_ICLASS_VPCMPEQW: case XED_ICLASS_VPCMPEQD:
+    case XED_ICLASS_VPMAXSW: case XED_ICLASS_VPMAXUB:
+    case XED_ICLASS_VPMINSW: case XED_ICLASS_VPMINUB:
+    case XED_ICLASS_VPAND: case XED_ICLASS_VPOR: case XED_ICLASS_VPXOR:
+    case XED_ICLASS_VANDPS: case XED_ICLASS_VANDPD:
+    case XED_ICLASS_VORPS: case XED_ICLASS_VORPD:
+    case XED_ICLASS_VXORPS: case XED_ICLASS_VXORPD:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The opcode and pp of a map-0F register copy's other direction: the load form
+// names the destination in ModRM.reg and the source in ModRM.rm, the store
+// form the reverse, and between two registers either spelling performs the
+// same copy. Returns false for anything without a second spelling. VMOVSS and
+// VMOVSD have one too, but their register form merges a third operand and is
+// left to the merge-operand analyses.
+static bool vex_move_other_direction(uint8_t opcode, unsigned pp,
+                                     uint8_t *alt_opcode, unsigned *alt_pp)
+{
+    *alt_pp = pp;
+    switch (opcode) {
+    case 0x10: case 0x11:  // vmovups, vmovupd
+    case 0x28: case 0x29:  // vmovaps, vmovapd
+        if (pp > 1) {
+            return false;
+        }
+        *alt_opcode = opcode ^ 1;
+        return true;
+    case 0x6f: case 0x7f:  // vmovdqa, vmovdqu
+        if (pp != 1 && pp != 2) {
+            return false;
+        }
+        *alt_opcode = opcode ^ 0x10;
+        return true;
+    case 0x7e:             // vmovq xmm, xmm/m64 (F3)
+        if (pp != 2) {
+            return false;  // 66 7E is vmovd/vmovq to a GPR
+        }
+        *alt_opcode = 0xd6;
+        *alt_pp = 1;
+        return true;
+    case 0xd6:             // vmovq xmm/m64, xmm (66)
+        if (pp != 1) {
+            return false;
+        }
+        *alt_opcode = 0x7e;
+        *alt_pp = 2;
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The explicit register operands of an instruction, in XED's order; returns
+// how many, or -1 if there are more than `max` or any operand is not a
+// register.
+static int vex_explicit_regs(const xed_decoded_inst_t *xedd,
+                             xed_reg_enum_t *regs, int max)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    int n = 0;
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (xed_operand_operand_visibility(op) != XED_OPVIS_EXPLICIT) {
+            continue;
+        }
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || n == max) {
+            return -1;
+        }
+        regs[n++] = xed_decoded_inst_get_reg(xedd, name);
+    }
+    return n;
+}
+
+// The two-byte VEX prefix cannot carry VEX.B, so a register 8-15 in ModRM.rm
+// forces the three-byte form even with map 0F and W0. ModRM.reg (VEX.R) and
+// vvvv number all sixteen in either form, so where an operation lets the high
+// register move out of rm, the byte is avoidable:
+//   vpaddd ymm0, ymm1, ymm8   c4 c1 75 fe c0   ->   vpaddd ymm0, ymm8, ymm1   c5 bd fe c1
+//   vmovdqa xmm0, xmm8        c4 c1 79 6f c0   ->   vmovdqa xmm0, xmm8        c5 79 7f c0
+// A commutative operation swaps its sources, putting the high one in vvvv
+// and the other, which must then be 0-7, in rm. A register copy uses its
+// other-direction opcode (the store form of a load, or the reverse), which
+// trades the reg and rm fields, so the destination must be 0-7. This is the
+// register-choice half of the three-byte prefix; check_oversized_vex is the
+// encoder half, and the two never meet on one instruction (it requires VEX.B
+// clear, this VEX.B set).
+//
+// Soundness. Both rewrites compute the same bits: the operation is the same
+// iclass, the sources are commutative exactly (vex_sources_commute), or the
+// copy is one copy spelled two ways, and none of these touches flags or raises
+// an exception. Neither has a memory operand -- with one, VEX.B extends the
+// base, which no reordering frees. Rather than trust the bit arithmetic, the
+// rewrite is assembled and decoded, and the finding stands only if XED reads
+// back the same iclass, one byte shorter, with the operands in the expected
+// places.
+bool check_vex_operand_order(const xed_decoded_inst_t *xedd)
+{
+    if (xed3_operand_get_vexvalid(xedd) != 1 ||
+        xed3_operand_get_map(xedd) != 1 ||
+        xed_operand_values_has_rexw_prefix(xed_decoded_inst_operands_const(xedd)) ||
+        xed3_operand_get_rexx(xedd) != 0 ||
+        xed3_operand_get_rexb(xedd) == 0 ||
+        xed_decoded_inst_number_of_memory_operands(xedd) != 0) {
+        return true;
+    }
+    unsigned p = xed3_operand_get_nprefixes(xedd);
+    if (xed3_operand_get_pos_nominal_opcode(xedd) - p != 3 ||
+        xed3_operand_get_mod(xedd) != 3 ||
+        xed_decoded_inst_get_length(xedd) != p + 5 ||
+        xed3_operand_get_vl(xedd) > 1) {
+        return true;  // the C4 prefix, opcode and a register ModRM, nothing else
+    }
+    // The fields as the instruction spells them: ModRM.reg with VEX.R, ModRM.rm
+    // with VEX.B, vvvv (which XED keeps inverted, as encoded), L and pp.
+    unsigned reg = (xed3_operand_get_rexr(xedd) << 3) | xed3_operand_get_reg(xedd);
+    unsigned rm = 8 | xed3_operand_get_rm(xedd);
+    unsigned vvvv = ~((xed3_operand_get_vexdest3(xedd) << 3) |
+                      xed3_operand_get_vexdest210(xedd)) & 0xf;
+    unsigned lpp = (xed3_operand_get_vl(xedd) << 2) |
+        xed_operand_values_get_pp_vex_prefix(xed_decoded_inst_operands_const(xedd));
+    uint8_t opcode = (uint8_t) xed3_operand_get_nominal_opcode(xedd);
+    unsigned not_r = xed3_operand_get_rexr(xedd) ? 0 : 0x80;
+
+    xed_reg_enum_t before[3];
+    int n = vex_explicit_regs(xedd, before, 3);
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    uint8_t out[4];
+    xed_reg_enum_t want[3];
+    if (n == 3 && vex_sources_commute(iclass)) {
+        if (vvvv >= 8) {
+            return true;  // both sources high: one of them stays in rm
+        }
+        out[0] = 0xc5;
+        out[1] = (uint8_t) (not_r | ((~rm & 0xf) << 3) | lpp);
+        out[2] = opcode;
+        out[3] = (uint8_t) (0xc0 | ((reg & 7) << 3) | vvvv);
+        want[0] = before[0];
+        want[1] = before[2];
+        want[2] = before[1];
+    } else if (n == 2 && vvvv == 0) {
+        uint8_t alt_opcode;
+        unsigned alt_pp;
+        if (reg >= 8 ||
+            !vex_move_other_direction(opcode, lpp & 3, &alt_opcode, &alt_pp)) {
+            return true;  // a high destination stays in rm either way
+        }
+        out[0] = 0xc5;
+        out[1] = (uint8_t) (0x78 | (lpp & 4) | alt_pp);  // R set, vvvv 1111
+        out[2] = alt_opcode;
+        out[3] = (uint8_t) (0xc0 | ((rm & 7) << 3) | reg);
+        want[0] = before[0];
+        want[1] = before[1];
+    } else {
+        return true;
+    }
+
+    xed_decoded_inst_t reenc;
+    decode_init(&reenc);
+    if (xed_decode(&reenc, out, sizeof(out)) != XED_ERROR_NONE ||
+        xed_decoded_inst_get_length(&reenc) != sizeof(out) ||
+        xed_decoded_inst_get_iclass(&reenc) != iclass) {
+        return true;
+    }
+    xed_reg_enum_t after[3];
+    if (vex_explicit_regs(&reenc, after, 3) != n) {
+        return true;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (after[i] != want[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // sub reg, reg zeros the register at the same size as xor reg, reg, but
 // xor is the portable dependency-breaking idiom. Mainstream cores (Intel
 // Sandy Bridge onward, AMD) recognize both xor reg, reg and sub reg, reg
@@ -5388,6 +5582,7 @@ static const struct check_entry checks[] = {
     {check_sse_zero_idiom,             "suboptimal SSE zero idiom",       0},
     {check_oversized_evex,             "oversized EVEX encoding",         0},
     {check_oversized_vex,              "oversized VEX encoding",          0},
+    {check_vex_operand_order,          "suboptimal VEX operand order",    0},
 };
 
 // Multi-instruction peephole (the first analysis to span two instructions,

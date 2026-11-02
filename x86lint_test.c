@@ -1785,6 +1785,63 @@ static void check_oversized_vex_test(void)
     ASSERT_FINDINGS(vex_c4, "oversized VEX encoding", 1);
 }
 
+static void check_vex_operand_order_test(void)
+{
+    // A commutative operation with its high source in rm: swap the sources.
+    CHECK_BYTES_ASM(!check_vex_operand_order, "vpaddd ymm0, ymm1, ymm8",
+        0xc4, 0xc1, 0x75, 0xfe, 0xc0);                                  // -> c5 bd fe c1
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x79, 0xef, 0xc1);  // vpxor xmm0, xmm0, xmm9
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x78, 0x54, 0xc2);  // vandps xmm0, xmm0, xmm10
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x79, 0x74, 0xc0);  // vpcmpeqb xmm0, xmm0, xmm8
+    // A high destination rides in VEX.R, which the two-byte form carries.
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0x41, 0x75, 0xfe, 0xc0);  // vpaddd ymm8, ymm1, ymm8
+    // A copy with its high source in rm: the other-direction opcode.
+    CHECK_BYTES_ASM(!check_vex_operand_order, "vmovdqa xmm0, xmm8",
+        0xc4, 0xc1, 0x79, 0x6f, 0xc0);                                  // -> c5 79 7f c0
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x7a, 0x6f, 0xc1);  // vmovdqu xmm0, xmm9
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x78, 0x28, 0xc0);  // vmovaps xmm0, xmm8
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x79, 0x10, 0xc0);  // vmovupd xmm0, xmm8
+    CHECK_BYTES(!check_vex_operand_order, 0xc4, 0xc1, 0x7a, 0x7e, 0xc0);  // vmovq xmm0, xmm8 (F3 7E -> 66 D6)
+    // ... or the store form with its high destination in rm (-> load form).
+    CHECK_BYTES_ASM(!check_vex_operand_order, "vmovaps ymm8, ymm0",
+        0xc4, 0xc1, 0x7c, 0x29, 0xc0);                                  // -> c5 7c 28 c0
+
+    // Both sources high: one stays in rm whichever order.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0x41, 0x35, 0xfe, 0xc0);  // vpaddd ymm8, ymm9, ymm8
+    // Not commutative.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x75, 0xfa, 0xc0);  // vpsubd ymm0, ymm1, ymm8
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x71, 0xdf, 0xc0);  // vpandn xmm0, xmm1, xmm8
+    // FP add commutes except in which NaN payload it returns.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x74, 0x58, 0xc0);  // vaddps ymm0, ymm1, ymm8
+    // A scalar merge takes its upper lanes from the first source.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x72, 0x10, 0xc0);  // vmovss xmm0, xmm1, xmm8
+    // A copy between two high registers, or between unlike register files.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0x41, 0x79, 0x6f, 0xc0);  // vmovdqa xmm8, xmm8
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x79, 0x6e, 0xc0);  // vmovd xmm0, r8d
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x79, 0xd7, 0xc0);  // vpmovmskb eax, xmm8
+    // VEX.B extends a base register: no reordering frees it.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x79, 0x6f, 0x00);  // vmovdqa xmm0, [r8]
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0x71, 0xfe, 0x00);  // vpaddd xmm0, xmm1, [r8]
+    // The three-byte form for other reasons: map 0F38, W1.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc2, 0x75, 0x40, 0xc0);  // vpmulld ymm0, ymm1, ymm8
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xc1, 0xf9, 0x6e, 0xc0);  // vmovq xmm0, r8
+    // VEX.B clear is check_oversized_vex's case, and C5 is already short.
+    CHECK_BYTES( check_vex_operand_order, 0xc4, 0xe1, 0x75, 0xfe, 0xc2);  // vpaddd ymm0, ymm1, ymm2 (C4)
+    CHECK_BYTES( check_vex_operand_order, 0xc5, 0xbd, 0xfe, 0xc1);        // vpaddd ymm0, ymm8, ymm1
+    CHECK_BYTES( check_vex_operand_order, 0x62, 0xd1, 0x75, 0x28, 0xfe, 0xc0);  // vpaddd ymm0, ymm1, ymm8 (EVEX)
+    CHECK_BYTES( check_vex_operand_order, 0x66, 0x41, 0x0f, 0xfe, 0xc0);  // paddd xmm0, xmm8 (legacy)
+    CHECK_BYTES( check_vex_operand_order, 0x90);                          // nop
+
+    // Dispatcher wiring: unconditional, and never alongside the oversized VEX
+    // finding.
+    static const uint8_t swap[] = {
+        0xc4, 0xc1, 0x75, 0xfe, 0xc0,  // vpaddd ymm0, ymm1, ymm8
+        0xc4, 0xc1, 0x79, 0x6f, 0xc0,  // vmovdqa xmm0, xmm8
+        0xc3,                          // ret
+    };
+    ASSERT_FINDINGS(swap, "suboptimal VEX operand order", 2);
+}
+
 // Flag-liveness gating: check_instructions should suppress findings whose
 // suggested replacement would clobber a flag that's read downstream. These
 // tests construct two-or-three instruction sequences and assert the
@@ -8873,6 +8930,7 @@ int main(int argc, char *argv[])
     check_sse_zero_idiom_test();
     check_oversized_evex_test();
     check_oversized_vex_test();
+    check_vex_operand_order_test();
     check_flag_liveness_test();
     check_flag_liveness_corners_test();
     check_reg_liveness_test();

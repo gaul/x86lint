@@ -257,6 +257,14 @@ bool check_oversized_evex(const xed_decoded_inst_t *xedd);
 // r8-r15 base/index/rm operand -- which wastes one byte
 bool check_oversized_vex(const xed_decoded_inst_t *xedd);
 
+// return false if a register-to-register VEX instruction needs the three-byte
+// prefix only because a register 8-15 sits in ModRM.rm, and the operation lets
+// it move: a commutative integer or bitwise operation whose other source is
+// 0-7 (swap the sources), or a register copy whose destination is 0-7 (use the
+// other-direction opcode). Either rewrite takes the two-byte prefix and saves a
+// byte; the rewrite is re-decoded to confirm it
+bool check_vex_operand_order(const xed_decoded_inst_t *xedd);
+
 // return false if the bytes at `offset` do not begin with an ENDBR64
 // instruction. For a caller with outside evidence that an indirect branch can
 // land at `offset` -- an ELF relocation, an init_array slot, an exported

@@ -258,6 +258,7 @@ with the corpus populations that argue for or against each, live in
 | [suboptimal SSE MOV opcode](analyses.md#suboptimal-sse-mov-opcode) | `MOVAPS`/`MOVUPS` |
 | [suboptimal SSE zero idiom](analyses.md#suboptimal-sse-zero-idiom) | `XORPS` |
 | [suboptimal SUB reg, reg](analyses.md#suboptimal-sub-reg-reg) | `XOR reg, reg`, which every core recognizes as independent |
+| [suboptimal VEX operand order](analyses.md#suboptimal-vex-operand-order) | swap the sources, or the other-direction move, for the two-byte VEX prefix |
 | [suboptimal XOR immediate](analyses.md#suboptimal-xor-immediate) | `NOT`, while the flags are dead |
 | [unneeded explicit immediate](analyses.md#unneeded-explicit-immediate) | the implied-operand form |
 | [unneeded explicit register](analyses.md#unneeded-explicit-register) | the accumulator form |
@@ -900,7 +901,9 @@ way that cost was paid:
   with VEX.W clear fits the two-byte C5 form except for VEX.B and VEX.X, so
   the third byte was spent on the number of the register in the r/m or
   index field. For a commutative operation, swapping the two sources removes
-  it.
+  it, as does the other-direction opcode for a register copy; the
+  [suboptimal VEX operand order](analyses.md#suboptimal-vex-operand-order)
+  check reports those sites.
 * **R12 base without an index** takes a SIB byte, because R12 shares RSP's
   r/m encoding, and **R13 base with zero displacement** takes a disp8 of 0,
   because R13 shares RBP's. The RSP and RBP counts sit beside them because

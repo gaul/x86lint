@@ -1276,6 +1276,52 @@ stays in the default scan.*
   where XOR leaves it undefined. Nothing here can gate on that -- FLAG_ARITH
   omits AF -- and no 64-bit code observes it without LAHF or PUSHF
 
+## suboptimal VEX operand order
+
+* `C4C175FEC0` instead of `C5BDFEC1` (VPADDD YMM0, YMM1, YMM8 -> VPADDD
+  YMM0, YMM8, YMM1). The two-byte VEX prefix carries VEX.R and all four
+  vvvv bits but not VEX.B, so a register 8-15 in ModRM.rm forces the
+  three-byte form even where map 0F and W0 would otherwise fit the short
+  one. A commutative operation can move its high source into vvvv,
+  provided the other source is 0-7 and can take rm.
+* `C4C1796FC0` instead of `C5797FC0` (VMOVDQA XMM0, XMM8, load form ->
+  store form). A register copy has two spellings, with the source in rm or
+  in reg, so a high source goes in reg when the destination is 0-7. The
+  pairs are MOVAPS/MOVAPD 28/29, MOVUPS/MOVUPD 10/11, MOVDQA/MOVDQU 6F/7F
+  and MOVQ xmm, xmm F3 7E/66 D6.
+* Sound by construction. The set of commutative operations is exact:
+  integer add, saturating add, multiply, multiply-add, average, SAD,
+  equality compares, min/max, and the bitwise logic of both domains. None
+  of these writes flags or raises an exception. FP add and multiply are
+  excluded although GCC and LLVM both treat them as commutative: when both
+  sources are NaN, the result is the first source's payload. Scalar forms
+  are excluded because they take their upper lanes from the first source.
+  VMOVSS/VMOVSD are excluded because their register forms merge a third
+  operand. A memory operand is never flagged, since there VEX.B extends the
+  base. The rewrite is assembled and decoded, and the finding stands only
+  if XED reads back the same iclass with the operands where they should be,
+  one byte shorter. The check fires only with VEX.B set and
+  [oversized VEX encoding](#oversized-vex-encoding) only with it clear, so
+  the two never report the same instruction.
+* Measured on 2026-11-01:
+
+  | binary | sites | mix |
+  | --- | --- | --- |
+  | libcrypto | 1,224 | perlasm, mostly `vpxor`, `vpaddd`, `vpaddq` |
+  | libxul | 606 | 523 sources to swap, 83 `vmovdqa` |
+  | glibc | 380 | 376 in the AVX2 `strcasecmp`/`strncasecmp` family, 368 of them `vpaddb` |
+  | Go toolchain | 296 | hand-written assembly |
+  | SpiderMonkey WasmBaseline | 186 | |
+  | SpiderMonkey WasmIon | 29 | |
+
+  libLLVM, libclang-cpp, bash and ld.so have none, nor do SpiderMonkey's JS
+  tiers. Clang's output has none because LLVM already commutes for the
+  short encoding. GCC 16 does not. GNU as `-O2` swaps some sources and no
+  copies, and Go's assembler encodes what it is given.
+* Most three-byte copies in the corpus cannot be fixed this way. In libxul
+  and WasmIon they are `vmovd` to or from a GPR, which has no second
+  spelling, or copies with both registers high.
+
 ## suboptimal XOR immediate
 
 * `83F0 FF` instead of `F7D0` (XOR EAX, -1 -> NOT EAX, when flags are unused)

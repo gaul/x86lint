@@ -912,7 +912,7 @@ way that cost was paid:
 The total is what register numbering cost, not what a better allocation
 would save: most high registers are in use because the low ones were
 occupied. Across the corpora measured on 2026-11-01 it is 2.2-2.9% of code
-bytes in compiled code (libxul 2.2%, librustc_driver 2.3%, the GCC-built
+bytes in compiled code (libxul 2.2%, librustc_driver 2.3%, the clang-built
 libLLVM and libclang-cpp 2.8-2.9%), about 85% of it REX bytes for R8-R15.
 
 The rarely used registers -- high bytes, R16-R31, vector registers 16-31,

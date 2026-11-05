@@ -101,6 +101,7 @@ static uint8_t *collect_branch_targets(const uint8_t *code, size_t size)
 struct func_sym {
     uint64_t value;     // st_value: a vaddr, or a section offset in ET_REL
     uint64_t size;      // st_size: 0 for an unsized assembly label
+    const char *name;   // into the mapped string table, or NULL
     uint16_t shndx;
 };
 
@@ -146,6 +147,7 @@ static size_t build_func_ranges(const Elf64_Shdr *shdr, uint64_t shndx,
         r[n].start = start;
         r[n].end = funcs[i].size > shdr->sh_size - start
             ? shdr->sh_size : start + funcs[i].size;
+        r[n].name = funcs[i].name;
         ++n;
     }
     if (n == 0) {
@@ -160,10 +162,14 @@ static size_t build_func_ranges(const Elf64_Shdr *shdr, uint64_t shndx,
     }
     // Merge overlaps so no byte is scanned twice. Aliased symbols (one
     // address, several names) are the common case; an unsized label inside a
-    // sized function is the other.
+    // sized function is the other. Strictly overlapping only: two functions
+    // that abut -- the next starting exactly where the previous ends, which
+    // is every function whose size is a multiple of the alignment -- are two
+    // functions, and merging them (as `<=` did until 2026-11) handed a
+    // per-function tool one range holding several prologues and frames.
     size_t k = 0;
     for (size_t i = 1; i < n; ++i) {
-        if (r[i].start <= r[k].end) {
+        if (r[i].start < r[k].end) {
             if (r[i].end > r[k].end) {
                 r[k].end = r[i].end;
             }
@@ -198,6 +204,22 @@ static int load_func_syms(const Elf64_Ehdr *ehdr, uint64_t shnum,
             return 0;
         }
         const Elf64_Sym *syms = (const Elf64_Sym *) (base + shdr->sh_offset);
+        // The symbol names, for the tools that report per function. sh_link
+        // names the string table; one that is out of bounds or does not end
+        // in a NUL -- the terminator every lookup below relies on -- leaves
+        // the names NULL rather than reading past the mapping.
+        const char *strtab = NULL;
+        uint64_t strtab_size = 0;
+        if (shdr->sh_link < shnum) {
+            const Elf64_Shdr *str = &shdrs[shdr->sh_link];
+            if (str->sh_type == SHT_STRTAB && str->sh_size != 0 &&
+                str->sh_offset <= file_size &&
+                str->sh_size <= file_size - str->sh_offset &&
+                base[str->sh_offset + str->sh_size - 1] == '\0') {
+                strtab = (const char *) (base + str->sh_offset);
+                strtab_size = str->sh_size;
+            }
+        }
         struct func_sym *funcs = malloc(nsyms * sizeof(*funcs));
         if (funcs == NULL) {
             return -1;
@@ -212,6 +234,8 @@ static int load_func_syms(const Elf64_Ehdr *ehdr, uint64_t shnum,
             funcs[nfuncs].value = syms[s].st_value;
             funcs[nfuncs].size = syms[s].st_size;
             funcs[nfuncs].shndx = syms[s].st_shndx;
+            funcs[nfuncs].name = strtab != NULL &&
+                syms[s].st_name < strtab_size ? strtab + syms[s].st_name : NULL;
             ++nfuncs;
         }
         // A table stripped of symbol types must not exclude every byte.

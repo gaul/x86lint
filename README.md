@@ -1218,12 +1218,37 @@ built separately with `XED_PATH=/path/to/xed make tools`:
   `--cold-below` reports how much of each C++ count sits in GCC's
   size-optimized cold partition. The libxul split in
   [TODO.md](TODO.md) is its output.
+* `tools/framescan` sizes the frame-layout counterfactual: of the bytes a
+  binary pays for 32-bit displacements on its stack-slot accesses -- three
+  per access past 127 bytes from the base register, a cost no instruction
+  check can see because every access is correctly encoded for the offset
+  the compiler gave it -- how many a frequency-aware slot order would
+  recover. It is the register census's question asked of the frame: a
+  whole-function cost, split into what a different allocation saves and
+  what is structural. Each `.symtab` function's explicit RSP-based accesses
+  (and RBP-based ones under a frame pointer, by `-p`'s prologue rule) are
+  keyed to slots relative to the return address, with RSP's depth tracked
+  through pushes, frame allocation and stack-clash probe loops; the slots
+  divide into incoming arguments (the ABI's), pushed registers (the
+  prologue's) and locals (the layout's), and a 0/1 knapsack per base asks
+  which locals fitting in the 128-byte disp8 window -- less the pushes,
+  below RBP -- cover the most accesses. Three bytes times the accesses that
+  gains over today is the bound. It weighs accesses statically and treats
+  slots as independent, so it is an upper bound, and `-f NAME` dumps a
+  function's slot table to check against objdump; `-m` dumps the functions
+  behind its own contradiction counter. Measured in [TODO.md](TODO.md),
+  "Frame layout": 4.1-4.8% of code bytes in GCC output with frame pointers
+  and 7.7% in Go, of which 39-76% is recoverable by the bound.
 
 All of them restrict the scan to the symbol table's function ranges and skip
 the dynamic linker's import glue exactly as the driver does, so no pair or
 distance spans two functions, none is mined from the non-code that executable
 sections interleave, and none counts the PLT's one fixed template as though a
-compiler had emitted it; `-a` scans every byte. The workflow behind several
+compiler had emitted it; `-a` scans every byte (`framescan` has no `-a`:
+without function boundaries there is no frame). Two functions that abut with
+no padding between them are two ranges: until 2026-11 the loader merged them,
+which the pair and distance tools barely noticed and a per-function tool
+could not survive. The workflow behind several
 current checks: run `pairscan` over a
 representative corpus, classify the top shapes as by-design or foldable,
 then use `defuse` to decide whether a candidate needs adjacency only or a

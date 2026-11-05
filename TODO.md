@@ -2234,6 +2234,117 @@ What this sweep changed in the tools: `tools/shapescan` gained the
 thirteen candidates above and per-candidate example caps, so `-e ""`
 prints examples for every candidate in one scan.
 
+## Frame layout (2026-11-05)
+
+A frame slot more than 127 bytes from its base register costs a disp32
+where a nearer one costs a disp8: three bytes on every access, paid for
+a choice the compiler made once per function. No instruction check can
+report it, since every access is correctly encoded for the offset it was
+given, and the register census (`-r`) is the precedent for asking the
+question anyway: sum a cost over the binary, then split it into what a
+different allocation would save and what is structural.
+`tools/framescan` does that for the frame. A quick objdump pass had put
+the raw cost at 7.4% of `/bin/go`'s `.text` and 4.0% of libLLVM's, more
+than the 2.2-2.9% that register numbering costs; the tool's job was to
+say how much of it a layout could recover.
+
+**Method.** Every explicit RSP-based memory operand, and every RBP-based
+one in a function that establishes a frame pointer by `-p`'s prologue
+rule, is a slot access costed by the displacement width XED decoded.
+Slots are keyed by position relative to the return address, with RSP's
+depth tracked through the walk, and classified as incoming arguments
+(above the return address, the ABI's), pushed registers (the
+prologue's) or locals (the layout's). Per function and per base
+register, a 0/1 knapsack picks the locals that fit in the disp8 window
+and cover the most accesses; the window is 128 bytes above RSP, and 128
+bytes below RBP *less the pushed registers*, which sit in front of the
+locals. Three bytes times the gain over today's in-window accesses is
+the recoverable bound. Accesses are weighed by static count, slots are
+independent, and an LEA's slot is sized at 8 bytes, so it is an upper
+bound; `.cold` fragments are tallied but weigh nothing, since a layout
+driven by frequency would already have placed them last.
+
+**Controls.** Four builds of one file, a 512-byte buffer plus ten
+values live across calls. gcc and clang at `-O2` both put the spills at
+the bottom of the frame and the buffer above: every access disp8,
+nothing to recover. With `-fno-omit-frame-pointer` both address locals
+from RBP, and gcc puts the buffer nearest RBP and the five spills behind
+it, every one a disp32 (36 bytes recoverable, exactly the slot table
+objdump shows); clang keeps the spills near RBP and only the buffer's
+two accesses pay (6 bytes). Fedora builds with frame pointers, so the
+gcc shape is libxul's and glibc's.
+
+| binary | functions | slot accesses, disp32 | bytes over disp8 | of code bytes | recoverable by the bound | structural: locals that do not fit | incoming arguments |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Firefox `libxul.so` (local opt build, GCC C++ + Rust, frame pointers, no PGO) | 279,405 | 1,994,365 of 4,268,662 (46.7%) | 5,983,095 | **4.80%** | **2,675,214 (44.7%)**, 99.6% of it RBP-based, in 39,043 functions | 3,289,557 | 18,156 |
+| `/bin/go` 1.26 | 16,170 | 195,601 of 420,226 (46.5%) | 586,794 | **7.71%** | 228,945 (39.0%) | 175,500 | **182,301** |
+| glibc `libc.so.6` | 3,898 | 20,660 of 38,027 (54.3%) | 61,980 | 4.14% | 47,127 (76.0%) | 14,802 | 51 |
+| `ld.so` | 385 | 1,202 of 2,593 (46.4%) | 3,606 | 2.03% | 2,298 (63.7%) | 1,068 | 240 |
+
+**What it says.** The frame-slot disp32 cost is larger than the
+register-numbering cost in every binary but `ld.so`, and 39-76% of it
+is recoverable by the bound: 2.68 MB of libxul, 2.1% of its code bytes.
+libxul's recoverable share is almost entirely RBP-based, and the control
+says why: under a frame pointer GCC addresses locals from RBP, the five
+pushed registers take the first 40 of the window's 128 bytes, and the
+aggregates go nearest RBP with the spills behind them. The structural
+remainder is frames too large for any order (3.29 MB in libxul: 29,586
+functions have 129-1024 bytes of locals and 2,057 more than that) and,
+in Go, the ABI: 182 KB of Go's cost is **incoming arguments**, because
+Go's register ABI spills arguments into a caller-reserved area that the
+callee addresses as `[rsp + frame + 8 + k]`, a disp32 in any function
+whose frame passes 120 bytes. That is 2.4% of Go's code bytes fixed by
+the calling convention, which no layout touches.
+
+The functions at the top of libxul's list are worth reading as a
+compiler writer: `PContentParent::OnMessageReceived` (4,552 bytes of
+locals, 2,856 disp32 accesses, 6,207 recoverable), `js::Interpret`
+(776 bytes of locals, **2,492 of its 2,562 slot accesses disp32**,
+5,886 recoverable -- the interpreter loop, where the static count is
+also a dynamic one), and the three `WebGLImageConverter::run`
+instantiations at 11,000-12,000 slot accesses each.
+
+**What building it corrected.** Four model errors, each found by
+dumping a slot table (`-f`) or the tool's own contradiction counter
+(`-m`: a disp32 local inside a frame small enough to reach), and each
+worth recording because the first number was wrong by it:
+
+* **`tools/corpus.c` merged abutting functions.** The range merge used
+  `<=`, so a function ending exactly where the next begins -- every
+  function whose size is a multiple of its alignment -- became one range
+  with its neighbour. A 64-byte function reporting slots 312 bytes below
+  RBP exposed it. Fixed to strict overlap: libxul has 279,405 functions,
+  not 261,817, and `ld.so` and libc's cold fragments (51 and 107) become
+  visible instead of being swallowed. The pair and distance tools never
+  noticed because they reset at branch targets; a per-function tool
+  cannot survive it.
+* **The pushed registers eat RBP's window.** The first libc figure was
+  83% recoverable; subtracting the push area from the knapsack's
+  capacity made it 76%, and 44.7% rather than 58% for libxul.
+* **Not every RSP-relative operand is a slot.** Go opens functions with
+  `lea r12, [rsp - N]` for its stack-growth check; GCC's stack-clash
+  probe loop is `lea r11, [rsp - N] ; sub rsp, 0x1000 ; or [rsp], 0 ;
+  cmp rsp, r11 ; jne`, and its unrolled form repeats the `sub`/`or` pair.
+  Taken as accesses, the first made 178,000 of Go's disp32 slots read
+  as incoming arguments, and the probes sized every large frame at
+  exactly 4,096 bytes. A LEA before the frame exists, and a zero store
+  to `[rsp]` right after a page-sized `sub`, are now neither.
+* **Leaves use the red zone.** A leaf with a frame pointer allocates
+  nothing and keeps its locals up to 128 bytes below RSP, so a frame's
+  extent is not its allocation. The residue of the contradiction counter
+  on libxul is under 0.5% of its disp32 accesses, in dav1d's hand-written
+  AVX-512 (which reads its arguments before allocating scratch) and
+  shrink-wrapped leaves.
+
+**Next.** The bound weighs cold code as hot code; the profile join the
+`--json` mode was built for would turn it into a dynamic count, and
+`js::Interpret` is the function to try it on. The control's gcc shape
+-- aggregates nearest RBP, spills behind -- is a layout question for
+GCC's frame-pointer path specifically, and a two-line reproduction
+exists in `framescan`'s calibration. Whether the bound survives a
+real reordering is the usual question: a slot table is not a layout,
+and the 2.68 MB is what a layout could reach, not what one would.
+
 ## Investigated and closed (2026-08 sweep)
 
 Candidates measured and set aside, recorded so they are not

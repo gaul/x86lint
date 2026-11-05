@@ -31,10 +31,14 @@
 // be compared -- so it lives in one place rather than being duplicated per
 // tool.
 
-// A half-open byte range within a section, in section-relative offsets.
+// A half-open byte range within a section, in section-relative offsets. When
+// the range came from a function symbol, `name` is that symbol's name (the
+// first of them, for aliases); it is NULL for a whole-section range or a
+// string table that would not validate.
 typedef struct {
     uint64_t start;
     uint64_t end;
+    const char *name;
 } corpus_range;
 
 typedef struct {

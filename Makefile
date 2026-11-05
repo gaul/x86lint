@@ -27,11 +27,15 @@ all: lib x86lint test
 
 # Corpus-mining research utilities (see "Mining tools" in README.md); not part
 # of the default build or of check.
-tools: tools/pairscan tools/defuse tools/cohere tools/shapescan
+tools: tools/pairscan tools/defuse tools/cohere tools/shapescan tools/framescan
 
 tools/pairscan: tools/pairscan.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
 		tools/pairscan.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+
+tools/framescan: tools/framescan.c tools/corpus.c tools/corpus.h
+	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
+		tools/framescan.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
 
 tools/cohere: tools/cohere.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \

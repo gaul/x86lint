@@ -72,7 +72,7 @@ snapshot() {  # snapshot <name> <args...>
         sed -e 's/vaddr 0x[0-9a-f]\{2,\}/vaddr 0xADDR/' \
             -e 's/^== section [0-9][0-9]* /== section N /' \
             -e 's/"vaddr": [0-9][0-9]*/"vaddr": N/' \
-            -e 's/ at 0x[0-9a-f]*$/ at 0xADDR/' \
+            -e 's/ at 0x[0-9a-f]*\(, 0x[0-9a-f]*\)*$/ at 0xADDR/' \
             -e 's/ENDBR64: 0x[0-9a-f]*/ENDBR64: 0xADDR/' \
             -e 's/^  GNU property ISA note: used = 0$/  GNU property ISA note: none/' \
             -e "s|$dir/|<fixtures>/|g" \

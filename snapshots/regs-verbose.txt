@@ -36,7 +36,7 @@ register census: 13 instructions, 0 undecodable bytes skipped
     R13 base with zero displacement (disp8): 1 (rbp, no alternative: 0)
     VEX: 1 two-byte, 1 three-byte; EVEX: 0, 0 of them naming a vector register 16-31
     high-byte register at 0xADDR
-    REX only for a register numbered 8-15 at 0x400158, 0x400173, 0x40017d
+    REX only for a register numbered 8-15 at 0xADDR
     REX only for SPL/BPL/SIL/DIL at 0xADDR
     three-byte VEX only for a high r/m or index register at 0xADDR
     R12 base without an index (SIB byte) at 0xADDR

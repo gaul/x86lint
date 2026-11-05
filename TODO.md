@@ -2280,6 +2280,8 @@ gcc shape is libxul's and glibc's.
 | `/bin/go` 1.26 | 16,170 | 195,601 of 420,226 (46.5%) | 586,794 | **7.71%** | 228,945 (39.0%) | 175,500 | **182,301** |
 | glibc `libc.so.6` | 3,898 | 20,660 of 38,027 (54.3%) | 61,980 | 4.14% | 47,127 (76.0%) | 14,802 | 51 |
 | `ld.so` | 385 | 1,202 of 2,593 (46.4%) | 3,606 | 2.03% | 2,298 (63.7%) | 1,068 | 240 |
+| Fedora Firefox 159 `libxul.so` (GCC, PGO hot/cold split, frame pointers in 41,773 functions only; ranges from MiniDebugInfo), **34,080 `.cold` fragments weighed as cold** | 315,610 | 1,808,487 of 4,687,047 (38.6%) | 5,425,461 | **4.85%** | 1,857,435 (34.2%), 75% RSP-based | 3,017,943, plus 514,200 in the fragments | 35,778 |
+| same, **`-c 0x62b4971`: the whole cold partition weighed as cold** (149,857 more functions) | 315,610 | same | same | 4.85% | **969,369 (17.9%)** | 2,383,155, plus 2,052,804 in cold code | 15,438 |
 
 **What it says.** The frame-slot disp32 cost is larger than the
 register-numbering cost in every binary but `ld.so`, and 39-76% of it
@@ -2303,6 +2305,35 @@ locals, 2,856 disp32 accesses, 6,207 recoverable), `js::Interpret`
 5,886 recoverable -- the interpreter loop, where the static count is
 also a dynamic one), and the three `WebGLImageConverter::run`
 instantiations at 11,000-12,000 slot accesses each.
+
+**The Fedora build, and what the profile does to the bound.** Fedora's
+libxul is the same source under PGO with GCC's hot/cold split, stripped
+to MiniDebugInfo (which the tools now read), and with frame pointers in
+only 41,773 of its 315,610 functions -- the "Build properties" table
+above had counted 42,346 `push rbp ; mov rbp, rsp` in its bytes and this
+agrees. Its raw cost is the local build's, 4.85% of code bytes, but the
+layout differs with the frame pointer: GCC's RSP-based layout keeps the
+spills at the bottom (the control's `-O2` shape), so the recoverable
+share is 34.2% rather than 44.7%, three quarters of it RSP-based, and
+what remains is frames too large for the window. Then the profile.
+The 34,080 `.cold` fragments span `0x335c780..0x62b47c7`, the very
+bottom of `.text`, because GCC emits the whole cold partition --
+fragments and wholly cold functions together -- ahead of everything
+else; 149,857 further functions start below the last fragment's end,
+so **58% of the binary's functions are profile-cold**, and they hold
+**2.05 MB of the 5.42 MB** disp32 cost. Weighing them as the profile
+does (`-c 0x62b4971`) takes the bound from 1.86 MB to **969 KB, 17.9%
+of the cost and 0.87% of code bytes**. That is the honest figure for a
+PGO build, and the gap between it and the local build's 44.7% is the
+measure of how much a static count overweights code that does not run.
+The fragments' own 171,400 disp32 accesses -- a fragment addresses its
+parent's frame from RSP at the parent's depth -- are cold by
+construction, and the earlier claim that "the layout is right about the
+cold code" is now a number: 38% of the cost sits where the profile put
+it. The top of the list changes with the weighting: `blend_pixels`
+(swgl, 7,680 bytes of SIMD temporaries in 563 slots, 4,020 of 4,038
+slot accesses disp32) and `BaselineCacheIRCompiler::compile` survive,
+`PContentChild::OnMessageReceived` is cold and falls off.
 
 **What building it corrected.** Four model errors, each found by
 dumping a slot table (`-f`) or the tool's own contradiction counter
@@ -2336,9 +2367,11 @@ worth recording because the first number was wrong by it:
   AVX-512 (which reads its arguments before allocating scratch) and
   shrink-wrapped leaves.
 
-**Next.** The bound weighs cold code as hot code; the profile join the
-`--json` mode was built for would turn it into a dynamic count, and
-`js::Interpret` is the function to try it on. The control's gcc shape
+**Next.** The bound weighs hot code uniformly; the cold partition is the
+one weight a binary carries, and the Fedora rows show it is worth a
+factor of two. The profile join the `--json` mode was built for would
+turn the rest into a dynamic count, and `js::Interpret` is the function
+to try it on. The control's gcc shape
 -- aggregates nearest RBP, spills behind -- is a layout question for
 GCC's frame-pointer path specifically, and a two-line reproduction
 exists in `framescan`'s calibration. Whether the bound survives a

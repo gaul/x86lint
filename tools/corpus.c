@@ -16,6 +16,7 @@
 
 #include <elf.h>
 #include <fcntl.h>
+#include <lzma.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -181,13 +182,123 @@ static size_t build_func_ranges(const Elf64_Shdr *shdr, uint64_t shndx,
     return k + 1;
 }
 
-// Read the symbol table's function ranges, if the binary kept one. Only
+// Validate an ELF image's section header table and return its section count,
+// as main.c validates it: a stride other than sizeof(Elf64_Shdr) would
+// misparse the table, and a file with 0xff00 or more sections keeps its real
+// count in section header 0's sh_size. Returns -1 when the table is
+// malformed; *shnum is zero when there is none.
+static int elf_shnum(const uint8_t *base, size_t size, uint64_t *shnum)
+{
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *) base;
+    *shnum = 0;
+    if (ehdr->e_shoff == 0) {
+        return 0;
+    }
+    if (ehdr->e_shentsize != sizeof(Elf64_Shdr) || ehdr->e_shoff > size ||
+        size - ehdr->e_shoff < sizeof(Elf64_Shdr)) {
+        return -1;
+    }
+    const Elf64_Shdr *shdrs = (const Elf64_Shdr *) (base + ehdr->e_shoff);
+    uint64_t n = ehdr->e_shnum != 0 ? ehdr->e_shnum : shdrs[0].sh_size;
+    if (n > (size - ehdr->e_shoff) / sizeof(Elf64_Shdr)) {
+        return -1;
+    }
+    *shnum = n;
+    return 0;
+}
+
+// Decompress an xz stream into a fresh buffer, or return NULL.
+static uint8_t *xz_decompress(const uint8_t *in, size_t in_size,
+                              size_t *out_size)
+{
+    lzma_stream strm = LZMA_STREAM_INIT;
+    if (lzma_stream_decoder(&strm, UINT64_MAX, LZMA_CONCATENATED) != LZMA_OK) {
+        return NULL;
+    }
+    size_t cap = in_size * 8 + 4096, len = 0;
+    uint8_t *out = malloc(cap);
+    if (out == NULL) {
+        lzma_end(&strm);
+        return NULL;
+    }
+    strm.next_in = in;
+    strm.avail_in = in_size;
+    lzma_ret ret;
+    for (;;) {
+        if (len == cap) {
+            uint8_t *grown = realloc(out, cap * 2);
+            if (grown == NULL) {
+                free(out);
+                lzma_end(&strm);
+                return NULL;
+            }
+            out = grown;
+            cap *= 2;
+        }
+        strm.next_out = out + len;
+        strm.avail_out = cap - len;
+        ret = lzma_code(&strm, LZMA_FINISH);
+        len = cap - strm.avail_out;
+        if (ret != LZMA_OK) {
+            break;
+        }
+    }
+    lzma_end(&strm);
+    if (ret != LZMA_STREAM_END) {
+        free(out);
+        return NULL;
+    }
+    *out_size = len;
+    return out;
+}
+
+// MiniDebugInfo. Fedora strips .symtab from every binary it ships and keeps
+// an xz-compressed ELF holding just the symbol tables in .gnu_debugdata, which
+// gdb reads for backtraces and tools/split.py already relies on. Returns the
+// decompressed image, whose symbols carry the same vaddrs as the file's own
+// would have, or NULL when there is no such section or it will not decode.
+static uint8_t *load_minidebug(const uint8_t *base, size_t size,
+                               const Elf64_Shdr *shdrs, uint64_t shnum,
+                               const char *shstr, uint64_t shstr_size,
+                               size_t *out_size)
+{
+    if (shstr == NULL) {
+        return NULL;
+    }
+    for (uint64_t i = 0; i < shnum; ++i) {
+        const Elf64_Shdr *shdr = &shdrs[i];
+        if (shdr->sh_type != SHT_PROGBITS || shdr->sh_name >= shstr_size ||
+            strcmp(shstr + shdr->sh_name, ".gnu_debugdata") != 0 ||
+            shdr->sh_size == 0 || shdr->sh_offset > size ||
+            shdr->sh_size > size - shdr->sh_offset) {
+            continue;
+        }
+        size_t len = 0;
+        uint8_t *inner = xz_decompress(base + shdr->sh_offset, shdr->sh_size,
+                                       &len);
+        if (inner == NULL) {
+            return NULL;
+        }
+        const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *) inner;
+        if (len < sizeof(*ehdr) || memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0 ||
+            ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+            free(inner);
+            return NULL;
+        }
+        *out_size = len;
+        return inner;
+    }
+    return NULL;
+}
+
+// Read the symbol table's function ranges, if the image kept one. Only
 // SHT_SYMTAB qualifies: .dynsym survives stripping but lists exports alone,
 // and scanning just those would mine almost no code while reporting success.
-static int load_func_syms(const Elf64_Ehdr *ehdr, uint64_t shnum,
-                          uint64_t file_size, const uint8_t *base,
-                          struct func_sym **out, size_t *nout)
+// `base` is a validated ELF image: the mapped file, or its MiniDebugInfo.
+static int load_func_syms(const uint8_t *base, size_t file_size,
+                          uint64_t shnum, struct func_sym **out, size_t *nout)
 {
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *) base;
     const Elf64_Shdr *shdrs = (const Elf64_Shdr *) (base + ehdr->e_shoff);
     for (uint64_t i = 0; i < shnum; ++i) {
         const Elf64_Shdr *shdr = &shdrs[i];
@@ -275,6 +386,8 @@ int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,
     int rc = -1;
     struct func_sym *funcs = NULL;
     size_t nfuncs = 0;
+    uint8_t *inner = NULL;      // the MiniDebugInfo image the names live in
+    size_t inner_len = 0;
 
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *) base;
     if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
@@ -287,33 +400,13 @@ int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,
         goto out;
     }
 
-    // Section header bounds, as main.c validates them: a stride other than
-    // sizeof(Elf64_Shdr) would misparse the table, and a file with 0xff00 or
-    // more sections keeps its real count in section header 0's sh_size.
     uint64_t shnum = 0;
-    if (ehdr->e_shoff != 0) {
-        if (ehdr->e_shentsize != sizeof(Elf64_Shdr) ||
-            ehdr->e_shoff > map_len ||
-            map_len - ehdr->e_shoff < sizeof(Elf64_Shdr)) {
-            fprintf(stderr, "%s: malformed section header table\n", path);
-            goto out;
-        }
-        const Elf64_Shdr *shdrs = (const Elf64_Shdr *) (base + ehdr->e_shoff);
-        shnum = ehdr->e_shnum != 0 ? ehdr->e_shnum : shdrs[0].sh_size;
-        if (shnum > (map_len - ehdr->e_shoff) / sizeof(Elf64_Shdr)) {
-            fprintf(stderr, "%s: section header count %lu overruns the file\n",
-                path, (unsigned long) shnum);
-            goto out;
-        }
+    if (elf_shnum(base, map_len, &shnum) != 0) {
+        fprintf(stderr, "%s: malformed section header table\n", path);
+        goto out;
     }
     if (shnum == 0) {
         fprintf(stderr, "%s: no section headers to scan\n", path);
-        goto out;
-    }
-
-    if (!scan_all &&
-        load_func_syms(ehdr, shnum, map_len, base, &funcs, &nfuncs) != 0) {
-        fprintf(stderr, "%s: malformed symbol table\n", path);
         goto out;
     }
 
@@ -339,6 +432,29 @@ int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,
             base[s->sh_offset + s->sh_size - 1] == '\0') {
             shstr = (const char *) (base + s->sh_offset);
             shstr_size = s->sh_size;
+        }
+    }
+
+    // Function ranges from the file's own .symtab, or failing that from the
+    // symbol table its MiniDebugInfo kept, which a stripped distro library is
+    // the whole reason for.
+    if (!scan_all) {
+        if (load_func_syms(base, map_len, shnum, &funcs, &nfuncs) != 0) {
+            fprintf(stderr, "%s: malformed symbol table\n", path);
+            goto out;
+        }
+        if (funcs == NULL) {
+            inner = load_minidebug(base, map_len, shdrs, shnum, shstr,
+                                   shstr_size, &inner_len);
+            uint64_t inner_shnum = 0;
+            if (inner != NULL &&
+                (elf_shnum(inner, inner_len, &inner_shnum) != 0 ||
+                 load_func_syms(inner, inner_len, inner_shnum, &funcs,
+                                &nfuncs) != 0)) {
+                fprintf(stderr, "%s: malformed .gnu_debugdata symbol table\n",
+                        path);
+                goto out;
+            }
         }
     }
 
@@ -378,6 +494,7 @@ int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,
             .ranges = nranges != 0 ? ranges : &whole,
             .nranges = nranges != 0 ? nranges : 1,
             .by_symbol = nranges != 0,
+            .minidebug = nranges != 0 && inner != NULL,
         };
         fn(&sec, ctx);
         free((void *) sec.targets);
@@ -387,6 +504,7 @@ int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,
 
 out:
     free(funcs);
+    free(inner);
     munmap(base, map_len);
     return rc;
 }

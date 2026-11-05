@@ -29,27 +29,31 @@ all: lib x86lint test
 # of the default build or of check.
 tools: tools/pairscan tools/defuse tools/cohere tools/shapescan tools/framescan
 
+# The tools link liblzma (xz-devel) to read the MiniDebugInfo a stripped
+# distro binary keeps in .gnu_debugdata; the linter itself does not.
+TOOL_LIBS = ${XED_PATH}/obj/libxed.a -llzma
+
 tools/pairscan: tools/pairscan.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
-		tools/pairscan.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+		tools/pairscan.c tools/corpus.c $(TOOL_LIBS) -o $@
 
 tools/framescan: tools/framescan.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
-		tools/framescan.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+		tools/framescan.c tools/corpus.c $(TOOL_LIBS) -o $@
 
 tools/cohere: tools/cohere.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
-		tools/cohere.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+		tools/cohere.c tools/corpus.c $(TOOL_LIBS) -o $@
 
 # shapescan includes x86lint.c for the window checks and the gates they call,
 # all of which are static, so it compiles the linter rather than linking it.
 tools/shapescan: tools/shapescan.c tools/corpus.c tools/corpus.h x86lint.c x86lint.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
-		tools/shapescan.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+		tools/shapescan.c tools/corpus.c $(TOOL_LIBS) -o $@
 
 tools/defuse: tools/defuse.c tools/corpus.c tools/corpus.h
 	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
-		tools/defuse.c tools/corpus.c ${XED_PATH}/obj/libxed.a -o $@
+		tools/defuse.c tools/corpus.c $(TOOL_LIBS) -o $@
 
 # Run the unit suite, the ELF-driver smoke test and the JIT-converter tests.
 check: all

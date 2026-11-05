@@ -89,9 +89,14 @@
 // reason to read the result as a bound, and the first measurement in any
 // direction should be checked against a dumped slot table (`-f`).
 //
-// Usage: framescan [-v] [-m] [-n MAX] [-f SUBSTR] <binary>...
+// Usage: framescan [-v] [-m] [-n MAX] [-f SUBSTR] [-c ADDR] <binary>...
 //   -v  list the functions with the most recoverable bytes
 //   -n  how many to list (default 16)
+//   -c  treat every function starting below vaddr ADDR as profile-cold, like
+//       a .cold fragment: tallied, not weighed. GCC's hot/cold split under
+//       PGO lays the whole cold partition out first, fragments and whole
+//       cold functions alike, so the end of the highest .cold fragment
+//       bounds it (tools/split.py's --cold-below is the same knob)
 //   -f  dump the slot table of every function whose name contains SUBSTR
 //       (up to eight functions), for checking the model against objdump
 //   -m  dump the first eight functions behind the "tracking miss" count: a
@@ -230,7 +235,8 @@ static int slot_key_cmp(const void *a, const void *b)
 struct func {
     uint64_t vaddr;
     const char *name;
-    bool fragment;        // a .cold fragment: part of another function's frame
+    bool fragment;        // profile-cold: a .cold fragment, or below -c
+    bool cold_by_address; // ... the latter
     bool frame_pointer;
     bool dynamic;         // RSP assigned from something the walk cannot follow
     bool calls;           // not a leaf: the red zone below RSP is not its to use
@@ -265,8 +271,9 @@ struct top {
 struct totals {
     struct slots slots;
     // Scope.
-    uint64_t functions, fragments, frame_pointer, dynamic;
+    uint64_t functions, fragments, cold_functions, frame_pointer, dynamic;
     uint64_t sections_without_symbols, bytes_without_symbols;
+    bool minidebug;             // the ranges came from .gnu_debugdata
     uint64_t insns, skipped, code_bytes, alloc_failures;
     // Every frame-slot access, by displacement width.
     uint64_t accesses[NWIDTH];
@@ -292,11 +299,12 @@ static bool verbose = false;
 static bool miss_dump = false;
 static size_t top_n = TOP_DEFAULT;
 static const char *dump_substr = NULL;
+static uint64_t cold_below = 0;
 
 static void usage(const char *argv0)
 {
-    fprintf(stderr, "usage: %s [-v] [-m] [-n MAX] [-f SUBSTR] <binary>...\n",
-            argv0);
+    fprintf(stderr, "usage: %s [-v] [-m] [-n MAX] [-f SUBSTR] [-c ADDR]"
+            " <binary>...\n", argv0);
 }
 
 // === the frame-pointer prologue, as x86lint.c judges it ===
@@ -742,9 +750,12 @@ static void finish(struct func *f, struct totals *t)
 {
     ++t->functions;
     t->alloc_failures += f->alloc_failures;
-    if (f->fragment) {
+    if (f->cold_by_address) {
+        ++t->cold_functions;
+    } else if (f->fragment) {
         ++t->fragments;
-    } else {
+    }
+    if (!f->fragment) {
         if (f->frame_pointer) {
             ++t->frame_pointer;
         }
@@ -877,13 +888,19 @@ static void scan_section(const corpus_section *sec, void *ctx)
         t->bytes_without_symbols += sec->size;
         return;
     }
+    if (sec->minidebug) {
+        t->minidebug = true;
+    }
     for (size_t r = 0; r < sec->nranges; ++r) {
         const corpus_range *range = &sec->ranges[r];
+        bool named_cold = range->name != NULL &&
+            strstr(range->name, ".cold") != NULL;
+        bool below = cold_below != 0 && sec->vaddr + range->start < cold_below;
         struct func f = {
             .vaddr = sec->vaddr + range->start,
             .name = range->name,
-            .fragment = range->name != NULL &&
-                strstr(range->name, ".cold") != NULL,
+            .fragment = named_cold || below,
+            .cold_by_address = below && !named_cold,
         };
         slots_reset(&t->slots);
         t->code_bytes += range->end - range->start;
@@ -925,9 +942,14 @@ static void report(const char *path, const struct totals *t)
         return;
     }
     printf("  functions %" PRIu64 " (frame pointer %" PRIu64 ", dynamic stack %"
-           PRIu64 ", cold fragments %" PRIu64 "); instructions %" PRIu64
-           ", undecodable bytes %" PRIu64 "\n",
-           t->functions, t->frame_pointer, t->dynamic, t->fragments, t->insns,
+           PRIu64 ", cold fragments %" PRIu64,
+           t->functions, t->frame_pointer, t->dynamic, t->fragments);
+    if (cold_below != 0) {
+        printf(", functions below 0x%" PRIx64 " %" PRIu64, cold_below,
+               t->cold_functions);
+    }
+    printf(")%s; instructions %" PRIu64 ", undecodable bytes %" PRIu64 "\n",
+           t->minidebug ? ", ranges from .gnu_debugdata" : "", t->insns,
            t->skipped);
     printf("  frame-slot accesses %" PRIu64 ": disp0 %" PRIu64 " (%.1f%%),"
            " disp8 %" PRIu64 " (%.1f%%), disp32 %" PRIu64 " (%.1f%%);"
@@ -998,6 +1020,8 @@ int main(int argc, char **argv)
             top_n = n < 1 ? 1 : n > TOP_MAX ? TOP_MAX : (size_t) n;
         } else if (strcmp(argv[argi], "-f") == 0 && argi + 1 < argc) {
             dump_substr = argv[++argi];
+        } else if (strcmp(argv[argi], "-c") == 0 && argi + 1 < argc) {
+            cold_below = strtoull(argv[++argi], NULL, 0);
         } else {
             usage(argv[0]);
             return 2;

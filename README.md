@@ -1236,16 +1236,26 @@ built separately with `XED_PATH=/path/to/xed make tools`:
   gains over today is the bound. It weighs accesses statically and treats
   slots as independent, so it is an upper bound, and `-f NAME` dumps a
   function's slot table to check against objdump; `-m` dumps the functions
-  behind its own contradiction counter. Measured in [TODO.md](TODO.md),
-  "Frame layout": 4.1-4.8% of code bytes in GCC output with frame pointers
-  and 7.7% in Go, of which 39-76% is recoverable by the bound.
+  behind its own contradiction counter. Code the build has marked
+  profile-cold weighs nothing in the bound: `.cold` fragments by name, and
+  under `-c ADDR` every function below that address, which is how GCC's
+  hot/cold split lays a PGO binary out (the end of its highest `.cold`
+  fragment is the boundary; `tools/split.py --cold-below` is the same knob).
+  Measured in [TODO.md](TODO.md), "Frame layout": 4.1-4.9% of code bytes in
+  GCC output and 7.7% in Go, of which 18-76% is recoverable by the bound,
+  the low end being Fedora's PGO libxul once its cold partition is weighed
+  as the profile says.
 
 All of them restrict the scan to the symbol table's function ranges and skip
 the dynamic linker's import glue exactly as the driver does, so no pair or
 distance spans two functions, none is mined from the non-code that executable
 sections interleave, and none counts the PLT's one fixed template as though a
 compiler had emitted it; `-a` scans every byte (`framescan` has no `-a`:
-without function boundaries there is no frame). Two functions that abut with
+without function boundaries there is no frame). A binary whose `.symtab`
+was stripped but that kept MiniDebugInfo -- the xz-compressed symbol tables
+Fedora leaves in `.gnu_debugdata` for gdb -- gets its ranges and names from
+there, which is what makes a distro library a per-function corpus; the tools
+link liblzma (`xz-devel`) for it, and the linter does not. Two functions that abut with
 no padding between them are two ranges: until 2026-11 the loader merged them,
 which the pair and distance tools barely noticed and a per-function tool
 could not survive. The workflow behind several

@@ -49,7 +49,9 @@ typedef struct {
     const uint8_t *targets;     // direct-branch-target bitmap, one bit per byte
     const corpus_range *ranges; // the ranges to scan, ascending and disjoint
     size_t nranges;
-    bool by_symbol;             // ranges came from the symbol table
+    bool by_symbol;             // ranges came from a symbol table
+    bool minidebug;             // ... the one in .gnu_debugdata, the file's
+                                // own having been stripped
 } corpus_section;
 
 // Invoked once per executable section.
@@ -88,8 +90,10 @@ bool corpus_conditional_write(const xed_decoded_inst_t *xedd);
 // cleanly and would otherwise contribute pair counts and def-use distances
 // from bytes that are not instructions. Unsized symbols extend to the next
 // function's start; overlapping ranges (aliased symbols) are merged so no
-// byte is scanned twice. `scan_all` forces whole-section ranges, which is
-// also what a stripped binary gets.
+// byte is scanned twice. A binary whose .symtab was stripped but that kept
+// MiniDebugInfo -- the xz-compressed symbol tables Fedora leaves in
+// .gnu_debugdata -- gets its ranges and names from there. `scan_all` forces
+// whole-section ranges, which is also what a binary with neither gets.
 //
 // Returns 0 on success and -1 on failure, after printing the reason.
 int corpus_scan_file(const char *path, bool scan_all, corpus_section_fn fn,

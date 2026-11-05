@@ -8214,6 +8214,112 @@ static void census_test(void)
     x86lint_census_destroy(NULL);
 }
 
+static void consts_test(void)
+{
+    // Widths, keys and roles. The values are keyed as the operand holds
+    // them: `mov rax, -1` (imm32) and `movabs rax, -1` (imm64) are one
+    // 64-bit value carried twice, and the three carriers of 0x80004005 --
+    // materialized, compared, stored -- one 32-bit value carried three
+    // times. Everything sits in one function but the trailing MOVABS,
+    // which is in none.
+    static const uint8_t code[] = {
+        0x48, 0xb8, 0xb9, 0xe5, 0xe4, 0x1c, 0x6d, 0x47, 0x58, 0xbf,
+                                            // movabs rax, 0xbf58476d1ce4e5b9
+        0xb8, 0x05, 0x40, 0x00, 0x80,       // mov eax, 0x80004005
+        0x3d, 0x05, 0x40, 0x00, 0x80,       // cmp eax, 0x80004005
+        0xc7, 0x00, 0x05, 0x40, 0x00, 0x80, // mov dword [rax], 0x80004005
+        0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff,   // mov rax, -1
+        0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                            // movabs rax, -1
+        0x68, 0x78, 0x56, 0x34, 0x12,       // push 0x12345678
+        0xa9, 0x01, 0x00, 0x00, 0x00,       // test eax, 1
+        0x83, 0xe0, 0x0f,                   // and eax, 0xf
+        0xb0, 0x01,                         // mov al, 1
+        0x66, 0xb8, 0x34, 0x12,             // mov ax, 0x1234
+        0xc3,                               // ret
+        0x48, 0xb8, 0xb9, 0xe5, 0xe4, 0x1c, 0x6d, 0x47, 0x58, 0xbf,
+                                            // movabs rax, ... in no function
+    };
+    static const x86lint_func_range one = {0x1000, 0x103f, "f"};
+    x86lint_consts *c = x86lint_consts_create();
+    assert(c != NULL);
+    x86lint_consts_set_functions(c, &one, 1);
+    x86lint_consts_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_consts_instructions(c) == 13);
+    assert(x86lint_consts_skipped(c) == 0);
+    assert(x86lint_consts_count(c, X86LINT_IMM8) == 2);
+    assert(x86lint_consts_bytes(c, X86LINT_IMM8) == 2);
+    assert(x86lint_consts_count(c, X86LINT_IMM16) == 1);
+    assert(x86lint_consts_count(c, X86LINT_IMM32) == 6);
+    assert(x86lint_consts_bytes(c, X86LINT_IMM32) == 24);
+    assert(x86lint_consts_count(c, X86LINT_IMM64) == 3);
+    assert(x86lint_consts_bytes(c, X86LINT_IMM64) == 24);
+    assert(x86lint_consts_values(c) == 5);
+    // Two imm32 values fit an imm8: -1 under MOV into a register, 1 under
+    // TEST; neither instruction has the byte form.
+    size_t mov_reg, mov_mem, test;
+    assert(x86lint_consts_fit_imm8(c, &mov_reg, &mov_mem, &test) == 2);
+    assert(mov_reg == 1 && mov_mem == 0 && test == 1);
+    size_t sites, imm64, repeats;
+    assert(x86lint_consts_lookup(c, true, 0xbf58476d1ce4e5b9ull, &sites,
+        &imm64, &repeats));
+    assert(sites == 2 && imm64 == 2 && repeats == 0);   // one in no function
+    assert(x86lint_consts_lookup(c, false, 0x80004005, &sites, &imm64,
+        &repeats));
+    assert(sites == 3 && imm64 == 0 && repeats == 2);
+    assert(x86lint_consts_lookup(c, true, UINT64_MAX, &sites, &imm64,
+        &repeats));
+    assert(sites == 2 && imm64 == 1 && repeats == 1);
+    // The 32-bit all-ones value was never carried: `mov rax, -1` is 64-bit.
+    assert(!x86lint_consts_lookup(c, false, 0xffffffff, &sites, &imm64,
+        &repeats));
+    assert(sites == 0);
+    // PUSH's operand is 64 bits wide in 64-bit mode.
+    assert(x86lint_consts_lookup(c, true, 0x12345678, &sites, &imm64,
+        &repeats));
+    assert(sites == 1 && repeats == 0);
+    assert(x86lint_consts_repeats(c) == 3);
+    assert(x86lint_consts_repeat_bytes(c) == 4 + 4 + 8);
+    x86lint_consts_destroy(c);
+
+    // Without function ranges the values tally and nothing repeats.
+    c = x86lint_consts_create();
+    assert(c != NULL);
+    x86lint_consts_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_consts_values(c) == 5);
+    assert(x86lint_consts_repeats(c) == 0);
+    x86lint_consts_destroy(c);
+
+    // A value carried once each by two functions repeats in neither.
+    static const x86lint_func_range two[] = {
+        {0x1000, 0x103f, "f"}, {0x103f, 0x1049, "g"},
+    };
+    c = x86lint_consts_create();
+    assert(c != NULL);
+    x86lint_consts_set_functions(c, two, 2);
+    x86lint_consts_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_consts_lookup(c, true, 0xbf58476d1ce4e5b9ull, &sites,
+        &imm64, &repeats));
+    assert(sites == 2 && repeats == 0);
+    assert(x86lint_consts_repeats(c) == 3);
+    x86lint_consts_destroy(c);
+
+    // NULL is accepted everywhere.
+    x86lint_consts_scan(NULL, code, sizeof(code), 0);
+    x86lint_consts_set_evidence(NULL, NULL, 0);
+    x86lint_consts_set_functions(NULL, NULL, 0);
+    assert(x86lint_consts_instructions(NULL) == 0);
+    assert(x86lint_consts_skipped(NULL) == 0);
+    assert(x86lint_consts_count(NULL, X86LINT_IMM32) == 0);
+    assert(x86lint_consts_bytes(NULL, X86LINT_IMM32) == 0);
+    assert(x86lint_consts_values(NULL) == 0);
+    assert(x86lint_consts_repeats(NULL) == 0);
+    assert(x86lint_consts_repeat_bytes(NULL) == 0);
+    assert(x86lint_consts_fit_imm8(NULL, &mov_reg, &mov_mem, &test) == 0);
+    assert(!x86lint_consts_lookup(NULL, false, 0, &sites, &imm64, &repeats));
+    x86lint_consts_destroy(NULL);
+}
+
 // Register numbers in XED's encoding order, as x86lint_regs_gpr_count takes.
 enum { RAX = 0, RCX = 1, RDX = 2, RSP = 4, RSI = 6, R8 = 8, R9 = 9,
        R12 = 12, R13 = 13, R16 = 16 };
@@ -8983,6 +9089,7 @@ int main(int argc, char *argv[])
     finding_callback_test();
     census_test();
     regs_test();
+    consts_test();
     mask_relocated_test();
     build_test();
     thunk_test();

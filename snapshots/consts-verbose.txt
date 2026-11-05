@@ -1,0 +1,25 @@
+constant census: 13 instructions, 0 undecodable bytes skipped
+  immediates by encoded width: imm8 1, imm16 0, imm32 6, imm64 4; 57 bytes, 73.08% of the 78 bytes swept
+  wide immediates (imm32 and imm64): 10 carrying 5 distinct values, 56 bytes (71.79%), 1 unevidenced
+    materialized into a register by MOV: 6 (40 bytes)
+    stored by MOV or PUSH: 2 (8 bytes)
+    consumed in place by an operation: 2 (8 bytes)
+    imm32 fitting a sign-extended imm8: 2; MOV carries 1 (1 into a register, 0 to memory) and TEST 1, and neither has an imm8 form
+    a one-byte form for them would save 6 bytes (7.69% of the bytes swept); the other 0 are ALU, PUSH and IMUL, which have one
+    imm64, which MOVABS alone carries: 4 building 2 distinct values, 32 bytes (41.03%), 1 unevidenced
+  repeats within a function: 3 in 1 of 2 functions, 16 bytes (28.57% of the wide-immediate bytes); 1 wide immediate in no function
+  how often a function carries a value it repeats: twice 1, 3 times 1, 4 times 0, 5 or more times 0
+  most bytes spent on one value:
+        bytes    sites      mov    store    imm64  value
+           24        3        3        0        3  64-bit 0xbf58476d1ce4e5b9  at 0xADDR
+           12        3        1        1        0  32-bit 0x80004005          at 0xADDR
+           12        2        2        0        1  64-bit 0xffffffffffffffff  at 0xADDR
+            4        1        0        0        0  32-bit 0x1                 at 0xADDR
+            4        1        0        1        0  64-bit 0x12345678          at 0xADDR
+  most bytes spent repeating one value within a function:
+        bytes  repeats functions  value
+            8        2         1  32-bit 0x80004005          carried 3 times in <_start>: 0xADDR
+            8        1         1  64-bit 0xffffffffffffffff  carried 2 times in <_start>: 0xADDR
+  functions: 2 sized from .symtab
+  code evidence: 2 function symbols + 0 .eh_frame FDEs + 0 Go pclntab functions covering 68 of 78 executable bytes
+exit status: 0

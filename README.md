@@ -598,21 +598,21 @@ Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
 than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
-`-r`, `-e`, `-j`, `-s` and `-p` are separate reports whose output would
+`-r`, `-k`, `-e`, `-j`, `-s` and `-p` are separate reports whose output would
 interleave with it, and the driver refuses the combination rather than
 choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
 pads, `-i` to replace the lint scan with an ISA census of the binary, `-r`
-with a register census, `-j` with a JCC-erratum verdict, `-s` with a
-speculation-thunk verdict, and `-p` with a per-function build-property audit;
-see the next sections.
+with a register census, `-k` with a constant census, `-j` with a JCC-erratum
+verdict, `-s` with a speculation-thunk verdict, and `-p` with a per-function
+build-property audit; see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
-broken run. `-e` findings set the exit status like any other; the `-i` and
-`-r` censuses never set it, the `-j` audit sets it only under `-t skylake`
+broken run. `-e` findings set the exit status like any other; the `-i`, `-r`
+and `-k` censuses never set it, the `-j` audit sets it only under `-t skylake`
 (the one target that has the erratum), the `-s` audit only for a mitigation
 left incomplete, and the `-p` audit never.
 
@@ -927,6 +927,108 @@ AVX-512 assembly, which has no symbols or CFI -- while glibc's 2697 are all
 evidenced and all inside its `*_evex` and `*_avx512` string and memory
 functions, which use YMM16-YMM31 because those registers need no
 VZEROUPPER.
+
+## Constant census (`-k`)
+
+`x86lint -k` replaces the lint scan with a census of constants: which
+immediates the code carries, what they cost in encoding bytes, and which a
+function carries more than once. It is the x86 counterpart of armlint's `-c`
+report on MOVZ/MOVK chains (`-c` here is taken by the finding classes). It
+sweeps the same bytes as `-i` and `-r`, carries the same evidence labels, and
+combines with them and with `-f`.
+
+```console
+$ ./x86lint -k /usr/lib64/libc.so.6
+constant census: 359838 instructions, 0 undecodable bytes skipped
+  immediates by encoded width: imm8 33983, imm16 139, imm32 19990, imm64 532; 118477 bytes, 7.75% of the 1528109 bytes swept
+  wide immediates (imm32 and imm64): 20522 carrying 1447 distinct values, 84216 bytes (5.51%)
+    materialized into a register by MOV: 10533 (44260 bytes)
+    stored by MOV or PUSH: 4980 (19920 bytes)
+    consumed in place by an operation: 5009 (20036 bytes)
+    imm32 fitting a sign-extended imm8: 13004; MOV carries 12935 (8130 into a register, 4805 to memory) and TEST 69, and neither has an imm8 form
+    a one-byte form for them would save 39012 bytes (2.55% of the bytes swept); the other 0 are ALU, PUSH and IMUL, which have one
+    imm64, which MOVABS alone carries: 532 building 148 distinct values, 4256 bytes (0.28%)
+  repeats within a function: 8811 in 1060 of 3897 functions, 35900 bytes (42.63% of the wide-immediate bytes); 1 wide immediate in no function
+  how often a function carries a value it repeats: twice 1720, 3 times 559, 4 times 236, 5 or more times 545
+  most bytes spent on one value:
+        bytes    sites      mov    store    imm64  value
+        10620     2655     2161      494        0  32-bit 0x1
+         6436     1609        1     1608        0  64-bit 0x0
+         4844     1211      976      235        0  32-bit 0xffffffff
+         4324     1081      144      937        0  32-bit 0x0
+    ...
+    (1427 more distinct values)
+  most bytes spent repeating one value within a function:
+        bytes  repeats functions  value
+         6396     1599       410  32-bit 0x1
+         3920      980       324  64-bit 0x0
+    ...
+    (421 more distinct values)
+  functions: 3897 sized from .symtab
+  code evidence: 9896 function symbols + 3799 .eh_frame FDEs + 0 Go pclntab functions covering 1497314 of 1528109 executable bytes
+```
+
+x86 has no constant chains: a constant is one immediate field, and the
+field's width is what it costs. A value in -128..127 rides in one byte on
+almost any instruction, a wider one costs four, and a 64-bit value that does
+not sign-extend from 32 bits costs eight and is carried by `MOV` alone
+(`MOVABS`), so a comparison against it or a mask by it has to materialize it
+into a register first. The census tallies every immediate by encoded width
+and keys the wide ones -- imm32 and imm64 -- by value, so the top of the table
+is the binary's signature constants: hash multipliers, error codes, tag masks,
+field offsets. Values are keyed at the effective operand width, as the
+register would hold them: `mov eax, 0xffffffff` and `mov rax, -1` are two
+values, while `mov rax, -1` (imm32, sign-extended) and `movabs rax, -1`
+(imm64) are one, and the `imm64` column says how many of a value's sites took
+the eight-byte encoding. The `mov` and `store` columns split a value's sites
+into materializations into a register and stores to memory (`MOV mem, imm`
+and `PUSH imm`); the remainder are operations consuming the value in place.
+
+Two lines are the reason the census exists:
+
+* **imm32 fitting a sign-extended imm8.** Every ALU instruction has a byte
+  form for a small immediate, which is why compilers never emit `add eax,
+  0x00000001` and the oversized-immediate check finds so little. `MOV` has
+  none, for a register or for memory, and neither does `TEST` above a byte
+  operand: `mov eax, 1` is five bytes and `mov qword [rsp+0x28], 0` eight,
+  four of them an immediate whose value fits one. Those sites are two thirds
+  of a C++ binary's imm32s, and a one-byte form would save 2.0-3.4% of code
+  bytes across the corpora measured on 2026-11-05 -- the size of the
+  register-numbering cost, and more uniform across compilers, because it is
+  the instruction set's cost rather than the compiler's. The line also says
+  what the top of every value table is made of: libxul's commonest wide
+  constant is `64-bit 0x0`, 224,602 sites of `mov qword [mem], 0`.
+* **Repeats within a function.** A repeat is a wide immediate whose value an
+  earlier instruction of the same function already carried, in address
+  order; neither dominance nor liveness is checked. It bounds what keeping
+  the value in a register could save -- the second `MOVABS` of a value is ten
+  bytes a register copy would make three -- and does not measure it: an imm32
+  consumed in place is the idiom x86 offers for free, and a rebuild after a
+  call can be cheaper than a spill. The functions are the sized symbols of
+  `.symtab`, or the exports of `.dynsym` when `.symtab` is stripped, and the
+  `functions:` line says which. A stripped distro library's exports bound
+  little of its code (Fedora's libxul exports 2 functions), so the count then
+  covers almost nothing and the report says how many wide immediates fell in
+  no function. The driver does not read MiniDebugInfo; the mining tools do.
+
+The imm64 line is the chain census proper, and it finds what armlint's finds
+on AArch64: libLLVM materializes splitmix64's multiplier
+`0xbf58476d1ce4e5b9` -- `DenseMap`'s pointer hash -- 19,151 times (153 KB),
+1,218 of them in one function, and libxul's clang build carries
+SpiderMonkey's `UndefinedValue` tag `0xfff9800000000000` 15,046 times and
+the header words of an empty `nsString` and `nsAutoString` 24,390 times
+between them. Fedora's GCC build of the same source has none of the tag in
+its top twenty and 15,209 `mov eax, 0x1fff3` instead: GCC spells the
+constant as `mov eax, 0x1fff3 ; shl rax, 47`, nine bytes against ten, and
+this census keys that pair by its parts -- x86's one chain, and the piece of
+armlint's chain tracking a port turns out to want.
+
+`-v` adds each value's first three sites and, for a repeated value, the
+function that carries it most often with its first sites there. Immediates a
+relocation will rewrite are masked out as the lint scan masks them, so a
+kernel module's `mov r64, imm32` placeholders do not count as the value 0.
+imm8 and imm16 are counted and costed but not keyed by value. The
+measurements and their reading are in TODO.md ("Constant census").
 
 ## JCC erratum audit (`-j`)
 

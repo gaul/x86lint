@@ -2271,12 +2271,17 @@ nothing to recover. With `-fno-omit-frame-pointer` both address locals
 from RBP, and gcc puts the buffer nearest RBP and the five spills behind
 it, every one a disp32 (36 bytes recoverable, exactly the slot table
 objdump shows); clang keeps the spills near RBP and only the buffer's
-two accesses pay (6 bytes). Fedora builds with frame pointers, so the
-gcc shape is libxul's and glibc's.
+two accesses pay (6 bytes). Fedora builds glibc with GCC and frame
+pointers, so the gcc shape is libc's. The local libxul is clang's (its
+`.comment` carries clang 20.1.8 from Mozilla's taskcluster toolchain and
+rustc 1.91.1, and a 4 MB window of it has 1,169 `inc` and no `add $1`
+where the Fedora build's has 2,208 `add $1` and no `inc`); an earlier
+draft of this section called it GCC's, and read its layout through the
+gcc control. Corrected 2026-11-05 while building the constant census.
 
 | binary | functions | slot accesses, disp32 | bytes over disp8 | of code bytes | recoverable by the bound | structural: locals that do not fit | incoming arguments |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Firefox `libxul.so` (local opt build, GCC C++ + Rust, frame pointers, no PGO) | 279,405 | 1,994,365 of 4,268,662 (46.7%) | 5,983,095 | **4.80%** | **2,675,214 (44.7%)**, 99.6% of it RBP-based, in 39,043 functions | 3,289,557 | 18,156 |
+| Firefox `libxul.so` (local opt build, clang 20 C++ + Rust, frame pointers, no PGO) | 279,405 | 1,994,365 of 4,268,662 (46.7%) | 5,983,095 | **4.80%** | **2,675,214 (44.7%)**, 99.6% of it RBP-based, in 39,043 functions | 3,289,557 | 18,156 |
 | `/bin/go` 1.26 | 16,170 | 195,601 of 420,226 (46.5%) | 586,794 | **7.71%** | 228,945 (39.0%) | 175,500 | **182,301** |
 | glibc `libc.so.6` | 3,898 | 20,660 of 38,027 (54.3%) | 61,980 | 4.14% | 47,127 (76.0%) | 14,802 | 51 |
 | `ld.so` | 385 | 1,202 of 2,593 (46.4%) | 3,606 | 2.03% | 2,298 (63.7%) | 1,068 | 240 |
@@ -2286,10 +2291,15 @@ gcc shape is libxul's and glibc's.
 **What it says.** The frame-slot disp32 cost is larger than the
 register-numbering cost in every binary but `ld.so`, and 39-76% of it
 is recoverable by the bound: 2.68 MB of libxul, 2.1% of its code bytes.
-libxul's recoverable share is almost entirely RBP-based, and the control
-says why: under a frame pointer GCC addresses locals from RBP, the five
-pushed registers take the first 40 of the window's 128 bytes, and the
-aggregates go nearest RBP with the spills behind them. The structural
+libxul's recoverable share is almost entirely RBP-based, as it must be:
+under a frame pointer both compilers address locals from RBP, and the
+pushed registers take the first bytes of the window. What the control
+does not say is why clang's layout leaves 2.68 MB in reach: with five
+spills and one buffer the clang control kept the spills near RBP and
+recovered 6 bytes, so the control is too small to show what clang does
+with many locals, and the 44.7% is a question for clang's frame-pointer
+path that the gcc control's shape (aggregates nearest RBP, spills
+behind) does not answer. The structural
 remainder is frames too large for any order (3.29 MB in libxul: 29,586
 functions have 129-1024 bytes of locals and 2,057 more than that) and,
 in Go, the ABI: 182 KB of Go's cost is **incoming arguments**, because
@@ -2312,9 +2322,10 @@ to MiniDebugInfo (which the tools now read), and with frame pointers in
 only 41,773 of its 315,610 functions -- the "Build properties" table
 above had counted 42,346 `push rbp ; mov rbp, rsp` in its bytes and this
 agrees. Its raw cost is the local build's, 4.85% of code bytes, but the
-layout differs with the frame pointer: GCC's RSP-based layout keeps the
-spills at the bottom (the control's `-O2` shape), so the recoverable
-share is 34.2% rather than 44.7%, three quarters of it RSP-based, and
+layout differs with the compiler and the frame pointer: GCC's RSP-based
+layout keeps the spills at the bottom (the control's `-O2` shape), so the
+recoverable share is 34.2% rather than clang's 44.7%, three quarters of
+it RSP-based, and
 what remains is frames too large for the window. Then the profile.
 The 34,080 `.cold` fragments span `0x335c780..0x62b47c7`, the very
 bottom of `.text`, because GCC emits the whole cold partition --
@@ -2377,6 +2388,129 @@ GCC's frame-pointer path specifically, and a two-line reproduction
 exists in `framescan`'s calibration. Whether the bound survives a
 real reordering is the usual question: a slot table is not a layout,
 and the 2.68 MB is what a layout could reach, not what one would.
+
+## Constant census (2026-11-05)
+
+The armlint `-c` port, as `x86lint -k` (`-c` here is the finding
+classes). armlint counts what every constant too wide for one
+instruction costs in MOVZ/MOVK chains; x86 has no chains, so the census
+counts immediates by encoded width, keys the wide ones (imm32 and imm64)
+by value at the operand width, splits them by what carries them (MOV
+into a register, MOV or PUSH to memory, an operation consuming the value
+in place), and counts the repeats within a function on armlint's terms
+for rebuilds. Two measurements the port did not plan for lead the
+results.
+
+**Method.** The sweep and evidence labels of `-i` and `-r`. Function
+ranges come from `.symtab`, else the exports, and the report says which:
+a stripped Fedora library gets exports alone, so its repeat count covers
+the exported bodies and the line says how many wide immediates fell in
+no function. An immediate a relocation will rewrite is masked out as the
+lint scan masks it; without that, a kernel module's `mov r64, imm32`
+addresses all read as the value 0 (amt.ko: 875 instructions excluded,
+and `LIST_POISON2`, `0xdead000000000122`, is its top imm64). Values are
+keyed as the operand holds them -- `mov eax, 0xffffffff` and `mov rax,
+-1` are two, `mov rax, -1` and `movabs rax, -1` one -- and PUSH's
+operand is 64 bits wide, so `push imm32` keys with the 64-bit values. A
+thirteen-instruction fixture pins every count in `driver_test.sh` and
+the unit test.
+
+| binary | compiler | immediates, of code bytes | wide (imm32 + imm64) | imm64 (MOVABS) | imm32 that fit an imm8 | a one-byte MOV/TEST form would save | repeats within a function |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Firefox `libxul.so` (local, no PGO) | clang 20 + Rust | 11.11 MB, 8.78% | 1,912,851 sites, 42,667 values, 8.48 MB (6.69%) | 206,123 sites, 9,733 values, 1.65 MB (1.30%) | 1,132,011 of 1,706,728 (66%), all but 576 under MOV | **3.40 MB, 2.68%** | 857,235 in 110,850 of 277,401 functions, 3.71 MB (43.8% of wide bytes) |
+| Fedora Firefox 159 `libxul.so` (PGO) | GCC | 8.74 MB, 7.75% | 1,536,567 sites, 37,862 values, 6.53 MB (5.79%) | 96,452 sites, 9,998 values, 772 KB (0.68%) | 917,914 of 1,440,115 (64%) | 2.75 MB, 2.44% | not counted: 2 exported functions |
+| Fedora `libLLVM.so.23.1` | clang | 6.51 MB, 8.63% | 1,028,632 sites, 37,364 values, 4.56 MB (6.05%) | 111,492 sites, 9,115 values, 892 KB (1.18%) | 572,645 of 917,140 (62%) | 1.72 MB, 2.28% | 129,134 in 10,479 of 31,317 exported functions, 585 KB; 782,899 sites in no function |
+| `/bin/go` 1.26 | Go | 409 KB, 5.30% | 75,369 sites, 3,240 values, 316 KB (4.09%) | 3,613 sites, 1,096 values, 29 KB (0.37%) | 59,866 of 71,756 (83%) | 180 KB, 2.33% | 32,127 in 4,835 of 16,165 functions, 133 KB (42.1%) |
+| glibc `libc.so.6` | GCC | 118 KB, 7.75% | 20,522 sites, 1,447 values, 84 KB (5.51%) | 532 sites, 148 values, 4.3 KB (0.28%) | 13,004 of 19,990 (65%) | 39 KB, 2.55% | 8,811 in 1,060 of 3,897 functions, 36 KB (42.6%) |
+| `ld.so` | GCC | 14.8 KB, 8.19% | 2,527 sites, 609 values, 10.5 KB (5.83%) | 109 sites, 76 values, 872 B (0.48%) | 1,228 of 2,418 (51%) | 3.7 KB, 2.04% | 1,018 in 109 of 384 functions, 4.2 KB (39.6%) |
+| `/bin/bash` (stripped) | GCC | 79 KB, 7.34% | 14,574 sites, 703 values, 59 KB (5.49%) | 177 sites, 73 values, 1.4 KB (0.13%) | 12,040 of 14,397 (84%) | 36 KB, 3.36% | 4,455 in 698 of 1,763 exported functions, 18 KB; 5,863 sites in no function |
+
+**The missing `mov r/m, imm8`.** Every ALU instruction has a byte form
+for a small immediate, which is why compilers never emit `add eax,
+0x00000001` and the oversized-immediate check finds so little. MOV has
+none, for a register or for memory, and neither does TEST above a byte
+operand: `mov eax, 1` is five bytes and `mov qword [rsp+0x28], 0`
+eight, four of them an immediate whose value fits one. Those sites are
+51-84% of every binary's imm32s -- two thirds in the compiled C++ -- and
+in every binary all but a few hundred of them are MOV and TEST; the
+instructions that had a byte form and did not take it number 0 in five
+binaries, 29 in libLLVM and 6 in Go, so the cost is the instruction
+set's, not the compiler's. Three bytes each comes to **2.0-3.4% of code
+bytes, 3.40 MB of libxul**, the size of the register-numbering cost
+(2.2-2.9%) and more uniform across compilers than anything else in this
+file. It is also what the top of every value table is made of: libxul's
+commonest wide constant is `64-bit 0x0`, 224,602 sites and every one a
+`mov qword [mem], 0` (898 KB), then `32-bit 0x1` (197,581, 182,529 into
+a register), `32-bit 0x0`, `64-bit 0x1`, `0x4`, `0x8`, `0x2`. The
+compiler's one legitimate answer is `xor reg, reg` for zero into a
+register, which the "suboptimal MOV zero" check asks for and which is
+why `32-bit 0x0` has 12,187 materializations against 101,466 stores;
+the store of zero has no spelling that does not cost a register or a
+read-modify-write (`and qword [mem], 0` is five bytes and a load-op-
+store), and the materialization of 1 has none at all.
+
+**The imm64 census is the chain census,** and it finds what armlint's
+finds on AArch64. libLLVM materializes splitmix64's multiplier
+`0xbf58476d1ce4e5b9` -- `DenseMap`'s pointer hash,
+`densemap::detail::mix` -- 19,151 times, 153 KB, 1,218 of them in one
+function (`SLPVectorizerPass::vectorizeStores`, 12 KB of one constant),
+and 6,807 of its sites are repeats within the 655 exported functions
+that carry it more than once. libxul's clang build carries SpiderMonkey's
+`UndefinedValue` tag `0xfff9800000000000` 15,046 times (120 KB;
+`js::Interpret` 55 of them), the shifted tag mask `0xfffe000000000000`
+9,532, and two values no table of magic numbers lists: `0x2000100000000`
+(13,761) and `0x3001100000000` (10,629) are the header word of an empty
+`nsString` and `nsAutoString` -- `mLength = 0`, then `mDataFlags` and
+`mClassFlags` -- so 24,390 ten-byte MOVABS, 244 KB, construct empty
+strings. `0x8000000000000000` (18,142) is INT64_MIN: dav1d's default
+timestamp is one of its C sites, and one Rust function in the `suggest`
+crate carries it 207 times ahead of a jump table. `0x7fffffffffffffff`
+(10,255) is `isize::MAX`, the bound Rust's allocation paths compare
+sizes against. Go's imm64s are 0.37% of its bytes and Go's largest
+repeated 64-bit value is ML-DSA's `0x7fe001`, 63 times in `ntt`.
+
+**GCC spells the tag as a chain.** Fedora's GCC build of the same
+source has no `0xfff9800000000000` in its top twenty and `32-bit
+0x1fff3` 15,209 times instead, all MOV into a register; the sampled sites
+read `mov eax, 0x1fff3 ; shl rax, 47`, nine bytes against MOVABS's ten.
+So x86 does have a chain -- GCC emits the two-instruction build when it
+saves a byte -- and this census keys it by its parts, under a value
+nothing in Firefox means. The GCC build's 96,452 imm64s against the
+clang build's 206,123 are partly this spelling and partly PGO's cold
+code compiled for size, and the census cannot apportion the two without
+following the shift. That is the one piece of armlint's chain tracking
+an x86 port turns out to want.
+
+**Repeats are mostly the imm8 cost in another guise.** 40-44% of the
+wide-immediate bytes repeat a value within their function in every
+binary with full symbols (libxul 43.8%, Go 42.1%, libc 42.6%, `ld.so`
+39.6%), against the 28-34% of chain instructions armlint sees rebuilt in
+rustc and clang. The count is led by small values with no cheaper
+spelling: `32-bit 0x1` 133,465 repeats in libxul, 3,970 of them `mov
+eax, 1` in `StaticPrefs::InitAll`; `64-bit 0x0` 137,212, 679 of them
+`mov qword [mem], 0` in glean's `fog_labeled_alloc_size`. Keeping zero
+in a register turns an eight-byte store into a four-byte one at the cost
+of the register, the trade armlint describes, and with sixteen registers
+one a compiler is entitled to decline. The imm64 rows are the ones to
+read as rebuilds proper: libxul's INT64_MIN 13,558 repeats in 1,946
+functions (108 KB), libLLVM's splitmix 6,807 in 655, each a ten-byte
+instruction a register copy would make three.
+
+**The Fedora caveat.** `.symtab` stripped leaves the driver two
+functions in libxul, so its repeat line is empty; libLLVM's 31,317
+exports hold 24% of its wide immediates and bash's 1,763 hold 60%. The
+MiniDebugInfo the mining tools read since 2026-11-05 would make every
+function available, and the driver does not read it because that is a
+dependency (liblzma) rather than a line of code. Left as a decision.
+
+**Next.** Follow `shl` after `mov r32, imm32` into the same register, so
+GCC's two-instruction builds key by the value they build. The literal-
+pool counterfactual: libxul's 206,123 MOVABS are 1.65 MB of immediates
+where a `mov r64, [rip+disp32]` is seven bytes against ten, 618 KB back
+for a 78 KB pool of 9,733 values, at a load each -- the AArch64 shape,
+and the question is which of those constants are hot. The profile join
+again: `js::Interpret` carries the Undefined tag 55 times and is the one
+function where a pinned register's cost and gain are both measurable.
 
 ## Investigated and closed (2026-08 sweep)
 

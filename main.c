@@ -2203,13 +2203,14 @@ int main(int argc, char **argv)
     // Exit status follows the grep convention so a gating CI can tell a
     // dirty scan from a broken run: 0 = clean scan, 1 = opportunities
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
-    // The -i and -r censuses are informational and never contribute
+    // The -i, -r and -k censuses are informational and never contribute
     // findings.
     bool verbose = false;
     bool scan_all = false;
     bool endbr = false;
     bool isa_census = false;
     bool reg_census = false;
+    bool const_census = false;
     bool jcc_audit = false;
     bool thunk_audit = false;
     bool prop_audit = false;
@@ -2232,6 +2233,10 @@ int main(int argc, char **argv)
             isa_census = true;
         } else if (strcmp(argv[i], "-r") == 0) {
             reg_census = true;
+        } else if (strcmp(argv[i], "-k") == 0) {
+            // The constant census: -c, armlint's letter for it, is taken
+            // by the finding classes.
+            const_census = true;
         } else if (strcmp(argv[i], "-j") == 0) {
             jcc_audit = true;
         } else if (strcmp(argv[i], "-s") == 0) {
@@ -2280,7 +2285,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-j] [-s] [-p] [--json] "
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2291,7 +2296,7 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-j] [-s] [-p] [--json] "
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2301,7 +2306,7 @@ int main(int argc, char **argv)
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-j] [-s] [-p] [--json] "
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2314,19 +2319,21 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: -a and -f are mutually exclusive\n", argv[0]);
         return 2;
     }
-    // The ISA (-i) and register (-r) censuses describe the same sweep of
-    // every executable byte, so from here on one flag drives that sweep and
-    // the two only decide which tallies it feeds and which reports print.
-    const bool census = isa_census || reg_census;
+    // The ISA (-i), register (-r) and constant (-k) censuses describe the
+    // same sweep of every executable byte, so from here on one flag drives
+    // that sweep and the three only decide which tallies it feeds and which
+    // reports print.
+    const bool census = isa_census || reg_census || const_census;
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i, -r, -e, -j, -s and -p are separate
-    // reports whose shapes this schema does not describe. Refused rather than
-    // resolved, since either choice would surprise half the callers.
+    // prose with the document, and -i, -r, -k, -e, -j, -s and -p are
+    // separate reports whose shapes this schema does not describe. Refused
+    // rather than resolved, since either choice would surprise half the
+    // callers.
     if (json && (verbose || census || endbr || jcc_audit || thunk_audit ||
                  prop_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -r, -e, -j, -s or "
-            "-p\n", argv[0]);
+            "%s: --json cannot be combined with -v, -i, -r, -k, -e, -j, -s "
+            "or -p\n", argv[0]);
         return 2;
     }
 
@@ -2342,6 +2349,7 @@ int main(int argc, char **argv)
     x86lint_summary *summary = NULL;
     x86lint_census *census_data = NULL;
     x86lint_regs *regs_data = NULL;
+    x86lint_consts *consts_data = NULL;
     x86lint_jcc *jcc_data = NULL;
     uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
     x86lint_build *prop_data = NULL;
@@ -2474,8 +2482,11 @@ int main(int argc, char **argv)
     // sample of a library's, but a biased fraction is still a fraction where no
     // sample at all is nothing. Never both, or every exported function would
     // be counted twice and the denominator would be fiction.
+    // -k counts a function's repeats of a constant, so it wants ranges on
+    // the same terms -- .symtab, else the exports -- and says which it got;
+    // the sweep itself still covers every byte.
     bool have_symtab = false;
-    for (uint64_t i = 0; prop_audit && i < shnum; ++i) {
+    for (uint64_t i = 0; (prop_audit || const_census) && i < shnum; ++i) {
         Elf64_Shdr sh;
         if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(sh)), &sh,
                      sizeof(sh))) {
@@ -2486,9 +2497,10 @@ int main(int argc, char **argv)
             break;
         }
     }
-    bool use_dynsym = fname != NULL || (prop_audit && !have_symtab);
+    bool use_dynsym = fname != NULL ||
+        ((prop_audit || const_census) && !have_symtab);
     if ((!scan_all && !census && !jcc_audit && !thunk_audit) ||
-        fname != NULL || prop_audit) {
+        fname != NULL || prop_audit || const_census) {
         // An ET_REL symbol's value is an offset into its own section, so
         // placing it needs that section's address; remember them all while
         // the headers are being read anyway. Only ET_REL asks.
@@ -2658,7 +2670,10 @@ int main(int argc, char **argv)
     // nothing loads it, yet every section carries the address the engine
     // really compiled at, so the tier and function names are as real as an
     // executable's and the by-function table is the per-tier breakdown.
-    if (!census && funcs != NULL) {
+    //
+    // The constant census borrows the same table to bound "within a
+    // function".
+    if ((!census || const_census) && funcs != NULL) {
         attr = malloc(nfuncs * sizeof(*attr));
         if (attr != NULL) {
             size_t n = 0;
@@ -2801,6 +2816,15 @@ int main(int argc, char **argv)
                 goto out;
             }
         }
+        if (const_census) {
+            consts_data = x86lint_consts_create();
+            if (consts_data == NULL) {
+                fprintf(stderr, "%s: failed to allocate the constant "
+                    "census\n", path);
+                goto out;
+            }
+            x86lint_consts_set_functions(consts_data, attr, nattr);
+        }
 
         // Code evidence, gathered before the scan so every tally can be
         // labeled. Relocatable objects are skipped: their symbol values
@@ -2882,6 +2906,8 @@ int main(int argc, char **argv)
             x86lint_census_set_evidence(census_data, evidence.r,
                 evidence.n);
             x86lint_regs_set_evidence(regs_data, evidence.r, evidence.n);
+            x86lint_consts_set_evidence(consts_data, evidence.r,
+                evidence.n);
         }
     }
 
@@ -3039,6 +3065,44 @@ int main(int argc, char **argv)
             // loop, aggregated across sections. Under -f only the named
             // function's slices are scanned -- the per-function census
             // that answers "what level is this one IFUNC target".
+            //
+            // The constant census reads immediates, and an immediate a
+            // relocation will rewrite is a placeholder, not a constant:
+            // every `mov r64, imm32` of a kernel module's addresses reads
+            // as the value 0. It sweeps a copy with those instructions
+            // masked out, as the lint scan does, while the ISA and
+            // register censuses keep the bytes as emitted.
+            uint8_t *kbuf = buf;
+            uint8_t *kcopy = NULL;
+            if (consts_data != NULL) {
+                size_t sec_relocs = 0;
+                bool reloc_oom = false;
+                uint8_t *reloc_map = relocated_field_starts(f, shdrs, &rela,
+                    i, shdr.sh_size, file_size, &sec_relocs, &reloc_oom);
+                if (reloc_oom) {
+                    fprintf(stderr, "%s: failed to read the relocations of "
+                        "section %lu; cannot tell which immediates they "
+                        "rewrite\n", path, (unsigned long) i);
+                    free(reloc_map);
+                    goto out;
+                }
+                if (reloc_map != NULL) {
+                    kcopy = malloc(shdr.sh_size);
+                    if (kcopy == NULL) {
+                        fprintf(stderr, "%s: failed to allocate %lu bytes\n",
+                            path, (unsigned long) shdr.sh_size);
+                        free(reloc_map);
+                        goto out;
+                    }
+                    memcpy(kcopy, buf, shdr.sh_size);
+                    size_t rbytes = 0;
+                    relocated_insts += x86lint_mask_relocated(kcopy,
+                        shdr.sh_size, reloc_map, &rbytes);
+                    relocated_bytes += rbytes;
+                    kbuf = kcopy;
+                }
+                free(reloc_map);
+            }
             if (fname != NULL) {
                 // -f refused ET_REL above, so the run is by address.
                 size_t count;
@@ -3052,6 +3116,8 @@ int main(int argc, char **argv)
                         funcs[s].value);
                     x86lint_regs_scan(regs_data, buf + off, len,
                         funcs[s].value);
+                    x86lint_consts_scan(consts_data, kbuf + off, len,
+                        funcs[s].value);
                     exec_bytes += len;
                 }
             } else {
@@ -3059,8 +3125,11 @@ int main(int argc, char **argv)
                     shdr.sh_addr);
                 x86lint_regs_scan(regs_data, buf, shdr.sh_size,
                     shdr.sh_addr);
+                x86lint_consts_scan(consts_data, kbuf, shdr.sh_size,
+                    shdr.sh_addr);
                 exec_bytes += shdr.sh_size;
             }
+            free(kcopy);
             free(buf);
             buf = NULL;
             continue;
@@ -3149,6 +3218,31 @@ int main(int argc, char **argv)
         // either report read alone says what its labels rest on.
         if (reg_census) {
             x86lint_regs_print(regs_data, verbose);
+            print_code_evidence(evidence.n, evidence_funcs, evidence_fdes,
+                evidence_gofuncs, evidence_covered, exec_bytes);
+        }
+        if (const_census) {
+            x86lint_consts_print(consts_data, verbose);
+            // What bounded "within a function", so the repeat counts are
+            // read against the table that produced them: exports alone
+            // leave most of a stripped library's code in no function.
+            if (fname != NULL) {
+                printf("  functions: the %zu named by -f\n", nattr);
+            } else if (nattr == 0 && ehdr.e_type == ET_REL &&
+                       funcs != NULL) {
+                printf("  functions: %zu symbols, none placed (a relocatable "
+                    "object's sections have no addresses), so repeats were "
+                    "not counted\n", nfuncs);
+            } else if (nattr == 0) {
+                printf("  functions: none (no sized function symbols), so "
+                    "repeats were not counted\n");
+            } else if (have_symtab) {
+                printf("  functions: %zu sized from .symtab\n", nattr);
+            } else {
+                printf("  functions: %zu exported in .dynsym (.symtab is "
+                    "stripped, so the code in no function goes without a "
+                    "repeat count)\n", nattr);
+            }
             print_code_evidence(evidence.n, evidence_funcs, evidence_fdes,
                 evidence_gofuncs, evidence_covered, exec_bytes);
         }
@@ -3296,7 +3390,8 @@ int main(int argc, char **argv)
         if (fname != NULL) {
             printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
                 fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
-        } else if (funcs != NULL) {
+        } else if (funcs != NULL && !census) {
+            // -k loads the symbols to attribute repeats, not to restrict.
             printf("scan restricted to %zu function symbols "
                 "(-a scans every byte)\n", nfuncs);
         }
@@ -3323,6 +3418,7 @@ out:
     x86lint_jcc_destroy(jcc_data);
     x86lint_census_destroy(census_data);
     x86lint_regs_destroy(regs_data);
+    x86lint_consts_destroy(consts_data);
     free(evidence.r);
     x86lint_summary_destroy(summary);
     free(attr);

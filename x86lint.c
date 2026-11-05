@@ -3189,23 +3189,30 @@ size_t x86lint_summary_function_findings(const x86lint_summary *summary,
     return summary->func_hits[idx];
 }
 
-// The installed function containing vaddr, or nfuncs for none. Binary
-// search over the sorted, non-overlapping ranges.
-static size_t summary_func_at(const x86lint_summary *summary, uint64_t vaddr)
+// The range containing vaddr, or n for none. Binary search over sorted,
+// non-overlapping ranges.
+static size_t func_range_at(const x86lint_func_range *funcs, size_t n,
+                            uint64_t vaddr)
 {
     size_t lo = 0;
-    size_t hi = summary->nfuncs;
+    size_t hi = n;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (vaddr < summary->funcs[mid].start) {
+        if (vaddr < funcs[mid].start) {
             hi = mid;
-        } else if (vaddr >= summary->funcs[mid].end) {
+        } else if (vaddr >= funcs[mid].end) {
             lo = mid + 1;
         } else {
             return mid;
         }
     }
-    return summary->nfuncs;
+    return n;
+}
+
+// The installed function containing vaddr, or nfuncs for none.
+static size_t summary_func_at(const x86lint_summary *summary, uint64_t vaddr)
+{
+    return func_range_at(summary->funcs, summary->nfuncs, vaddr);
 }
 
 size_t x86lint_summary_instructions(const x86lint_summary *summary)
@@ -4522,6 +4529,712 @@ void x86lint_regs_print(const x86lint_regs *regs, bool verbose)
     for (int c = 0; c < X86LINT_REG_COSTS; ++c) {
         regs_print_samples(regs_cost_names[c], &regs->cost_samples[c],
             regs->cost[c]);
+    }
+}
+
+// ==== the constant census ============================================
+//
+// See the block comment on x86lint_consts in the header for what is keyed,
+// what a repeat is, and what the counts bound. Two open-addressed tables:
+// every wide value seen, and the values of the function being swept, which
+// close into the first when the sweep leaves the function.
+
+#define CONSTS_TOP 20
+#define CONSTS_SAMPLES 3
+
+// What the instruction does with its immediate.
+enum consts_role {
+    CROLE_MOV,      // MOV reg, imm: materialized into a register
+    CROLE_STORE,    // MOV mem, imm or PUSH imm: written to memory
+    CROLE_OP,       // consumed in place: ALU, CMP, TEST, IMUL, ...
+    CROLE_ROLES,
+};
+
+static const char *const consts_role_names[CROLE_ROLES] = {
+    "materialized into a register by MOV",
+    "stored by MOV or PUSH",
+    "consumed in place by an operation",
+};
+
+// Carriers of an imm32 that would fit an imm8; see x86lint_consts.fit.
+enum { FIT_MOV_REG, FIT_MOV_MEM, FIT_TEST, FIT_OTHER };
+
+struct consts_value {
+    uint64_t value;
+    bool is_64bit;
+    size_t sites;               // 0 marks a free slot
+    uint64_t bytes;             // immediate bytes spent on it
+    size_t role[CROLE_ROLES];
+    size_t imm64;               // sites carrying it in eight bytes
+    size_t unevidenced;
+    uint64_t at[CONSTS_SAMPLES];    // its first sites
+    // Repeats within a function, and the function that carries it most
+    // often (the first of those tied) with its first sites there.
+    size_t repeats;
+    uint64_t repeat_bytes;
+    size_t functions;           // functions that repeat it
+    size_t fn_sites;
+    uint64_t fn_vaddr;
+    char *fn_name;              // NULL when nameless
+    uint64_t fn_at[CONSTS_SAMPLES];
+};
+
+// One value's sites in the function being swept.
+struct consts_local {
+    uint64_t value;
+    bool is_64bit;
+    size_t count;               // 0 marks a free slot
+    uint64_t repeat_bytes;      // immediate bytes from the second site on
+    uint64_t at[CONSTS_SAMPLES];
+};
+
+struct x86lint_consts {
+    size_t instructions;
+    size_t skipped;
+    uint64_t swept;             // bytes handed to the scan
+
+    size_t count[X86LINT_IMM_WIDTHS];
+    uint64_t bytes[X86LINT_IMM_WIDTHS];
+    size_t wide_unevidenced;    // imm32 and imm64 sites outside evidence
+    size_t imm64_unevidenced;
+    size_t role[CROLE_ROLES];   // wide sites
+    uint64_t role_bytes[CROLE_ROLES];
+    size_t outside;             // wide sites in no installed function
+    uint64_t outside_bytes;
+    // imm32 sites whose value would fit a sign-extended imm8, by what
+    // carries them: MOV into a register and MOV to memory, neither of
+    // which has an imm8 form; TEST, which has none either above a byte
+    // operand; and the instructions that do have one.
+    size_t fit[4];
+
+    size_t repeats;
+    uint64_t repeat_bytes;
+    size_t repeating_functions;
+    size_t carried[4];          // (function, value) pairs carried twice,
+                                // 3 times, 4 times, 5 or more
+
+    struct consts_value *values;    // kept under half full
+    size_t nvalues;
+    size_t values_cap;          // a power of two, or 0
+
+    // The function being swept: its index, its values so far, and the
+    // slots they occupy, so that closing it clears what it used rather
+    // than the whole table.
+    size_t fn;                  // SIZE_MAX outside every function
+    struct consts_local *local;
+    size_t *local_used;
+    size_t nlocal;
+    size_t local_cap;
+
+    bool oom;                   // a table failed to grow: values incomplete
+
+    const x86lint_evidence_range *evidence;
+    size_t nevidence;
+    const x86lint_func_range *funcs;
+    size_t nfuncs;
+};
+
+x86lint_consts *x86lint_consts_create(void)
+{
+    x86lint_consts *c = calloc(1, sizeof(*c));
+    if (c != NULL) {
+        c->fn = SIZE_MAX;
+    }
+    return c;
+}
+
+void x86lint_consts_destroy(x86lint_consts *c)
+{
+    if (c == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < c->values_cap; ++i) {
+        free(c->values[i].fn_name);
+    }
+    free(c->values);
+    free(c->local);
+    free(c->local_used);
+    free(c);
+}
+
+void x86lint_consts_set_evidence(x86lint_consts *c,
+                                 const x86lint_evidence_range *ranges,
+                                 size_t count)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->evidence = ranges;
+    c->nevidence = count;
+}
+
+void x86lint_consts_set_functions(x86lint_consts *c,
+                                  const x86lint_func_range *funcs,
+                                  size_t count)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->funcs = funcs;
+    c->nfuncs = funcs == NULL ? 0 : count;
+}
+
+size_t x86lint_consts_instructions(const x86lint_consts *c)
+{
+    return c == NULL ? 0 : c->instructions;
+}
+
+size_t x86lint_consts_skipped(const x86lint_consts *c)
+{
+    return c == NULL ? 0 : c->skipped;
+}
+
+size_t x86lint_consts_count(const x86lint_consts *c,
+                            enum x86lint_imm_width width)
+{
+    if (c == NULL || width >= X86LINT_IMM_WIDTHS) {
+        return 0;
+    }
+    return c->count[width];
+}
+
+uint64_t x86lint_consts_bytes(const x86lint_consts *c,
+                              enum x86lint_imm_width width)
+{
+    if (c == NULL || width >= X86LINT_IMM_WIDTHS) {
+        return 0;
+    }
+    return c->bytes[width];
+}
+
+size_t x86lint_consts_values(const x86lint_consts *c)
+{
+    return c == NULL ? 0 : c->nvalues;
+}
+
+size_t x86lint_consts_repeats(const x86lint_consts *c)
+{
+    return c == NULL ? 0 : c->repeats;
+}
+
+uint64_t x86lint_consts_repeat_bytes(const x86lint_consts *c)
+{
+    return c == NULL ? 0 : c->repeat_bytes;
+}
+
+size_t x86lint_consts_fit_imm8(const x86lint_consts *c, size_t *mov_reg,
+                               size_t *mov_mem, size_t *test)
+{
+    *mov_reg = 0;
+    *mov_mem = 0;
+    *test = 0;
+    if (c == NULL) {
+        return 0;
+    }
+    *mov_reg = c->fit[FIT_MOV_REG];
+    *mov_mem = c->fit[FIT_MOV_MEM];
+    *test = c->fit[FIT_TEST];
+    return c->fit[FIT_MOV_REG] + c->fit[FIT_MOV_MEM] + c->fit[FIT_TEST] +
+        c->fit[FIT_OTHER];
+}
+
+// MurmurHash3's 64-bit finalizer over the value, with the operand width in
+// the top bit so the two widths of one number do not share a probe run.
+static size_t consts_hash(uint64_t value, bool is_64bit)
+{
+    uint64_t h = value ^ (is_64bit ? 0x8000000000000000ull : 0);
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return (size_t) h;
+}
+
+// The slot for (is_64bit, value) in a table of cap slots: the one holding
+// it, or the first free one along its probe sequence. The caller keeps the
+// table under half full.
+static struct consts_value *consts_value_slot(struct consts_value *table,
+                                              size_t cap, bool is_64bit,
+                                              uint64_t value)
+{
+    size_t j = consts_hash(value, is_64bit) & (cap - 1);
+    for (;;) {
+        struct consts_value *e = &table[j];
+        if (e->sites == 0 || (e->value == value && e->is_64bit == is_64bit)) {
+            return e;
+        }
+        j = (j + 1) & (cap - 1);
+    }
+}
+
+static struct consts_local *consts_local_slot(struct consts_local *table,
+                                              size_t cap, bool is_64bit,
+                                              uint64_t value)
+{
+    size_t j = consts_hash(value, is_64bit) & (cap - 1);
+    for (;;) {
+        struct consts_local *e = &table[j];
+        if (e->count == 0 || (e->value == value && e->is_64bit == is_64bit)) {
+            return e;
+        }
+        j = (j + 1) & (cap - 1);
+    }
+}
+
+static bool consts_values_grow(x86lint_consts *c)
+{
+    size_t cap = c->values_cap == 0 ? 1024 : c->values_cap * 2;
+    struct consts_value *table = calloc(cap, sizeof(*table));
+    if (table == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < c->values_cap; ++i) {
+        const struct consts_value *e = &c->values[i];
+        if (e->sites != 0) {
+            *consts_value_slot(table, cap, e->is_64bit, e->value) = *e;
+        }
+    }
+    free(c->values);
+    c->values = table;
+    c->values_cap = cap;
+    return true;
+}
+
+static bool consts_local_grow(x86lint_consts *c)
+{
+    size_t cap = c->local_cap == 0 ? 64 : c->local_cap * 2;
+    struct consts_local *table = calloc(cap, sizeof(*table));
+    size_t *used = malloc(cap * sizeof(*used));
+    if (table == NULL || used == NULL) {
+        free(table);
+        free(used);
+        return false;
+    }
+    for (size_t i = 0; i < c->nlocal; ++i) {
+        const struct consts_local *e = &c->local[c->local_used[i]];
+        struct consts_local *slot =
+            consts_local_slot(table, cap, e->is_64bit, e->value);
+        *slot = *e;
+        used[i] = (size_t) (slot - table);
+    }
+    free(c->local);
+    free(c->local_used);
+    c->local = table;
+    c->local_used = used;
+    c->local_cap = cap;
+    return true;
+}
+
+static char *consts_copy_name(const char *name)
+{
+    if (name == NULL) {
+        return NULL;
+    }
+    size_t n = strlen(name) + 1;
+    char *copy = malloc(n);
+    if (copy != NULL) {
+        memcpy(copy, name, n);
+    }
+    return copy;
+}
+
+// Close the function being swept: every value it carried more than once is
+// a run of repeats, credited to the value and to the totals, and its table
+// is cleared for the next one.
+static void consts_flush(x86lint_consts *c)
+{
+    bool repeated = false;
+    for (size_t i = 0; i < c->nlocal; ++i) {
+        struct consts_local *l = &c->local[c->local_used[i]];
+        size_t k = l->count;
+        if (k >= 2 && c->fn != SIZE_MAX && c->values_cap != 0) {
+            struct consts_value *e = consts_value_slot(c->values,
+                c->values_cap, l->is_64bit, l->value);
+            if (e->sites != 0) {
+                repeated = true;
+                c->repeats += k - 1;
+                c->repeat_bytes += l->repeat_bytes;
+                c->carried[k < 5 ? k - 2 : 3]++;
+                e->repeats += k - 1;
+                e->repeat_bytes += l->repeat_bytes;
+                e->functions++;
+                if (k > e->fn_sites) {
+                    e->fn_sites = k;
+                    e->fn_vaddr = c->funcs[c->fn].start;
+                    free(e->fn_name);
+                    e->fn_name = consts_copy_name(c->funcs[c->fn].name);
+                    memcpy(e->fn_at, l->at, sizeof(e->fn_at));
+                }
+            }
+        }
+        memset(l, 0, sizeof(*l));
+    }
+    if (repeated) {
+        c->repeating_functions++;
+    }
+    c->nlocal = 0;
+}
+
+static void consts_tally(x86lint_consts *c, const xed_decoded_inst_t *xedd,
+                         uint64_t at)
+{
+    unsigned bits = xed_decoded_inst_get_immediate_width_bits(xedd);
+    enum x86lint_imm_width w;
+    switch (bits) {
+    case 8: w = X86LINT_IMM8; break;
+    case 16: w = X86LINT_IMM16; break;
+    case 32: w = X86LINT_IMM32; break;
+    case 64: w = X86LINT_IMM64; break;
+    default: return;
+    }
+    c->count[w]++;
+    c->bytes[w] += bits / 8;
+    if (w < X86LINT_IMM32) {
+        return;
+    }
+
+    bool unevidenced = c->nevidence != 0 &&
+        !ranges_contain(c->evidence, c->nevidence, at);
+    c->wide_unevidenced += unevidenced;
+    if (w == X86LINT_IMM64) {
+        c->imm64_unevidenced += unevidenced;
+    }
+
+    // The value as the operand holds it: an imm32 sign-extends into a
+    // 64-bit operand, and a 32-bit operand keeps 32 bits. The signed
+    // accessor is 32 bits wide, so an imm64 is read unsigned.
+    unsigned opw = xed_decoded_inst_get_operand_width(xedd);
+    bool is_64bit = opw >= 64;
+    uint64_t value;
+    if (bits == 64) {
+        value = xed_decoded_inst_get_unsigned_immediate(xedd);
+    } else {
+        value = (uint64_t) (int64_t)
+            xed_decoded_inst_get_signed_immediate(xedd);
+        if (opw > 0 && opw < 64) {
+            value &= ((uint64_t) 1 << opw) - 1;
+        }
+    }
+
+    enum consts_role role = CROLE_OP;
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    if (iclass == XED_ICLASS_MOV) {
+        const xed_operand_t *dst =
+            xed_inst_operand(xed_decoded_inst_inst(xedd), 0);
+        role = xed_operand_name(dst) == XED_OPERAND_MEM0
+            ? CROLE_STORE : CROLE_MOV;
+    } else if (iclass == XED_ICLASS_PUSH) {
+        role = CROLE_STORE;
+    }
+    c->role[role]++;
+    c->role_bytes[role] += bits / 8;
+    if (bits == 32) {
+        int64_t s = is_64bit ? (int64_t) value
+                             : (int64_t) (int32_t) (uint32_t) value;
+        if (s >= -128 && s <= 127) {
+            int kind = role == CROLE_MOV ? FIT_MOV_REG
+                : iclass == XED_ICLASS_MOV ? FIT_MOV_MEM
+                : iclass == XED_ICLASS_TEST ? FIT_TEST : FIT_OTHER;
+            c->fit[kind]++;
+        }
+    }
+
+    if (c->oom) {
+        return;
+    }
+    if (c->nvalues * 2 >= c->values_cap && !consts_values_grow(c)) {
+        c->oom = true;
+        return;
+    }
+    struct consts_value *e = consts_value_slot(c->values, c->values_cap,
+        is_64bit, value);
+    if (e->sites == 0) {
+        e->value = value;
+        e->is_64bit = is_64bit;
+        c->nvalues++;
+    }
+    if (e->sites < CONSTS_SAMPLES) {
+        e->at[e->sites] = at;
+    }
+    e->sites++;
+    e->bytes += bits / 8;
+    e->role[role]++;
+    e->imm64 += bits == 64;
+    e->unevidenced += unevidenced;
+
+    // Within a function. The sweep is in address order, so leaving the
+    // current function's range closes it.
+    if (c->nfuncs == 0) {
+        return;
+    }
+    size_t fn = func_range_at(c->funcs, c->nfuncs, at);
+    if (fn == c->nfuncs) {
+        fn = SIZE_MAX;
+    }
+    if (fn != c->fn) {
+        consts_flush(c);
+        c->fn = fn;
+    }
+    if (fn == SIZE_MAX) {
+        c->outside++;
+        c->outside_bytes += bits / 8;
+        return;
+    }
+    if (c->nlocal * 2 >= c->local_cap && !consts_local_grow(c)) {
+        c->oom = true;
+        return;
+    }
+    struct consts_local *l = consts_local_slot(c->local, c->local_cap,
+        is_64bit, value);
+    if (l->count == 0) {
+        l->value = value;
+        l->is_64bit = is_64bit;
+        c->local_used[c->nlocal++] = (size_t) (l - c->local);
+    } else {
+        l->repeat_bytes += bits / 8;
+    }
+    if (l->count < CONSTS_SAMPLES) {
+        l->at[l->count] = at;
+    }
+    l->count++;
+}
+
+void x86lint_consts_scan(x86lint_consts *c, const uint8_t *inst, size_t len,
+                         uint64_t vaddr)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->swept += len;
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            ++c->skipped;
+            continue;
+        }
+        consts_tally(c, &xedd, vaddr + i);
+        c->instructions++;
+        i += xed_decoded_inst_get_length(&xedd);
+    }
+    // A function does not span two calls, so whatever is open closes here.
+    consts_flush(c);
+    c->fn = SIZE_MAX;
+}
+
+bool x86lint_consts_lookup(const x86lint_consts *c, bool is_64bit,
+                           uint64_t value, size_t *sites, size_t *imm64,
+                           size_t *repeats)
+{
+    *sites = 0;
+    *imm64 = 0;
+    *repeats = 0;
+    if (c == NULL || c->values_cap == 0) {
+        return false;
+    }
+    const struct consts_value *e = consts_value_slot(c->values,
+        c->values_cap, is_64bit, value);
+    if (e->sites == 0) {
+        return false;
+    }
+    *sites = e->sites;
+    *imm64 = e->imm64;
+    *repeats = e->repeats;
+    return true;
+}
+
+static double consts_pct(uint64_t n, uint64_t d)
+{
+    return d == 0 ? 0.0 : 100.0 * (double) n / (double) d;
+}
+
+// Whether a ranks above b: by bytes -- spent repeating it, or on it at all
+// -- then by value, the 32-bit width first.
+static bool consts_ranks_above(const struct consts_value *a,
+                               const struct consts_value *b, bool repeats)
+{
+    uint64_t ka = repeats ? a->repeat_bytes : a->bytes;
+    uint64_t kb = repeats ? b->repeat_bytes : b->bytes;
+    if (ka != kb) {
+        return ka > kb;
+    }
+    if (a->value != b->value) {
+        return a->value < b->value;
+    }
+    return !a->is_64bit && b->is_64bit;
+}
+
+static void consts_print_sites(const uint64_t *at, size_t shown, size_t count)
+{
+    for (size_t k = 0; k < shown; ++k) {
+        printf("%s 0x%" PRIx64, k == 0 ? "" : ",", at[k]);
+    }
+    if (count > shown) {
+        printf(" (+%zu more)", count - shown);
+    }
+}
+
+// Print one ranking: its top CONSTS_TOP values and a count of the rest.
+// Silent when no value qualifies (the repeat ranking of code that repeats
+// nothing).
+static void consts_print_ranking(const x86lint_consts *c, bool repeats,
+                                 bool verbose)
+{
+    size_t top[CONSTS_TOP];
+    size_t ntop = 0;
+    size_t n = 0;
+    for (size_t i = 0; i < c->values_cap; ++i) {
+        const struct consts_value *e = &c->values[i];
+        if (e->sites == 0 || (repeats && e->repeats == 0)) {
+            continue;
+        }
+        n++;
+        size_t at = ntop;
+        while (at > 0 &&
+               consts_ranks_above(e, &c->values[top[at - 1]], repeats)) {
+            at--;
+        }
+        if (at == CONSTS_TOP) {
+            continue;
+        }
+        if (ntop < CONSTS_TOP) {
+            ntop++;
+        }
+        memmove(&top[at + 1], &top[at], (ntop - 1 - at) * sizeof(top[0]));
+        top[at] = i;
+    }
+    if (n == 0) {
+        return;
+    }
+    if (repeats) {
+        printf("  most bytes spent repeating one value within a function:\n");
+        printf("    %9s %8s %9s  %s\n", "bytes", "repeats", "functions",
+            "value");
+    } else {
+        printf("  most bytes spent on one value:\n");
+        printf("    %9s %8s %8s %8s %8s  %s\n", "bytes", "sites", "mov",
+            "store", "imm64", "value");
+    }
+    for (size_t i = 0; i < ntop; ++i) {
+        const struct consts_value *e = &c->values[top[i]];
+        if (repeats) {
+            printf("    %9" PRIu64 " %8zu %9zu  ", e->repeat_bytes,
+                e->repeats, e->functions);
+        } else {
+            printf("    %9" PRIu64 " %8zu %8zu %8zu %8zu  ", e->bytes,
+                e->sites, e->role[CROLE_MOV], e->role[CROLE_STORE],
+                e->imm64);
+        }
+        const char *width = e->is_64bit ? "64-bit" : "32-bit";
+        if (!verbose) {
+            printf("%s 0x%" PRIx64 "\n", width, e->value);
+            continue;
+        }
+        // The samples: where to look in a disassembler.
+        printf("%s 0x%-16" PRIx64 "  ", width, e->value);
+        if (repeats) {
+            printf("carried %zu times in ", e->fn_sites);
+            if (e->fn_name != NULL) {
+                printf("<%s>:", e->fn_name);
+            } else {
+                printf("<0x%" PRIx64 ">:", e->fn_vaddr);
+            }
+            consts_print_sites(e->fn_at, e->fn_sites < CONSTS_SAMPLES
+                ? e->fn_sites : CONSTS_SAMPLES, e->fn_sites);
+        } else {
+            printf("at");
+            consts_print_sites(e->at, e->sites < CONSTS_SAMPLES
+                ? e->sites : CONSTS_SAMPLES, e->sites);
+        }
+        printf("\n");
+    }
+    if (n > ntop) {
+        printf("    (%zu more distinct values)\n", n - ntop);
+    }
+}
+
+void x86lint_consts_print(const x86lint_consts *c, bool verbose)
+{
+    if (c == NULL) {
+        return;
+    }
+    printf("constant census: %zu instructions, %zu undecodable bytes "
+        "skipped\n", c->instructions, c->skipped);
+
+    uint64_t all_bytes = 0;
+    for (int w = 0; w < X86LINT_IMM_WIDTHS; ++w) {
+        all_bytes += c->bytes[w];
+    }
+    printf("  immediates by encoded width: imm8 %zu, imm16 %zu, imm32 %zu, "
+        "imm64 %zu; %" PRIu64 " bytes, %.2f%% of the %" PRIu64 " bytes "
+        "swept\n", c->count[X86LINT_IMM8], c->count[X86LINT_IMM16],
+        c->count[X86LINT_IMM32], c->count[X86LINT_IMM64], all_bytes,
+        consts_pct(all_bytes, c->swept), c->swept);
+
+    size_t wide = c->count[X86LINT_IMM32] + c->count[X86LINT_IMM64];
+    uint64_t wide_bytes = c->bytes[X86LINT_IMM32] + c->bytes[X86LINT_IMM64];
+    printf("  wide immediates (imm32 and imm64): %zu carrying %zu distinct "
+        "values, %" PRIu64 " bytes (%.2f%%)", wide, c->nvalues, wide_bytes,
+        consts_pct(wide_bytes, c->swept));
+    if (c->wide_unevidenced != 0) {
+        printf(", %zu unevidenced", c->wide_unevidenced);
+    }
+    printf("\n");
+    for (int r = 0; r < CROLE_ROLES; ++r) {
+        printf("    %s: %zu (%" PRIu64 " bytes)\n", consts_role_names[r],
+            c->role[r], c->role_bytes[r]);
+    }
+    // The structural cost in the table above: x86 narrows an ALU
+    // immediate to a byte but has no such form for MOV, so `mov eax, 1`
+    // and `mov qword [rsp+8], 0` pay four bytes for a value that fits one,
+    // and TEST is the same above a byte operand.
+    size_t no_form = c->fit[FIT_MOV_REG] + c->fit[FIT_MOV_MEM] +
+        c->fit[FIT_TEST];
+    printf("    imm32 fitting a sign-extended imm8: %zu; MOV carries %zu "
+        "(%zu into a register, %zu to memory) and TEST %zu, and neither has "
+        "an imm8 form\n", no_form + c->fit[FIT_OTHER],
+        c->fit[FIT_MOV_REG] + c->fit[FIT_MOV_MEM], c->fit[FIT_MOV_REG],
+        c->fit[FIT_MOV_MEM], c->fit[FIT_TEST]);
+    printf("    a one-byte form for them would save %" PRIu64 " bytes "
+        "(%.2f%% of the bytes swept); the other %zu are ALU, PUSH and IMUL, "
+        "which have one\n", (uint64_t) no_form * 3,
+        consts_pct((uint64_t) no_form * 3, c->swept), c->fit[FIT_OTHER]);
+    size_t imm64_values = 0;
+    for (size_t i = 0; i < c->values_cap; ++i) {
+        imm64_values += c->values[i].sites != 0 && c->values[i].imm64 != 0;
+    }
+    printf("    imm64, which MOVABS alone carries: %zu building %zu distinct "
+        "values, %" PRIu64 " bytes (%.2f%%)", c->count[X86LINT_IMM64],
+        imm64_values, c->bytes[X86LINT_IMM64],
+        consts_pct(c->bytes[X86LINT_IMM64], c->swept));
+    if (c->imm64_unevidenced != 0) {
+        printf(", %zu unevidenced", c->imm64_unevidenced);
+    }
+    printf("\n");
+
+    if (c->nfuncs == 0) {
+        printf("  repeats within a function: not counted (no function "
+            "ranges)\n");
+    } else {
+        printf("  repeats within a function: %zu in %zu of %zu functions, %"
+            PRIu64 " bytes (%.2f%% of the wide-immediate bytes); %zu wide "
+            "immediate%s in no function\n", c->repeats,
+            c->repeating_functions, c->nfuncs, c->repeat_bytes,
+            consts_pct(c->repeat_bytes, wide_bytes), c->outside,
+            c->outside == 1 ? "" : "s");
+        printf("  how often a function carries a value it repeats: twice "
+            "%zu, 3 times %zu, 4 times %zu, 5 or more times %zu\n",
+            c->carried[0], c->carried[1], c->carried[2], c->carried[3]);
+    }
+    if (c->oom) {
+        printf("  (a table failed to grow, so the values and repeats are "
+            "incomplete)\n");
+    }
+    consts_print_ranking(c, false, verbose);
+    if (c->nfuncs != 0) {
+        consts_print_ranking(c, true, verbose);
     }
 }
 

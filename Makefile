@@ -77,6 +77,7 @@ clean:
 		tools/defuse \
 		tools/cohere \
 		tools/shapescan \
+		tools/framescan \
 		*.o
 
 # None of these name a file that is built; `tools` and `snapshots` are also

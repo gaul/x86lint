@@ -565,6 +565,110 @@ size_t x86lint_regs_cost_count(const x86lint_regs *regs,
 // Encoding bytes the costs above add up to.
 size_t x86lint_regs_cost_bytes(const x86lint_regs *regs);
 
+// A constant census: which immediates the code carries, what they cost in
+// encoding bytes, and which a function carries more than once. The ISA
+// census answers "which extensions" and the register census "which
+// registers"; this answers "which constants", the x86 counterpart of
+// armlint's -c report on MOVZ/MOVK chains.
+//
+// x86 has no chains: a constant is one immediate field, and the field's
+// width is what it costs. A value in -128..127 rides in one byte on almost
+// any instruction; a wider one costs four; and a 64-bit value that does not
+// sign-extend from 32 bits costs eight and is carried by MOV alone
+// (MOVABS), so a comparison against it or a mask by it has to materialize
+// it into a register first. The census tallies every immediate by encoded
+// width, and keys the wide ones -- imm32 and imm64 -- by value, so that a
+// reader can see what the bytes were spent on: the top of the table is a
+// binary's signature constants (hash multipliers, error codes, tag masks,
+// field offsets).
+//
+// Values are keyed at the effective operand width, as the register would
+// hold them: `mov eax, 0xffffffff` and `mov rax, -1` are two values, while
+// `mov rax, -1` (imm32, sign-extended) and `movabs rax, -1` (imm64) are one.
+// A repeat is a wide immediate whose value an earlier instruction of the
+// same function already carried, in address order; neither dominance nor
+// liveness is checked. It bounds what keeping the value in a register could
+// save -- the second MOVABS of a value is ten bytes a register copy would
+// make three -- and does not measure it: an imm32 consumed in place is the
+// idiom x86 offers for free, and a rebuild after a call can be cheaper than
+// a spill. Functions come from x86lint_consts_set_functions; without them
+// repeats are not counted. Same linear sweep, resync and evidence labeling
+// as the other censuses, with the same caution: data decoded as code
+// carries immediates too, and each phantom imm64 is a distinct value.
+// Opaque; NULL is accepted everywhere.
+typedef struct x86lint_consts x86lint_consts;
+
+x86lint_consts *x86lint_consts_create(void);
+void x86lint_consts_destroy(x86lint_consts *consts);
+
+// Install borrowed, sorted, non-overlapping code-evidence ranges, as for
+// the ISA census.
+void x86lint_consts_set_evidence(x86lint_consts *consts,
+                                 const x86lint_evidence_range *ranges,
+                                 size_t count);
+
+// Install the function ranges that bound "within a function": sorted by
+// start, non-overlapping, and outliving the census along with their names,
+// which the census does not copy or free (the contract of
+// x86lint_summary_set_functions). NULL/0 (the default) disables the repeat
+// count.
+void x86lint_consts_set_functions(x86lint_consts *consts,
+                                  const x86lint_func_range *funcs,
+                                  size_t count);
+
+// Linear-sweep decode of `len` bytes at virtual address `vaddr`. A
+// function's bytes must arrive in one call for its repeats to be found.
+void x86lint_consts_scan(x86lint_consts *consts, const uint8_t *inst,
+                         size_t len, uint64_t vaddr);
+
+// Print the census: immediates by width, the wide ones by role, the repeat
+// counts, and the twenty values most bytes were spent on, overall and in
+// repeats; verbose adds up to three sites for each value and the function
+// that repeats it most.
+void x86lint_consts_print(const x86lint_consts *consts, bool verbose);
+
+size_t x86lint_consts_instructions(const x86lint_consts *consts);
+size_t x86lint_consts_skipped(const x86lint_consts *consts);
+
+// Encoded immediate widths. An instruction with no immediate is in none.
+enum x86lint_imm_width {
+    X86LINT_IMM8,
+    X86LINT_IMM16,
+    X86LINT_IMM32,
+    X86LINT_IMM64,
+    X86LINT_IMM_WIDTHS,
+};
+
+// Instructions carrying an immediate of one encoded width, and the
+// immediate bytes they spent.
+size_t x86lint_consts_count(const x86lint_consts *consts,
+                            enum x86lint_imm_width width);
+uint64_t x86lint_consts_bytes(const x86lint_consts *consts,
+                              enum x86lint_imm_width width);
+
+// Distinct wide values (imm32 and imm64, keyed as described above).
+size_t x86lint_consts_values(const x86lint_consts *consts);
+
+// Wide immediates repeating a value within their function, and the
+// immediate bytes those repeats spent.
+size_t x86lint_consts_repeats(const x86lint_consts *consts);
+uint64_t x86lint_consts_repeat_bytes(const x86lint_consts *consts);
+
+// imm32 sites whose value would fit a sign-extended imm8, and how many of
+// them MOV carries into a register, MOV carries to memory, and TEST
+// carries: the three that have no imm8 form, so those sites are the
+// instruction set's cost rather than the compiler's. The remainder (ALU,
+// PUSH, IMUL) had a byte form available.
+size_t x86lint_consts_fit_imm8(const x86lint_consts *consts, size_t *mov_reg,
+                               size_t *mov_mem, size_t *test);
+
+// One wide value's tally: the sites carrying it, how many of them as an
+// imm64, and its repeats. `is_64bit` selects the 64-bit operand width.
+// False when the value was never seen.
+bool x86lint_consts_lookup(const x86lint_consts *consts, bool is_64bit,
+                           uint64_t value, size_t *sites, size_t *imm64,
+                           size_t *repeats);
+
 // Called once per finding, in the order findings are reported, when passed
 // to check_instructions. The summary answers "how many of each kind"; this
 // answers "which instruction, at what address" -- the form a consumer needs

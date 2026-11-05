@@ -73,6 +73,7 @@ snapshot() {  # snapshot <name> <args...>
             -e 's/^== section [0-9][0-9]* /== section N /' \
             -e 's/"vaddr": [0-9][0-9]*/"vaddr": N/' \
             -e 's/ at 0x[0-9a-f]*\(, 0x[0-9a-f]*\)*$/ at 0xADDR/' \
+            -e 's/>: 0x[0-9a-f]*\(, 0x[0-9a-f]*\)*$/>: 0xADDR/' \
             -e 's/ENDBR64: 0x[0-9a-f]*/ENDBR64: 0xADDR/' \
             -e 's/^  GNU property ISA note: used = 0$/  GNU property ISA note: none/' \
             -e "s|$dir/|<fixtures>/|g" \
@@ -284,6 +285,37 @@ _start:
     .byte 0xc3                          # ret
     .size _start, . - _start
     .byte 0x87, 0xc8                    # xchg eax, ecx (outside _start)
+    .section .note.GNU-stack, "", @progbits
+EOF
+
+# Constant-census fixture for -k: the widths, the two keyings of a value
+# (operand width, and imm32 against imm64 for one 64-bit value), the three
+# roles, repeats within _start, the same value again in a second function
+# (no repeat), and a trailing MOVABS outside both for the unevidenced and
+# in-no-function counts.
+cat >"$dir/consts.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    .byte 0x48, 0xb8, 0xb9, 0xe5, 0xe4, 0x1c, 0x6d, 0x47, 0x58, 0xbf   # movabs rax, 0xbf58476d1ce4e5b9
+    .byte 0xb8, 0x05, 0x40, 0x00, 0x80                                 # mov eax, 0x80004005
+    .byte 0x3d, 0x05, 0x40, 0x00, 0x80                                 # cmp eax, 0x80004005: carried again
+    .byte 0xc7, 0x00, 0x05, 0x40, 0x00, 0x80                           # mov dword [rax], 0x80004005: and stored
+    .byte 0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff                     # mov rax, -1: imm32, a 64-bit value
+    .byte 0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff   # movabs rax, -1: the same value in eight bytes
+    .byte 0x68, 0x78, 0x56, 0x34, 0x12                                 # push 0x12345678
+    .byte 0xa9, 0x01, 0x00, 0x00, 0x00                                 # test eax, 1: four bytes for a value that fits one; TEST has no imm8 form
+    .byte 0x83, 0xe0, 0x0f                                             # and eax, 0xf: imm8, not wide
+    .byte 0xc3                                                         # ret
+    .size _start, . - _start
+    .globl second
+    .type second, @function
+second:
+    .byte 0x48, 0xb8, 0xb9, 0xe5, 0xe4, 0x1c, 0x6d, 0x47, 0x58, 0xbf   # movabs rax, 0xbf58476d1ce4e5b9: another function, no repeat
+    .byte 0xc3                                                         # ret
+    .size second, . - second
+    .byte 0x48, 0xb8, 0xb9, 0xe5, 0xe4, 0x1c, 0x6d, 0x47, 0x58, 0xbf   # the same, outside every function
     .section .note.GNU-stack, "", @progbits
 EOF
 
@@ -818,7 +850,8 @@ _start:
 EOF
 
 for f in finding clean bmi notrack census isanote perfunc target advisory \
-         jccpad jccraw jccmixed canary canarysetup frameptr deadcmp regs; do
+         jccpad jccraw jccmixed canary canarysetup frameptr deadcmp regs \
+         consts; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -1133,6 +1166,52 @@ expect '^ISA census: 13 instructions'
 run 0 -r -f _start "$dir/regs"
 expect '^register census: 12 instructions, 0 undecodable bytes skipped$'
 
+# -k replaces the lint scan with the constant census. Values are keyed at
+# the operand width (the imm32 and imm64 spellings of -1 are one value, in
+# two encodings), roles are split, and repeats are counted within _start
+# alone: second's copy of the hash multiplier is no repeat, and the one
+# outside both functions is unevidenced and in no function.
+run 0 -k "$dir/consts"
+expect '^constant census: 13 instructions, 0 undecodable bytes skipped$'
+expect '^  immediates by encoded width: imm8 1, imm16 0, imm32 6, imm64 4; 57 bytes, [0-9.]+% of the [0-9]+ bytes swept$'
+expect '^  wide immediates \(imm32 and imm64\): 10 carrying 5 distinct values, 56 bytes \([0-9.]+%\), 1 unevidenced$'
+expect '^    materialized into a register by MOV: 6 \(40 bytes\)$'
+expect '^    stored by MOV or PUSH: 2 \(8 bytes\)$'
+expect '^    consumed in place by an operation: 2 \(8 bytes\)$'
+expect '^    imm32 fitting a sign-extended imm8: 2; MOV carries 1 \(1 into a register, 0 to memory\) and TEST 1, and neither has an imm8 form$'
+expect '^    a one-byte form for them would save 6 bytes \([0-9.]+% of the bytes swept\); the other 0 are ALU, PUSH and IMUL, which have one$'
+expect '^    imm64, which MOVABS alone carries: 4 building 2 distinct values, 32 bytes \([0-9.]+%\), 1 unevidenced$'
+expect '^  repeats within a function: 3 in 1 of 2 functions, 16 bytes \(28\.57% of the wide-immediate bytes\); 1 wide immediate in no function$'
+expect '^  how often a function carries a value it repeats: twice 1, 3 times 1, 4 times 0, 5 or more times 0$'
+expect '^ +24 +3 +3 +0 +3  64-bit 0xbf58476d1ce4e5b9$'
+expect '^ +12 +3 +1 +1 +0  32-bit 0x80004005$'
+expect '^ +12 +2 +2 +0 +1  64-bit 0xffffffffffffffff$'
+expect '^ +4 +1 +0 +0 +0  32-bit 0x1$'
+expect '^ +4 +1 +0 +1 +0  64-bit 0x12345678$'
+expect '^ +8 +2 +1  32-bit 0x80004005$'
+expect '^ +8 +1 +1  64-bit 0xffffffffffffffff$'
+expect '^  functions: 2 sized from \.symtab$'
+expect '^  code evidence: 2 function symbols '
+reject 'optimization opportunities' "lint tail in constant-census mode"
+reject 'scan restricted' "restricted-scan line in constant-census mode"
+reject 'register census' "register census without -r"
+# -v adds each value's first sites and the function that repeats it most.
+run 0 -k -v "$dir/consts"
+expect '64-bit 0xbf58476d1ce4e5b9 +at 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+$' \
+    "-v value sample line"
+expect '32-bit 0x80004005 +carried 3 times in <_start>: 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+$' \
+    "-v repeat sample line"
+# -f narrows it to one function, which then repeats nothing.
+run 0 -k -f second "$dir/consts"
+expect '^constant census: 2 instructions, 0 undecodable bytes skipped$'
+expect '^  repeats within a function: 0 in 0 of 1 functions, 0 bytes'
+expect '^  functions: the 1 named by -f$'
+# The three censuses print from one sweep.
+run 0 -i -r -k "$dir/consts"
+expect '^ISA census: 13 instructions'
+expect '^register census: 13 instructions'
+expect '^constant census: 13 instructions'
+
 # -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
 run 0 "$dir/cetbad"
 reject 'ENDBR64' "ENDBR64 output without -e"
@@ -1408,6 +1487,8 @@ snapshot census -i "$dir/census"
 snapshot census-verbose -i -v "$dir/census"
 snapshot regs -r "$dir/regs"
 snapshot regs-verbose -r -v "$dir/regs"
+snapshot consts -k "$dir/consts"
+snapshot consts-verbose -k -v "$dir/consts"
 snapshot endbr-missing -e "$dir/cetbad"
 snapshot jcc-absent -j -t skylake "$dir/jccraw"
 snapshot jcc-present -j "$dir/jccpad"

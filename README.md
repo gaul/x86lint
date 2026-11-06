@@ -1018,10 +1018,14 @@ on AArch64: libLLVM materializes splitmix64's multiplier
 SpiderMonkey's `UndefinedValue` tag `0xfff9800000000000` 15,046 times and
 the header words of an empty `nsString` and `nsAutoString` 24,390 times
 between them. Fedora's GCC build of the same source has none of the tag in
-its top twenty and 15,209 `mov eax, 0x1fff3` instead: GCC spells the
-constant as `mov eax, 0x1fff3 ; shl rax, 47`, nine bytes against ten, and
-this census keys that pair by its parts -- x86's one chain, and the piece of
-armlint's chain tracking a port turns out to want.
+its top twenty and 15,209 `mov eax, 0x1fff3` instead: 15,178 of them are
+followed by `shl rax, 47`, GCC's nine-byte spelling of the ten-byte MOVABS,
+and this census keys that pair by its parts -- x86's one chain, and the
+piece of armlint's chain tracking a port turns out to want. GCC emits the
+pair only where it optimizes for size (`-Os`, or code its profile calls
+cold: 13,463 of the Fedora pairs sit in the PGO cold partition, against
+2,059 MOVABS in the hot one) and only into rax-rdi, where `mov r32, imm32`
+has no REX prefix and the pair is actually the shorter spelling.
 
 `-v` adds each value's first three sites and, for a repeated value, the
 function that carries it most often with its first sites there. Immediates a

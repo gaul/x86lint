@@ -2469,17 +2469,55 @@ crate carries it 207 times ahead of a jump table. `0x7fffffffffffffff`
 sizes against. Go's imm64s are 0.37% of its bytes and Go's largest
 repeated 64-bit value is ML-DSA's `0x7fe001`, 63 times in `ntt`.
 
-**GCC spells the tag as a chain.** Fedora's GCC build of the same
-source has no `0xfff9800000000000` in its top twenty and `32-bit
-0x1fff3` 15,209 times instead, all MOV into a register; the sampled sites
-read `mov eax, 0x1fff3 ; shl rax, 47`, nine bytes against MOVABS's ten.
-So x86 does have a chain -- GCC emits the two-instruction build when it
-saves a byte -- and this census keys it by its parts, under a value
-nothing in Firefox means. The GCC build's 96,452 imm64s against the
-clang build's 206,123 are partly this spelling and partly PGO's cold
-code compiled for size, and the census cannot apportion the two without
-following the shift. That is the one piece of armlint's chain tracking
-an x86 port turns out to want.
+**GCC spells the tag as a chain, where the profile says cold.** Fedora's
+GCC build of the same source has no `0xfff9800000000000` in its top
+twenty and `32-bit 0x1fff3` 15,209 times instead, all MOV into a
+register. 15,178 of those are followed within seven instructions by `shl
+r64, 47` into the same register (7,729 adjacent; GCC's scheduler
+interleaves the rest with stores and argument setup), building
+`UndefinedValue()` in nine bytes against MOVABS's ten; the other 31 pass
+the bare tag as a call argument. So x86 does have a chain, and this
+census keys it by its parts, under a value nothing in Firefox means.
+That is the one piece of armlint's chain tracking an x86 port turns out
+to want. A two-line control (gcc 16.2 and clang 23.1, 2026-11-05) gives
+the rule: GCC emits the chain only when optimizing for size -- `-Os`, or
+a `cold` function at `-O2` -- and MOVABS otherwise; clang emits MOVABS at
+both levels. `-Os` also normalizes the split: `NullValue`'s `0x1fff4 <<
+47` comes out `mov eax, 0x7ffd ; shl rax, 49`, every trailing zero
+shifted out, so a fold has to accept any shift. With PGO the rule is
+visible by address, split at the cold partition's end (0x62b4971, the
+framescan boundary):
+
+| spelling of `0xfff9800000000000` | hot partition | cold partition |
+| --- | --- | --- |
+| `movabs r64, imm64` | 2,059 | 554 |
+| `mov r32, 0x1fff3` with its `shl 47` within 7 instructions | 1,715 | 13,463 |
+| `mov r32, 0x1fff3` with no shift (the tag as an argument) | 17 | 14 |
+
+The leakage across the boundary is GCC deciding per basic block where
+the boundary is per partition. The byte rule is exact: `mov r8d, imm32`
+carries a REX prefix and is six bytes, so the chain into r8-r15 is ten
+bytes and saves nothing, and none of the 7,729 adjacent chains targets
+one; of the 554 cold-partition MOVABS, 379 target r8-r15:
+
+| MOVABS of the tag, by destination | rax-rdi, rbp | r8-r15 |
+| --- | --- | --- |
+| hot partition | 1,851 | 208 |
+| cold partition | 175 | 379 |
+
+Which form is cheaper depends on the partition, and GCC's answer is the
+right one in each. MOVABS is one uop with no inputs, ready in a cycle on
+any ALU port; the chain is two dependent uops, two cycles, one of them on
+a shift port. The latency rarely matters -- a constant has no inputs and
+the out-of-order engine hoists it -- so the hot price is one uop of issue
+and retire bandwidth. The byte does not buy uop-cache room either: by
+Agner Fog's measurements a 64-bit immediate costs two entries in Intel's
+decoded-uop cache, so both spellings occupy two. The saving is in L1i
+and on disk, roughly 15 KB across this libxul against a MOVABS-everywhere
+build, small beside the 2.75 MB the missing `mov r/m, imm8` form costs
+the same binary. The GCC build's 96,452 imm64s against the clang build's
+206,123 are partly this spelling and partly PGO's size-optimized cold
+code; the tag's share is apportioned above, the rest is not.
 
 **Repeats are mostly the imm8 cost in another guise.** 40-44% of the
 wide-immediate bytes repeat a value within their function in every
@@ -2503,8 +2541,12 @@ MiniDebugInfo the mining tools read since 2026-11-05 would make every
 function available, and the driver does not read it because that is a
 dependency (liblzma) rather than a line of code. Left as a decision.
 
-**Next.** Follow `shl` after `mov r32, imm32` into the same register, so
-GCC's two-instruction builds key by the value they build. The literal-
+**Next.** Follow `shl r64, n` after `mov r32, imm32` into the same
+register, within the basic block -- the pair sits up to seven
+instructions apart and the shift varies, 47 for the Undefined tag and 49
+for Null -- so GCC's two-instruction builds key by the value they build,
+and the Fedora build's Undefined count reads 17,791 beside the clang
+build's 15,046 instead of nothing. The literal-
 pool counterfactual: libxul's 206,123 MOVABS are 1.65 MB of immediates
 where a `mov r64, [rip+disp32]` is seven bytes against ten, 618 KB back
 for a 78 KB pool of 9,733 values, at a load each -- the AArch64 shape,

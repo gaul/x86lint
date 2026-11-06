@@ -1,0 +1,25 @@
+inlining census: 31 instructions, 0 undecodable bytes skipped
+  calls: 10 direct (call rel32), 2 indirect (through a register or memory), 1 of the direct unevidenced
+    direct calls to a function start: 7; into a function elsewhere than its start: 1; to a linker stub (PLT): 1; to no sized function: 1
+  tail jumps: 2 to another function's start, 0 to a linker stub
+  callees by body bytes (the function's size less a leading ENDBR64, a frame-pointer frame and a trailing RET):
+        body  functions      calls  tail jumps  share of direct calls
+           0          1          1           0  10.00%
+         1-8          2          4           2  40.00%
+        9-16          0          0           0  0.00%
+       17-32          1          1           0  10.00%
+       33-64          1          1           0  10.00%
+      65-128          0          0           0  0.00%
+     129-256          0          0           0  0.00%
+        257+          0          0           0  0.00%
+  calls to functions of at most 16 body bytes: 5 (50.00% of direct calls) to 3 functions
+    of the functions: 0 exported in .dynsym (0 calls), 1 forwarding with a final jump (1 calls), 1 empty (1 calls), 0 recursive
+    replacing each call with its callee's body would remove 17 bytes before anything the inliner then simplifies; 5 of the calls have a body under the call's five bytes
+  the functions of at most 16 body bytes most called:
+       calls   tail  body  size  function
+           3      2     2     7  <g>  called at 0xADDR
+           1      0     0     6  <e>  called at 0xADDR
+           1      0     2     7  <w> (forwarder)  called at 0xADDR
+  functions: 6 sized from .symtab
+  code evidence: 6 function symbols + 0 .eh_frame FDEs + 0 Go pclntab functions covering 101 of 106 executable bytes
+exit status: 0

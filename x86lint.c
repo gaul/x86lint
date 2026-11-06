@@ -5238,6 +5238,591 @@ void x86lint_consts_print(const x86lint_consts *c, bool verbose)
     }
 }
 
+// ==== the inlining census ============================================
+//
+// See the block comment on x86lint_inline in the header for what is placed
+// and what a body is. One table, indexed like the installed function ranges:
+// what each function received (calls to its start, tail jumps to it, calls
+// from inside itself) and what its own bytes showed (a leading ENDBR64, a
+// trailing RET), from which its body size follows.
+
+#define INLINE_TOP 20
+#define INLINE_SAMPLES 3
+
+struct inline_callee {
+    size_t calls;               // direct calls to its start
+    size_t tail_jumps;          // jumps to its start from another function
+    size_t self_calls;          // of the calls, those from inside itself
+    uint64_t at[INLINE_SAMPLES];    // the first call sites
+    bool endbr;                 // begins with ENDBR64
+    bool frame_push;            // PUSH RBP first (after any ENDBR64) ...
+    bool frame_mov;             // ... then MOV RBP, RSP
+    bool frame_pop;             // POP RBP right before the final RET or JMP
+    bool ret;                   // its last instruction is RET
+    bool tail;                  // its last instruction is JMP: a forwarder
+};
+
+struct x86lint_inline {
+    size_t instructions;
+    size_t skipped;
+    uint64_t swept;             // bytes handed to the scan
+
+    size_t direct[X86LINT_CALL_KINDS];
+    size_t direct_unevidenced;
+    size_t indirect;
+    size_t tail[X86LINT_CALL_KINDS];
+    size_t fragment_jumps;      // jumps to a .cold fragment's start
+
+    struct inline_callee *callee;   // one per installed function, or NULL
+    bool oom;                   // the table could not be allocated
+
+    // The previous instruction swept, for the frame-pointer frame: its
+    // function, where it ended, and whether it was PUSH RBP or POP RBP.
+    size_t prev_fn;
+    uint64_t prev_end;
+    bool prev_push_rbp;
+    bool prev_pop_rbp;
+
+    const x86lint_evidence_range *evidence;
+    size_t nevidence;
+    const x86lint_func_range *funcs;
+    size_t nfuncs;
+    const x86lint_evidence_range *stubs;
+    size_t nstubs;
+    const uint64_t *exported;
+    size_t nexported;
+};
+
+x86lint_inline *x86lint_inline_create(void)
+{
+    x86lint_inline *c = calloc(1, sizeof(*c));
+    if (c != NULL) {
+        c->prev_fn = SIZE_MAX;
+    }
+    return c;
+}
+
+void x86lint_inline_destroy(x86lint_inline *c)
+{
+    if (c == NULL) {
+        return;
+    }
+    free(c->callee);
+    free(c);
+}
+
+void x86lint_inline_set_evidence(x86lint_inline *c,
+                                 const x86lint_evidence_range *ranges,
+                                 size_t count)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->evidence = ranges;
+    c->nevidence = count;
+}
+
+void x86lint_inline_set_functions(x86lint_inline *c,
+                                  const x86lint_func_range *funcs,
+                                  size_t count)
+{
+    if (c == NULL) {
+        return;
+    }
+    free(c->callee);
+    c->callee = NULL;
+    c->funcs = funcs;
+    c->nfuncs = funcs == NULL ? 0 : count;
+    c->oom = false;
+    if (c->nfuncs != 0) {
+        c->callee = calloc(c->nfuncs, sizeof(*c->callee));
+        if (c->callee == NULL) {
+            c->oom = true;
+            c->nfuncs = 0;
+        }
+    }
+}
+
+void x86lint_inline_set_stubs(x86lint_inline *c,
+                              const x86lint_evidence_range *ranges,
+                              size_t count)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->stubs = ranges;
+    c->nstubs = count;
+}
+
+void x86lint_inline_set_exported(x86lint_inline *c, const uint64_t *starts,
+                                 size_t count)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->exported = starts;
+    c->nexported = starts == NULL ? 0 : count;
+}
+
+size_t x86lint_inline_instructions(const x86lint_inline *c)
+{
+    return c == NULL ? 0 : c->instructions;
+}
+
+size_t x86lint_inline_skipped(const x86lint_inline *c)
+{
+    return c == NULL ? 0 : c->skipped;
+}
+
+size_t x86lint_inline_calls(const x86lint_inline *c,
+                            enum x86lint_call_kind kind)
+{
+    return c == NULL || kind >= X86LINT_CALL_KINDS ? 0 : c->direct[kind];
+}
+
+size_t x86lint_inline_indirect_calls(const x86lint_inline *c)
+{
+    return c == NULL ? 0 : c->indirect;
+}
+
+size_t x86lint_inline_tail_jumps(const x86lint_inline *c,
+                                 enum x86lint_call_kind kind)
+{
+    return c == NULL || kind >= X86LINT_CALL_KINDS ? 0 : c->tail[kind];
+}
+
+// A hot/cold-split fragment: part of its function, not a function.
+static bool inline_is_fragment(const char *name)
+{
+    return name != NULL && strstr(name, ".cold") != NULL;
+}
+
+static bool inline_is_exported(const x86lint_inline *c, uint64_t start)
+{
+    size_t lo = 0;
+    size_t hi = c->nexported;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (c->exported[mid] < start) {
+            lo = mid + 1;
+        } else if (c->exported[mid] > start) {
+            hi = mid;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The function's size less the ENDBR64, frame-pointer frame and RET its
+// sweep noticed. The frame counts only whole: PUSH and MOV together, and
+// the POP only under them.
+static uint64_t inline_body(const x86lint_inline *c, size_t i)
+{
+    const struct inline_callee *e = &c->callee[i];
+    uint64_t size = c->funcs[i].end - c->funcs[i].start;
+    bool frame = e->frame_push && e->frame_mov;
+    uint64_t trim = (e->endbr ? 4 : 0) + (frame ? 4 : 0) +
+        (frame && e->frame_pop ? 1 : 0) + (e->ret ? 1 : 0);
+    return size > trim ? size - trim : 0;
+}
+
+static void inline_tally(x86lint_inline *c, const xed_decoded_inst_t *xedd,
+                         uint64_t at)
+{
+    unsigned len = xed_decoded_inst_get_length(xedd);
+    xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(xedd);
+    xed_reg_enum_t reg0 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    xed_reg_enum_t reg1 = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG1);
+    size_t fn = func_range_at(c->funcs, c->nfuncs, at);
+    if (fn != c->nfuncs) {
+        struct inline_callee *e = &c->callee[fn];
+        uint64_t start = c->funcs[fn].start;
+        // Follows the previous instruction swept, in the same function.
+        bool contiguous = fn == c->prev_fn && at == c->prev_end;
+        if (at == start && iclass == XED_ICLASS_ENDBR64) {
+            e->endbr = true;
+        }
+        if ((at == start || (e->endbr && at == start + 4)) &&
+            iclass == XED_ICLASS_PUSH && reg0 == XED_REG_RBP) {
+            e->frame_push = true;
+        }
+        if (contiguous && c->prev_push_rbp && iclass == XED_ICLASS_MOV &&
+            reg0 == XED_REG_RBP && reg1 == XED_REG_RSP) {
+            e->frame_mov = true;
+        }
+        if (at + len == c->funcs[fn].end) {
+            if (iclass == XED_ICLASS_RET_NEAR) {
+                e->ret = true;
+            } else if (iclass == XED_ICLASS_JMP) {
+                e->tail = true;
+            }
+            if ((e->ret || e->tail) && contiguous && c->prev_pop_rbp) {
+                e->frame_pop = true;
+            }
+        }
+    }
+    c->prev_fn = fn;
+    c->prev_end = at + len;
+    c->prev_push_rbp = iclass == XED_ICLASS_PUSH && reg0 == XED_REG_RBP;
+    c->prev_pop_rbp = iclass == XED_ICLASS_POP && reg0 == XED_REG_RBP;
+    if (iclass != XED_ICLASS_CALL_NEAR && iclass != XED_ICLASS_JMP) {
+        return;
+    }
+    bool call = iclass == XED_ICLASS_CALL_NEAR;
+    if (xed_decoded_inst_get_branch_displacement_width_bits(xedd) == 0) {
+        // Through a register or memory: a PLT stub's own jump, a vtable
+        // call, a jump table. Nothing to place.
+        if (call) {
+            c->indirect++;
+        }
+        return;
+    }
+    uint64_t target = at + len +
+        (uint64_t) xed_decoded_inst_get_branch_displacement(xedd);
+    enum x86lint_call_kind kind;
+    size_t t = c->nfuncs;
+    if (ranges_contain(c->stubs, c->nstubs, target)) {
+        kind = X86LINT_CALL_STUB;
+    } else {
+        t = func_range_at(c->funcs, c->nfuncs, target);
+        if (t == c->nfuncs) {
+            kind = X86LINT_CALL_UNPLACED;
+        } else if (c->funcs[t].start != target) {
+            kind = X86LINT_CALL_INSIDE;
+        } else {
+            kind = X86LINT_CALL_FUNCTION;
+        }
+    }
+    if (call) {
+        c->direct[kind]++;
+        if (c->nevidence != 0 &&
+            !ranges_contain(c->evidence, c->nevidence, at)) {
+            c->direct_unevidenced++;
+        }
+        if (kind == X86LINT_CALL_FUNCTION) {
+            struct inline_callee *e = &c->callee[t];
+            if (e->calls < INLINE_SAMPLES) {
+                e->at[e->calls] = at;
+            }
+            e->calls++;
+            if (t == fn) {
+                e->self_calls++;
+            }
+        }
+        return;
+    }
+    // A jump is a tail call when it leaves its function for another's
+    // start or for a stub. A jump within its function, into the middle of
+    // another, or to its own start (a loop) is ordinary control flow; a
+    // jump to a .cold fragment's start is its function continuing.
+    if (kind == X86LINT_CALL_STUB) {
+        c->tail[kind]++;
+    } else if (kind == X86LINT_CALL_FUNCTION && t != fn) {
+        if (inline_is_fragment(c->funcs[t].name)) {
+            c->fragment_jumps++;
+        } else {
+            c->tail[kind]++;
+            c->callee[t].tail_jumps++;
+        }
+    }
+}
+
+void x86lint_inline_scan(x86lint_inline *c, const uint8_t *inst, size_t len,
+                         uint64_t vaddr)
+{
+    if (c == NULL) {
+        return;
+    }
+    c->swept += len;
+    for (size_t i = 0; i < len; ) {
+        xed_decoded_inst_t xedd;
+        decode_init(&xedd);
+        if (xed_decode(&xedd, inst + i, len - i) != XED_ERROR_NONE) {
+            ++i;
+            ++c->skipped;
+            continue;
+        }
+        inline_tally(c, &xedd, vaddr + i);
+        c->instructions++;
+        i += xed_decoded_inst_get_length(&xedd);
+    }
+}
+
+size_t x86lint_inline_tiny_calls(const x86lint_inline *c, size_t *functions,
+                                 size_t *exported, size_t *recursive)
+{
+    size_t calls = 0;
+    size_t nfunctions = 0;
+    size_t nexported = 0;
+    size_t nrecursive = 0;
+    for (size_t i = 0; c != NULL && i < c->nfuncs; ++i) {
+        const struct inline_callee *e = &c->callee[i];
+        if (e->calls == 0 || inline_body(c, i) > X86LINT_INLINE_TINY) {
+            continue;
+        }
+        calls += e->calls;
+        nfunctions++;
+        nexported += inline_is_exported(c, c->funcs[i].start);
+        nrecursive += e->self_calls != 0;
+    }
+    if (functions != NULL) {
+        *functions = nfunctions;
+    }
+    if (exported != NULL) {
+        *exported = nexported;
+    }
+    if (recursive != NULL) {
+        *recursive = nrecursive;
+    }
+    return calls;
+}
+
+bool x86lint_inline_lookup(const x86lint_inline *c, uint64_t start,
+                           size_t *calls, size_t *tail_jumps, uint64_t *body,
+                           bool *recursive, bool *forwarder)
+{
+    *calls = 0;
+    *tail_jumps = 0;
+    *body = 0;
+    *recursive = false;
+    *forwarder = false;
+    if (c == NULL) {
+        return false;
+    }
+    size_t i = func_range_at(c->funcs, c->nfuncs, start);
+    if (i == c->nfuncs || c->funcs[i].start != start) {
+        return false;
+    }
+    *calls = c->callee[i].calls;
+    *tail_jumps = c->callee[i].tail_jumps;
+    *body = inline_body(c, i);
+    *recursive = c->callee[i].self_calls != 0;
+    *forwarder = c->callee[i].tail;
+    return true;
+}
+
+static double inline_pct(uint64_t n, uint64_t d)
+{
+    return d == 0 ? 0.0 : 100.0 * (double) n / (double) d;
+}
+
+// Callee size bins, by body bytes: 0, 1-8, 9-16, 17-32, ..., 257 and up.
+#define INLINE_BINS 8
+
+static size_t inline_bin(uint64_t body)
+{
+    if (body == 0) {
+        return 0;
+    }
+    size_t bin = 1;
+    for (uint64_t top = 8; body > top && bin < INLINE_BINS - 1; top *= 2) {
+        bin++;
+    }
+    return bin;
+}
+
+// A tiny callee in the ranking: most called first, then by address.
+struct inline_rank {
+    size_t calls;
+    uint64_t start;
+    size_t index;
+};
+
+static int inline_rank_cmp(const void *a, const void *b)
+{
+    const struct inline_rank *ra = a, *rb = b;
+    if (ra->calls != rb->calls) {
+        return ra->calls > rb->calls ? -1 : 1;
+    }
+    return ra->start < rb->start ? -1 : ra->start > rb->start;
+}
+
+void x86lint_inline_print(const x86lint_inline *c, bool verbose)
+{
+    if (c == NULL) {
+        return;
+    }
+    printf("inlining census: %zu instructions, %zu undecodable bytes "
+        "skipped\n", c->instructions, c->skipped);
+    size_t direct = 0;
+    for (int k = 0; k < X86LINT_CALL_KINDS; ++k) {
+        direct += c->direct[k];
+    }
+    printf("  calls: %zu direct (call rel32), %zu indirect (through a "
+        "register or memory)", direct, c->indirect);
+    if (c->direct_unevidenced != 0) {
+        printf(", %zu of the direct unevidenced", c->direct_unevidenced);
+    }
+    printf("\n");
+    printf("    direct calls to a function start: %zu; into a function "
+        "elsewhere than its start: %zu; to a linker stub (PLT): %zu; to no "
+        "sized function: %zu\n", c->direct[X86LINT_CALL_FUNCTION],
+        c->direct[X86LINT_CALL_INSIDE], c->direct[X86LINT_CALL_STUB],
+        c->direct[X86LINT_CALL_UNPLACED]);
+    printf("  tail jumps: %zu to another function's start, %zu to a linker "
+        "stub", c->tail[X86LINT_CALL_FUNCTION], c->tail[X86LINT_CALL_STUB]);
+    if (c->fragment_jumps != 0) {
+        printf("; %zu jumps to a .cold fragment stay with their function",
+            c->fragment_jumps);
+    }
+    printf("\n");
+    if (c->oom) {
+        printf("  callees: the table could not be allocated, so no call was "
+            "placed\n");
+        return;
+    }
+    if (c->nfuncs == 0) {
+        printf("  callees: none (no function ranges), so no call was "
+            "placed\n");
+        return;
+    }
+
+    // The callees by body size, the headline, and the ranking, in one
+    // pass each over the table.
+    size_t bin_functions[INLINE_BINS] = {0};
+    size_t bin_calls[INLINE_BINS] = {0};
+    size_t bin_tail[INLINE_BINS] = {0};
+    size_t tiny_functions = 0;
+    size_t tiny_calls = 0;
+    size_t tiny_exported = 0;
+    size_t tiny_exported_calls = 0;
+    size_t tiny_recursive = 0;
+    size_t tiny_forwarders = 0;     // ending in a jump, and their calls
+    size_t tiny_forwarder_calls = 0;
+    size_t tiny_empty = 0;          // a body of 0 bytes, and their calls
+    size_t tiny_empty_calls = 0;
+    size_t tiny_shrinking = 0;      // calls whose callee's body is under the call
+    int64_t delta = 0;              // net bytes of inlining each in place
+    struct inline_rank *rank = NULL;
+    size_t nrank = 0;
+    for (size_t i = 0; i < c->nfuncs; ++i) {
+        const struct inline_callee *e = &c->callee[i];
+        if (e->calls == 0 && e->tail_jumps == 0) {
+            continue;
+        }
+        uint64_t body = inline_body(c, i);
+        size_t bin = inline_bin(body);
+        bin_functions[bin]++;
+        bin_calls[bin] += e->calls;
+        bin_tail[bin] += e->tail_jumps;
+        if (e->calls == 0 || body > X86LINT_INLINE_TINY) {
+            continue;
+        }
+        tiny_functions++;
+        tiny_calls += e->calls;
+        if (inline_is_exported(c, c->funcs[i].start)) {
+            tiny_exported++;
+            tiny_exported_calls += e->calls;
+        }
+        tiny_recursive += e->self_calls != 0;
+        if (e->tail) {
+            tiny_forwarders++;
+            tiny_forwarder_calls += e->calls;
+        }
+        if (body == 0) {
+            tiny_empty++;
+            tiny_empty_calls += e->calls;
+        }
+        if (body < 5) {
+            tiny_shrinking += e->calls;
+        }
+        delta += (int64_t) e->calls * ((int64_t) body - 5);
+        if (rank != NULL || nrank == 0) {
+            struct inline_rank *grown = realloc(rank,
+                (nrank + 1) * sizeof(*rank));
+            if (grown == NULL) {
+                free(rank);
+                rank = NULL;
+            } else {
+                rank = grown;
+                rank[nrank].calls = e->calls;
+                rank[nrank].start = c->funcs[i].start;
+                rank[nrank].index = i;
+            }
+        }
+        nrank++;
+    }
+
+    printf("  callees by body bytes (the function's size less a leading "
+        "ENDBR64, a frame-pointer frame and a trailing RET):\n");
+    printf("    %8s %10s %10s %11s  %s\n", "body", "functions", "calls",
+        "tail jumps", "share of direct calls");
+    static const char *const bin_names[INLINE_BINS] = {
+        "0", "1-8", "9-16", "17-32", "33-64", "65-128", "129-256", "257+",
+    };
+    for (size_t b = 0; b < INLINE_BINS; ++b) {
+        printf("    %8s %10zu %10zu %11zu  %.2f%%\n", bin_names[b],
+            bin_functions[b], bin_calls[b], bin_tail[b],
+            inline_pct(bin_calls[b], direct));
+    }
+    printf("  calls to functions of at most %d body bytes: %zu (%.2f%% of "
+        "direct calls) to %zu functions\n", X86LINT_INLINE_TINY, tiny_calls,
+        inline_pct(tiny_calls, direct), tiny_functions);
+    printf("    of the functions: %zu exported in .dynsym (%zu calls), %zu "
+        "forwarding with a final jump (%zu calls), %zu empty (%zu calls), "
+        "%zu recursive\n", tiny_exported, tiny_exported_calls,
+        tiny_forwarders, tiny_forwarder_calls, tiny_empty, tiny_empty_calls,
+        tiny_recursive);
+    printf("    replacing each call with its callee's body would %s %" PRId64
+        " bytes before anything the inliner then simplifies; %zu of the "
+        "calls have a body under the call's five bytes\n",
+        delta < 0 ? "remove" : "add", delta < 0 ? -delta : delta,
+        tiny_shrinking);
+    if (nrank == 0) {
+        return;
+    }
+    if (rank == NULL) {
+        printf("  (the ranking could not be allocated)\n");
+        return;
+    }
+    qsort(rank, nrank, sizeof(*rank), inline_rank_cmp);
+    printf("  the functions of at most %d body bytes most called:\n",
+        X86LINT_INLINE_TINY);
+    printf("    %8s %6s %5s %5s  %s\n", "calls", "tail", "body", "size",
+        "function");
+    size_t ntop = nrank < INLINE_TOP ? nrank : INLINE_TOP;
+    for (size_t r = 0; r < ntop; ++r) {
+        size_t i = rank[r].index;
+        const struct inline_callee *e = &c->callee[i];
+        printf("    %8zu %6zu %5" PRIu64 " %5" PRIu64 "  ", e->calls,
+            e->tail_jumps, inline_body(c, i),
+            c->funcs[i].end - c->funcs[i].start);
+        if (c->funcs[i].name != NULL) {
+            printf("<%s>", c->funcs[i].name);
+        } else {
+            printf("<0x%" PRIx64 ">", c->funcs[i].start);
+        }
+        const char *flags[3];
+        size_t nflags = 0;
+        if (inline_is_exported(c, c->funcs[i].start)) {
+            flags[nflags++] = "exported";
+        }
+        if (e->tail) {
+            flags[nflags++] = "forwarder";
+        }
+        if (e->self_calls != 0) {
+            flags[nflags++] = "recursive";
+        }
+        for (size_t k = 0; k < nflags; ++k) {
+            printf("%s%s%s", k == 0 ? " (" : ", ", flags[k],
+                k + 1 == nflags ? ")" : "");
+        }
+        if (verbose) {
+            printf("  called at");
+            size_t n = e->calls < INLINE_SAMPLES ? e->calls : INLINE_SAMPLES;
+            for (size_t s = 0; s < n; ++s) {
+                printf("%s 0x%" PRIx64, s == 0 ? "" : ",", e->at[s]);
+            }
+        }
+        printf("\n");
+    }
+    if (nrank > ntop) {
+        printf("    (%zu more functions)\n", nrank - ntop);
+    }
+    free(rank);
+}
+
 // ==== the JCC erratum audit ==========================================
 //
 // See the block comment on x86lint_jcc in the header for the erratum, why

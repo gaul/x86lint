@@ -8214,6 +8214,162 @@ static void census_test(void)
     x86lint_census_destroy(NULL);
 }
 
+static void inline_test(void)
+{
+    // Six functions. f calls g twice, h, itself, the middle of h, a stub,
+    // an unplaced address, e and w, then calls through memory and through a
+    // register; g is ENDBR64 + XOR + RET, a two-byte body; h is twenty bytes
+    // of MOV and a RET; t is a bare jump to g, a tail call; e is a
+    // frame-pointer frame around nothing, an empty function; w is the same
+    // frame around a jump to g, a forwarder. A trailing call to g sits in
+    // no function.
+    static const uint8_t code[] = {
+        // f at 0x1000
+        0xf3, 0x0f, 0x1e, 0xfa,                 // endbr64
+        0xe8, 0x31, 0x00, 0x00, 0x00,           // call g (0x103a)
+        0xe8, 0x2c, 0x00, 0x00, 0x00,           // call g
+        0xe8, 0x2e, 0x00, 0x00, 0x00,           // call h (0x1041)
+        0xe8, 0xe8, 0xff, 0xff, 0xff,           // call f (0x1000): recursive
+        0xe8, 0x25, 0x00, 0x00, 0x00,           // call h+1 (0x1042): inside
+        0xe8, 0xde, 0x0f, 0x00, 0x00,           // call 0x2000: a stub
+        0xe8, 0xd9, 0x1f, 0x00, 0x00,           // call 0x3000: no function
+        0xe8, 0x2c, 0x00, 0x00, 0x00,           // call e (0x1058)
+        0xe8, 0x2d, 0x00, 0x00, 0x00,           // call w (0x105e)
+        0xff, 0x15, 0x00, 0x00, 0x00, 0x00,     // call [rip+0]: indirect
+        0xff, 0xd0,                             // call rax: indirect
+        0xc3,                                   // ret
+        // g at 0x103a
+        0xf3, 0x0f, 0x1e, 0xfa,                 // endbr64
+        0x31, 0xc0,                             // xor eax, eax
+        0xc3,                                   // ret
+        // h at 0x1041
+        0xb8, 0x01, 0x00, 0x00, 0x00,           // mov eax, 1, four times
+        0xb8, 0x01, 0x00, 0x00, 0x00,
+        0xb8, 0x01, 0x00, 0x00, 0x00,
+        0xb8, 0x01, 0x00, 0x00, 0x00,
+        0xc3,                                   // ret
+        // t at 0x1056
+        0xeb, 0xe2,                             // jmp g: a tail call
+        // e at 0x1058
+        0x55,                                   // push rbp
+        0x48, 0x89, 0xe5,                       // mov rbp, rsp
+        0x5d,                                   // pop rbp
+        0xc3,                                   // ret
+        // w at 0x105e
+        0x55,                                   // push rbp
+        0x48, 0x89, 0xe5,                       // mov rbp, rsp
+        0x5d,                                   // pop rbp
+        0xeb, 0xd5,                             // jmp g
+        // in no function, at 0x1065
+        0xe8, 0xd0, 0xff, 0xff, 0xff,           // call g
+    };
+    static const x86lint_func_range funcs[] = {
+        {0x1000, 0x103a, "f"}, {0x103a, 0x1041, "g"},
+        {0x1041, 0x1056, "h"}, {0x1056, 0x1058, "t"},
+        {0x1058, 0x105e, "e"}, {0x105e, 0x1065, "w"},
+    };
+    static const x86lint_evidence_range stub = {0x2000, 0x2010};
+    static const uint64_t exported = 0x103a;
+    x86lint_inline *c = x86lint_inline_create();
+    assert(c != NULL);
+    x86lint_inline_set_functions(c, funcs, 6);
+    x86lint_inline_set_stubs(c, &stub, 1);
+    x86lint_inline_set_exported(c, &exported, 1);
+    x86lint_inline_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_inline_instructions(c) == 31);
+    assert(x86lint_inline_skipped(c) == 0);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_FUNCTION) == 7);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_INSIDE) == 1);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_STUB) == 1);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_UNPLACED) == 1);
+    assert(x86lint_inline_indirect_calls(c) == 2);
+    assert(x86lint_inline_tail_jumps(c, X86LINT_CALL_FUNCTION) == 2);
+    assert(x86lint_inline_tail_jumps(c, X86LINT_CALL_STUB) == 0);
+    size_t functions, nexported, recursive;
+    assert(x86lint_inline_tiny_calls(c, &functions, &nexported,
+        &recursive) == 5);
+    assert(functions == 3 && nexported == 1 && recursive == 0);
+    size_t calls, tail;
+    uint64_t body;
+    bool self, fwd;
+    assert(x86lint_inline_lookup(c, 0x103a, &calls, &tail, &body, &self,
+        &fwd));
+    assert(calls == 3 && tail == 2 && body == 2 && !self && !fwd);
+    assert(x86lint_inline_lookup(c, 0x1000, &calls, &tail, &body, &self,
+        &fwd));
+    assert(calls == 1 && tail == 0 && body == 0x3a - 4 - 1 && self && !fwd);
+    assert(x86lint_inline_lookup(c, 0x1041, &calls, &tail, &body, &self,
+        &fwd));
+    assert(calls == 1 && body == 20 && !self && !fwd);
+    // t ends in a jump, not a RET, so nothing is trimmed from it.
+    assert(x86lint_inline_lookup(c, 0x1056, &calls, &tail, &body, &self,
+        &fwd));
+    assert(calls == 0 && tail == 0 && body == 2 && fwd);
+    // The frame is trimmed whole: e is empty, w is its jump.
+    assert(x86lint_inline_lookup(c, 0x1058, &calls, &tail, &body, &self,
+        &fwd));
+    assert(calls == 1 && body == 0 && !fwd);
+    assert(x86lint_inline_lookup(c, 0x105e, &calls, &tail, &body, &self,
+        &fwd));
+    assert(calls == 1 && body == 2 && fwd);
+    assert(!x86lint_inline_lookup(c, 0x1042, &calls, &tail, &body, &self,
+        &fwd));
+    x86lint_inline_destroy(c);
+
+    // Without stub ranges the call into the PLT is a call to no function.
+    c = x86lint_inline_create();
+    assert(c != NULL);
+    x86lint_inline_set_functions(c, funcs, 6);
+    x86lint_inline_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_STUB) == 0);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_UNPLACED) == 2);
+    assert(x86lint_inline_tiny_calls(c, &functions, &nexported,
+        &recursive) == 5);
+    assert(nexported == 0);
+    x86lint_inline_destroy(c);
+
+    // Without functions nothing is placed.
+    c = x86lint_inline_create();
+    assert(c != NULL);
+    x86lint_inline_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_FUNCTION) == 0);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_UNPLACED) == 10);
+    assert(x86lint_inline_indirect_calls(c) == 2);
+    assert(x86lint_inline_tiny_calls(c, NULL, NULL, NULL) == 0);
+    assert(!x86lint_inline_lookup(c, 0x103a, &calls, &tail, &body, &self,
+        &fwd));
+    x86lint_inline_destroy(c);
+
+    // A jump to a .cold fragment's start is its function continuing, not a
+    // tail call; calls to it still count.
+    static const x86lint_func_range split[] = {
+        {0x1000, 0x103a, "f"}, {0x103a, 0x1041, "f.cold"},
+        {0x1041, 0x1056, "h"}, {0x1056, 0x1058, "t"},
+        {0x1058, 0x105e, "e"}, {0x105e, 0x1065, "w"},
+    };
+    c = x86lint_inline_create();
+    assert(c != NULL);
+    x86lint_inline_set_functions(c, split, 6);
+    x86lint_inline_scan(c, code, sizeof(code), 0x1000);
+    assert(x86lint_inline_tail_jumps(c, X86LINT_CALL_FUNCTION) == 0);
+    assert(x86lint_inline_calls(c, X86LINT_CALL_FUNCTION) == 7);
+    x86lint_inline_destroy(c);
+
+    // NULL is accepted everywhere.
+    x86lint_inline_scan(NULL, code, sizeof(code), 0);
+    x86lint_inline_set_evidence(NULL, NULL, 0);
+    x86lint_inline_set_functions(NULL, NULL, 0);
+    x86lint_inline_set_stubs(NULL, NULL, 0);
+    x86lint_inline_set_exported(NULL, NULL, 0);
+    assert(x86lint_inline_instructions(NULL) == 0);
+    assert(x86lint_inline_calls(NULL, X86LINT_CALL_FUNCTION) == 0);
+    assert(x86lint_inline_tiny_calls(NULL, NULL, NULL, NULL) == 0);
+    assert(!x86lint_inline_lookup(NULL, 0, &calls, &tail, &body, &self,
+        &fwd));
+    x86lint_inline_print(NULL, false);
+    x86lint_inline_destroy(NULL);
+}
+
 static void consts_test(void)
 {
     // Widths, keys and roles. The values are keyed as the operand holds
@@ -9090,6 +9246,7 @@ int main(int argc, char *argv[])
     census_test();
     regs_test();
     consts_test();
+    inline_test();
     mask_relocated_test();
     build_test();
     thunk_test();

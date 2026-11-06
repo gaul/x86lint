@@ -598,21 +598,22 @@ Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
 than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
-`-r`, `-k`, `-e`, `-j`, `-s` and `-p` are separate reports whose output would
-interleave with it, and the driver refuses the combination rather than
+`-r`, `-k`, `-n`, `-e`, `-j`, `-s` and `-p` are separate reports whose output
+would interleave with it, and the driver refuses the combination rather than
 choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
 pads, `-i` to replace the lint scan with an ISA census of the binary, `-r`
-with a register census, `-k` with a constant census, `-j` with a JCC-erratum
-verdict, `-s` with a speculation-thunk verdict, and `-p` with a per-function
-build-property audit; see the next sections.
+with a register census, `-k` with a constant census, `-n` with an inlining
+census, `-j` with a JCC-erratum verdict, `-s` with a speculation-thunk
+verdict, and `-p` with a per-function build-property audit; see the next
+sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
-broken run. `-e` findings set the exit status like any other; the `-i`, `-r`
-and `-k` censuses never set it, the `-j` audit sets it only under `-t skylake`
+broken run. `-e` findings set the exit status like any other; the `-i`, `-r`,
+`-k` and `-n` censuses never set it, the `-j` audit sets it only under `-t skylake`
 (the one target that has the erratum), the `-s` audit only for a mitigation
 left incomplete, and the `-p` audit never.
 
@@ -1033,6 +1034,90 @@ relocation will rewrite are masked out as the lint scan masks them, so a
 kernel module's `mov r64, imm32` placeholders do not count as the value 0.
 imm8 and imm16 are counted and costed but not keyed by value. The
 measurements and their reading are in TODO.md ("Constant census").
+
+## Inlining census (`-n`)
+
+`x86lint -n` replaces the lint scan with a census of what the compiler left
+as a call: where every direct call goes, and how many go to functions so
+small that the call is most of what the caller pays for.
+
+```
+$ ./x86lint -n /usr/lib64/libc.so.6
+inlining census: 359838 instructions, 0 undecodable bytes skipped
+  calls: 12887 direct (call rel32), 550 indirect (through a register or memory)
+    direct calls to a function start: 9676; into a function elsewhere than its start: 1; to a linker stub (PLT): 3210; to no sized function: 0
+  tail jumps: 629 to another function's start, 96 to a linker stub; 63 jumps to a .cold fragment stay with their function
+  callees by body bytes (the function's size less a leading ENDBR64, a frame-pointer frame and a trailing RET):
+        body  functions      calls  tail jumps  share of direct calls
+           0          2          2           0  0.02%
+         1-8         31        177           3  1.37%
+        9-16         52       1266          29  9.82%
+       17-32        118        936          68  7.26%
+       33-64        170        936          51  7.26%
+      65-128        254       2059          69  15.98%
+     129-256        377       2084         129  16.17%
+        257+        633       2216         280  17.20%
+  calls to functions of at most 16 body bytes: 1445 (11.21% of direct calls) to 81 functions
+    of the functions: 60 exported in .dynsym (1406 calls), 49 forwarding with a final jump (322 calls), 2 empty (2 calls), 0 recursive
+    replacing each call with its callee's body would add 13247 bytes before anything the inliner then simplifies; 12 of the calls have a body under the call's five bytes
+  the functions of at most 16 body bytes most called:
+       calls   tail  body  size  function
+         896      0    16    20  <__stack_chk_fail> (exported)
+         117     15    15    19  <__GI___dcgettext> (exported, forwarder)
+          66      0    16    20  <__GI___chk_fail> (exported)
+          51      0     7    12  <__GI___close_nocancel_nostatus> (exported)
+          32      2    10    14  <__GI___pthread_mutex_unlock> (exported, forwarder)
+    ...
+    (61 more functions)
+  functions: 3897 sized from .symtab
+  code evidence: 9896 function symbols + 3799 .eh_frame FDEs + 0 Go pclntab functions covering 1497314 of 1528109 executable bytes
+```
+
+Every direct near call is placed against the binary's function ranges: on a
+function's start, inside a function elsewhere than its start, in a linker
+stub (the PLT and its variants, so an import reads as one rather than as a
+call to nothing), or on no sized function. Unconditional jumps that leave
+their function for another's start are tail calls and are counted beside the
+calls; a jump to a `.cold` fragment is its function continuing and is counted
+apart. Function ranges come from `.symtab`, or from the exports of `.dynsym`
+when `.symtab` is stripped, and the `functions:` line says which: a stripped
+distro library's exports place only the calls to exported functions, and the
+line counts the rest as calls to no sized function. A relocatable object's
+calls are resolved by relocations and are not placed. Under `-f` the call
+sites come from the named function and every function stays a callee.
+
+A callee is measured by its body: the symbol's size less a leading `ENDBR64`
+(four bytes a CET build spends in every function), a frame-pointer frame
+(`push rbp ; mov rbp, rsp` at the start and `pop rbp` before the return, five
+bytes a frame-pointer build spends in every function) and a trailing `RET`, so
+a function that returns a constant measures as the bytes that compute it, an
+empty one measures 0, and a Fedora build's 20-byte symbol measures as the 10
+bytes it does work in. The headline is the calls to functions of at most 16
+body bytes, with three kinds told apart: a *forwarder* ends in a jump to the
+function that does the work, so a call to it is a call that could have gone
+there directly; an *empty* function has a body of 0 bytes; and an *exported*
+one is interposable from outside the object, which is why GCC under `-fPIC`
+leaves its calls alone. The size counterfactual is the plain one -- each call
+replaced by its callee's body, nothing simplified -- so it mostly says that
+tiny functions cost dynamically (a call/return pair, a return-predictor
+entry, the calling convention) rather than in bytes, except for the calls
+whose callee's body is under the call's own five bytes, which it counts.
+
+Measured on 2026-11-05 (see TODO.md, "Inlining census"), the tiny callees are
+mostly there on purpose -- Go's stack-growth and write-barrier stubs are
+98.7% of its 22.6%, glibc's `__stack_chk_fail` is 62% of its 11.2%, and Rust's
+`handle_alloc_error` leads libxul's -- and the real misses are the empty and
+near-empty functions a cross-translation-unit call reaches in a build without
+LTO: an empty debug hook called 3,837 times in libxul, 92 empty exported
+functions with 1,105 calls in libLLVM. The controls behind that reading: two
+translation units at `-O2` leave 92% (GCC) and 96% (clang) of their calls to
+tiny functions in place and `-flto` removes every one; a shared object under
+GCC's `-fPIC` sends its calls to its own exported functions through the PLT
+rather than leaving them as direct calls, so GCC's semantic-interposition
+cost hides in the `to a linker stub` count, not in this census's headline.
+
+`-v` adds each ranked function's first three call sites. `-i`, `-r`, `-k` and
+`-n` share one sweep and may be combined.
 
 ## JCC erratum audit (`-j`)
 

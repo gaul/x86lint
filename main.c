@@ -68,6 +68,70 @@ static int attr_range_cmp(const void *a, const void *b)
     return strcmp(ra->name, rb->name);
 }
 
+// The sized, named, placed function symbols as sorted, disjoint ranges for
+// attribution. Aliases collapse to one name (start ascending, end
+// descending, then name, so the widest range wins and ties break
+// deterministically); overlaps are clipped. An ET_REL symbol is placed by
+// adding its section's address, and only where that address is non-zero:
+// an ordinary object file leaves every section at 0, so its symbols would
+// all pile up at the same addresses and attribute findings to whichever
+// name sorted first, while a JIT-dump image (tools/*2elf.py) is relocatable
+// yet carries the address the engine really compiled at in every section.
+// NULL, with *count 0, when the table cannot be allocated.
+static x86lint_func_range *place_functions(const struct func_sym *funcs,
+                                           size_t nfuncs, bool rel,
+                                           const uint64_t *sec_addr,
+                                           uint64_t shnum, size_t *count)
+{
+    *count = 0;
+    x86lint_func_range *attr = malloc(nfuncs * sizeof(*attr));
+    if (attr == NULL) {
+        return NULL;
+    }
+    size_t n = 0;
+    for (size_t s = 0; s < nfuncs; ++s) {
+        if (funcs[s].name == NULL || funcs[s].name[0] == '\0' ||
+            funcs[s].size == 0) {
+            continue;
+        }
+        uint64_t base = 0;
+        if (rel) {
+            if (sec_addr == NULL || funcs[s].shndx >= shnum ||
+                sec_addr[funcs[s].shndx] == 0) {
+                continue;
+            }
+            base = sec_addr[funcs[s].shndx];
+        }
+        if (funcs[s].value > UINT64_MAX - base ||
+            funcs[s].size > UINT64_MAX - base - funcs[s].value) {
+            continue;
+        }
+        attr[n].start = base + funcs[s].value;
+        attr[n].end = attr[n].start + funcs[s].size;
+        attr[n].name = funcs[s].name;
+        ++n;
+    }
+    qsort(attr, n, sizeof(*attr), attr_range_cmp);
+    size_t m = 0;
+    for (size_t s = 0; s < n; ++s) {
+        if (m > 0 && attr[s].start < attr[m - 1].end) {
+            if (attr[s].end <= attr[m - 1].end) {
+                continue;       // contained alias: drop
+            }
+            attr[s].start = attr[m - 1].end;    // clip the overlap
+        }
+        attr[m++] = attr[s];
+    }
+    *count = m;
+    return attr;
+}
+
+static int stub_range_cmp(const void *a, const void *b)
+{
+    const x86lint_evidence_range *ra = a, *rb = b;
+    return ra->start < rb->start ? -1 : ra->start > rb->start;
+}
+
 // Order for the section walk: an ET_REL symbol by holding section then
 // offset, a linked image's by address. Sorted once, the symbols a section
 // holds are one contiguous run that funcs_in_section finds by binary search,
@@ -2203,7 +2267,7 @@ int main(int argc, char **argv)
     // Exit status follows the grep convention so a gating CI can tell a
     // dirty scan from a broken run: 0 = clean scan, 1 = opportunities
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
-    // The -i, -r and -k censuses are informational and never contribute
+    // The -i, -r, -k and -n censuses are informational and never contribute
     // findings.
     bool verbose = false;
     bool scan_all = false;
@@ -2211,6 +2275,7 @@ int main(int argc, char **argv)
     bool isa_census = false;
     bool reg_census = false;
     bool const_census = false;
+    bool inline_census = false;
     bool jcc_audit = false;
     bool thunk_audit = false;
     bool prop_audit = false;
@@ -2237,6 +2302,10 @@ int main(int argc, char **argv)
             // The constant census: -c, armlint's letter for it, is taken
             // by the finding classes.
             const_census = true;
+        } else if (strcmp(argv[i], "-n") == 0) {
+            // The inlining census: the calls not inlined. -i, the natural
+            // letter, is the ISA census.
+            inline_census = true;
         } else if (strcmp(argv[i], "-j") == 0) {
             jcc_audit = true;
         } else if (strcmp(argv[i], "-s") == 0) {
@@ -2285,7 +2354,7 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-j] [-s] [-p] [--json] "
+                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-n] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2296,7 +2365,7 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-j] [-s] [-p] [--json] "
+                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-n] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2306,7 +2375,7 @@ int main(int argc, char **argv)
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-j] [-s] [-p] [--json] "
+            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-n] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
                 "[-c advisory|security|all] <ELF_FILE>\n",
@@ -2319,21 +2388,22 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s: -a and -f are mutually exclusive\n", argv[0]);
         return 2;
     }
-    // The ISA (-i), register (-r) and constant (-k) censuses describe the
-    // same sweep of every executable byte, so from here on one flag drives
-    // that sweep and the three only decide which tallies it feeds and which
-    // reports print.
-    const bool census = isa_census || reg_census || const_census;
+    // The ISA (-i), register (-r), constant (-k) and inlining (-n) censuses
+    // describe the same sweep of every executable byte, so from here on one
+    // flag drives that sweep and the four only decide which tallies it
+    // feeds and which reports print.
+    const bool census = isa_census || reg_census || const_census ||
+        inline_census;
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i, -r, -k, -e, -j, -s and -p are
+    // prose with the document, and -i, -r, -k, -n, -e, -j, -s and -p are
     // separate reports whose shapes this schema does not describe. Refused
     // rather than resolved, since either choice would surprise half the
     // callers.
     if (json && (verbose || census || endbr || jcc_audit || thunk_audit ||
                  prop_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -r, -k, -e, -j, -s "
-            "or -p\n", argv[0]);
+            "%s: --json cannot be combined with -v, -i, -r, -k, -n, -e, -j, "
+            "-s or -p\n", argv[0]);
         return 2;
     }
 
@@ -2350,6 +2420,14 @@ int main(int argc, char **argv)
     x86lint_census *census_data = NULL;
     x86lint_regs *regs_data = NULL;
     x86lint_consts *consts_data = NULL;
+    x86lint_inline *inline_data = NULL;
+    x86lint_func_range *callees = NULL;  // every function, for -n's targets
+    size_t ncallees = 0;
+    bool callees_owned = false;         // a table of its own, not attr
+    uint64_t *exports = NULL;           // .dynsym function starts, sorted
+    size_t nexports = 0;
+    x86lint_evidence_range *stubs = NULL;   // the PLT sections' ranges
+    size_t nstubs = 0;
     x86lint_jcc *jcc_data = NULL;
     uint64_t jcc_unplaced = 0;  // sections whose address mod 32 is not pinned
     x86lint_build *prop_data = NULL;
@@ -2482,11 +2560,13 @@ int main(int argc, char **argv)
     // sample of a library's, but a biased fraction is still a fraction where no
     // sample at all is nothing. Never both, or every exported function would
     // be counted twice and the denominator would be fiction.
-    // -k counts a function's repeats of a constant, so it wants ranges on
-    // the same terms -- .symtab, else the exports -- and says which it got;
-    // the sweep itself still covers every byte.
+    // -k counts a function's repeats of a constant and -n places calls
+    // against functions, so they want ranges on the same terms -- .symtab,
+    // else the exports -- and say which they got; the sweep itself still
+    // covers every byte.
     bool have_symtab = false;
-    for (uint64_t i = 0; (prop_audit || const_census) && i < shnum; ++i) {
+    for (uint64_t i = 0; (prop_audit || const_census || inline_census) &&
+                         i < shnum; ++i) {
         Elf64_Shdr sh;
         if (!read_at(f, (long) (ehdr.e_shoff + i * sizeof(sh)), &sh,
                      sizeof(sh))) {
@@ -2498,9 +2578,9 @@ int main(int argc, char **argv)
         }
     }
     bool use_dynsym = fname != NULL ||
-        ((prop_audit || const_census) && !have_symtab);
+        ((prop_audit || const_census || inline_census) && !have_symtab);
     if ((!scan_all && !census && !jcc_audit && !thunk_audit) ||
-        fname != NULL || prop_audit || const_census) {
+        fname != NULL || prop_audit || const_census || inline_census) {
         // An ET_REL symbol's value is an offset into its own section, so
         // placing it needs that section's address; remember them all while
         // the headers are being read anyway. Only ET_REL asks.
@@ -2604,6 +2684,15 @@ int main(int argc, char **argv)
         }
     }
 
+    // The inlining census places calls against every function even when
+    // -f narrows the scan to one, so its table is taken here, before the
+    // narrowing below. (sec_addr is set only for ET_REL, which -f refuses.)
+    if (inline_census && fname != NULL && funcs != NULL) {
+        callees = place_functions(funcs, nfuncs, ehdr.e_type == ET_REL,
+            sec_addr, shnum, &ncallees);
+        callees_owned = true;
+    }
+
     // -f: keep only the named function. Sized symbols only (an unsized
     // assembly label has no known extent) and deduplicated by address --
     // the same function appears in .symtab and .dynsym, and legitimately
@@ -2640,6 +2729,38 @@ int main(int argc, char **argv)
         nfuncs = kept;
     }
 
+    // The inlining census marks exported callees: the defined, sized
+    // functions of .dynsym, whichever table the ranges came from. Best
+    // effort -- without the table nothing is marked.
+    if (inline_census && ehdr.e_type != ET_REL) {
+        for (uint64_t i = 0; i < shnum; ++i) {
+            if (shdrs[i].sh_type != SHT_DYNSYM ||
+                shdrs[i].sh_entsize != sizeof(Elf64_Sym) ||
+                shdrs[i].sh_size == 0) {
+                continue;
+            }
+            Elf64_Sym *syms = (Elf64_Sym *) load_section(f, &shdrs[i],
+                file_size);
+            if (syms == NULL) {
+                break;
+            }
+            size_t nsyms = shdrs[i].sh_size / sizeof(Elf64_Sym);
+            exports = malloc(nsyms * sizeof(*exports));
+            for (size_t s = 0; exports != NULL && s < nsyms; ++s) {
+                unsigned type = ELF64_ST_TYPE(syms[s].st_info);
+                if ((type == STT_FUNC || type == STT_GNU_IFUNC) &&
+                    syms[s].st_shndx != SHN_UNDEF && syms[s].st_size != 0) {
+                    exports[nexports++] = syms[s].st_value;
+                }
+            }
+            if (exports != NULL) {
+                qsort(exports, nexports, sizeof(*exports), u64_cmp);
+            }
+            free(syms);
+            break;
+        }
+    }
+
     // Into section order, once, for the per-section runs below.
     if (funcs != NULL) {
         sort_func_syms(funcs, nfuncs, ehdr.e_type == ET_REL);
@@ -2672,46 +2793,15 @@ int main(int argc, char **argv)
     // executable's and the by-function table is the per-tier breakdown.
     //
     // The constant census borrows the same table to bound "within a
-    // function".
-    if ((!census || const_census) && funcs != NULL) {
-        attr = malloc(nfuncs * sizeof(*attr));
-        if (attr != NULL) {
-            size_t n = 0;
-            for (size_t s = 0; s < nfuncs; ++s) {
-                if (funcs[s].name == NULL || funcs[s].name[0] == '\0' ||
-                    funcs[s].size == 0) {
-                    continue;
-                }
-                uint64_t base = 0;
-                if (ehdr.e_type == ET_REL) {
-                    if (sec_addr == NULL || funcs[s].shndx >= shnum ||
-                        sec_addr[funcs[s].shndx] == 0) {
-                        continue;
-                    }
-                    base = sec_addr[funcs[s].shndx];
-                }
-                if (funcs[s].value > UINT64_MAX - base ||
-                    funcs[s].size > UINT64_MAX - base - funcs[s].value) {
-                    continue;
-                }
-                attr[n].start = base + funcs[s].value;
-                attr[n].end = attr[n].start + funcs[s].size;
-                attr[n].name = funcs[s].name;
-                ++n;
-            }
-            qsort(attr, n, sizeof(*attr), attr_range_cmp);
-            size_t m = 0;
-            for (size_t s = 0; s < n; ++s) {
-                if (m > 0 && attr[s].start < attr[m - 1].end) {
-                    if (attr[s].end <= attr[m - 1].end) {
-                        continue;       // contained alias: drop
-                    }
-                    attr[s].start = attr[m - 1].end;    // clip the overlap
-                }
-                attr[m++] = attr[s];
-            }
-            nattr = m;      // installed into the summary once it exists
-        }
+    // function", and the inlining census places calls against it -- the
+    // full table taken above when -f narrowed this one, otherwise this one.
+    if ((!census || const_census || inline_census) && funcs != NULL) {
+        attr = place_functions(funcs, nfuncs, ehdr.e_type == ET_REL,
+            sec_addr, shnum, &nattr);    // installed into the summary below
+    }
+    if (inline_census && callees == NULL) {
+        callees = attr;
+        ncallees = nattr;
     }
 
     // Section names, for the per-section banner -v prints. Findings carry an
@@ -2825,6 +2915,42 @@ int main(int argc, char **argv)
             }
             x86lint_consts_set_functions(consts_data, attr, nattr);
         }
+        if (inline_census) {
+            inline_data = x86lint_inline_create();
+            if (inline_data == NULL) {
+                fprintf(stderr, "%s: failed to allocate the inlining "
+                    "census\n", path);
+                goto out;
+            }
+            x86lint_inline_set_functions(inline_data, callees, ncallees);
+            x86lint_inline_set_exported(inline_data, exports, nexports);
+            // The linker's stubs, so a call into the PLT reads as an
+            // import. The scan below skips those sections, so their ranges
+            // are taken from the headers here.
+            stubs = calloc(shnum != 0 ? shnum : 1, sizeof(*stubs));
+            if (stubs == NULL) {
+                fprintf(stderr, "%s: failed to allocate the stub ranges\n",
+                    path);
+                goto out;
+            }
+            for (uint64_t i = 0; i < shnum; ++i) {
+                const Elf64_Shdr *sh = &shdrs[i];
+                if (sh->sh_type != SHT_PROGBITS ||
+                    !(sh->sh_flags & SHF_EXECINSTR) || sh->sh_size == 0) {
+                    continue;
+                }
+                const char *nm = shstrtab != NULL &&
+                    sh->sh_name < shstrtab_size ? shstrtab + sh->sh_name : "";
+                if (is_linker_stub_section(nm) &&
+                    sh->sh_addr <= UINT64_MAX - sh->sh_size) {
+                    stubs[nstubs].start = sh->sh_addr;
+                    stubs[nstubs].end = sh->sh_addr + sh->sh_size;
+                    nstubs++;
+                }
+            }
+            qsort(stubs, nstubs, sizeof(*stubs), stub_range_cmp);
+            x86lint_inline_set_stubs(inline_data, stubs, nstubs);
+        }
 
         // Code evidence, gathered before the scan so every tally can be
         // labeled. Relocatable objects are skipped: their symbol values
@@ -2907,6 +3033,8 @@ int main(int argc, char **argv)
                 evidence.n);
             x86lint_regs_set_evidence(regs_data, evidence.r, evidence.n);
             x86lint_consts_set_evidence(consts_data, evidence.r,
+                evidence.n);
+            x86lint_inline_set_evidence(inline_data, evidence.r,
                 evidence.n);
         }
     }
@@ -3070,8 +3198,10 @@ int main(int argc, char **argv)
             // relocation will rewrite is a placeholder, not a constant:
             // every `mov r64, imm32` of a kernel module's addresses reads
             // as the value 0. It sweeps a copy with those instructions
-            // masked out, as the lint scan does, while the ISA and
-            // register censuses keep the bytes as emitted.
+            // masked out, as the lint scan does, while the ISA, register
+            // and inlining censuses keep the bytes as emitted (a relocated
+            // call is still a call; where its target goes is the
+            // relocation's business, and ET_REL places no function anyway).
             uint8_t *kbuf = buf;
             uint8_t *kcopy = NULL;
             if (consts_data != NULL) {
@@ -3118,6 +3248,8 @@ int main(int argc, char **argv)
                         funcs[s].value);
                     x86lint_consts_scan(consts_data, kbuf + off, len,
                         funcs[s].value);
+                    x86lint_inline_scan(inline_data, buf + off, len,
+                        funcs[s].value);
                     exec_bytes += len;
                 }
             } else {
@@ -3126,6 +3258,8 @@ int main(int argc, char **argv)
                 x86lint_regs_scan(regs_data, buf, shdr.sh_size,
                     shdr.sh_addr);
                 x86lint_consts_scan(consts_data, kbuf, shdr.sh_size,
+                    shdr.sh_addr);
+                x86lint_inline_scan(inline_data, buf, shdr.sh_size,
                     shdr.sh_addr);
                 exec_bytes += shdr.sh_size;
             }
@@ -3242,6 +3376,32 @@ int main(int argc, char **argv)
                 printf("  functions: %zu exported in .dynsym (.symtab is "
                     "stripped, so the code in no function goes without a "
                     "repeat count)\n", nattr);
+            }
+            print_code_evidence(evidence.n, evidence_funcs, evidence_fdes,
+                evidence_gofuncs, evidence_covered, exec_bytes);
+        }
+        if (inline_census) {
+            x86lint_inline_print(inline_data, verbose);
+            // What the calls were placed against, so a count of calls to
+            // no function is read against the table that produced it.
+            if (ncallees == 0 && ehdr.e_type == ET_REL && funcs != NULL) {
+                printf("  functions: %zu symbols, none placed (a relocatable "
+                    "object's sections have no addresses and its calls are "
+                    "resolved by relocations), so no call was placed\n",
+                    nfuncs);
+            } else if (ncallees == 0) {
+                printf("  functions: none (no sized function symbols), so no "
+                    "call was placed\n");
+            } else if (fname != NULL) {
+                printf("  functions: %zu sized from %s as callees; call "
+                    "sites scanned in the %zu named by -f\n", ncallees,
+                    have_symtab ? ".symtab" : ".dynsym", nattr);
+            } else if (have_symtab) {
+                printf("  functions: %zu sized from .symtab\n", ncallees);
+            } else {
+                printf("  functions: %zu exported in .dynsym (.symtab is "
+                    "stripped, so a call to any other function is a call to "
+                    "no sized function)\n", ncallees);
             }
             print_code_evidence(evidence.n, evidence_funcs, evidence_fdes,
                 evidence_gofuncs, evidence_covered, exec_bytes);
@@ -3419,6 +3579,12 @@ out:
     x86lint_census_destroy(census_data);
     x86lint_regs_destroy(regs_data);
     x86lint_consts_destroy(consts_data);
+    x86lint_inline_destroy(inline_data);
+    if (callees_owned) {
+        free(callees);
+    }
+    free(exports);
+    free(stubs);
     free(evidence.r);
     x86lint_summary_destroy(summary);
     free(attr);

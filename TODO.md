@@ -2577,6 +2577,112 @@ and the question is which of those constants are hot. The profile join
 again: `js::Interpret` carries the Undefined tag 55 times and is the one
 function where a pinned register's cost and gain are both measurable.
 
+## Inlining census (2026-11-05)
+
+`x86lint -n`: where a binary's direct calls go, and how many go to
+functions so small that the call is most of what the caller pays for. The
+brainstorm sized it at "direct calls to functions of at most 16 bytes: go
+22.6%, libc 2.4%" by symbol size; the census measures bodies, and the
+control it was told to have first is below.
+
+**Method.** Every direct near call (`call rel32`) is placed against the
+function ranges -- `.symtab`, else the exports -- as landing on a function
+start, inside a function, in a linker stub (`.plt` and variants, so an
+import reads as an import) or on no sized function; indirect calls are
+counted and not placed. An unconditional jump leaving its function for
+another's start is a tail call; a jump to a `.cold` fragment is its
+function continuing (libc 63, `ld.so` 12). A callee's body is its size
+less a leading ENDBR64, a frame-pointer frame (`push rbp ; mov rbp, rsp`
+... `pop rbp`, counted whole) and a trailing RET, so a Fedora function's
+20-byte symbol is 10 bytes of body and an empty function is 0. A callee
+whose last instruction is a jump is a forwarder. Exported callees are the
+sized functions of `.dynsym`. A six-function fixture pins every line.
+
+**Control** (gcc 16.2, clang 23.1; four two-instruction callees in `b.c`,
+their callers in `a.c`; `one.c` has both in one translation unit with
+default visibility):
+
+| build | direct calls | to tiny functions | where the rest went |
+| --- | --- | --- | --- |
+| two TUs, gcc -O2 | 13 | 12 (92%) | |
+| two TUs, gcc -O2 -flto | 1 | 0 | inlined |
+| two TUs, gcc -Os | 9 | 6 (67%) | |
+| two TUs, clang -O2 | 27 | 26 (96%) | the loop unrolled into more calls |
+| two TUs, clang -O2 -flto | 1 | 0 | inlined |
+| one TU, gcc -O2 -fPIC -shared | 8 | 0 | 7 through the PLT to its own functions: semantic interposition |
+| same, -fno-semantic-interposition | 2 | 0 | inlined |
+| same, clang | 2 | 0 | inlined |
+| same, gcc, linked -Bsymbolic | 8 | 6 (75%) | direct calls to exported tiny functions |
+
+So the measure reads an LTO switch cleanly, and GCC's interposition cost
+lands in the stub count rather than the headline: under `-fPIC` the
+library's calls to its own exported functions go through the PLT, where
+this census cannot tell them from imports (the follow-up is in "Candidate
+lenses").
+
+| binary | compiler | direct calls (indirect) | to a start / to the PLT / to no function | calls to functions of at most 16 body bytes | of the callees | most called |
+| --- | --- | --- | --- | --- | --- | --- |
+| Firefox `libxul.so` (local, frame pointers, no LTO) | clang 20 + Rust | 1,699,980 (348,297) | 1,255,187 / 441,250 / 3,543 | **103,785 (6.11%)** to 5,106 functions; 10,322 of the calls shrink | 2,325 forwarders (32,551 calls), 5 empty (3,851 calls), 0 exported | `alloc::alloc::handle_alloc_error` 29,633; `MozillaRegisterDebugFD` 3,837 (empty); `OCSPRequest::AddRef` 3,340 |
+| Fedora Firefox 159 `libxul.so` | GCC | 1,614,713 (342,153) | 0 / 274,671 / 1,340,042 | not placed: 2 exported functions | | |
+| Fedora `libLLVM.so.23.1` | clang | 873,241 (85,324) | 314,000 / 263,367 / 295,874 | 17,438 (2.00%) to 1,230 functions; 3,646 shrink | all exported; 469 forwarders (4,512), 92 empty (1,105) | `reportFatalInternalError` 2,532; `deallocate_buffer` 1,096 + 377 tail; `Instruction::getStableDebugLoc` 999 (4 bytes) |
+| `/bin/go` 1.26 | Go | 110,658 (6,488) | 110,658 / 0 / 0 | 24,994 (22.59%) to 84 functions | 17 forwarders carry 24,672 of the calls | `runtime.morestack_noctxt` 11,046; `gcWriteBarrier2` 8,306 |
+| glibc `libc.so.6` | GCC | 12,887 (550) | 9,676 / 3,210 / 0 | 1,445 (11.21%) to 81 functions | 60 exported (1,406 calls), 49 forwarders (322) | `__stack_chk_fail` 896; `__dcgettext` 117 |
+| `ld.so` | GCC | 1,451 (209) | 1,451 / 0 / 0 | 76 (5.24%) to 9 functions | 4 forwarders (20) | `_dl_write` 47 (a syscall wrapper) |
+| `/bin/bash` (stripped, `-rdynamic`) | GCC | 19,445 (167) | 5,974 / 9,956 / 3,515 | 1 | | |
+
+**The tiny callees are mostly there on purpose.** The disassembly sorts
+them into three kinds. Forwarders: Go's stack-growth and write-barrier
+stubs (`mov r11d, 16 ; jmp gcWriteBarrier`) are 24,672 of Go's 24,994, so
+its 22.6% is the runtime's calling convention, not an inliner's miss;
+libxul's JSAPI entry points (`JS_DefinePropertyById` jumps to
+`DefineDataPropertyById`, `js::ToStringSlow` to `ToStringSlow<CanGC>`) and
+`nsArrayBase::Count`, which loads a vtable slot and jumps to it, are 32,551
+of its 103,785; LLVM's `deallocate_buffer` is `jmp operator delete@plt`.
+Cold shims kept out of line by attribute: Rust's `handle_alloc_error`
+(29,633 calls, the most called tiny function in libxul) and
+`panic_already_borrowed` (2,000), LLVM's `reportFatalInternalError`
+(2,532), glibc's `__stack_chk_fail`, 896 of its 1,445. And the misses
+proper, where the whole body fits in the call: `MozillaRegisterDebugFD` is
+`push rbp ; mov rbp, rsp ; pop rbp ; ret` -- a debug hook compiled to
+nothing -- called 3,837 times and tail-jumped to 156, 19 KB of calls to an
+empty function; libLLVM has 92 empty exported functions with 1,105 calls
+(`IRBuilderDefaultInserter::~IRBuilderDefaultInserter` 601) and
+`Instruction::getStableDebugLoc` is `lea rax, [rdi+0x30] ; ret` called 999
+times; `OCSPRequest::AddRef` is the survivor name identical-code folding
+gave every out-of-line `AddRef` in libxul, 13 bytes called 3,340 times.
+The calls whose callee's body is under the call itself -- the ones
+inlining shrinks -- are 10,322 in libxul and 3,646 in libLLVM.
+
+**It is the build, not the compiler.** The control leaves 92-96% of
+cross-unit calls to tiny functions in place at `-O2` under both compilers
+and none under `-flto`. The local libxul is built without LTO, which its
+10,322 shrinking calls and its empty debug hook show; Fedora's libLLVM
+exports a four-byte accessor and calls it 999 times. On the size side the
+counterfactual says the obvious: replacing every tiny call with its body
+adds 467 KB to libxul and 138 KB to Go, because a 9-16 byte body is bigger
+than a 5-byte call. The cost of a tiny call is dynamic -- the call/return
+pair, the return-predictor entry, arguments marshalled for a function that
+reads one field -- and the profile join is what would price it.
+
+**The PLT is a quarter of the calls.** libxul's 441,250 calls into the
+PLT are 26% of its direct calls (its allocator lives in `libmozglue`, so
+every `malloc` and `free` is one), libLLVM's 263,367 are 30%, bash's 9,956
+are 51%. The one-TU `-fPIC` control shows GCC's semantic interposition
+putting a library's calls to its own exported functions in the same
+bucket; separating self-calls from imports means walking `.rela.plt` to
+`.dynsym` as the ENDBR audit does, and is the follow-up most worth having.
+
+**The Fedora caveat, again.** Two exported functions place none of the
+Fedora libxul's 1.6 M direct calls; the MiniDebugInfo decision in
+"Candidate lenses" is what would change that, and it matters more here
+than for `-k`, which lost only the repeat count.
+
+**Calibration.** Go's 22.6% by symbol size was 22.59% by body: the
+runtime stubs have no frame and no ENDBR64. libc's 2.4% by symbol size
+became 11.2% by body, because Fedora's build spends ENDBR64, a frame and a
+RET -- ten bytes -- in every function, and a 16-byte threshold on symbol
+size was a 6-byte threshold on work. The measure to trust is the body.
+
 ## Candidate lenses (2026-11-05)
 
 The whole-binary analyses proposed on 2026-11-05 in the spirit of `-r`,

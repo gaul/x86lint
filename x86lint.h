@@ -669,6 +669,127 @@ bool x86lint_consts_lookup(const x86lint_consts *consts, bool is_64bit,
                            uint64_t value, size_t *sites, size_t *imm64,
                            size_t *repeats);
 
+// An inlining census: where the binary's direct calls go, and how many of
+// them go to functions so small that a call is most of what the caller pays
+// for. The other censuses ask what the code is made of; this asks what the
+// compiler left as a call. A `call rel32` to a two-instruction function is
+// five bytes of caller, a call/return pair, and the whole calling convention
+// -- arguments marshalled into registers, caller-saved registers given up --
+// for work an inliner would have folded into the caller for nothing. The
+// reasons such a call survives are mostly visible in the binary: the callee
+// is in another translation unit and the build has no LTO; the callee is
+// exported from a shared object and GCC under -fPIC keeps it interposable;
+// the callee is recursive; the callee is reached through the PLT. The census
+// counts each.
+//
+// Every direct near call is placed against the installed function ranges:
+// to a function's start, into a function elsewhere than its start, to a
+// linker stub (the PLT ranges installed with x86lint_inline_set_stubs), or
+// to no sized function. Unconditional jumps that leave their function for
+// another's start are tail calls and are counted beside the calls. A callee
+// is measured by its body: the symbol's size less a leading ENDBR64 (a
+// CET build spends four bytes on it in every function), a frame-pointer
+// frame (`push rbp ; mov rbp, rsp` at the start and `pop rbp` before the
+// return, five bytes a frame-pointer build spends in every function) and a
+// trailing RET, so a function that merely returns a constant measures as
+// the bytes that compute it and an empty one measures 0. A callee whose
+// last instruction is a jump is a forwarder: its body is a jump to the
+// function that does the work, and a call to it is a call that could have
+// gone there directly. The headline is the calls to functions of at most
+// X86LINT_INLINE_TINY body bytes.
+//
+// Same linear sweep, resync and evidence labeling as the other censuses.
+// Function ranges come from x86lint_inline_set_functions; without them no
+// call can be placed and the census reports only the call shapes. The
+// exported starts (x86lint_inline_set_exported) mark callees that a dynamic
+// linker could interpose. A `.cold` fragment (GCC's and LLVM's hot/cold
+// splitting names it `f.cold` or `f.cold.N`) is part of its function: a jump
+// to one is not a tail call and is counted apart. Opaque; NULL is accepted
+// everywhere.
+typedef struct x86lint_inline x86lint_inline;
+
+x86lint_inline *x86lint_inline_create(void);
+void x86lint_inline_destroy(x86lint_inline *census);
+
+// Install borrowed, sorted, non-overlapping code-evidence ranges, as for
+// the ISA census.
+void x86lint_inline_set_evidence(x86lint_inline *census,
+                                 const x86lint_evidence_range *ranges,
+                                 size_t count);
+
+// Install the function ranges calls are placed against: sorted by start,
+// non-overlapping, outliving the census along with their names (the
+// contract of x86lint_summary_set_functions). Installing allocates a table
+// of the same length; on failure the census behaves as if none were given.
+void x86lint_inline_set_functions(x86lint_inline *census,
+                                  const x86lint_func_range *funcs,
+                                  size_t count);
+
+// Install borrowed, sorted, non-overlapping ranges of linker stubs (.plt
+// and its variants), so a call into one is reported as an import rather
+// than as a call to no function.
+void x86lint_inline_set_stubs(x86lint_inline *census,
+                              const x86lint_evidence_range *ranges,
+                              size_t count);
+
+// Install the borrowed, sorted start addresses of the functions .dynsym
+// exports; a callee among them is marked exported.
+void x86lint_inline_set_exported(x86lint_inline *census,
+                                 const uint64_t *starts, size_t count);
+
+// Linear-sweep decode of `len` bytes at virtual address `vaddr`. A callee's
+// ENDBR64, frame and RET are noticed when its own bytes are swept; a callee
+// the sweep never reaches measures as its whole size.
+void x86lint_inline_scan(x86lint_inline *census, const uint8_t *inst,
+                         size_t len, uint64_t vaddr);
+
+// Print the census: the call shapes, the callees by body size, the calls to
+// tiny functions and what inlining them in place would do to the code
+// size, and the twenty tiny functions most called; verbose adds up to
+// three call sites for each.
+void x86lint_inline_print(const x86lint_inline *census, bool verbose);
+
+size_t x86lint_inline_instructions(const x86lint_inline *census);
+size_t x86lint_inline_skipped(const x86lint_inline *census);
+
+// Where a direct call or tail jump landed.
+enum x86lint_call_kind {
+    X86LINT_CALL_FUNCTION,  // the start of an installed function
+    X86LINT_CALL_INSIDE,    // inside an installed function, not at its start
+    X86LINT_CALL_STUB,      // a linker stub: an import through the PLT
+    X86LINT_CALL_UNPLACED,  // no installed function or stub
+    X86LINT_CALL_KINDS,
+};
+
+// Direct near calls (`call rel32`) by where they landed, and the indirect
+// ones (through a register or memory), which the census cannot place.
+size_t x86lint_inline_calls(const x86lint_inline *census,
+                            enum x86lint_call_kind kind);
+size_t x86lint_inline_indirect_calls(const x86lint_inline *census);
+
+// Unconditional jumps leaving their function for another function's start
+// (X86LINT_CALL_FUNCTION) or for a linker stub (X86LINT_CALL_STUB); the
+// other kinds are always 0.
+size_t x86lint_inline_tail_jumps(const x86lint_inline *census,
+                                 enum x86lint_call_kind kind);
+
+// A tiny function: at most this many body bytes.
+#define X86LINT_INLINE_TINY 16
+
+// Direct calls to the start of a tiny function; the distinct functions they
+// reach, how many of those are exported and how many call themselves.
+size_t x86lint_inline_tiny_calls(const x86lint_inline *census,
+                                 size_t *functions, size_t *exported,
+                                 size_t *recursive);
+
+// One installed function's tally: direct calls to its start, tail jumps to
+// it, its body bytes, whether it calls itself, and whether it is a
+// forwarder (ends in a jump). False when `start` is not an installed
+// function's start.
+bool x86lint_inline_lookup(const x86lint_inline *census, uint64_t start,
+                           size_t *calls, size_t *tail_jumps, uint64_t *body,
+                           bool *recursive, bool *forwarder);
+
 // Called once per finding, in the order findings are reported, when passed
 // to check_instructions. The summary answers "how many of each kind"; this
 // answers "which instruction, at what address" -- the form a consumer needs

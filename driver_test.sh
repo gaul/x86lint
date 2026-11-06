@@ -319,6 +319,72 @@ second:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# Inlining-census fixture for -n: _start calls g twice (a two-byte body:
+# ENDBR64 + XOR + RET), h once (twenty bytes of MOV), itself once, into the
+# middle of h once, into a PLT-shaped stub section once, an unsized label
+# once, e once (a frame-pointer frame around nothing) and w once (the same
+# frame around a jump to g, a forwarder), then through memory and through a
+# register; t tail-jumps to g; the unsized label's own call to g is in no
+# function.
+cat >"$dir/inline.s" <<'EOF'
+    .text
+    .globl _start
+    .type _start, @function
+_start:
+    endbr64
+    call g
+    call g
+    call h
+    call _start
+    call h+1
+    call stub
+    call nowhere
+    call e
+    call w
+    call *0(%rip)
+    call *%rax
+    ret
+    .size _start, . - _start
+    .globl g
+    .type g, @function
+g:
+    endbr64
+    xorl %eax, %eax
+    ret
+    .size g, . - g
+    .type h, @function
+h:
+    .rept 4
+    movl $1, %eax
+    .endr
+    ret
+    .size h, . - h
+    .type t, @function
+t:
+    jmp g
+    .size t, . - t
+    .type e, @function
+e:
+    pushq %rbp
+    movq %rsp, %rbp
+    popq %rbp
+    ret
+    .size e, . - e
+    .type w, @function
+w:
+    pushq %rbp
+    movq %rsp, %rbp
+    popq %rbp
+    jmp g
+    .size w, . - w
+nowhere:
+    call g
+    .section .plt, "ax", @progbits
+stub:
+    .byte 0xff, 0x25, 0x00, 0x00, 0x00, 0x00    # jmp *0(%rip): a PLT entry's shape
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # A census fixture carrying the toolchain ISA accounting (-mneeded style):
 # ISA_1_NEEDED says baseline+v2, ISA_1_USED all four levels. Properties in
 # one note must be sorted by ascending pr_type: NEEDED (0xc0008002) before
@@ -851,7 +917,7 @@ EOF
 
 for f in finding clean bmi notrack census isanote perfunc target advisory \
          jccpad jccraw jccmixed canary canarysetup frameptr deadcmp regs \
-         consts; do
+         consts inline; do
     if ! cc -nostdlib -static -Wl,--build-id=none \
             -o "$dir/$f" "$dir/$f.s"; then
         echo "driver_test.sh: fixture build failed" >&2
@@ -1212,6 +1278,55 @@ expect '^ISA census: 13 instructions'
 expect '^register census: 13 instructions'
 expect '^constant census: 13 instructions'
 
+# -n places every direct call: seven land on a function start (g three
+# times, h, _start, e, w), one inside h, one in the .plt stub and one on
+# the unsized label; two are indirect. t's and w's jumps to g are tail
+# calls. g's body is two bytes, h's twenty, _start's 53 (58 less ENDBR64
+# and RET), e's 0 and w's 2 (the frame trimmed), so g, e and w are the tiny
+# callees, w a forwarder and e empty, and inlining their five calls shrinks
+# the code.
+run 0 -n "$dir/inline"
+expect '^inlining census: 31 instructions, 0 undecodable bytes skipped$'
+expect '^  calls: 10 direct \(call rel32\), 2 indirect \(through a register or memory\), 1 of the direct unevidenced$'
+expect '^    direct calls to a function start: 7; into a function elsewhere than its start: 1; to a linker stub \(PLT\): 1; to no sized function: 1$'
+expect '^  tail jumps: 2 to another function'"'"'s start, 0 to a linker stub$'
+expect '^ +0 +1 +1 +0  10\.00%$'
+expect '^ +1-8 +2 +4 +2  40\.00%$'
+expect '^ +17-32 +1 +1 +0  10\.00%$'
+expect '^ +33-64 +1 +1 +0  10\.00%$'
+expect '^ +257\+ +0 +0 +0  0\.00%$'
+expect '^  calls to functions of at most 16 body bytes: 5 \(50\.00% of direct calls\) to 3 functions$'
+expect '^    of the functions: 0 exported in \.dynsym \(0 calls\), 1 forwarding with a final jump \(1 calls\), 1 empty \(1 calls\), 0 recursive$'
+expect '^    replacing each call with its callee'"'"'s body would remove 17 bytes before anything the inliner then simplifies; 5 of the calls have a body under the call'"'"'s five bytes$'
+expect '^ +3 +2 +2 +7  <g>$'
+expect '^ +1 +0 +0 +6  <e>$'
+expect '^ +1 +0 +2 +7  <w> \(forwarder\)$'
+expect '^  functions: 6 sized from \.symtab$'
+expect '^  code evidence: 6 function symbols '
+reject 'optimization opportunities' "lint tail in inlining-census mode"
+reject 'constant census' "constant census without -k"
+# -v adds the call sites.
+run 0 -n -v "$dir/inline"
+expect '^ +3 +2 +2 +7  <g>  called at 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+$' \
+    "-v call-site line"
+# -f narrows the call sites to one function while every function stays a
+# callee: g's two calls from _start, and nothing from t, w or the label.
+# The callees' own bytes are not swept, so their ENDBR64, frames and RETs
+# go unnoticed and their bodies read as their whole sizes.
+run 0 -n -f _start "$dir/inline"
+expect '^inlining census: 13 instructions, 0 undecodable bytes skipped$'
+expect '^    direct calls to a function start: 6; into a function elsewhere than its start: 1; to a linker stub \(PLT\): 1; to no sized function: 1$'
+expect '^  tail jumps: 0 to another function'"'"'s start, 0 to a linker stub$'
+expect '^ +2 +0 +7 +7  <g>$'
+expect '^ +1 +0 +6 +6  <e>$'
+expect '^  functions: 6 sized from \.symtab as callees; call sites scanned in the 1 named by -f$'
+# All four censuses print from one sweep.
+run 0 -i -r -k -n "$dir/inline"
+expect '^ISA census: 31 instructions'
+expect '^register census: 31 instructions'
+expect '^constant census: 31 instructions'
+expect '^inlining census: 31 instructions'
+
 # -e is opt-in: without it no ENDBR64 pass runs, even on a CET-broken binary.
 run 0 "$dir/cetbad"
 reject 'ENDBR64' "ENDBR64 output without -e"
@@ -1489,6 +1604,8 @@ snapshot regs -r "$dir/regs"
 snapshot regs-verbose -r -v "$dir/regs"
 snapshot consts -k "$dir/consts"
 snapshot consts-verbose -k -v "$dir/consts"
+snapshot inline -n "$dir/inline"
+snapshot inline-verbose -n -v "$dir/inline"
 snapshot endbr-missing -e "$dir/cetbad"
 snapshot jcc-absent -j -t skylake "$dir/jccraw"
 snapshot jcc-present -j "$dir/jccpad"

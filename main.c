@@ -2262,6 +2262,126 @@ static void print_code_evidence(size_t nranges, size_t funcs, size_t fdes,
     }
 }
 
+// The command line. Every option has a long name, which is the documented
+// spelling, and a one-letter alias, kept because the letters predate the
+// names and scripts use them. The letters shared with armlint (-v, -A, -f,
+// -i, -c, -m, -a and --json) mean the same thing in both tools, so a reader
+// of one report can read the other, and so do the long names. This table is
+// also what --help and a usage error print, so no option can be parsed
+// without being documented.
+enum option_id {
+    OPT_VERBOSE,
+    OPT_ALL_BYTES,
+    OPT_FUNCTION,
+    OPT_ENDBR,
+    OPT_ISA,
+    OPT_REGISTERS,
+    OPT_CONSTANTS,
+    OPT_INLINING,
+    OPT_JCC,
+    OPT_THUNKS,
+    OPT_PROPERTIES,
+    OPT_JSON,
+    OPT_ASSUME,
+    OPT_TUNE,
+    OPT_ENABLE,
+    OPT_HELP,
+};
+
+struct option_spec {
+    enum option_id id;
+    const char *shrt;   // the one-letter alias, or NULL
+    const char *lng;    // the long name
+    const char *arg;    // what the help calls the value, or NULL for a switch
+    const char *help;   // wrapped at its newlines
+};
+
+static const struct option_spec options[] = {
+    {OPT_VERBOSE, "-v", "--verbose", NULL,
+     "print each finding with its disassembly"},
+    {OPT_ALL_BYTES, "-A", "--all-bytes", NULL,
+     "scan every byte, not only the sized functions"},
+    {OPT_FUNCTION, "-f", "--function", "FUNC",
+     "scan only the function named FUNC"},
+    {OPT_ENDBR, "-e", "--endbr", NULL,
+     "also verify the CET IBT landing pads"},
+    // The censuses and audits replace the lint scan. The ISA census has
+    // -i, which is why the inlining census is -n.
+    {OPT_ISA, "-i", "--isa", NULL,
+     "an ISA census in place of the lint scan"},
+    {OPT_REGISTERS, "-r", "--registers", NULL,
+     "a register census"},
+    {OPT_CONSTANTS, "-c", "--constants", NULL,
+     "a constant census"},
+    {OPT_INLINING, "-n", "--inlining", NULL,
+     "an inlining census"},
+    {OPT_JCC, "-j", "--jcc", NULL,
+     "a JCC-erratum audit"},
+    {OPT_THUNKS, "-s", "--thunks", NULL,
+     "a speculation-thunk audit"},
+    {OPT_PROPERTIES, "-p", "--properties", NULL,
+     "a build-property audit"},
+    {OPT_JSON, NULL, "--json", NULL,
+     "the findings as a JSON document on stdout"},
+    // "assume" rather than "extension" because not every value is one: v8
+    // asserts V8's register conventions (see X86LINT_EXT_V8).
+    {OPT_ASSUME, "-m", "--assume", "EXT",
+     "the target has EXT: bmi1, bmi2, movbe, apx or v8"},
+    {OPT_TUNE, "-t", "--tune", "TARGET",
+     "generic, sandybridge, skylake, icelake, zen or silvermont"},
+    {OPT_ENABLE, "-a", "--enable", "KIND",
+     "also report advisory, security or all finding classes"},
+    {OPT_HELP, "-h", "--help", NULL,
+     "print this help"},
+};
+
+static void usage(FILE *to, const char *argv0)
+{
+    fprintf(to, "usage: %s [OPTION]... <ELF_FILE>\n", argv0);
+    for (size_t k = 0; k < sizeof options / sizeof options[0]; ++k) {
+        const struct option_spec *o = &options[k];
+        char name[32];
+        snprintf(name, sizeof name, "%s%s%s", o->lng,
+            o->arg != NULL ? " " : "", o->arg != NULL ? o->arg : "");
+        fprintf(to, "  %s%s %-18s ", o->shrt != NULL ? o->shrt : "  ",
+            o->shrt != NULL ? "," : " ", name);
+        // A help text wraps at its newlines, continued under itself.
+        for (const char *h = o->help; *h != '\0'; ++h) {
+            fputc(*h, to);
+            if (*h == '\n') {
+                fprintf(to, "%25s", "");
+            }
+        }
+        fputc('\n', to);
+    }
+}
+
+// The option argv[i] spells, or NULL for a non-option. A long name may carry
+// its value as --name=VALUE, which *value then points at; otherwise *value
+// is NULL and a valued option takes the next argument.
+static const struct option_spec *option_match(const char *arg,
+    const char **value)
+{
+    *value = NULL;
+    for (size_t k = 0; k < sizeof options / sizeof options[0]; ++k) {
+        const struct option_spec *o = &options[k];
+        if (o->shrt != NULL && strcmp(arg, o->shrt) == 0) {
+            return o;
+        }
+        size_t n = strlen(o->lng);
+        if (strncmp(arg, o->lng, n) == 0) {
+            if (arg[n] == '\0') {
+                return o;
+            }
+            if (arg[n] == '=') {
+                *value = arg + n + 1;
+                return o;
+            }
+        }
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     // Exit status follows the grep convention so a gating CI can tell a
@@ -2286,108 +2406,129 @@ int main(int argc, char **argv)
     const char *path = NULL;
     const char *fname = NULL;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "-v") == 0) {
+        const char *value;
+        const struct option_spec *o = option_match(argv[i], &value);
+        if (o == NULL) {
+            if (path == NULL && argv[i][0] != '-') {
+                path = argv[i];
+                continue;
+            }
+            fprintf(stderr, "%s: unexpected argument '%s'\n", argv[0],
+                argv[i]);
+            usage(stderr, argv[0]);
+            return 2;
+        }
+        if (o->arg == NULL && value != NULL) {
+            fprintf(stderr, "%s: %s takes no value\n", argv[0], o->lng);
+            return 2;
+        }
+        if (o->arg != NULL && value == NULL) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: %s needs a value\n", argv[0], o->lng);
+                usage(stderr, argv[0]);
+                return 2;
+            }
+            value = argv[++i];
+        }
+        switch (o->id) {
+        case OPT_VERBOSE:
             verbose = true;
-        } else if (strcmp(argv[i], "-A") == 0) {
+            break;
+        case OPT_ALL_BYTES:
             scan_all = true;
-        } else if (strcmp(argv[i], "-e") == 0) {
+            break;
+        case OPT_FUNCTION:
+            fname = value;
+            break;
+        case OPT_ENDBR:
             endbr = true;
-        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
-            fname = argv[++i];
-        } else if (strcmp(argv[i], "-i") == 0) {
+            break;
+        case OPT_ISA:
             isa_census = true;
-        } else if (strcmp(argv[i], "-r") == 0) {
+            break;
+        case OPT_REGISTERS:
             reg_census = true;
-        } else if (strcmp(argv[i], "-c") == 0) {
-            // The constant census, under armlint's letter for it. The
-            // letters the two tools share mean the same thing: -A scans
-            // every byte and -a enables the opt-in finding classes, as in
-            // armlint, so that a reader of one report can read the other.
+            break;
+        case OPT_CONSTANTS:
             const_census = true;
-        } else if (strcmp(argv[i], "-n") == 0) {
-            // The inlining census: the calls not inlined. -i, the natural
-            // letter, is the ISA census.
+            break;
+        case OPT_INLINING:
             inline_census = true;
-        } else if (strcmp(argv[i], "-j") == 0) {
+            break;
+        case OPT_JCC:
             jcc_audit = true;
-        } else if (strcmp(argv[i], "-s") == 0) {
+            break;
+        case OPT_THUNKS:
             thunk_audit = true;
-        } else if (strcmp(argv[i], "-p") == 0) {
+            break;
+        case OPT_PROPERTIES:
             prop_audit = true;
-        } else if (strcmp(argv[i], "--json") == 0) {
+            break;
+        case OPT_JSON:
             json = true;
-        } else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
+            break;
+        case OPT_ASSUME:
+            if (strcmp(value, "bmi1") == 0) {
+                extensions |= X86LINT_EXT_BMI1;
+            } else if (strcmp(value, "bmi2") == 0) {
+                extensions |= X86LINT_EXT_BMI2;
+            } else if (strcmp(value, "movbe") == 0) {
+                extensions |= X86LINT_EXT_MOVBE;
+            } else if (strcmp(value, "apx") == 0) {
+                extensions |= X86LINT_EXT_APX;
+            } else if (strcmp(value, "v8") == 0) {
+                // Not an ISA extension: asserts that R14 holds V8's
+                // 4 GB-aligned pointer-compression cage base (see
+                // X86LINT_EXT_V8).
+                extensions |= X86LINT_EXT_V8;
+            } else {
+                fprintf(stderr, "%s: unknown --assume extension '%s' "
+                    "(known: bmi1, bmi2, movbe, apx, v8)\n", argv[0], value);
+                return 2;
+            }
+            break;
+        case OPT_TUNE:
+            // The microarchitecture being tuned for. A different axis from
+            // --assume: that says an encoding exists on the target, this
+            // says a rewrite is worth making there. The default assumes
+            // every documented penalty applies, so it reports only what
+            // pays on every core.
+            if (!x86lint_target_parse(value, &target)) {
+                fprintf(stderr, "%s: unknown --tune target '%s' (known: "
+                    "generic, sandybridge, skylake, icelake, zen, "
+                    "silvermont)\n", argv[0], value);
+                return 2;
+            }
+            break;
+        case OPT_ENABLE: {
             // Additional kinds of finding. The default scan reports only
             // verified rewrites, which is what makes a non-zero exit mean
-            // "there is something here to fix"; advice the tool cannot check
-            // and review items that are not rewrites at all are opt-in. Once
-            // enabled they count like any other finding.
+            // "there is something here to fix"; advice the tool cannot
+            // check and review items that are not rewrites at all are
+            // opt-in. Once enabled they count like any other finding.
             uint32_t klass;
-            if (!x86lint_class_parse(argv[++i], &klass)) {
-                fprintf(stderr, "%s: unknown -a class '%s'\n",
-                    argv[0], argv[i]);
+            if (!x86lint_class_parse(value, &klass)) {
+                fprintf(stderr, "%s: unknown --enable class '%s' (known: "
+                    "advisory, security, all)\n", argv[0], value);
                 return 2;
             }
             classes |= klass;
-        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            // The microarchitecture being tuned for. A different axis from
-            // -m: that says an encoding exists on the target, this says a
-            // rewrite is worth making there. The default assumes every
-            // documented penalty applies, so it reports only what pays on
-            // every core.
-            if (!x86lint_target_parse(argv[++i], &target)) {
-                fprintf(stderr, "%s: unknown -t target '%s'\n",
-                    argv[0], argv[i]);
-                return 2;
-            }
-        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
-            ++i;
-            if (strcmp(argv[i], "bmi1") == 0) {
-                extensions |= X86LINT_EXT_BMI1;
-            } else if (strcmp(argv[i], "bmi2") == 0) {
-                extensions |= X86LINT_EXT_BMI2;
-            } else if (strcmp(argv[i], "movbe") == 0) {
-                extensions |= X86LINT_EXT_MOVBE;
-            } else if (strcmp(argv[i], "apx") == 0) {
-                extensions |= X86LINT_EXT_APX;
-            } else if (strcmp(argv[i], "v8") == 0) {
-                // Not an ISA extension: asserts that R14 holds V8's 4 GB-aligned
-                // pointer-compression cage base (see X86LINT_EXT_V8).
-                extensions |= X86LINT_EXT_V8;
-            } else {
-                fprintf(stderr,
-                    "usage: %s [-v] [-A] [-e] [-f FUNC] [-i] [-r] [-c] [-n] [-j] [-s] [-p] [--json] "
-                "[-m bmi1|bmi2|movbe|apx|v8] "
-                "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "[-a advisory|security|all] <ELF_FILE>\n",
-                    argv[0]);
-                return 2;
-            }
-        } else if (path == NULL && argv[i][0] != '-') {
-            path = argv[i];
-        } else {
-            fprintf(stderr,
-                "usage: %s [-v] [-A] [-e] [-f FUNC] [-i] [-r] [-c] [-n] [-j] [-s] [-p] [--json] "
-                "[-m bmi1|bmi2|movbe|apx|v8] "
-                "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "[-a advisory|security|all] <ELF_FILE>\n",
-                argv[0]);
-            return 2;
+            break;
+        }
+        case OPT_HELP:
+            usage(stdout, argv[0]);
+            return 0;
         }
     }
     if (path == NULL) {
-        fprintf(stderr,
-            "usage: %s [-v] [-A] [-e] [-f FUNC] [-i] [-r] [-c] [-n] [-j] [-s] [-p] [--json] "
-                "[-m bmi1|bmi2|movbe|apx|v8] "
-                "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "[-a advisory|security|all] <ELF_FILE>\n",
-            argv[0]);
+        usage(stderr, argv[0]);
         return 2;
     }
-    // -A widens the scan to every byte and -f narrows it to one function;
-    // combining them has no coherent meaning.
+    // --all-bytes widens the scan to every byte and --function narrows it to
+    // one function; combining them has no coherent meaning.
     if (fname != NULL && scan_all) {
-        fprintf(stderr, "%s: -A and -f are mutually exclusive\n", argv[0]);
+        fprintf(stderr, "%s: --all-bytes and --function are mutually "
+            "exclusive\n", argv[0]);
         return 2;
     }
     // The ISA (-i), register (-r), constant (-c) and inlining (-n) censuses
@@ -2404,8 +2545,9 @@ int main(int argc, char **argv)
     if (json && (verbose || census || endbr || jcc_audit || thunk_audit ||
                  prop_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -r, -c, -n, -e, -j, "
-            "-s or -p\n", argv[0]);
+            "%s: --json cannot be combined with --verbose, --endbr, a census "
+            "(--isa, --registers, --constants, --inlining) or an audit "
+            "(--jcc, --thunks, --properties)\n", argv[0]);
         return 2;
     }
 

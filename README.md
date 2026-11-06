@@ -355,18 +355,54 @@ often the instruction it names actually runs. It is independent of both
 passes `NULL` for the summary and `false` for verbose. The driver's `--json`
 mode is built on it.
 
-x86lint can also read arbitrary 64-bit ELF executables directly. When the
-binary kept its symbol table (`.symtab`), the scan is restricted to the byte
-ranges of its function symbols: executable sections routinely interleave
-non-code that *decodes* cleanly -- GHC info tables, LLVM's constexpr tables,
-jump tables -- which linear sweep would otherwise report pseudo-instruction
-findings from, and which the undecodable-bytes counter cannot flag. Excluded
-bytes are tallied into that skipped count, and a summary line reports the
-restriction; pass `-A` to scan every byte anyway. The dynamic symbol table is
-never used for this -- it survives stripping but lists only exports, and
-scanning just those would silently miss almost all code -- so stripped
-binaries scan whole sections exactly as before. An unsized assembly label
-extends to the next function's start, keeping coverage conservative.
+x86lint can also read arbitrary 64-bit ELF executables directly:
+
+```console
+$ ./x86lint /bin/ls                            # the lint scan
+$ ./x86lint --verbose --function main /bin/ls  # each finding, in one function
+$ ./x86lint --constants /usr/lib64/libc.so.6   # the constant census
+```
+
+Every option has a long name and a one-letter alias, and `x86lint --help`
+prints the table. The letters shared with armlint (`-v`, `-A`, `-f`, `-i`,
+`-c`, `-m`, `-a` and `--json`) mean the same thing in both tools, and so do
+their long names. A value follows its option as the next argument or joined
+with `=` (`--function=main`).
+
+| option | effect |
+| --- | --- |
+| `-v`, `--verbose` | print each finding with its disassembly |
+| `-A`, `--all-bytes` | scan every byte, not only the sized functions |
+| `-f FUNC`, `--function FUNC` | scan only the function named FUNC |
+| `-e`, `--endbr` | also verify the CET IBT landing pads |
+| `-i`, `--isa` | an ISA census in place of the lint scan |
+| `-r`, `--registers` | a register census |
+| `-c`, `--constants` | a constant census |
+| `-n`, `--inlining` | an inlining census |
+| `-j`, `--jcc` | a JCC-erratum audit |
+| `-s`, `--thunks` | a speculation-thunk audit |
+| `-p`, `--properties` | a build-property audit |
+| `--json` | the findings as a JSON document on stdout |
+| `-m EXT`, `--assume EXT` | the target has EXT: `bmi1`, `bmi2`, `movbe` or `apx`; `v8` asserts V8's register conventions |
+| `-t TARGET`, `--tune TARGET` | `generic`, `sandybridge`, `skylake`, `icelake`, `zen` or `silvermont` |
+| `-a KIND`, `--enable KIND` | also report the `advisory`, `security` or `all` finding classes |
+| `-h`, `--help` | print this table |
+
+The sections below name each mode by its letter, which is how the examples
+spell it.
+
+When the binary kept its symbol table (`.symtab`), the scan is restricted to
+the byte ranges of its function symbols: executable sections routinely
+interleave non-code that *decodes* cleanly -- GHC info tables, LLVM's
+constexpr tables, jump tables -- which linear sweep would otherwise report
+pseudo-instruction findings from, and which the undecodable-bytes counter
+cannot flag. Excluded bytes are tallied into that skipped count, and a
+summary line reports the restriction; pass `-A` (`--all-bytes`) to scan
+every byte anyway. The dynamic symbol table is never used for this -- it
+survives stripping but lists only exports, and scanning just those would
+silently miss almost all code -- so stripped binaries scan whole sections
+exactly as before. An unsized assembly label extends to the next function's
+start, keeping coverage conservative.
 
 An instruction whose bytes a relocation will rewrite is excluded whatever the
 symbols say, because its immediate or displacement is not a value. It is zero,
@@ -458,27 +494,25 @@ Attribution uses sized function symbols only; a finding in code reached
 through an unsized assembly label lands in an honest
 `outside every function range` row rather than the wrong neighbor.
 
-Pass `-f NAME` to restrict the scan to the one function named NAME --
-"lint just this function". Unlike the default restriction, `-f` also
-draws on the dynamic symbol table, so naming an exported function of a
+Pass `-f NAME` (`--function NAME`) to restrict the scan to the one function
+named NAME -- "lint just this function". Unlike the default restriction, `-f`
+also draws on the dynamic symbol table, so naming an exported function of a
 stripped library works; every sized symbol spelled NAME is scanned (a
 versioned export like glibc's two `memcpy`s has several sites), and the
 count line reflects only their instructions. `-f` combines with `-i`
 for a per-function census; see that section.
 
-Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` to declare that the
-binary's target supports those instruction-set extensions, enabling the
-checks that suggest replacing a baseline sequence with an instruction from
+Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` (`--assume`) to declare
+that the binary's target supports those instruction-set extensions, enabling
+the checks that suggest replacing a baseline sequence with an instruction from
 that set (missing ANDN, missing BLSI, missing BLSMSK, missing BLSR, missing
-SHLX/SHRX/SARX, missing MOVBE, missing APX NDD, missing APX
-SETZU). These
-are opt-in because the finding is only actionable when the target guarantees
-the extension: a distro binary built for x86-64-v2 could not have used ANDN
-however clear the opportunity, and inferring availability from the
-surrounding bytes is unsound for binaries like glibc that keep baseline code
-and CPU-dispatched BMI-rich variants in the same section. The flags are
-independent, matching their CPUID feature bits: `-m bmi2` does not imply
-`-m bmi1`.
+SHLX/SHRX/SARX, missing MOVBE, missing APX NDD, missing APX SETZU). These are
+opt-in because the finding is only actionable when the target guarantees the
+extension: a distro binary built for x86-64-v2 could not have used ANDN however
+clear the opportunity, and inferring availability from the surrounding bytes is
+unsound for binaries like glibc that keep baseline code and CPU-dispatched
+BMI-rich variants in the same section. The flags are independent, matching
+their CPUID feature bits: `-m bmi2` does not imply `-m bmi1`.
 
 `-m v8` is a knowledge bit rather than an ISA bit, and is armlint's flag
 of the same name: it asserts a runtime invariant of the scanned code,
@@ -488,13 +522,13 @@ unsound for arbitrary code and stays silent without it. Pass it when
 scanning V8's JIT output or its embedded builtins; never for an ordinary
 binary.
 
-Pass `-t generic|sandybridge|skylake|icelake|zen|silvermont` to name the
-microarchitecture the code is tuned for. This is a different axis from `-m`:
-that says whether an encoding *exists* on the target, where `-t` says whether
-a rewrite is *worth making* there, and several of x86lint's are not worth it
-everywhere. The default, `generic`, assumes every documented penalty applies
-at once, so it reports the rewrites that pay on every core and withholds the
-ones that only sometimes do.
+Pass `-t generic|sandybridge|skylake|icelake|zen|silvermont` (`--tune`) to name
+the microarchitecture the code is tuned for. This is a different axis from
+`-m`: that says whether an encoding *exists* on the target, where `-t` says
+whether a rewrite is *worth making* there, and several of x86lint's are not
+worth it everywhere. The default, `generic`, assumes every documented penalty
+applies at once, so it reports the rewrites that pay on every core and
+withholds the ones that only sometimes do.
 
 Four behaviours move with it, and they move in both directions:
 
@@ -529,12 +563,12 @@ Lake. An unknown name is a usage error rather than a silent fallback to the
 default, since a typo that quietly changed which findings appear would be
 worse than a refusal.
 
-Pass `-a advisory`, `-a security` or `-a all` to report kinds of finding the
-default scan withholds. Most checks state a verified byte-level rewrite: the
-replacement is equivalent, the tool proved the conditions, and applying it is
-mechanical. Those are the default, and they are what makes a non-zero exit
-mean "there is something here to fix". Two other kinds do not fit that
-description and were, until now, reported beside them as though they did.
+Pass `-a advisory`, `-a security` or `-a all` (`--enable`) to report kinds of
+finding the default scan withholds. Most checks state a verified byte-level
+rewrite: the replacement is equivalent, the tool proved the conditions, and
+applying it is mechanical. Those are the default, and they are what makes a
+non-zero exit mean "there is something here to fix". Two other kinds do not fit
+that description and were, until now, reported beside them as though they did.
 
 * **advisory** is a real improvement whose fix the tool cannot verify or
   cannot even see. The SETcc zero-extension's rewrite belongs upstream of the
@@ -602,12 +636,13 @@ than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
 would interleave with it, and the driver refuses the combination rather than
 choosing for the caller.
 
-Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
-pads, `-i` to replace the lint scan with an ISA census of the binary, `-r`
-with a register census, `-c` with a constant census, `-n` with an inlining
-census, `-j` with a JCC-erratum verdict, `-s` with a speculation-thunk
-verdict, and `-p` with a per-function build-property audit; see the next
-sections.
+Pass `-e` (`--endbr`) to also verify the binary's CET
+indirect-branch-tracking landing pads, `-i` (`--isa`) to replace the lint
+scan with an ISA census of the binary, `-r` (`--registers`) with a register
+census, `-c` (`--constants`) with a constant census, `-n` (`--inlining`) with
+an inlining census, `-j` (`--jcc`) with a JCC-erratum verdict, `-s`
+(`--thunks`) with a speculation-thunk verdict, and `-p` (`--properties`) with
+a per-function build-property audit; see the next sections.
 
 The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
@@ -617,7 +652,7 @@ broken run. `-e` findings set the exit status like any other; the `-i`, `-r`,
 (the one target that has the erratum), the `-s` audit only for a mitigation
 left incomplete, and the `-p` audit never.
 
-## ENDBR64 (CET IBT) verification
+## ENDBR64 (CET IBT) verification (`-e`, `--endbr`)
 
 With Intel CET's indirect branch tracking enforced, an indirect `JMP` or
 `CALL` must land on an `ENDBR64` instruction or the CPU raises a
@@ -712,7 +747,7 @@ into the final link, so the question is only answerable for executables and
 shared objects. The library exports the single-site predicate
 (`check_endbr64_target`); the evidence collection lives in the driver.
 
-## ISA census (`-i`)
+## ISA census (`-i`, `--isa`)
 
 `x86lint -i` replaces the lint scan with a census: every instruction in the
 binary's executable sections, tallied by the XED isa-set it belongs to and
@@ -835,7 +870,7 @@ x87 hits (correctly: they are info tables), but real Haskell code is
 equally unlabeled there. Evidence quality varies by build; when a
 binary has none at all, nothing is labeled and the line says so.
 
-## Register census (`-r`)
+## Register census (`-r`, `--registers`)
 
 `x86lint -r` replaces the lint scan with a census of registers: which
 architectural registers the code names, in what role and at what width, and
@@ -929,7 +964,7 @@ evidenced and all inside its `*_evex` and `*_avx512` string and memory
 functions, which use YMM16-YMM31 because those registers need no
 VZEROUPPER.
 
-## Constant census (`-c`)
+## Constant census (`-c`, `--constants`)
 
 `x86lint -c` replaces the lint scan with a census of constants: which
 immediates the code carries, what they cost in encoding bytes, and which a
@@ -1035,7 +1070,7 @@ kernel module's `mov r64, imm32` placeholders do not count as the value 0.
 imm8 and imm16 are counted and costed but not keyed by value. The
 measurements and their reading are in TODO.md ("Constant census").
 
-## Inlining census (`-n`)
+## Inlining census (`-n`, `--inlining`)
 
 `x86lint -n` replaces the lint scan with a census of what the compiler left
 as a call: where every direct call goes, and how many go to functions so
@@ -1119,7 +1154,7 @@ cost hides in the `to a linker stub` count, not in this census's headline.
 `-v` adds each ranked function's first three call sites. `-i`, `-r`, `-c` and
 `-n` share one sweep and may be combined.
 
-## JCC erratum audit (`-j`)
+## JCC erratum audit (`-j`, `--jcc`)
 
 Skylake-derived cores cannot cache a jump in the decoded-icache when the
 jump's bytes cross a 32-byte boundary or its last byte is the last byte of
@@ -1205,7 +1240,7 @@ dump's verdict describes the machine that produced it and not the engine: on
 an AMD host a V8 corpus reports `mitigation absent`, correctly, because
 nothing there needed padding.
 
-## Speculation thunk audit (`-s`)
+## Speculation thunk audit (`-s`, `--thunks`)
 
 A retpoline replaces an indirect branch with a call to a thunk that returns to
 the intended target, so the branch predictor never sees an indirect transfer to
@@ -1265,7 +1300,7 @@ because libc's returns really are unrouted, which is accurate but says more
 about the link than about the code. A kernel module has no such passengers,
 which is why it is the case with clean semantics.
 
-## Build-property audit (`-p`)
+## Build-property audit (`-p`, `--properties`)
 
 `x86lint -p` reports build properties that a function's own code reveals, as
 fractions of the functions rather than facts about the image. That makes the

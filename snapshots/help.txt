@@ -1,0 +1,18 @@
+usage: x86lint [OPTION]... <ELF_FILE>
+  -v, --verbose          print each finding with its disassembly
+  -A, --all-bytes        scan every byte, not only the sized functions
+  -f, --function FUNC    scan only the function named FUNC
+  -e, --endbr            also verify the CET IBT landing pads
+  -i, --isa              an ISA census in place of the lint scan
+  -r, --registers        a register census
+  -c, --constants        a constant census
+  -n, --inlining         an inlining census
+  -j, --jcc              a JCC-erratum audit
+  -s, --thunks           a speculation-thunk audit
+  -p, --properties       a build-property audit
+      --json             the findings as a JSON document on stdout
+  -m, --assume EXT       the target has EXT: bmi1, bmi2, movbe, apx or v8
+  -t, --tune TARGET      generic, sandybridge, skylake, icelake, zen or silvermont
+  -a, --enable KIND      also report advisory, security or all finding classes
+  -h, --help             print this help
+exit status: 0

@@ -1576,12 +1576,33 @@ if [ "$rc" -gt 1 ]; then
     fail "self-lint of $X86LINT exited $rc"
 fi
 
+# Every option has a long name, which spells the same run as its letter, with
+# the value as the next argument or joined by '='. One fixture every mode has
+# something to say about, and identical output and exit status either way.
+for pair in -v:--verbose -A:--all-bytes -e:--endbr -i:--isa -r:--registers \
+        -c:--constants -n:--inlining -j:--jcc -s:--thunks -p:--properties \
+        '-f _start:--function _start' '-f _start:--function=_start' \
+        '-m bmi2:--assume bmi2' '-m bmi2:--assume=bmi2' \
+        '-t icelake:--tune icelake' '-t icelake:--tune=icelake' \
+        '-a all:--enable all' '-a all:--enable=all'; do
+    short=${pair%%:*}
+    long=${pair#*:}
+    "$X86LINT" $short "$dir/inline" >"$dir/short.out" 2>&1
+    rc_short=$?
+    "$X86LINT" $long "$dir/inline" >"$dir/long.out" 2>&1
+    rc_long=$?
+    if [ "$rc_short" -ne "$rc_long" ] || \
+            ! cmp -s "$dir/short.out" "$dir/long.out"; then
+        fail "'$long' does not spell the same run as '$short'"
+    fi
+done
+
 # Whole-report snapshots. The assertions above state what each fixture is
 # for, one fact at a time; these pin everything else the report says --
 # column widths, ordering, the lines nobody wrote a grep for -- across the
 # surfaces the tool has: the default report, -A, -v, --json, the census,
 # the ENDBR64 pass, the per-function table, the three opt-in axes (-m, -a,
-# -t) and the usage text. Regenerate with REGEN=1 ./driver_test.sh and read
+# -t), the usage text and --help. Regenerate with REGEN=1 ./driver_test.sh and read
 # the resulting diff; a change nobody can explain is the point of the layer.
 snapshot finding "$dir/finding"
 snapshot finding-all -A "$dir/finding"
@@ -1624,9 +1645,11 @@ snapshot relocatable -v "$dir/finding.o"
 snapshot reloc-excluded -v "$dir/reloc.o"
 snapshot reloc-unmarked -v "$dir/noreloc.o"
 snapshot usage
+snapshot help --help
 
-# Tool-failure paths: usage, unknown flag, dangling or unknown -m value,
-# unreadable file, non-ELF input.
+# Tool-failure paths: usage, unknown flag, dangling or unknown -m value, a
+# value on a switch, unreadable file, non-ELF input; and --help, which is not
+# one.
 run 2
 expect 'usage:'
 run 2 -x "$dir/finding"
@@ -1634,6 +1657,18 @@ expect 'usage:'
 run 2 -m
 expect 'usage:'
 run 2 -m sse9 "$dir/finding"
+expect 'unknown --assume extension'
+run 2 --tune nehalem "$dir/finding"
+expect 'unknown --tune target'
+run 2 --enable bogus "$dir/finding"
+expect 'unknown --enable class'
+run 2 --verbose=1 "$dir/finding"
+expect 'takes no value'
+run 2 --bogus "$dir/finding"
+expect "unexpected argument '--bogus'"
+run 0 --help
+expect '^  -c, --constants'
+run 0 -h
 expect 'usage:'
 run 2 "$dir/does-not-exist"
 run 2 "$dir/finding.s"

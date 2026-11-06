@@ -2449,6 +2449,29 @@ the store of zero has no spelling that does not cost a register or a
 read-modify-write (`and qword [mem], 0` is five bytes and a load-op-
 store), and the materialization of 1 has none at all.
 
+**What the small immediates are** (local libxul, an objdump pass whose
+memory side matches the census exactly and whose register side is within
+1.5% of it):
+
+| value | into a 32-bit register | into a 64-bit register (`mov r64, simm32`) | 32-bit store | 64-bit store |
+| --- | --- | --- | --- | --- |
+| 0 | 12,187 | 0 | 101,466 | 224,601 |
+| 1 | 182,529 | 0 | 15,034 | 49,574 |
+| 2 to 127 | 383,894 | 24 | 35,126 | 88,813 |
+| -1 | 13,144 | 2,700 | 4,130 | 3,246 |
+| -128 to -2 | 3,341 | 465 | 2,040 | 37 |
+
+The commonest register values between 2 and 127 are 4, 8, 2, 16, 3, 5, 24,
+6, 50 and 7: sizes, enumerators and counts. The compilers take every
+cheaper spelling that exists -- `xor` for the zero into a register (the
+12,187 left are sites where the flags must survive), and the byte
+register for TEST: libxul tests bit 0 of a byte register about 52,000
+times (25,686 `test al, 1`) against three `test r32, 1`, so the 576 wide
+TEST sites are masks with the sign bit set, `test eax, 0xfffffff0` and
+the like, which no byte operand expresses. `or eax, -1` (three bytes) and
+`push 1 ; pop rax` (three) exist but read the old register or touch the
+stack, so only `-Os` and `-Oz` take them.
+
 **The imm64 census is the chain census,** and it finds what armlint's
 finds on AArch64. libLLVM materializes splitmix64's multiplier
 `0xbf58476d1ce4e5b9` -- `DenseMap`'s pointer hash,
@@ -2553,6 +2576,29 @@ for a 78 KB pool of 9,733 values, at a load each -- the AArch64 shape,
 and the question is which of those constants are hot. The profile join
 again: `js::Interpret` carries the Undefined tag 55 times and is the one
 function where a pinned register's cost and gain are both measurable.
+
+## Candidate lenses (2026-11-05)
+
+The whole-binary analyses proposed on 2026-11-05 in the spirit of `-r`,
+with the sizing each got from an objdump pass. The sizings are upper
+bounds from one binary each; recalibrate on the corpus before quoting one
+in a section above. Built so far: `tools/framescan` ("Frame layout"),
+`-k` ("Constant census") and `-n` ("Inlining census"), each in its own
+section; the rest are recorded here so they are not re-proposed and so
+the next one can be picked by size.
+
+| analysis | what it measures | sizing so far | status |
+| --- | --- | --- | --- |
+| Hot/cold partition as an axis | Every count split by the PGO partition, read from each FDE's initial CFA in `.eh_frame` (a fragment whose first CFA row is not `rsp+8` starts inside its parent's frame). Also the natural weighting for `framescan`. | Fedora libxul: the frame-layout bound fell from 34.2% to 17.9% when weighted by hand; the GCC chain tables in "Constant census" show a per-partition compiler policy the census could only see by address | Next to build: it changes every existing number, the two census headlines included |
+| `mov`+`shl` chain fold in `-k` | Key `mov r32, imm32 ; shl r64, n` (same register, within the basic block, up to seven instructions apart, any `n`: 47 for the Undefined tag, 49 for Null) by the value it builds, a nine-byte imm64 site | Fedora libxul: 15,178 pairs; the Undefined count would read 17,791 beside the clang build's 15,046 instead of nothing | Specified by measurement; an afternoon in `consts_tally` with a per-register pending slot |
+| Literal-pool counterfactual | What a 7-byte RIP-relative load would save against the 10-byte MOVABS, per value, at a load each | libxul: 618 KB back for a 78 KB pool of 9,733 values | Needs the profile to say which constants are hot; `tools/` work, since it wants MiniDebugInfo |
+| MiniDebugInfo in the driver | Function tables for stripped Fedora binaries, so `-k` repeats, `-n` placement and `-f` work there | Fedora libxul: 2 exported functions today; `-n` places none of its 1.6 M calls | A liblzma dependency decision, the user's; the mining tools already read it |
+| Profile join | Weight `--json` findings by `perf script` samples; the README promises it and nothing does it | `js::Interpret` is the test function: 2,492 of 2,562 slot accesses disp32, 55 Undefined tags, and the one place a pinned register's cost and gain are both measurable | Not started |
+| `-p` rows | Function alignment, loop alignment against the 1-in-16 chance baseline, interposable GOT/PLT self-references, ICF duplicates, hardening flags | Loop alignment: GCC 24-28% vs clang 7.3%; function alignment 16 everywhere, Go 32; the self-references and ICF duplicates are measured in "Four-toolchain corpus" | No rows yet. Trap: `ret; int3` is Go's and LLD's padding fill (go 2,444, libLLVM 36,908), not `-mharden-sls`; gate any SLS row on sized symbols |
+| Inlining census | Direct calls to functions of at most 16 body bytes, and why they survived | Go 22.6%, libc 2.4% by symbol size before the census; see "Inlining census" for the measured version | **Done** as `x86lint -n` |
+| `jmp` to a `ret` | A tail jump that lands on a bare `ret`, where a `ret` would do | libLLVM 3,950, Go 342, GCC 0 | Small and clang-only; probably not worth a check |
+| GCC frame-pointer layout | Whether aggregates nearest RBP (spills behind) is GCC's frame-pointer path specifically | Two-line reproduction in `framescan`'s calibration | Open question from "Frame layout" |
+| PLT self-calls | Of the calls into the PLT, those whose entry resolves to a function this object defines: GCC's semantic-interposition cost, which the inlining controls show hides in that bucket rather than as direct calls | one-TU `-fPIC` control: 7 of 8 calls; corpus share unmeasured | Follow-up to `-n`: walk `.rela.plt` to `.dynsym` as the ENDBR audit does |
 
 ## Investigated and closed (2026-08 sweep)
 

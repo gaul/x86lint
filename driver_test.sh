@@ -697,6 +697,29 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
+# canaryhidden: a stripped shared object whose one export is a plain wrapper
+# and whose protected function is local, so .dynsym lists no function that
+# reads the guard while the image imports the handler that function calls.
+# This is what Firefox's libfreeblpriv3.so looks like from the outside -- two
+# exports, 536 guard loads behind them -- and the verdict must say the
+# protection is in code the sample does not cover, not that there is none.
+cat >"$dir/canaryhidden.s" <<'EOF'
+    .text
+    .globl api
+    .type api, @function
+api:
+    .byte 0x31, 0xc0                    # xor eax, eax
+    .byte 0xc3                          # ret
+    .size api, . - api
+    .type hidden, @function
+hidden:
+    .byte 0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00  # mov rax, fs:0x28
+    call __stack_chk_fail@PLT
+    .byte 0xc3                          # ret
+    .size hidden, . - hidden
+    .section .note.GNU-stack, "", @progbits
+EOF
+
 # framePtr: three functions, of which one establishes a frame pointer the way a
 # compiler does, one opens with Go's stack-growth check before the same pair
 # (which a window of zero instructions would miss, as it missed 79% of
@@ -949,6 +972,8 @@ if ! cc -nostdlib -pie -Wl,--build-id=none \
         -o "$dir/cleandyn" "$dir/clean.s" ||
    ! cc -shared -nostdlib -Wl,--build-id=none \
         -o "$dir/cetso.so" "$dir/cetso.s" ||
+   ! cc -shared -nostdlib -Wl,--build-id=none,-s \
+        -o "$dir/canaryhidden.so" "$dir/canaryhidden.s" ||
    ! cc -c -o "$dir/clean.o" "$dir/clean.s" ||
    ! cc -c -o "$dir/jccpad.o" "$dir/jccpad.s" ||
    ! cc -c -o "$dir/reloc.o" "$dir/reloc.s" ||
@@ -1444,6 +1469,18 @@ expect 'no stack protector \(the guard is read but no handler is named'
 run 0 -p -v "$dir/canarysetup"
 expect '^    __stack_chk_fail absent in the symbol table$'
 
+# The converse: the handler is named but no examined function reads the guard,
+# so the protected functions are outside the sample. A stripped library's
+# .dynsym is where this happens, and "no stack protector" would be a false
+# claim about the 536 guard loads behind libfreeblpriv3.so's two exports.
+run 0 -p "$dir/canaryhidden.so"
+expect '^build properties: 1 function examined$'
+expect '^  stack protector: 0 of 1 function \(0\.0%\) -- -fstack-protector or -strong, in code this sample does not cover \(no examined function reads the guard, but __stack_chk_fail is named, so an unlisted function calls it\)$'
+reject ' -- no stack protector$' "a false claim on a biased sample"
+expect 'measured over the exported functions in \.dynsym'
+run 0 -p -v "$dir/canaryhidden.so"
+expect '^    __stack_chk_fail named in the symbol table$'
+
 # Nothing reads the guard at all.
 run 0 -p "$dir/clean"
 expect '^  stack protector: 0 of 1 function \(0\.0%\) -- no stack protector$'
@@ -1635,6 +1672,7 @@ snapshot jcc-unplaced -j "$dir/clean.o"
 snapshot canary-partial -p -v "$dir/canary"
 snapshot frameptr -p "$dir/frameptr"
 snapshot canary-setup -p -v "$dir/canarysetup"
+snapshot canary-hidden -p -v "$dir/canaryhidden.so"
 snapshot canary-none -p "$dir/clean"
 snapshot thunk-routed -s "$dir/thunkfull.o"
 snapshot thunk-hole -s "$dir/thunkhole.o"

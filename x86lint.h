@@ -1187,6 +1187,12 @@ enum x86lint_build_verdict {
     X86LINT_BUILD_ABSENT,    // no function has it
     X86LINT_BUILD_PARTIAL,   // some do
     X86LINT_BUILD_ALL,       // every one does
+    // None of the examined functions has it, but the image proves it is in
+    // use -- __stack_chk_fail is named, and only protected code calls it --
+    // so the property lives in code the symbol table does not list. The
+    // .dynsym sample of a stripped library is where this happens: exports
+    // that are thin wrappers, protection in the internals behind them.
+    X86LINT_BUILD_ELSEWHERE,
 };
 
 x86lint_build *x86lint_build_create(void);
@@ -1201,10 +1207,13 @@ void x86lint_build_scan_function(x86lint_build *build, const uint8_t *inst,
 
 // Corroboration from the container: whether the image names
 // __stack_chk_fail, which a protected function calls when the guard does not
-// match. Printed beside the coverage rather than folded into it -- a function
-// can read the guard without checking it, which is what a libc setting the
-// guard up does, so the two signals differ by a handful per binary and the
-// report says so instead of picking one.
+// match. Printed beside the coverage, and consulted where the coverage alone
+// would mislead, at both ends of the scale: functions reading the guard with
+// no handler named are a libc setting the guard up, not code protected by it
+// (ABSENT), and a handler named with no examined function reading the guard
+// means the protected functions are outside the sample (ELSEWHERE), not that
+// there are none. In between, the two signals differ by a handful per binary
+// and the report shows both instead of picking one.
 void x86lint_build_set_evidence(x86lint_build *build, bool chk_fail_named);
 
 // Print the audit. No return value: this mode never sets the exit status.

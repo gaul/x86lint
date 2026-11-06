@@ -8693,6 +8693,22 @@ static void build_test(void)
         X86LINT_BUILD_PARTIAL);
     x86lint_build_destroy(b);
 
+    // The converse: a handler named and no examined function reading the
+    // guard means the protected functions are outside the sample -- a
+    // stripped library whose exports are wrappers -- not that there are none.
+    b = x86lint_build_create();
+    assert(b != NULL);
+    x86lint_build_scan_function(b, plain, sizeof(plain));
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_ABSENT);
+    x86lint_build_set_evidence(b, true);
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_CANARY) ==
+        X86LINT_BUILD_ELSEWHERE);
+    // The handler says nothing about frame pointers.
+    assert(x86lint_build_verdict(b, X86LINT_BUILD_FRAME_PTR) ==
+        X86LINT_BUILD_ABSENT);
+    x86lint_build_destroy(b);
+
     // Every function guarded, which is what -fstack-protector-all produces.
     b = x86lint_build_create();
     assert(b != NULL);

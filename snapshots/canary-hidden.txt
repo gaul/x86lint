@@ -1,0 +1,6 @@
+build properties: 1 function examined
+  stack protector: 0 of 1 function (0.0%) -- -fstack-protector or -strong, in code this sample does not cover (no examined function reads the guard, but __stack_chk_fail is named, so an unlisted function calls it)
+  frame pointers: 0 of 1 function (0.0%) -- omitted (-fomit-frame-pointer, the default at -O2)
+    __stack_chk_fail named in the symbol table
+  measured over the exported functions in .dynsym (.symtab is stripped, so this is a biased sample of the binary's functions)
+exit status: 0

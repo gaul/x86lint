@@ -6280,6 +6280,16 @@ enum x86lint_build_verdict x86lint_build_verdict(const x86lint_build *build,
     }
     size_t n = build->count[prop];
     if (n == 0) {
+        // The converse of the ld.so case below. A handler is named, so some
+        // function calls it when its guard fails; no examined function reads
+        // the guard, so that function is not among them. Firefox 160's
+        // libfreeblpriv3.so is the shape: two exported functions, neither
+        // protected, and 536 guard loads in the code .dynsym does not list.
+        // Calling that `no stack protector` on a sample of two was a false
+        // claim, which is the one failure this tool is not allowed.
+        if (prop == X86LINT_BUILD_CANARY && build->chk_fail_named) {
+            return X86LINT_BUILD_ELSEWHERE;
+        }
         return X86LINT_BUILD_ABSENT;
     }
     // Reading the guard is not being protected by it. A protected function
@@ -6298,7 +6308,7 @@ enum x86lint_build_verdict x86lint_build_verdict(const x86lint_build *build,
 static void build_print_prop(const x86lint_build *build,
                              enum x86lint_build_prop prop, const char *name,
                              const char *absent, const char *partial,
-                             const char *all)
+                             const char *all, const char *elsewhere)
 {
     size_t n = build->count[prop];
     printf("  %s: %zu of %zu function%s", name, n, build->functions,
@@ -6315,6 +6325,11 @@ static void build_print_prop(const x86lint_build *build,
         break;
     case X86LINT_BUILD_ALL:
         printf(" -- %s\n", all);
+        break;
+    case X86LINT_BUILD_ELSEWHERE:
+        // Only the canary has a second signal to reach this verdict on; a
+        // property without one passes NULL and can never arrive here.
+        printf(" -- %s\n", elsewhere != NULL ? elsewhere : absent);
         break;
     case X86LINT_BUILD_UNKNOWN:
         printf("\n");
@@ -6341,7 +6356,10 @@ void x86lint_build_print(const x86lint_build *build, bool verbose)
             ? "no stack protector"
             : "no stack protector (the guard is read but no handler is named, "
               "so this is where it gets set up)",
-        "-fstack-protector or -strong", "-fstack-protector-all");
+        "-fstack-protector or -strong", "-fstack-protector-all",
+        "-fstack-protector or -strong, in code this sample does not cover "
+        "(no examined function reads the guard, but __stack_chk_fail is "
+        "named, so an unlisted function calls it)");
     // A frame-pointer build cannot reach every function -- a leaf needing no
     // frame does not get one even under -fno-omit-frame-pointer -- so the
     // reading is a nonzero share against a zero one, and "all" is a shape
@@ -6349,7 +6367,7 @@ void x86lint_build_print(const x86lint_build *build, bool verbose)
     build_print_prop(build, X86LINT_BUILD_FRAME_PTR, "frame pointers",
         "omitted (-fomit-frame-pointer, the default at -O2)",
         "kept (-fno-omit-frame-pointer; leaves that need no frame have none)",
-        "kept in every function");
+        "kept in every function", NULL);
     if (verbose) {
         // The corroborating signal, which the verdict above already rests on.
         // Which functions -strong protects is not decidable from the bytes --

@@ -1362,6 +1362,15 @@ function must be able to fail, so with no handler named the verdict is
 `no stack protector` however many functions touch the slot -- and the report
 says which of the two signals it is looking at.
 
+**The converse case was a false claim until 2026-11-06.** A named handler
+with no examined function reading the guard was reported as `no stack
+protector`. Firefox 160's libfreeblpriv3.so (2 exports, 536 guard loads in
+the code `.dynsym` omits) and libsoftokn3.so (10 exports, 261) showed what
+that does on a biased sample. It is now its own verdict, `X86LINT_BUILD_ELSEWHERE`,
+printed as "in code this sample does not cover" and gated on the handler the
+audit already reads; `canaryhidden.so` is the fixture, a stripped shared
+object whose only export is a plain wrapper around a protected local function.
+
 **Two measurement corrections worth keeping.** The guard load is not a
 prologue-only phenomenon: GCC schedules it wherever register pressure allows,
 and the first probe searched the first dozen instructions of each function,

@@ -1345,6 +1345,14 @@ names no `__stack_chk_fail` at all. An earlier version called that binary
 must be able to fail, so with no handler named anywhere the verdict is
 `no stack protector` however many functions touch the slot.
 
+The converse is a verdict of its own. A handler named with no examined
+function reading the guard means the protected functions are outside the
+sample, not that there are none: Firefox 160's libfreeblpriv3.so exports two
+functions, neither reads the guard, and the code `.dynsym` does not list holds
+536 guard loads. An earlier version called that `no stack protector` too, on a
+sample of two. The report now says the protection is in code the sample does
+not cover, and names the handler as the reason it knows.
+
 Which functions `-strong` protects is not decidable from the bytes -- it turns
 on having a local array or an address-taken local -- so the partial verdict
 names both flags and does not choose between them. The audit is informational

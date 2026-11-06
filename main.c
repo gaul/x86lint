@@ -2267,7 +2267,7 @@ int main(int argc, char **argv)
     // Exit status follows the grep convention so a gating CI can tell a
     // dirty scan from a broken run: 0 = clean scan, 1 = opportunities
     // found, 2 = tool failure (usage, I/O, malformed ELF, allocation).
-    // The -i, -r, -k and -n censuses are informational and never contribute
+    // The -i, -r, -c and -n censuses are informational and never contribute
     // findings.
     bool verbose = false;
     bool scan_all = false;
@@ -2288,7 +2288,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-v") == 0) {
             verbose = true;
-        } else if (strcmp(argv[i], "-a") == 0) {
+        } else if (strcmp(argv[i], "-A") == 0) {
             scan_all = true;
         } else if (strcmp(argv[i], "-e") == 0) {
             endbr = true;
@@ -2298,9 +2298,11 @@ int main(int argc, char **argv)
             isa_census = true;
         } else if (strcmp(argv[i], "-r") == 0) {
             reg_census = true;
-        } else if (strcmp(argv[i], "-k") == 0) {
-            // The constant census: -c, armlint's letter for it, is taken
-            // by the finding classes.
+        } else if (strcmp(argv[i], "-c") == 0) {
+            // The constant census, under armlint's letter for it. The
+            // letters the two tools share mean the same thing: -A scans
+            // every byte and -a enables the opt-in finding classes, as in
+            // armlint, so that a reader of one report can read the other.
             const_census = true;
         } else if (strcmp(argv[i], "-n") == 0) {
             // The inlining census: the calls not inlined. -i, the natural
@@ -2314,7 +2316,7 @@ int main(int argc, char **argv)
             prop_audit = true;
         } else if (strcmp(argv[i], "--json") == 0) {
             json = true;
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
             // Additional kinds of finding. The default scan reports only
             // verified rewrites, which is what makes a non-zero exit mean
             // "there is something here to fix"; advice the tool cannot check
@@ -2322,7 +2324,7 @@ int main(int argc, char **argv)
             // enabled they count like any other finding.
             uint32_t klass;
             if (!x86lint_class_parse(argv[++i], &klass)) {
-                fprintf(stderr, "%s: unknown -c class '%s'\n",
+                fprintf(stderr, "%s: unknown -a class '%s'\n",
                     argv[0], argv[i]);
                 return 2;
             }
@@ -2354,10 +2356,10 @@ int main(int argc, char **argv)
                 extensions |= X86LINT_EXT_V8;
             } else {
                 fprintf(stderr,
-                    "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-n] [-j] [-s] [-p] [--json] "
+                    "usage: %s [-v] [-A] [-e] [-f FUNC] [-i] [-r] [-c] [-n] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "[-c advisory|security|all] <ELF_FILE>\n",
+                "[-a advisory|security|all] <ELF_FILE>\n",
                     argv[0]);
                 return 2;
             }
@@ -2365,44 +2367,44 @@ int main(int argc, char **argv)
             path = argv[i];
         } else {
             fprintf(stderr,
-                "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-n] [-j] [-s] [-p] [--json] "
+                "usage: %s [-v] [-A] [-e] [-f FUNC] [-i] [-r] [-c] [-n] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "[-c advisory|security|all] <ELF_FILE>\n",
+                "[-a advisory|security|all] <ELF_FILE>\n",
                 argv[0]);
             return 2;
         }
     }
     if (path == NULL) {
         fprintf(stderr,
-            "usage: %s [-v] [-a] [-e] [-f FUNC] [-i] [-r] [-k] [-n] [-j] [-s] [-p] [--json] "
+            "usage: %s [-v] [-A] [-e] [-f FUNC] [-i] [-r] [-c] [-n] [-j] [-s] [-p] [--json] "
                 "[-m bmi1|bmi2|movbe|apx|v8] "
                 "[-t generic|sandybridge|skylake|icelake|zen|silvermont] "
-                "[-c advisory|security|all] <ELF_FILE>\n",
+                "[-a advisory|security|all] <ELF_FILE>\n",
             argv[0]);
         return 2;
     }
-    // -a widens the scan to every byte and -f narrows it to one function;
+    // -A widens the scan to every byte and -f narrows it to one function;
     // combining them has no coherent meaning.
     if (fname != NULL && scan_all) {
-        fprintf(stderr, "%s: -a and -f are mutually exclusive\n", argv[0]);
+        fprintf(stderr, "%s: -A and -f are mutually exclusive\n", argv[0]);
         return 2;
     }
-    // The ISA (-i), register (-r), constant (-k) and inlining (-n) censuses
+    // The ISA (-i), register (-r), constant (-c) and inlining (-n) censuses
     // describe the same sweep of every executable byte, so from here on one
     // flag drives that sweep and the four only decide which tallies it
     // feeds and which reports print.
     const bool census = isa_census || reg_census || const_census ||
         inline_census;
     // --json reports the peephole scan and nothing else: -v would interleave
-    // prose with the document, and -i, -r, -k, -n, -e, -j, -s and -p are
+    // prose with the document, and -i, -r, -c, -n, -e, -j, -s and -p are
     // separate reports whose shapes this schema does not describe. Refused
     // rather than resolved, since either choice would surprise half the
     // callers.
     if (json && (verbose || census || endbr || jcc_audit || thunk_audit ||
                  prop_audit)) {
         fprintf(stderr,
-            "%s: --json cannot be combined with -v, -i, -r, -k, -n, -e, -j, "
+            "%s: --json cannot be combined with -v, -i, -r, -c, -n, -e, -j, "
             "-s or -p\n", argv[0]);
         return 2;
     }
@@ -2545,10 +2547,10 @@ int main(int argc, char **argv)
     // and restricting the scan to those would silently skip almost every
     // internal function -- a clean report that scanned nothing. With no
     // .symtab (every stripped distro binary) the scan covers whole
-    // sections exactly as before; -a forces that even when symbols exist.
+    // sections exactly as before; -A forces that even when symbols exist.
     // The census and the JCC audit always scan every executable byte --
     // each is a description of the file, not a per-function report -- so
-    // they skip the restriction the same way -a does. -f NAME is different
+    // they skip the restriction the same way -A does. -f NAME is different
     // on both counts: an explicit request for one function is meaningful in
     // every mode, and naming an exported function of a stripped library is
     // its point, so it loads always and draws on .dynsym too. Names ride
@@ -2560,7 +2562,7 @@ int main(int argc, char **argv)
     // sample of a library's, but a biased fraction is still a fraction where no
     // sample at all is nothing. Never both, or every exported function would
     // be counted twice and the denominator would be fiction.
-    // -k counts a function's repeats of a constant and -n places calls
+    // -c counts a function's repeats of a constant and -n places calls
     // against functions, so they want ranges on the same terms -- .symtab,
     // else the exports -- and say which they got; the sweep itself still
     // covers every byte.
@@ -3068,7 +3070,7 @@ int main(int argc, char **argv)
             shdr.sh_name < shstrtab_size ? shstrtab + shdr.sh_name : "";
 
         // Skip the dynamic linker's import glue; see is_linker_stub_section.
-        // -a keeps its contract -- it means scan every byte, and that now
+        // -A keeps its contract -- it means scan every byte, and that now
         // includes the glue for anyone auditing a linker rather than a
         // compiler. The ENDBR64 verification (-e) is a separate pass and is
         // deliberately unaffected: PLT entries really are indirect-branch
@@ -3109,7 +3111,7 @@ int main(int argc, char **argv)
         // below, because it needs every executable byte exactly as it will be
         // executed: masking rewrites the buffer, and a jump in the padding
         // between two functions still pays the erratum. Like -e it is a
-        // separate pass over the whole file, so -a and -f do not change what
+        // separate pass over the whole file, so -A and -f do not change what
         // it sees.
         //
         // It needs the address the code will run at, which a section only
@@ -3551,9 +3553,9 @@ int main(int argc, char **argv)
             printf("scan restricted to function '%s': %zu site%s, %lu bytes\n",
                 fname, nfuncs, nfuncs == 1 ? "" : "s", (unsigned long) fbytes);
         } else if (funcs != NULL && !census) {
-            // -k loads the symbols to attribute repeats, not to restrict.
+            // -c loads the symbols to attribute repeats, not to restrict.
             printf("scan restricted to %zu function symbols "
-                "(-a scans every byte)\n", nfuncs);
+                "(-A scans every byte)\n", nfuncs);
         }
         // What the relocations took out, stated rather than left to be
         // inferred from the undecodable-byte count they inflate.

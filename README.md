@@ -362,7 +362,7 @@ non-code that *decodes* cleanly -- GHC info tables, LLVM's constexpr tables,
 jump tables -- which linear sweep would otherwise report pseudo-instruction
 findings from, and which the undecodable-bytes counter cannot flag. Excluded
 bytes are tallied into that skipped count, and a summary line reports the
-restriction; pass `-a` to scan every byte anyway. The dynamic symbol table is
+restriction; pass `-A` to scan every byte anyway. The dynamic symbol table is
 never used for this -- it survives stripping but lists only exports, and
 scanning just those would silently miss almost all code -- so stripped
 binaries scan whole sections exactly as before. An unsized assembly label
@@ -400,7 +400,7 @@ exit a compiler test suite gates on. The exclusion is by section rather than
 by symbol because the symbol restriction already hid it wherever `.symtab`
 survived (glibc reported none) and could not where it did not, so the noise
 appeared only on stripped binaries -- which is how a distro library is
-usually scanned. `-a` keeps its contract and scans the glue too, for anyone
+usually scanned. `-A` keeps its contract and scans the glue too, for anyone
 auditing a linker rather than a compiler. The `-e` verification is a separate
 pass and deliberately unaffected: PLT entries really are indirect-branch
 targets under IBT, so whether they carry landing pads is the one thing about
@@ -529,7 +529,7 @@ Lake. An unknown name is a usage error rather than a silent fallback to the
 default, since a typo that quietly changed which findings appear would be
 worse than a refusal.
 
-Pass `-c advisory`, `-c security` or `-c all` to report kinds of finding the
+Pass `-a advisory`, `-a security` or `-a all` to report kinds of finding the
 default scan withholds. Most checks state a verified byte-level rewrite: the
 replacement is equivalent, the tool proved the conditions, and applying it is
 mechanical. Those are the default, and they are what makes a non-zero exit
@@ -546,14 +546,14 @@ description and were, until now, reported beside them as though they did.
 * **security** is not a rewrite at all. The IBT-bypassing NOTRACK call is a
   review item, since dropping the prefix without padding the target trades
   the bypass for a `#CP` fault, so the reader is being asked to look rather
-  than to patch. armlint keeps the same kind behind its own opt-in flag,
+  than to patch. armlint keeps the same kind behind the same flag,
   `-a pac`.
 
 The bits are independent, so advisories can be asked for without review items
 or the other way round, and an unknown name is a usage error rather than a
 silent default. Enabling a class makes its findings count like any other,
 exit status included: you asked for them. On glibc the default scan reports
-7,130 findings and `-c advisory` reports 7,464, the difference being 194
+7,130 findings and `-a advisory` reports 7,464, the difference being 194
 SETcc zero-extensions and 140 prefix stalls.
 
 One finding changes class rather than appearing: under `-m apx` the SETcc
@@ -588,7 +588,7 @@ dispatch loop outweighs thousands in cold initialization code, and only a
 profile can tell the two apart. `function` and `function_offset` appear when
 the binary kept symbols to attribute against, and `restriction` carries what
 narrowed the scan -- `{"symbols": N}` by default, `{"function": ..., "sites":
-N, "bytes": N}` under `-f`, and absent under `-a` -- so that a partial scan
+N, "bytes": N}` under `-f`, and absent under `-A` -- so that a partial scan
 is not read as a clean sweep of the whole file.
 
 Findings are written as they are found rather than collected first, so a
@@ -598,13 +598,13 @@ Section and symbol names are copied from the file verbatim, so a binary whose
 string tables are not UTF-8 yields strings that are not either. The exit
 status is unchanged, and a file the driver rejects leaves stdout empty rather
 than half a document. `--json` describes the peephole scan alone: `-v`, `-i`,
-`-r`, `-k`, `-n`, `-e`, `-j`, `-s` and `-p` are separate reports whose output
+`-r`, `-c`, `-n`, `-e`, `-j`, `-s` and `-p` are separate reports whose output
 would interleave with it, and the driver refuses the combination rather than
 choosing for the caller.
 
 Pass `-e` to also verify the binary's CET indirect-branch-tracking landing
 pads, `-i` to replace the lint scan with an ISA census of the binary, `-r`
-with a register census, `-k` with a constant census, `-n` with an inlining
+with a register census, `-c` with a constant census, `-n` with an inlining
 census, `-j` with a JCC-erratum verdict, `-s` with a speculation-thunk
 verdict, and `-p` with a per-function build-property audit; see the next
 sections.
@@ -613,7 +613,7 @@ The exit status follows the grep convention -- 0 for a clean scan, 1 when any
 opportunity is found, 2 on a tool failure (unreadable or malformed input) --
 so x86lint can gate a compiler test suite and CI can tell a dirty scan from a
 broken run. `-e` findings set the exit status like any other; the `-i`, `-r`,
-`-k` and `-n` censuses never set it, the `-j` audit sets it only under `-t skylake`
+`-c` and `-n` censuses never set it, the `-j` audit sets it only under `-t skylake`
 (the one target that has the erratum), the `-s` audit only for a mitigation
 left incomplete, and the `-p` audit never.
 
@@ -929,17 +929,17 @@ evidenced and all inside its `*_evex` and `*_avx512` string and memory
 functions, which use YMM16-YMM31 because those registers need no
 VZEROUPPER.
 
-## Constant census (`-k`)
+## Constant census (`-c`)
 
-`x86lint -k` replaces the lint scan with a census of constants: which
+`x86lint -c` replaces the lint scan with a census of constants: which
 immediates the code carries, what they cost in encoding bytes, and which a
 function carries more than once. It is the x86 counterpart of armlint's `-c`
-report on MOVZ/MOVK chains (`-c` here is taken by the finding classes). It
-sweeps the same bytes as `-i` and `-r`, carries the same evidence labels, and
-combines with them and with `-f`.
+report on MOVZ/MOVK chains, under the same letter. It sweeps the same bytes
+as `-i` and `-r`, carries the same evidence labels, and combines with them
+and with `-f`.
 
 ```console
-$ ./x86lint -k /usr/lib64/libc.so.6
+$ ./x86lint -c /usr/lib64/libc.so.6
 constant census: 359838 instructions, 0 undecodable bytes skipped
   immediates by encoded width: imm8 33983, imm16 139, imm32 19990, imm64 532; 118477 bytes, 7.75% of the 1528109 bytes swept
   wide immediates (imm32 and imm64): 20522 carrying 1447 distinct values, 84216 bytes (5.51%)
@@ -1116,7 +1116,7 @@ GCC's `-fPIC` sends its calls to its own exported functions through the PLT
 rather than leaving them as direct calls, so GCC's semantic-interposition
 cost hides in the `to a linker stub` count, not in this census's headline.
 
-`-v` adds each ranked function's first three call sites. `-i`, `-r`, `-k` and
+`-v` adds each ranked function's first three call sites. `-i`, `-r`, `-c` and
 `-n` share one sweep and may be combined.
 
 ## JCC erratum audit (`-j`)
@@ -1441,7 +1441,7 @@ All of them restrict the scan to the symbol table's function ranges and skip
 the dynamic linker's import glue exactly as the driver does, so no pair or
 distance spans two functions, none is mined from the non-code that executable
 sections interleave, and none counts the PLT's one fixed template as though a
-compiler had emitted it; `-a` scans every byte (`framescan` has no `-a`:
+compiler had emitted it; `-A` scans every byte (`framescan` has no `-A`:
 without function boundaries there is no frame). A binary whose `.symtab`
 was stripped but that kept MiniDebugInfo -- the xz-compressed symbol tables
 Fedora leaves in `.gnu_debugdata` for gdb -- gets its ranges and names from

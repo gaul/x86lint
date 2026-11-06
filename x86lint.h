@@ -900,10 +900,10 @@ enum x86lint_classes {
     X86LINT_CLASS_SECURITY = 1u << 2,  // a review item, not a rewrite
 };
 
-// The name accepted by the driver's -c, or NULL for an unknown class.
+// The name accepted by the driver's -a, or NULL for an unknown class.
 const char *x86lint_class_name(uint32_t klass);
 
-// Parse a -c name into its bit; returns false for an unknown one. "all"
+// Parse a -a name into its bit; returns false for an unknown one. "all"
 // yields every class.
 bool x86lint_class_parse(const char *name, uint32_t *out);
 

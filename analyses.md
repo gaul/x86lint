@@ -276,7 +276,7 @@ argue for or against each, live in [TODO.md](TODO.md).
 
 ## IBT-bypassing NOTRACK call
 
-*Security class: reported only under `-c security` or `-c all`.*
+*Security class: reported only under `-a security` or `-a all`.*
 
 * `3E FFD0` (NOTRACK CALL RAX) -- the 3E prefix exempts this one indirect
   call from CET indirect-branch tracking: the CPU will not require an
@@ -322,7 +322,7 @@ argue for or against each, live in [TODO.md](TODO.md).
 
 ## length-changing prefix stall
 
-*Advisory class: reported only under `-c advisory` or `-c all`.*
+*Advisory class: reported only under `-a advisory` or `-a all`.*
 
 * `66 81C1 3412` (ADD CX, 0x1234) -- a 66 prefix that changes the
   immediate's length (imm32 -> imm16) defeats the pre-decoder's length
@@ -1209,7 +1209,7 @@ argue for or against each, live in [TODO.md](TODO.md).
 
 ## suboptimal SETcc zero-extension
 
-*Advisory class: reported only under `-c advisory` or `-c all`. Under `-m apx`
+*Advisory class: reported only under `-a advisory` or `-a all`. Under `-m apx`
 the same pair is "missing APX SETZU" instead, which is a verified rewrite and
 stays in the default scan.*
 

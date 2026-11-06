@@ -25,14 +25,14 @@ Figures marked **2026-09 Rust sweep** add three binaries totalling
 and C++ one does not: `geckodriver` (rustc, 715k) and `http3server`
 (rustc, 549k) from the Firefox tree, and uutils `coreutils` 0.11.0
 (1.98M), the only one of the three built outside this tree. uutils
-ships stripped, so it was swept with `-a`; treat its absolute numbers
+ships stripped, so it was swept with `-A`; treat its absolute numbers
 as upper bounds, though `geckodriver`'s symbol-restricted run
 reproduces the same ranking.
 
 Both tools restrict the scan to the symbol table's function ranges, so
 no pair or def-use distance spans two functions or is mined from the
 non-code that executable sections interleave. Only libxul, go and libc
-kept a `.symtab`; bash, libstdc++ and libcrypto were swept with `-a`,
+kept a `.symtab`; bash, libstdc++ and libcrypto were swept with `-A`,
 which scans every byte and therefore admits data-in-text. Treat their
 numbers as upper bounds.
 
@@ -552,7 +552,7 @@ adjacency counts over libxul (32.1M decoded instructions, against the
 828k, libstdc++ 358k, libc 356k and bash 254k. The sweep applies no
 liveness proof and no side-entry gate and is not symbol-restricted, so
 every figure is an upper bound admitting data-in-text -- the same
-standing this file gives its `-a`-swept binaries.
+standing this file gives its `-A`-swept binaries.
 
 | Pattern | Rewrite | 2026-09 port sweep |
 | --- | --- | --- |
@@ -898,12 +898,12 @@ rather than merely missing.
 
 | Item | Notes |
 | --- | --- |
-| ~~Linker import glue scanned as if it were compiler output~~ | **Done, 2026-09-15 (833a433).** The `.plt`, `.iplt` and `.plt.*` sections were linted, contributing a constant 135 unfixable findings per stripped binary: a lazy-binding entry pushes its relocation index with the 5-byte `push imm32`, so every entry whose index fits a signed imm8 draws an oversized-immediate finding and the count saturates at exactly 128, plus 7 from the resolver jumps. Identical in libstdc++ (1,105 PLT entries), bash (236) and libcrypto (161), and enough on their own to fail the non-zero exit a compiler test suite gates on. Excluded by section rather than by symbol, because the symbol restriction already hid it wherever `.symtab` survived and could not where it did not, so the noise appeared only on stripped binaries. `-a` still scans the glue; `-e` is untouched, PLT entries being real IBT targets. The fix also had to read the section-name table for every run rather than only under `-v`, `-e`, `-i` and `--json` -- a first version left that alone and silently did nothing in exactly the plain invocation it exists for |
+| ~~Linker import glue scanned as if it were compiler output~~ | **Done, 2026-09-15 (833a433).** The `.plt`, `.iplt` and `.plt.*` sections were linted, contributing a constant 135 unfixable findings per stripped binary: a lazy-binding entry pushes its relocation index with the 5-byte `push imm32`, so every entry whose index fits a signed imm8 draws an oversized-immediate finding and the count saturates at exactly 128, plus 7 from the resolver jumps. Identical in libstdc++ (1,105 PLT entries), bash (236) and libcrypto (161), and enough on their own to fail the non-zero exit a compiler test suite gates on. Excluded by section rather than by symbol, because the symbol restriction already hid it wherever `.symtab` survived and could not where it did not, so the noise appeared only on stripped binaries. `-A` still scans the glue; `-e` is untouched, PLT entries being real IBT targets. The fix also had to read the section-name table for every run rather than only under `-v`, `-e`, `-i` and `--json` -- a first version left that alone and silently did nothing in exactly the plain invocation it exists for |
 | Mach-O and universal-binary support | The driver reads ELF only: `main.c` contains no Mach-O or PE constant at all. armlint reads ELF, thin Mach-O and fat binaries, walking every ARM64-family slice. The direct gain is macOS Intel binaries, but the larger one is that **every cross-project figure in this file compares a Linux ELF corpus against armlint's macOS Mach-O one** and has to caveat it; a shared format would let the two tools measure the same binaries for the first time. What it needs: the `LC_SEGMENT_64`/`LC_SYMTAB` parse, `LC_FUNCTION_STARTS` for the scan restriction on stripped binaries (ELF has no equivalent and simply gives up there), the fat-header walk, and the `__stubs`/`__stub_helper`/`__objc_stubs` exclusion that pairs with the PLT row above. Most of this is architecture-independent and already written in armlint's `main.c`, the cputype filter aside |
 | ~~Durable candidate sizing~~ | **Done, 2026-09-15: `tools/shapescan`.** Sizes a named candidate with the rewrite's own conditions applied and reports which gate refused the rest. Candidates are C predicates rather than a data description, because every one measured this session needed operand-role matching, branch arithmetic, encodability through XED or a liveness walk; the file includes `x86lint.c` so a shipped candidate is measured by the code that realizes it, and an unshipped one is a draft check that moves into the linter rather than being rewritten. It mirrors the driver's corpus byte for byte -- same masking, same branch-target prepass, same decode and resync -- so the four shipped candidates reproduce x86lint's own counts exactly (19, 583, 10 and 352 on libxul), which is the tool's regression test. **The refusal breakdown is the point**, and it already said something no ad-hoc census had: of the vector fold's 18,236 libxul sites, 5,743 fail *encodability* rather than liveness, a third of the shape that every throwaway script had pre-filtered away and so never counted. What does not port from armlint's `shapescan.py` is `--selftest`'s mask verification, which exists because armlint hand-writes encoding masks; XED removes that failure mode |
 | ~~A target-core axis (`-t`)~~ | **Done, 2026-09-15: [#28](https://github.com/gaul/x86lint/issues/28).** Four behaviours whose worth is per-core became gates rather than prose: the slow-LEA exclusion, POPCNT's phantom destination, the length-changing prefix stall's MOV half and the SUB zeroing idiom. A check declares `target_requires` the way it declares `ext_required`, and `generic` sets every bit so the default scan is what it was. On libxul `-t icelake` takes "ADD foldable into LEA" from **2,678 to 28,064** and silences 6,431 POPCNT findings; the residue this file recorded as 37,037 was measured without every gate applied and the real figure is 25,386. The LCP split is the one that improves existing output rather than adding to it: MOV is 92% of that check's findings on rustc and pays nothing from Sandy Bridge through Skylake |
-| ~~An audit or advisory finding class~~ | **Done, 2026-09-15: `-c`.** Three kinds, and the hard half was deciding what the class means rather than adding the flag. A check states a verified rewrite (the default, and what makes a non-zero exit meaningful), advice whose fix the tool cannot check, or a review item that is not a rewrite at all. Membership is the checks that already described themselves that way: the SETcc zero-extension and the length-changing prefix stall are advisory, the IBT-bypassing NOTRACK call is security. The naming collision was real -- `-a` already means scan every byte -- so the flag is `-c`. Enabling a class makes its findings count like any other, matching how `-e` findings already behave |
-| ~~Snapshot/integration suite~~ | **Done, 2026-09-15: `snapshots/`, 19 files.** Added as a layer over `driver_test.sh` rather than as a migration, because armlint's shape does not transfer: its `.expected` files replace assertions, and x86lint's 115 `expect`/`reject` lines each state *why* a fixture exists, which a snapshot cannot. So the assertions stay and the snapshots pin everything they do not name -- column widths, ordering, a count on a line nobody wrote a grep for -- across all 19 report surfaces (default, `-a`, `-v`, `--json`, `-f`, `-i`, `-i -v`, `-e`, `-m`, `-c`, `-t`, the PLT skip and the usage text). The work that made them portable was deciding what belongs to the linker rather than the tool: section index, section load address, `--json`'s absolute vaddr, the census's sample addresses, an unpadded target's address, and whether the host's `ld` synthesizes an empty `ISA_1_USED` word or emits no note at all -- the last is why the existing assertion had accepted two spellings. Section-relative offsets, symbol names, byte spellings and every count stay. `make snapshots` regenerates; a missing snapshot is a failure, not a silent create; mismatches print a labelled diff and the run continues, so one invocation shows every changed report. The same commit deleted the suite's own skip: no C compiler now exits 2, because a skip that exits 0 is indistinguishable from a pass to `make` and to CI |
+| ~~An audit or advisory finding class~~ | **Done, 2026-09-15: `-c`.** Three kinds, and the hard half was deciding what the class means rather than adding the flag. A check states a verified rewrite (the default, and what makes a non-zero exit meaningful), advice whose fix the tool cannot check, or a review item that is not a rewrite at all. Membership is the checks that already described themselves that way: the SETcc zero-extension and the length-changing prefix stall are advisory, the IBT-bypassing NOTRACK call is security. The naming collision was real -- `-a` already means scan every byte -- so the flag was `-c` until 2026-11-05, when the flags were aligned with armlint's: the classes are `-a` as in armlint, scan-all is `-A`, and `-c` is the constant census. Enabling a class makes its findings count like any other, matching how `-e` findings already behave |
+| ~~Snapshot/integration suite~~ | **Done, 2026-09-15: `snapshots/`, 19 files.** Added as a layer over `driver_test.sh` rather than as a migration, because armlint's shape does not transfer: its `.expected` files replace assertions, and x86lint's 115 `expect`/`reject` lines each state *why* a fixture exists, which a snapshot cannot. So the assertions stay and the snapshots pin everything they do not name -- column widths, ordering, a count on a line nobody wrote a grep for -- across all 19 report surfaces (default, `-A`, `-v`, `--json`, `-f`, `-i`, `-i -v`, `-e`, `-m`, `-a`, `-t`, the PLT skip and the usage text). The work that made them portable was deciding what belongs to the linker rather than the tool: section index, section load address, `--json`'s absolute vaddr, the census's sample addresses, an unpadded target's address, and whether the host's `ld` synthesizes an empty `ISA_1_USED` word or emits no note at all -- the last is why the existing assertion had accepted two spellings. Section-relative offsets, symbol names, byte spellings and every count stay. `make snapshots` regenerates; a missing snapshot is a failure, not a silent create; mismatches print a labelled diff and the run continues, so one invocation shows every changed report. The same commit deleted the suite's own skip: no C compiler now exits 2, because a skip that exits 0 is indistinguishable from a pass to `make` and to CI |
 | ~~JIT-dump → ELF converters~~ | **Done, 2026-09-15: `tools/v8dump2elf.py`, `tools/jitdump2elf.py`, `tools/spidermonkey-jitdump.patch`.** Two converters where armlint has three, because the x86 half of the problem is shaped differently: V8's `--print-opt-code` prints encoding bytes and needs no patch, while **neither SpiderMonkey nor JSC prints a byte on x86-64** -- `IONFLAGS=codegen` is AT&T assembly with offsets, which is exactly why the 2026-09 sweeps in this file were awk over text. Both therefore need a hook, and a hook hands over the same four things whatever the engine (address, length, name, bytes), so one binary container serves both: `"X86J" | u64 addr | u32 size | u32 namelen | name | code`, concatenated with no file header so a killed process's dump still parses up to its truncation. The SpiderMonkey half is shipped as a patch to `jit::Linker::newCode`, the one place every blob passes through, and was **verified against SpiderMonkey's own `IONFLAGS=codegen` listing**: same instructions at the same offsets, with the `movabsq $0x0` patch placeholders carrying their linked values, which is what a linter should see. `--raw` reads a bare blob from the shell's own `disnative(f, file)` for a spot check with nothing patched. The driver needed one fix to make the naming worth anything: attribution skipped ET_REL outright, since an ordinary object leaves every section at address 0 and the names would pile up -- a JIT image is the ET_REL case that *does* carry real addresses, and now gets a per-tier by-function table. First contact: TurboFan 79 findings in 1,328 instructions, SpiderMonkey 560 in 16,992, both dominated by the same class (49 and 360 oversized branch displacements) because neither engine runs the relaxation pass an assembler does. `jit_test.sh` covers the parsers on synthetic dumps, so `make check` needs no engine |
 | ~~Differential against the decoder's own model~~ | **Done, 2026-09-26: `x86lint_model_check`, a `make check` layer.** `ARMLINT_LIVENESS_SWEEP=1` sweeps all 2^32 A64 encodings asserting that anything Capstone reports as read is never classified dead, and found four real defects on its first run. x86 has no enumerable encoding space, but XED's static instruction table is an enumeration of every iform it knows, and the oracle is better than a second opinion -- it is the decoder the findings are built on. **Five properties over 10,879 iforms and 17 fixtures; zero disagreements**, which is a weaker result than armlint's and needed its own evidence to be worth anything. See the write-up below |
 | ~~Doc split~~ | **Done, 2026-09-15.** armlint keeps a 554-line README plus a 3,795-line `analyses.md`; x86lint carried everything in one file that had reached 1,542 lines. The 77 implemented analyses moved to [analyses.md](analyses.md) verbatim, and the README's section became a linked two-column table: 729 lines and 1,057. The move was mechanical and checked as such -- every heading has exactly one link and every link a heading, and a token-level diff confirms the only prose that did not cross is the struck-through NOP row, which is not an implemented analysis and stayed in the table |
@@ -981,7 +981,7 @@ V8 through `d8 --print-opt-code --print-maglev-code` and
 catches Ion, Baseline, RegExp and the trampolines. **The corpora are
 almost pure code**: 225 undecodable bytes in V8's 6.9 MB and 4,072 in
 SpiderMonkey's 12.4 MB, 0.003% and 0.03%, so none of what follows is a
-phantom decode of data-in-text -- the risk that dominates `-a` sweeps of
+phantom decode of data-in-text -- the risk that dominates `-A` sweeps of
 compiled binaries.
 
 Against the same engines' own ahead-of-time code, and libxul for the
@@ -1820,7 +1820,7 @@ count comes from.
 | redundant ADD/SUB zero, unneeded zero displacement | 0 | 0 | 0 | 0 | 16 / 14 | libclang-cpp's TLS access sequences (`add r, 0`, `cmp [fs:rax+0], 0`) |
 | oversized EVEX encoding | 0 | 0 | 0 | 28 | 0 | not compiler output: all 504 are `vpxord xmm/ymm` in BLAKE3's hand-written AVX-512 assembly in libLLVM |
 | merging narrow move | 270 | 645 | 10 | 257 | 430 | universal (both compilers keep byte loads at -O2); libxul's are GCC's size-optimized code (99% C++, 99% of that in the cold partition) |
-| length-changing prefix stall (`-c all`) | 2,452 | 1,002 | 1,558 | 2,856 | 2,853 | universal, clang's C++ slightly higher |
+| length-changing prefix stall (`-a all`) | 2,452 | 1,002 | 1,558 | 2,856 | 2,853 | universal, clang's C++ slightly higher |
 
 What the table settles, with libxul read as GCC C++ plus Rust:
 
@@ -1866,7 +1866,7 @@ are left out. To reproduce:
 
     tools/split.py --cold-below 2f789a1 libxul.so x86lint-v.txt shapescan.txt
 
-Here `x86lint-v.txt` is `x86lint -v -c all` output and `shapescan.txt` is
+Here `x86lint-v.txt` is `x86lint -v -a all` output and `shapescan.txt` is
 `tools/shapescan -e "" -n 10000000` output.
 
 **Validation.** The fingerprints hold on each side:
@@ -1898,7 +1898,7 @@ is the fraction of the C++ count in the size-optimized partition.
 | check | C++ | Rust | C++ /M | Rust /M | cold share |
 | --- | --- | --- | --- | --- | --- |
 | suboptimal SSE MOV opcode | 42,684 | 77,672 | 2,446 | 9,518 | 18% |
-| length-changing prefix stall (`-c all`) | 41,358 | 22,176 | 2,370 | 2,717 | 67% |
+| length-changing prefix stall (`-a all`) | 41,358 | 22,176 | 2,370 | 2,717 | 67% |
 | suboptimal SSE zero idiom | 28,928 | 3,803 | 1,658 | 466 | 22% |
 | oversized ADD/SUB one | 28,133 | 0 | 1,612 | 0 | 18% |
 | missing SSE dependency break | 10,766 | 429 | 617 | 53 | 93% |
@@ -2391,8 +2391,10 @@ and the 2.68 MB is what a layout could reach, not what one would.
 
 ## Constant census (2026-11-05)
 
-The armlint `-c` port, as `x86lint -k` (`-c` here is the finding
-classes). armlint counts what every constant too wide for one
+The armlint `-c` port, as `x86lint -c` (it shipped as `-k` because `-c`
+was the finding classes, and took armlint's letter the same day when the
+flags were aligned: classes moved to armlint's `-a`, scan-all from `-a`
+to armlint's `-A`). armlint counts what every constant too wide for one
 instruction costs in MOVZ/MOVK chains; x86 has no chains, so the census
 counts immediates by encoded width, keys the wide ones (imm32 and imm64)
 by value at the operand width, splits them by what carries them (MOV
@@ -2675,7 +2677,7 @@ bucket; separating self-calls from imports means walking `.rela.plt` to
 **The Fedora caveat, again.** Two exported functions place none of the
 Fedora libxul's 1.6 M direct calls; the MiniDebugInfo decision in
 "Candidate lenses" is what would change that, and it matters more here
-than for `-k`, which lost only the repeat count.
+than for `-c`, which lost only the repeat count.
 
 **Calibration.** Go's 22.6% by symbol size was 22.59% by body: the
 runtime stubs have no frame and no ENDBR64. libc's 2.4% by symbol size
@@ -2689,16 +2691,16 @@ The whole-binary analyses proposed on 2026-11-05 in the spirit of `-r`,
 with the sizing each got from an objdump pass. The sizings are upper
 bounds from one binary each; recalibrate on the corpus before quoting one
 in a section above. Built so far: `tools/framescan` ("Frame layout"),
-`-k` ("Constant census") and `-n` ("Inlining census"), each in its own
+`-c` ("Constant census") and `-n` ("Inlining census"), each in its own
 section; the rest are recorded here so they are not re-proposed and so
 the next one can be picked by size.
 
 | analysis | what it measures | sizing so far | status |
 | --- | --- | --- | --- |
 | Hot/cold partition as an axis | Every count split by the PGO partition, read from each FDE's initial CFA in `.eh_frame` (a fragment whose first CFA row is not `rsp+8` starts inside its parent's frame). Also the natural weighting for `framescan`. | Fedora libxul: the frame-layout bound fell from 34.2% to 17.9% when weighted by hand; the GCC chain tables in "Constant census" show a per-partition compiler policy the census could only see by address | Next to build: it changes every existing number, the two census headlines included |
-| `mov`+`shl` chain fold in `-k` | Key `mov r32, imm32 ; shl r64, n` (same register, within the basic block, up to seven instructions apart, any `n`: 47 for the Undefined tag, 49 for Null) by the value it builds, a nine-byte imm64 site | Fedora libxul: 15,178 pairs; the Undefined count would read 17,791 beside the clang build's 15,046 instead of nothing | Specified by measurement; an afternoon in `consts_tally` with a per-register pending slot |
+| `mov`+`shl` chain fold in `-c` | Key `mov r32, imm32 ; shl r64, n` (same register, within the basic block, up to seven instructions apart, any `n`: 47 for the Undefined tag, 49 for Null) by the value it builds, a nine-byte imm64 site | Fedora libxul: 15,178 pairs; the Undefined count would read 17,791 beside the clang build's 15,046 instead of nothing | Specified by measurement; an afternoon in `consts_tally` with a per-register pending slot |
 | Literal-pool counterfactual | What a 7-byte RIP-relative load would save against the 10-byte MOVABS, per value, at a load each | libxul: 618 KB back for a 78 KB pool of 9,733 values | Needs the profile to say which constants are hot; `tools/` work, since it wants MiniDebugInfo |
-| MiniDebugInfo in the driver | Function tables for stripped Fedora binaries, so `-k` repeats, `-n` placement and `-f` work there | Fedora libxul: 2 exported functions today; `-n` places none of its 1.6 M calls | A liblzma dependency decision, the user's; the mining tools already read it |
+| MiniDebugInfo in the driver | Function tables for stripped Fedora binaries, so `-c` repeats, `-n` placement and `-f` work there | Fedora libxul: 2 exported functions today; `-n` places none of its 1.6 M calls | A liblzma dependency decision, the user's; the mining tools already read it |
 | Profile join | Weight `--json` findings by `perf script` samples; the README promises it and nothing does it | `js::Interpret` is the test function: 2,492 of 2,562 slot accesses disp32, 55 Undefined tags, and the one place a pinned register's cost and gain are both measurable | Not started |
 | `-p` rows | Function alignment, loop alignment against the 1-in-16 chance baseline, interposable GOT/PLT self-references, ICF duplicates, hardening flags | Loop alignment: GCC 24-28% vs clang 7.3%; function alignment 16 everywhere, Go 32; the self-references and ICF duplicates are measured in "Four-toolchain corpus" | No rows yet. Trap: `ret; int3` is Go's and LLD's padding fill (go 2,444, libLLVM 36,908), not `-mharden-sls`; gate any SLS row on sized symbols |
 | Inlining census | Direct calls to functions of at most 16 body bytes, and why they survived | Go 22.6%, libc 2.4% by symbol size before the census; see "Inlining census" for the measured version | **Done** as `x86lint -n` |

@@ -3297,7 +3297,7 @@ void x86lint_summary_print(const x86lint_summary *summary)
     // count reads as "and here is where to start". Capped -- a large binary
     // spreads findings over thousands of functions -- with the tail summed
     // into a residue line, and findings outside every installed range (the
-    // -a scan reaches such bytes) reported as their own honest row.
+    // -A scan reaches such bytes) reported as their own honest row.
     if (summary->func_hits != NULL) {
         size_t attributed = 0;
         size_t nhit = 0;

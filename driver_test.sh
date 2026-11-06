@@ -1,6 +1,6 @@
 #!/bin/sh
 # Smoke test for the ELF driver (main.c): section walk, symbol-table scan
-# restriction and its -a override, -v per-finding lines with section-relative
+# restriction and its -A override, -v per-finding lines with section-relative
 # offsets, the --json document, the summary tail, and the grep-convention
 # exit codes (0 clean scan, 1 opportunities found, 2 tool failure).
 # Fixtures are tiny static ELFs assembled with the system toolchain at run
@@ -104,7 +104,7 @@ reject() {  # reject <pattern> [description]
 # _start is a sized function symbol holding exactly one finding (the modrm
 # xchg, whose rewrite to 91 is unconditional -- no liveness dependence). Two
 # more xchg bytes sit OUTSIDE its range: the default symbol-restricted scan
-# must mask them (they count as skipped, not instructions) and -a must not.
+# must mask them (they count as skipped, not instructions) and -A must not.
 cat >"$dir/finding.s" <<'EOF'
     .text
     .globl _start
@@ -288,7 +288,7 @@ _start:
     .section .note.GNU-stack, "", @progbits
 EOF
 
-# Constant-census fixture for -k: the widths, the two keyings of a value
+# Constant-census fixture for -c: the widths, the two keyings of a value
 # (operand width, and imm32 against imm64 for one 64-bit value), the three
 # roles, repeats within _start, the same value again in a second function
 # (no repeat), and a trailing MOVABS outside both for the unevidenced and
@@ -969,8 +969,8 @@ expect '^ +1 +oversized XCHG encoding$' "count of 1 for oversized XCHG"
 expect '^scan restricted to 1 function symbols'
 expect '^1 optimization opportunities in 4 instructions$'
 
-# -a scans every byte of the section: the masked xchg surfaces.
-run 1 -a "$dir/finding"
+# -A scans every byte of the section: the masked xchg surfaces.
+run 1 -A "$dir/finding"
 expect '^ +2 +oversized XCHG encoding$' "count of 2 for oversized XCHG"
 expect '^2 optimization opportunities in 5 instructions$'
 reject 'scan restricted' "restricted-scan line under -a"
@@ -1002,7 +1002,7 @@ expect '^oversized XCHG encoding at offset: 0x8: ' "bare -v line for unsized f3"
 
 # -f restricts the scan to one named function, in lint and census mode
 # both; an unsized or unknown name is a tool failure, as is combining -f
-# with -a.
+# with -A.
 run 1 -f f2 "$dir/perfunc"
 expect "^scan restricted to function 'f2': 1 site, 3 bytes$"
 expect '^1 optimization opportunities in 2 instructions$'
@@ -1014,7 +1014,7 @@ expect "^scan restricted to function 'f2': 1 site, 3 bytes$"
 run 2 -f f3 "$dir/perfunc"
 expect "no sized function symbol named 'f3'"
 run 2 -f nosuch "$dir/perfunc"
-run 2 -a -f f2 "$dir/perfunc"
+run 2 -A -f f2 "$dir/perfunc"
 expect 'mutually exclusive'
 
 # --json: the same findings the -v scan reports, as one streamable document
@@ -1036,8 +1036,8 @@ run 0 --json "$dir/clean"
 expect '"findings": \[$'
 expect '"opportunities": 0'
 
-# -a drops the restriction entirely; -f reports which function it kept.
-run 1 --json -a "$dir/finding"
+# -A drops the restriction entirely; -f reports which function it kept.
+run 1 --json -A "$dir/finding"
 expect '"opportunities": 2'
 reject '"restriction"' "restriction key under -a"
 run 1 --json -f f2 "$dir/perfunc"
@@ -1065,7 +1065,7 @@ fi
 # array length agrees with the total it reports, and the findings carry the
 # absolute addresses of the fixture's four xchg sites.
 if command -v python3 >/dev/null 2>&1; then
-    "$X86LINT" --json -a "$dir/perfunc" >"$dir/out.json" 2>/dev/null
+    "$X86LINT" --json -A "$dir/perfunc" >"$dir/out.json" 2>/dev/null
     python3 - "$dir/out.json" <<'PYEOF' || fail "--json validation failed"
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -1099,20 +1099,20 @@ reject 'missing MOVBE' "MOVBE finding under -m apx"
 # The NOTRACK call is flagged; the switch-table jmp idiom beside it is not
 # (the instruction count pins that the jmp decoded and produced nothing).
 # The NOTRACK call is a security review item rather than a rewrite, so the
-# default scan is clean and -c security opts in. The instruction count pins
+# default scan is clean and -a security opts in. The instruction count pins
 # that the jmp still decoded either way.
 run 0 "$dir/notrack"
 reject 'NOTRACK' "security finding in the default scan"
-run 1 -c security "$dir/notrack"
+run 1 -a security "$dir/notrack"
 expect '^ +1 +IBT-bypassing NOTRACK call$' "count of 1 for NOTRACK call"
 expect '^1 optimization opportunities in 3 instructions$'
-run 1 -c all "$dir/notrack"
-expect '^ +1 +IBT-bypassing NOTRACK call$' "NOTRACK call under -c all"
+run 1 -a all "$dir/notrack"
+expect '^ +1 +IBT-bypassing NOTRACK call$' "NOTRACK call under -a all"
 # An unknown class is a usage error, not a silent default.
-run 2 -c bogus "$dir/notrack"
+run 2 -a bogus "$dir/notrack"
 
 # .plt and its variants are the dynamic linker's template, not compiler
-# output: one finding from .text by default, all three under -a. The
+# output: one finding from .text by default, all three under -A. The
 # instruction counts pin that the glue was not merely unreported but
 # unscanned.
 # -t decides the rewrites whose worth is per-core, and nothing else: the
@@ -1120,9 +1120,9 @@ run 2 -c bogus "$dir/notrack"
 # the SUB zeroing idiom only where SUB is not recognized as independent.
 run 0 "$dir/advisory"
 reject 'SETcc zero-extension' "advisory in the default scan"
-run 1 -c advisory "$dir/advisory"
-expect '^ +1 +suboptimal SETcc zero-extension$' "advisory under -c advisory"
-reject 'NOTRACK' "security finding under -c advisory alone"
+run 1 -a advisory "$dir/advisory"
+expect '^ +1 +suboptimal SETcc zero-extension$' "advisory under -a advisory"
+reject 'NOTRACK' "security finding under -a advisory alone"
 
 run 1 -t generic "$dir/target"
 reject 'ADD foldable into LEA' "slow-LEA fold under the conservative default"
@@ -1140,8 +1140,8 @@ run 2 -t nehalem "$dir/target"
 run 1 "$dir/pltskip"
 expect '^ +1 +oversized XCHG encoding$' "count of 1 with the glue skipped"
 expect '^1 optimization opportunities in 2 instructions$'
-run 1 -a "$dir/pltskip"
-expect '^ +3 +oversized XCHG encoding$' "count of 3 with -a"
+run 1 -A "$dir/pltskip"
+expect '^ +3 +oversized XCHG encoding$' "count of 3 with -A"
 expect '^3 optimization opportunities in 4 instructions$'
 
 # -i replaces the lint scan with the ISA census: levels attributed, the
@@ -1232,12 +1232,12 @@ expect '^ISA census: 13 instructions'
 run 0 -r -f _start "$dir/regs"
 expect '^register census: 12 instructions, 0 undecodable bytes skipped$'
 
-# -k replaces the lint scan with the constant census. Values are keyed at
+# -c replaces the lint scan with the constant census. Values are keyed at
 # the operand width (the imm32 and imm64 spellings of -1 are one value, in
 # two encodings), roles are split, and repeats are counted within _start
 # alone: second's copy of the hash multiplier is no repeat, and the one
 # outside both functions is unevidenced and in no function.
-run 0 -k "$dir/consts"
+run 0 -c "$dir/consts"
 expect '^constant census: 13 instructions, 0 undecodable bytes skipped$'
 expect '^  immediates by encoded width: imm8 1, imm16 0, imm32 6, imm64 4; 57 bytes, [0-9.]+% of the [0-9]+ bytes swept$'
 expect '^  wide immediates \(imm32 and imm64\): 10 carrying 5 distinct values, 56 bytes \([0-9.]+%\), 1 unevidenced$'
@@ -1262,18 +1262,18 @@ reject 'optimization opportunities' "lint tail in constant-census mode"
 reject 'scan restricted' "restricted-scan line in constant-census mode"
 reject 'register census' "register census without -r"
 # -v adds each value's first sites and the function that repeats it most.
-run 0 -k -v "$dir/consts"
+run 0 -c -v "$dir/consts"
 expect '64-bit 0xbf58476d1ce4e5b9 +at 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+$' \
     "-v value sample line"
 expect '32-bit 0x80004005 +carried 3 times in <_start>: 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+$' \
     "-v repeat sample line"
 # -f narrows it to one function, which then repeats nothing.
-run 0 -k -f second "$dir/consts"
+run 0 -c -f second "$dir/consts"
 expect '^constant census: 2 instructions, 0 undecodable bytes skipped$'
 expect '^  repeats within a function: 0 in 0 of 1 functions, 0 bytes'
 expect '^  functions: the 1 named by -f$'
 # The three censuses print from one sweep.
-run 0 -i -r -k "$dir/consts"
+run 0 -i -r -c "$dir/consts"
 expect '^ISA census: 13 instructions'
 expect '^register census: 13 instructions'
 expect '^constant census: 13 instructions'
@@ -1304,7 +1304,7 @@ expect '^ +1 +0 +2 +7  <w> \(forwarder\)$'
 expect '^  functions: 6 sized from \.symtab$'
 expect '^  code evidence: 6 function symbols '
 reject 'optimization opportunities' "lint tail in inlining-census mode"
-reject 'constant census' "constant census without -k"
+reject 'constant census' "constant census without -c"
 # -v adds the call sites.
 run 0 -n -v "$dir/inline"
 expect '^ +3 +2 +2 +7  <g>  called at 0x[0-9a-f]+, 0x[0-9a-f]+, 0x[0-9a-f]+$' \
@@ -1321,7 +1321,7 @@ expect '^ +2 +0 +7 +7  <g>$'
 expect '^ +1 +0 +6 +6  <e>$'
 expect '^  functions: 6 sized from \.symtab as callees; call sites scanned in the 1 named by -f$'
 # All four censuses print from one sweep.
-run 0 -i -r -k -n "$dir/inline"
+run 0 -i -r -c -n "$dir/inline"
 expect '^ISA census: 31 instructions'
 expect '^register census: 31 instructions'
 expect '^constant census: 31 instructions'
@@ -1579,12 +1579,12 @@ fi
 # Whole-report snapshots. The assertions above state what each fixture is
 # for, one fact at a time; these pin everything else the report says --
 # column widths, ordering, the lines nobody wrote a grep for -- across the
-# surfaces the tool has: the default report, -a, -v, --json, the census,
-# the ENDBR64 pass, the per-function table, the three opt-in axes (-m, -c,
+# surfaces the tool has: the default report, -A, -v, --json, the census,
+# the ENDBR64 pass, the per-function table, the three opt-in axes (-m, -a,
 # -t) and the usage text. Regenerate with REGEN=1 ./driver_test.sh and read
 # the resulting diff; a change nobody can explain is the point of the layer.
 snapshot finding "$dir/finding"
-snapshot finding-all -a "$dir/finding"
+snapshot finding-all -A "$dir/finding"
 snapshot finding-verbose -v "$dir/finding"
 snapshot finding-json --json "$dir/finding"
 snapshot clean "$dir/clean"
@@ -1592,18 +1592,18 @@ snapshot perfunc "$dir/perfunc"
 snapshot perfunc-verbose -v "$dir/perfunc"
 snapshot perfunc-function -f f2 "$dir/perfunc"
 snapshot bmi1 -m bmi1 "$dir/bmi"
-snapshot notrack-security -c security "$dir/notrack"
-snapshot advisory -c advisory "$dir/advisory"
+snapshot notrack-security -a security "$dir/notrack"
+snapshot advisory -a advisory "$dir/advisory"
 snapshot target-generic -t generic "$dir/target"
 snapshot target-icelake -t icelake "$dir/target"
 snapshot pltskip "$dir/pltskip"
-snapshot pltskip-all -a "$dir/pltskip"
+snapshot pltskip-all -A "$dir/pltskip"
 snapshot census -i "$dir/census"
 snapshot census-verbose -i -v "$dir/census"
 snapshot regs -r "$dir/regs"
 snapshot regs-verbose -r -v "$dir/regs"
-snapshot consts -k "$dir/consts"
-snapshot consts-verbose -k -v "$dir/consts"
+snapshot consts -c "$dir/consts"
+snapshot consts-verbose -c -v "$dir/consts"
 snapshot inline -n "$dir/inline"
 snapshot inline-verbose -n -v "$dir/inline"
 snapshot endbr-missing -e "$dir/cetbad"

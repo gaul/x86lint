@@ -7,7 +7,7 @@ Optimization opportunities by type:
 
 12 undecodable bytes skipped (data in code section?)
 
-scan restricted to 1 function symbols (-a scans every byte)
+scan restricted to 1 function symbols (-A scans every byte)
 2 instructions were excluded (12 of the undecodable bytes above): a relocation rewrites the immediate or displacement they encode
 1 optimization opportunities in 1 instructions
 exit status: 1

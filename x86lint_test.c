@@ -7028,6 +7028,157 @@ static void check_missing_blsi_test(void)
     ASSERT_FINDINGS_EXT(edge_on_neg, "missing BLSI", 0, X86LINT_EXT_BMI1);
 }
 
+// mov rX, -1 ; shl/shlx rX by n ; not rX ; and rX, rY is bzhi rX, rY, n --
+// advice, since the forms agree only for n below the width, and only under
+// -m bmi2 -a advisory. When reported it replaces the ANDN finding at the
+// NOT. See mov_shl_not_and_foldable_to_bzhi.
+static void check_missing_bzhi_test(void)
+{
+    const uint32_t both = X86LINT_EXT_BMI1 | X86LINT_EXT_BMI2;
+    int total;
+
+    // The JIT shape: SHLX of the all-ones register by a count register.
+    static const uint8_t fold32[] = {
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xffffffff
+        0xC4, 0xE2, 0x69, 0xF7, 0xC9,  // shlx ecx, ecx, edx
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(fold32, sizeof(fold32), "missing BZHI",
+                                      &total, both) == 1);
+    assert(total == 1);
+    // The advice is withheld from the default classes, and the exact ANDN
+    // fold it would subsume is reported instead.
+    assert(count_findings(fold32, sizeof(fold32), "missing BZHI", &total,
+                          both) == 0);
+    assert(count_findings(fold32, sizeof(fold32), "missing ANDN", &total,
+                          both) == 1);
+    assert(total == 1);
+    // BZHI is BMI2; under bmi1 alone only the ANDN fold exists.
+    assert(count_findings_all_classes(fold32, sizeof(fold32), "missing BZHI",
+                                      &total, X86LINT_EXT_BMI1) == 0);
+    assert(count_findings_all_classes(fold32, sizeof(fold32), "missing ANDN",
+                                      &total, X86LINT_EXT_BMI1) == 1);
+    assert(total == 1);
+
+    static const uint8_t fold64[] = {
+        0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF,  // mov rcx, -1
+        0xC4, 0xE2, 0xE9, 0xF7, 0xC9,              // shlx rcx, rcx, rdx
+        0x48, 0xF7, 0xD1,                          // not rcx
+        0x48, 0x21, 0xF1,                          // and rcx, rsi
+        0xC3,                                      // ret
+    };
+    assert(count_findings_all_classes(fold64, sizeof(fold64), "missing BZHI",
+                                      &total, both) == 1);
+    assert(total == 1);
+
+    // The legacy shift by CL, with the mask in another register. Under bmi2
+    // the shift is also its own missing SHLX finding, since the AND
+    // overwrites every flag it wrote.
+    static const uint8_t legacy[] = {
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF,  // mov eax, 0xffffffff
+        0xD3, 0xE0,                    // shl eax, cl
+        0xF7, 0xD0,                    // not eax
+        0x21, 0xF0,                    // and eax, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(legacy, sizeof(legacy), "missing BZHI",
+                                      &total, X86LINT_EXT_BMI2) == 1);
+    assert(count_findings_all_classes(legacy, sizeof(legacy),
+                                      "missing SHLX/SHRX/SARX", &total,
+                                      X86LINT_EXT_BMI2) == 1);
+    assert(total == 2);
+
+    // The count is the mask register: the shift reads the -1 the MOV wrote.
+    static const uint8_t count_is_mask[] = {
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xffffffff
+        0xD3, 0xE1,                    // shl ecx, cl
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(count_is_mask, sizeof(count_is_mask),
+                                      "missing BZHI", &total,
+                                      X86LINT_EXT_BMI2) == 0);
+    static const uint8_t shlx_count_is_mask[] = {
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xffffffff
+        0xC4, 0xE2, 0x71, 0xF7, 0xC9,  // shlx ecx, ecx, ecx
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(shlx_count_is_mask,
+                                      sizeof(shlx_count_is_mask),
+                                      "missing BZHI", &total,
+                                      X86LINT_EXT_BMI2) == 0);
+
+    // SHLX from another all-ones register: dropping that register's MOV
+    // needs it dead, which the tool cannot show.
+    static const uint8_t other_ones[] = {
+        0xBB, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ebx, 0xffffffff
+        0xC4, 0xE2, 0x69, 0xF7, 0xCB,  // shlx ecx, ebx, edx
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(other_ones, sizeof(other_ones),
+                                      "missing BZHI", &total,
+                                      X86LINT_EXT_BMI2) == 0);
+
+    // Not all ones: the shifted mask is not a low-bits mask.
+    static const uint8_t not_ones[] = {
+        0xB9, 0xFE, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xfffffffe
+        0xC4, 0xE2, 0x69, 0xF7, 0xC9,  // shlx ecx, ecx, edx
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(not_ones, sizeof(not_ones),
+                                      "missing BZHI", &total,
+                                      X86LINT_EXT_BMI2) == 0);
+
+    // An immediate AND has no BZHI form.
+    static const uint8_t imm_and[] = {
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xffffffff
+        0xC4, 0xE2, 0x69, 0xF7, 0xC9,  // shlx ecx, ecx, edx
+        0xF7, 0xD1,                    // not ecx
+        0x83, 0xE1, 0x7F,              // and ecx, 0x7f
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(imm_and, sizeof(imm_and),
+                                      "missing BZHI", &total,
+                                      X86LINT_EXT_BMI2) == 0);
+
+    // PF read downstream: AND defines it, BZHI does not.
+    static const uint8_t pf_live[] = {
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xffffffff
+        0xC4, 0xE2, 0x69, 0xF7, 0xC9,  // shlx ecx, ecx, edx
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0x7A, 0x00,                    // jp +0
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(pf_live, sizeof(pf_live),
+                                      "missing BZHI", &total,
+                                      X86LINT_EXT_BMI2) == 0);
+
+    // A direct branch onto the NOT reaches a partial idiom. The ANDN fold
+    // starts at the NOT, so it still stands.
+    static const uint8_t edge_on_not[] = {
+        0x74, 0x0A,                    // je +10 (to the not)
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF,  // mov ecx, 0xffffffff
+        0xC4, 0xE2, 0x69, 0xF7, 0xC9,  // shlx ecx, ecx, edx
+        0xF7, 0xD1,                    // not ecx
+        0x21, 0xF1,                    // and ecx, esi
+        0xC3,                          // ret
+    };
+    assert(count_findings_all_classes(edge_on_not, sizeof(edge_on_not),
+                                      "missing BZHI", &total, both) == 0);
+    assert(count_findings_all_classes(edge_on_not, sizeof(edge_on_not),
+                                      "missing ANDN", &total, both) == 1);
+}
+
 // shl/shr/sar reg, cl could be the flagless BMI2 shlx/shrx/sarx -- but only
 // when the caller declared BMI2 available (-m bmi2), only when every
 // arithmetic flag is dead, and (32-bit forms) only when the destination's
@@ -9251,6 +9402,7 @@ int main(int argc, char *argv[])
     check_missing_blsr_test();
     check_missing_blsmsk_test();
     check_missing_blsi_test();
+    check_missing_bzhi_test();
     check_missing_shlx_test();
     check_missing_movbe_test();
     check_missing_apx_ndd_test();

@@ -205,6 +205,7 @@ with the corpus populations that argue for or against each, live in
 | [missing BLSI (only with `-m bmi1`)](analyses.md#missing-blsi-only-with--m-bmi1) | `BLSI` |
 | [missing BLSMSK (only with `-m bmi1`)](analyses.md#missing-blsmsk-only-with--m-bmi1) | `BLSMSK` |
 | [missing BLSR (only with `-m bmi1`)](analyses.md#missing-blsr-only-with--m-bmi1) | `BLSR` |
+| [missing BZHI (only with `-m bmi2`)](analyses.md#missing-bzhi-only-with--m-bmi2) | `BZHI`, when the count is below the width; advisory |
 | [missing MOVBE (only with `-m movbe`)](analyses.md#missing-movbe-only-with--m-movbe) | `MOVBE` |
 | [missing MULX (only with `-m bmi2`)](analyses.md#missing-mulx-only-with--m-bmi2) | `MULX`, dropping the move out of the fixed register |
 | [missing POPCNT dependency break](analyses.md#missing-popcnt-dependency-break) | insert `XOR dst, dst` ahead of it |
@@ -506,7 +507,8 @@ Pass `-m bmi1`, `-m bmi2`, `-m movbe`, and/or `-m apx` (`--assume`) to declare
 that the binary's target supports those instruction-set extensions, enabling
 the checks that suggest replacing a baseline sequence with an instruction from
 that set (missing ANDN, missing BLSI, missing BLSMSK, missing BLSR, missing
-SHLX/SHRX/SARX, missing MOVBE, missing APX NDD, missing APX SETZU). These are
+BZHI, missing SHLX/SHRX/SARX, missing MOVBE, missing APX NDD, missing APX
+SETZU). These are
 opt-in because the finding is only actionable when the target guarantees the
 extension: a distro binary built for x86-64-v2 could not have used ANDN however
 clear the opportunity, and inferring availability from the surrounding bytes is

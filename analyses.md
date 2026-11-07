@@ -589,6 +589,23 @@ argue for or against each, live in [TODO.md](TODO.md).
   the AND's destination is the decremented register itself (the original
   keeps source-1 live there)
 
+## missing BZHI (only with `-m bmi2`)
+
+* `B9FFFFFFFF C4E269F7C9 F7D1 21F1` (MOV ECX, -1; SHLX ECX, ECX, EDX; NOT
+  ECX; AND ECX, ESI) -- one BZHI ECX, ESI, EDX (BMI2) keeps the low n bits,
+  four instructions for one. Advisory (`-a advisory`): SHL and SHLX reduce
+  the count mod the operand width, while BZHI reads bits 7:0 of the index
+  and keeps the whole source at the width or above, so the forms agree only
+  for a count below the width -- a range fact no window can show. A C
+  compiler knows it and emits BZHI; a JIT for wasm or JavaScript, whose
+  shifts are defined mod the width, does not, which is where the idiom
+  survives (zlib's bit reader in a JetStream 3 wasm build, 9 sites).
+  Withheld while PF -- defined by AND, undefined by BZHI -- may be read.
+  The legacy `SHL reg, CL` form matches too. Not flagged when the SHLX
+  shifts a different all-ones register (dropping its MOV needs that
+  register dead) or the count is the mask register itself. When reported
+  it replaces the ANDN finding at the window's NOT, which it subsumes
+
 ## missing MOVBE (only with `-m movbe`)
 
 * `8B06 0FC8` (MOV EAX, [RSI]; BSWAP EAX) -- one MOVBE EAX, [RSI] performs

@@ -10001,6 +10001,151 @@ static bool mov_neg_and_foldable_to_blsi(const uint8_t *inst, size_t len,
     return !branch_target_in(branch_targets, neg_offset, after_and);
 }
 
+// Advisory multi-instruction peephole (BMI2, four instructions): the
+// keep-the-low-n-bits idiom spelled out through a shifted all-ones mask,
+//
+//   mov ecx, -1 ; shlx ecx, ecx, edx ; not ecx ; and ecx, esi
+//                                            ->   bzhi ecx, esi, edx
+//   mov eax, -1 ; shl eax, cl ; not eax ; and eax, esi
+//                                            ->   bzhi eax, esi, ecx
+//
+// BZHI clears every bit of the source from the index upward, which is
+// x & ((1 << n) - 1) in one instruction where the spelled-out form takes
+// four. It is advice rather than a rewrite because the two count
+// differently: SHL and SHLX reduce the count mod the operand width, while
+// BZHI reads bits 7:0 of the index and keeps the whole source once that is
+// the width or more. The forms agree exactly when the count is below the
+// width, and nothing in a peephole window can show that -- it is a range
+// fact about the program. A compiler that knows it (C, where the shift
+// would be undefined otherwise) emits BZHI already; a JIT for a language
+// whose shifts are defined mod the width (wasm, JavaScript) needs a
+// range-checked or explicitly masked count, so this is where it shows.
+// Under the assumption the final flags differ only in PF -- both clear OF
+// and set SF/ZF from the result, BZHI's CF is clear for an in-range index
+// as AND's is, and BZHI leaves PF undefined -- so the advice is withheld
+// while PF may be read downstream.
+//
+// Matched: the all-ones MOV at the operand width (B8+r imm32, C7 /0 with
+// a sign-extended -1, or MOVABS), a 32/64-bit register SHL by CL or SHLX
+// shifting that same register, NOT of it, and AND of it with a register.
+// Not matched:
+//   * SHLX from a different all-ones register (mov ebx, -1 ; shlx ecx,
+//     ebx, edx): the fold would drop the MOV, and proving EBX dead needs
+//     register liveness this tool does not track;
+//   * a count in the mask register itself (shlx ecx, ecx, ecx): the count
+//     is then the -1 the MOV wrote, not a value BZHI could read;
+//   * an AND with the mask register (and ecx, ecx) or an immediate, and
+//     memory operands anywhere: no single BZHI computes them;
+//   * 8/16-bit widths (BZHI is 32/64 only). The exact REG0 matches pin all
+//     four instructions to one register and width.
+//
+// `mov` is the already-decoded instruction ending at `shift_offset`; the
+// caller reports at the MOV, where the BZHI lands, and receives the NOT's
+// offset in `not_offset_out` so the ANDN fold that the same window contains
+// is not reported beside the advice that subsumes it. A direct branch onto
+// any of the last three instructions reaches a partial idiom and suppresses
+// the advice.
+static bool mov_shl_not_and_foldable_to_bzhi(const uint8_t *inst, size_t len,
+                                             const uint8_t *branch_targets,
+                                             size_t shift_offset,
+                                             const xed_decoded_inst_t *mov,
+                                             size_t *not_offset_out)
+{
+    if (xed_decoded_inst_get_iclass(mov) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(mov) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(mov) == 0) {
+        return false;
+    }
+    unsigned width = xed_decoded_inst_get_operand_width(mov);
+    if (width != 32 && width != 64) {
+        return false;
+    }
+    uint64_t opmask = (width == 64) ? UINT64_MAX : UINT32_MAX;
+    if (((uint64_t) xed_decoded_inst_get_signed_immediate(mov) & opmask) !=
+            opmask) {
+        return false;
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(mov, XED_OPERAND_REG0);
+    if (xed_reg_class(dst) != XED_REG_CLASS_GPR) {
+        return false;
+    }
+    xed_reg_enum_t dst_full = xed_get_largest_enclosing_register(dst);
+
+    if (shift_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t shift;
+    decode_init(&shift);
+    if (xed_decode(&shift, inst + shift_offset, len - shift_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_number_of_memory_operands(&shift) > 0 ||
+        xed_decoded_inst_get_reg(&shift, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+    xed_reg_enum_t count;
+    switch (xed_decoded_inst_get_iclass(&shift)) {
+    case XED_ICLASS_SHL:
+        count = xed_decoded_inst_get_reg(&shift, XED_OPERAND_REG1);
+        if (count != XED_REG_CL) {
+            return false;
+        }
+        break;
+    case XED_ICLASS_SHLX:
+        if (xed_decoded_inst_get_reg(&shift, XED_OPERAND_REG1) != dst) {
+            return false;
+        }
+        count = xed_decoded_inst_get_reg(&shift, XED_OPERAND_REG2);
+        break;
+    default:
+        return false;
+    }
+    if (xed_reg_class(count) != XED_REG_CLASS_GPR ||
+        xed_get_largest_enclosing_register(count) == dst_full) {
+        return false;
+    }
+
+    size_t not_offset = shift_offset + xed_decoded_inst_get_length(&shift);
+    if (not_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t not_insn;
+    decode_init(&not_insn);
+    if (xed_decode(&not_insn, inst + not_offset, len - not_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&not_insn) != XED_ICLASS_NOT ||
+        xed_decoded_inst_number_of_memory_operands(&not_insn) > 0 ||
+        xed_decoded_inst_get_reg(&not_insn, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+
+    size_t and_offset = not_offset + xed_decoded_inst_get_length(&not_insn);
+    if (and_offset >= len) {
+        return false;
+    }
+    xed_decoded_inst_t and_insn;
+    decode_init(&and_insn);
+    if (xed_decode(&and_insn, inst + and_offset, len - and_offset) !=
+            XED_ERROR_NONE ||
+        xed_decoded_inst_get_iclass(&and_insn) != XED_ICLASS_AND ||
+        xed_decoded_inst_number_of_memory_operands(&and_insn) > 0 ||
+        xed_decoded_inst_get_immediate_width_bits(&and_insn) != 0 ||
+        xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG0) != dst) {
+        return false;
+    }
+    xed_reg_enum_t src = xed_decoded_inst_get_reg(&and_insn, XED_OPERAND_REG1);
+    if (xed_reg_class(src) != XED_REG_CLASS_GPR || src == dst) {
+        return false;
+    }
+
+    size_t after_and = and_offset + xed_decoded_inst_get_length(&and_insn);
+    if (flags_live_after(inst, len, after_and, FLAG_PF) ||
+        branch_target_in(branch_targets, shift_offset, after_and)) {
+        return false;
+    }
+    *not_offset_out = not_offset;
+    return true;
+}
+
 // The ADD/SUB/INC/DEC division of labor with mov_add_foldable_to_lea,
 // seen from that fold's side: it claims a register-headed pair only
 // while every flag the op writes is dead after it (lea writes none), so
@@ -12459,6 +12604,10 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
     // checks proceed.
     uint8_t *branch_targets = collect_branch_targets(inst, len);
 
+    // The NOT inside the last BZHI advice's window, whose ANDN fold that
+    // advice already accounts for.
+    size_t bzhi_not_offset = SIZE_MAX;
+
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
         decode_init(&xedd);
@@ -12872,11 +13021,29 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             }
         }
 
+        // Advisory multi-instruction peephole, only when the caller enabled
+        // BMI2: mov rX, -1 ; shl/shlx rX ; not rX ; and rX, rY is one
+        // bzhi rX, rY, count when the count is below the width, which the
+        // tool cannot verify. Reported against the MOV (at `offset`), where
+        // the replacement lands; the window's NOT is remembered so the ANDN
+        // fold inside it is not reported beside the advice that subsumes
+        // it. See mov_shl_not_and_foldable_to_bzhi.
+        size_t not_offset;
+        if ((extensions & X86LINT_EXT_BMI2) != 0 &&
+            (classes & X86LINT_CLASS_ADVISORY) != 0 &&
+            mov_shl_not_and_foldable_to_bzhi(inst, len, branch_targets, next,
+                                             &xedd, &not_offset)) {
+            emit_finding(&sink, "missing BZHI", offset, &xedd, inst + offset);
+            ++errors;
+            bzhi_not_offset = not_offset;
+        }
+
         // Multi-instruction peephole, only when the caller enabled BMI1:
         // not rX ; and rX, rY collapses to one andn rX, rX, rY. Reported
         // against the NOT (at `offset`), where the replacement lands. See
         // not_and_foldable_to_andn.
         if ((extensions & X86LINT_EXT_BMI1) != 0 &&
+            offset != bzhi_not_offset &&
             not_and_foldable_to_andn(inst, len, branch_targets, next, &xedd)) {
             emit_finding(&sink, "missing ANDN", offset, &xedd, inst + offset);
             ++errors;

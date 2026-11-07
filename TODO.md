@@ -1146,6 +1146,19 @@ displacement" and "branch to the next instruction" leave the tab's top
 25 entirely, and its `Other` tier's everything-else rate drops from 41.5
 to 3.2 per thousand.
 
+**The aligned rule missed the wasm baseline tier (2026-11-07).** Rabaldr's
+`BaseCompiler::jumpTable` binds its `br_table` table without
+`haltingAlign`, so in a JetStream 3 shell dump 58,894 of the tier's 67,397
+table words sat off the 8-byte grid and were scanned as code: 202,392
+phantom instructions and 4,558 phantom findings, among them 2,002 of the
+tier's 2,236 "dead compare", 775 of 789 "unneeded SIB byte", and every
+"missing SHLX/SHRX/SARX" under `-m bmi2`. Unaligned tables are now found
+from the `MOV r64, imm64` that loads every table's address: its
+immediate is the table's start, and the table is the run of in-blob words
+from there, which also catches a one-entry table. Ion, Baseline, RegExp
+and wasm Ion mask exactly the words they did before. Wasm baseline figures
+above predate this.
+
 **A tab is 2,082 copies of the runtime's trampolines.** The tab's largest
 tier by bytes was `Other` at 110.3 MB, 28.8% of its code, and it is
 2,082 copies of the same four blobs: the 34,304-byte JitRuntime

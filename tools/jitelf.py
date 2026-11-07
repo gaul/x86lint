@@ -87,9 +87,19 @@ def code_pointer_words(chunk):
     A word pointing into its own blob is such an entry.  The one legitimate
     instruction that carries one is `MOV r64, imm64` (REX.W B8+r), which is
     how the table's base address gets into a register, so a word whose two
-    preceding bytes spell that opcode is kept.  Tables are pointer-aligned by
-    the engine (haltingAlign(sizeof(void*))) and blobs are at least as
-    aligned, so only aligned words are considered.
+    preceding bytes spell that opcode is kept.  Ion and Baseline pointer-align
+    their tables (haltingAlign(sizeof(void*))) and blobs are at least as
+    aligned, so an aligned word is taken on its own.
+
+    The wasm baseline compiler does not align: BaseCompiler::jumpTable binds
+    the br_table table wherever the stubs before it ended, and in a
+    JetStream 3 run 87% of its table words sat off the 8-byte grid, where the
+    aligned scan never looked.  An unaligned word is not taken on its own --
+    eight arbitrary bytes at any of seven offsets would be -- but from the
+    same MOV r64, imm64 that loads every table's address: its immediate
+    names where a table starts, and the table is the run of in-blob words
+    from there.  The anchor is what catches a table of one entry, which a
+    rule requiring two adjacent words would not.
 
     The other pointer a SpiderMonkey blob carries in its code stream points
     the other way, out of the blob: every far jump to other code goes through
@@ -102,23 +112,38 @@ def code_pointer_words(chunk):
     data = chunk.data
     lo = chunk.addr
     hi = lo + len(data)
-    words = []
+    def inside(off):
+        return lo <= int.from_bytes(data[off:off + 8], 'little') < hi
+
+    words = set()
     for off in range(0, len(data) - 7, 8):
-        value = int.from_bytes(data[off:off + 8], 'little')
-        if not lo <= value < hi:
+        if not inside(off):
             continue
         if off >= 2 and data[off - 2] in (0x48, 0x49) and 0xb8 <= data[off - 1] <= 0xbf:
             continue
-        words.append(off)
+        words.add(off)
+    for rex in (0x48, 0x49):
+        for opcode in range(0xb8, 0xc0):
+            start = 0
+            while True:
+                at = data.find(bytes((rex, opcode)), start)
+                if at < 0 or at + 10 > len(data):
+                    break
+                start = at + 1
+                if not inside(at + 2):
+                    continue
+                table = int.from_bytes(data[at + 2:at + 10], 'little') - lo
+                while table + 8 <= len(data) and inside(table):
+                    words.add(table)
+                    table += 8
     start = 0
     while True:
         at = data.find(EXTENDED_JUMP, start)
         if at < 0 or at + 16 > len(data):
             break
-        words.append(at + 8)
+        words.add(at + 8)
         start = at + 16
-    words.sort()
-    return words
+    return sorted(words)
 
 
 # jmp qword ptr [rip+2] ; ud2 -- the head of an extended jump table entry,

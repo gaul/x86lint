@@ -264,6 +264,32 @@ if convert jitdump2elf.py --raw "$dir/table.bin" -o "$dir/table-raw.elf" \
         "the phantom finding the table produces"
 fi
 
+# The wasm baseline compiler binds its br_table table wherever the stubs
+# before it ended, so the table can sit off the 8-byte grid and hold a single
+# entry. Neither the aligned scan nor a two-word run would find it; the MOV
+# r64, imm64 that loads the table's address does, whatever the alignment.
+python3 - "$dir/odd.bin" <<'PYEOF'
+import struct, sys
+base = 0x7f0000001000
+code = bytes.fromhex('87c8' 'c3')                               # xchg; ret
+code += bytes.fromhex('48b8') + struct.pack('<Q', base + 15)    # mov rax, table
+code += bytes.fromhex('c3' 'cc')                                # ret; pad
+code += struct.pack('<Q', base + 23)                            # one entry, at 15
+code += bytes.fromhex('87c8' 'c3')                              # xchg; ret
+with open(sys.argv[1], 'wb') as f:
+    f.write(code)
+PYEOF
+
+if convert jitdump2elf.py --raw "$dir/odd.bin" -o "$dir/odd.elf" \
+        --addr 0x7f0000001000 --name odd; then
+    expect "$dir/conv" '1 code-pointer words masked in 1 blobs'
+    "$X86LINT" "$dir/odd.elf" >"$dir/out" 2>&1
+    expect "$dir/out" '^ +2 +oversized XCHG encoding$' \
+        "the code on both sides of an unaligned table"
+    reject "$dir/out" 'unneeded zero displacement' \
+        "an unaligned pointer decoded as code"
+fi
+
 # A file that is not records at all is refused at the first byte rather than
 # being read as a headerless blob.
 printf 'not a jit dump at all' >"$dir/junk.bin"

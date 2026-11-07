@@ -6970,8 +6970,10 @@ static const struct check_entry checks[] = {
 // code, notrack jump tables, entries from another section -- remain a
 // documented residual risk of operating on raw bytes (README, "Linear sweep
 // with resync").
-static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len)
+static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len,
+                                       uint8_t **backward)
 {
+    *backward = calloc((len + 7) / 8, 1);
     uint8_t *targets = calloc((len + 7) / 8, 1);
     if (targets == NULL) {
         return NULL;    // branch_target_in treats this as every-offset-hit
@@ -6998,6 +7000,10 @@ static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len)
                 xed_decoded_inst_get_branch_displacement(&xedd);
             if (target >= 0 && (uint64_t) target < (uint64_t) len) {
                 targets[target >> 3] |= (uint8_t) (1u << (target & 7));
+                if ((uint64_t) target <= offset && *backward != NULL) {
+                    (*backward)[target >> 3] |=
+                        (uint8_t) (1u << (target & 7));
+                }
             }
         }
         offset = next;
@@ -10836,6 +10842,195 @@ static bool dep_broken_in_history(const struct dep_history *h,
     return false;
 }
 
+// The vector registers a zero idiom has broken on EVERY path reaching the
+// current instruction, with no write to them since: the path-aware, unbounded
+// counterpart of the dep_history window for the vector gate. The window is
+// linear and short, which misses a mitigation the compiler hoisted above a
+// branch. SpiderMonkey's unsigned 64-bit conversion zeroes once and splits:
+//
+//     xorps    xmm0, xmm0
+//     test     rax, rax
+//     js       odd
+//     cvtsi2ss xmm0, rax          ; window sees the xorps
+//     jmp      done
+//   odd:
+//     mov r11, rax ; mov rcx, rax ; shr r11, 1 ; and ecx, 1 ; or r11, rcx
+//     cvtsi2ss xmm0, r11          ; window sees the other arm, not the xorps
+//
+// which was all 335 findings of the class on a JetStream 3 JIT dump.
+//
+// A zero idiom on a register sets its bit and any other write clears it,
+// whatever the distance between: a register no instruction has written since
+// its zeroing carries no dependency, however long ago that was. Each direct
+// forward transfer leaves the bits it saw with its target, and an instruction
+// starts from the AND over every edge into it -- the fallthrough when the
+// previous instruction has one, plus the recorded edges. An edge this forward
+// sweep cannot have recorded yet or at all -- a backward branch, an ENDBR64
+// landing pad, an instruction following a jmp or ret that no recorded branch
+// targets -- empties the set, as do calls (the callee may write any vector
+// register) and decode resyncs. Only ever a suppression, and sound: a bit is
+// set only when every path the sweep can see carries the idiom.
+struct pending_edge {
+    size_t target;
+    uint32_t mask;
+};
+
+struct xmm_zero_state {
+    uint32_t mask;              // bit n: xmm/ymm/zmm n is idiom-zeroed
+    bool falls_through;         // the previous instruction can fall through
+    bool broken;                // allocation failed: never suppress
+    struct pending_edge *heap;  // min-heap on target
+    size_t n, cap;
+};
+
+// The 0-31 index of the vector register `reg` names, or -1.
+static int vec_reg_index(xed_reg_enum_t reg)
+{
+    if (reg >= XED_REG_XMM_FIRST && reg <= XED_REG_XMM_LAST) {
+        return (int) (reg - XED_REG_XMM_FIRST);
+    }
+    if (reg >= XED_REG_YMM_FIRST && reg <= XED_REG_YMM_LAST) {
+        return (int) (reg - XED_REG_YMM_FIRST);
+    }
+    if (reg >= XED_REG_ZMM_FIRST && reg <= XED_REG_ZMM_LAST) {
+        return (int) (reg - XED_REG_ZMM_FIRST);
+    }
+    return -1;
+}
+
+static void pending_push(struct xmm_zero_state *z, size_t target,
+                         uint32_t mask)
+{
+    if (z->broken) {
+        return;
+    }
+    if (z->n == z->cap) {
+        size_t cap = z->cap != 0 ? z->cap * 2 : 64;
+        struct pending_edge *heap = realloc(z->heap, cap * sizeof(*heap));
+        if (heap == NULL) {
+            z->broken = true;
+            return;
+        }
+        z->heap = heap;
+        z->cap = cap;
+    }
+    size_t i = z->n++;
+    while (i > 0 && z->heap[(i - 1) / 2].target > target) {
+        z->heap[i] = z->heap[(i - 1) / 2];
+        i = (i - 1) / 2;
+    }
+    z->heap[i] = (struct pending_edge) {target, mask};
+}
+
+static struct pending_edge pending_pop(struct xmm_zero_state *z)
+{
+    struct pending_edge top = z->heap[0];
+    struct pending_edge last = z->heap[--z->n];
+    size_t i = 0;
+    for (;;) {
+        size_t c = 2 * i + 1;
+        if (c >= z->n) {
+            break;
+        }
+        if (c + 1 < z->n && z->heap[c + 1].target < z->heap[c].target) {
+            ++c;
+        }
+        if (z->heap[c].target >= last.target) {
+            break;
+        }
+        z->heap[i] = z->heap[c];
+        i = c;
+    }
+    if (z->n > 0) {
+        z->heap[i] = last;
+    }
+    return top;
+}
+
+// Merge the edges into the instruction at `offset` and return the bits that
+// hold on entry to it.
+static uint32_t xmm_zero_enter(struct xmm_zero_state *z, size_t offset,
+                               const xed_decoded_inst_t *xedd,
+                               const uint8_t *targets,
+                               const uint8_t *backward)
+{
+    uint32_t incoming = UINT32_MAX;
+    bool any_edge = false;
+    // A target inside an instruction never starts one in this sweep.
+    while (z->n > 0 && z->heap[0].target < offset) {
+        pending_pop(z);
+    }
+    while (z->n > 0 && z->heap[0].target == offset) {
+        incoming &= pending_pop(z).mask;
+        any_edge = true;
+    }
+    if (z->falls_through) {
+        if (any_edge) {
+            z->mask &= incoming;
+        }
+    } else {
+        z->mask = any_edge ? incoming : 0;
+    }
+    bool targeted = targets == NULL ||
+        (targets[offset >> 3] & (1u << (offset & 7))) != 0;
+    if (z->broken ||
+        (targeted && (backward == NULL ||
+                      (backward[offset >> 3] & (1u << (offset & 7))) != 0 ||
+                      xed_decoded_inst_get_iclass(xedd) ==
+                          XED_ICLASS_ENDBR64))) {
+        z->mask = 0;
+    }
+    return z->mask;
+}
+
+// Apply the instruction at [offset, next) to the bits and record its edge.
+static void xmm_zero_leave(struct xmm_zero_state *z,
+                           const xed_decoded_inst_t *xedd, size_t offset,
+                           size_t next, size_t len)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned nops = xed_inst_noperands(xi);
+    for (unsigned i = 0; i < nops; ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t name = xed_operand_name(op);
+        if (!xed_operand_is_register(name) || !xed_operand_written(op)) {
+            continue;
+        }
+        int idx = vec_reg_index(xed_decoded_inst_get_reg(xedd, name));
+        if (idx >= 0) {
+            z->mask &= ~(1u << idx);
+        }
+    }
+    xed_reg_enum_t dst = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    int idx = vec_reg_index(dst);
+    if (idx >= 0 &&
+        xmm_dep_mitigation(xedd, xed_get_largest_enclosing_register(dst))) {
+        z->mask |= 1u << idx;
+    }
+
+    if (xed_decoded_inst_get_branch_displacement_width_bits(xedd) != 0) {
+        int64_t target = (int64_t) next +
+            xed_decoded_inst_get_branch_displacement(xedd);
+        if (target > (int64_t) offset && (uint64_t) target < (uint64_t) len) {
+            pending_push(z, (size_t) target, z->mask);
+        }
+    }
+
+    xed_category_enum_t cat = xed_decoded_inst_get_category(xedd);
+    switch (cat) {
+    case XED_CATEGORY_CALL:
+    case XED_CATEGORY_SYSCALL:
+    case XED_CATEGORY_INTERRUPT:
+    case XED_CATEGORY_XSAVE:
+        z->mask = 0;
+        break;
+    default:
+        break;
+    }
+    z->falls_through = cat != XED_CATEGORY_UNCOND_BR &&
+                       cat != XED_CATEGORY_RET;
+}
+
 static bool popcnt_false_dep(const xed_decoded_inst_t *xedd,
                              const struct dep_history *history,
                              uint32_t tprops)
@@ -11010,13 +11205,17 @@ static bool redefines_xmm_full(const xed_decoded_inst_t *xedd,
 //     xor shape, or any adjacent full producer -- re-flagging mitigated code
 //     would bury the real findings. A direct edge onto the instruction
 //     reaches it without that predecessor; the suppression forgoes that
-//     path's finding, erring toward false negatives as everywhere else.
+//     path's finding, erring toward false negatives as everywhere else;
+//   * a zero idiom on every path reaching it with no write since, however far
+//     back or across however many branches (`zeroed`, see struct
+//     xmm_zero_state).
 //
 // A memory source needs no special handling, unlike POPCNT's: the address is
 // built from general-purpose registers, which a vector zero idiom cannot
 // disturb, so cvtss2sd xmm0, [rax] is flagged like any other form.
 static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
-                                const struct dep_history *history)
+                                const struct dep_history *history,
+                                uint32_t zeroed)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
     case XED_ICLASS_CVTSI2SD:
@@ -11046,6 +11245,9 @@ static bool sse_merge_false_dep(const xed_decoded_inst_t *xedd,
         if (xed_get_largest_enclosing_register(src) == parent) {
             return false;
         }
+    }
+    if ((zeroed & (1u << vec_reg_index(parent))) != 0) {
+        return false;
     }
     return !dep_broken_in_history(history, parent, redefines_xmm_full,
                                   xmm_dep_mitigation);
@@ -12602,7 +12804,13 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
     // branch_target_in treats as every-offset-targeted: the multi-instruction
     // findings are then conservatively suppressed while the single-instruction
     // checks proceed.
-    uint8_t *branch_targets = collect_branch_targets(inst, len);
+    uint8_t *backward_targets;
+    uint8_t *branch_targets =
+        collect_branch_targets(inst, len, &backward_targets);
+
+    // Idiom-zeroed vector registers on every path here (see struct
+    // xmm_zero_state).
+    struct xmm_zero_state xmm_zero = {0};
 
     // The NOT inside the last BZHI advice's window, whose ANDN fold that
     // advice already accounts for.
@@ -12628,6 +12836,8 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             dep_history_reset(&dep_history);
             ymm_upper_dirty = false;
             memset(&const_map, 0, sizeof(const_map));
+            xmm_zero.mask = 0;
+            xmm_zero.falls_through = false;
             offset += 1;
             continue;
         }
@@ -12635,6 +12845,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         if (summary != NULL) {
             summary->instructions++;
         }
+
+        uint32_t xmm_zeroed = xmm_zero_enter(&xmm_zero, offset, &xedd,
+                                             branch_targets, backward_targets);
 
         // Disabled: the savings are at most one decoded uop (same byte count)
         // and benign alignment-padding patterns generate noise even after the
@@ -13153,7 +13366,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // and merges into the rest, so a destination the adjacent
         // predecessor did not rewrite carries a false dependency; a vector
         // zero idiom just before breaks it. See sse_merge_false_dep.
-        if (sse_merge_false_dep(&xedd, &dep_history)) {
+        if (sse_merge_false_dep(&xedd, &dep_history, xmm_zeroed)) {
             emit_finding(&sink, "missing SSE dependency break", offset, &xedd,
                 inst + offset);
             ++errors;
@@ -13256,9 +13469,12 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         prev = xedd;
         have_prev = true;
         dep_history_push(&dep_history, &xedd);
+        xmm_zero_leave(&xmm_zero, &xedd, offset, next, len);
         offset = next;
     }
 
+    free(xmm_zero.heap);
+    free(backward_targets);
     free(branch_targets);
     return errors;
 }

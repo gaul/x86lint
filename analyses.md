@@ -673,9 +673,13 @@ argue for or against each, live in [TODO.md](TODO.md).
   dependency the xor would destroy), for the VEX and EVEX forms (whose
   third operand names the merge source outright -- the fix there is to
   choose that operand, a different rewrite reported separately as a stale
-  VEX merge operand), or when the preceding
+  VEX merge operand), when the preceding
   instruction already rewrote the whole register, whether by a
-  same-register vector XOR or by any full producer. ADDSD and the other
+  same-register vector XOR or by any full producer, or when a same-register
+  vector XOR reaches it on every path with no write to the register since,
+  at any distance and across forward branches (a backward branch, a call,
+  an ENDBR64, or an instruction after a jmp or ret that no seen branch
+  targets clears that knowledge). ADDSD and the other
   scalar arithmetic merge identically and are never flagged: their
   destination is a genuine source operand, the same real-versus-phantom
   input distinction that keeps BSF/BSR out of the POPCNT check. A memory

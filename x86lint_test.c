@@ -6014,6 +6014,80 @@ static void check_sse_merge_false_dep_test(void)
     };
     ASSERT_FINDINGS(mem_src, "missing SSE dependency break", 1);
 
+    // A zero idiom hoisted above a branch covers both arms, though the odd
+    // arm sits after a jmp, beyond the window, and past the other arm's
+    // conversion in the linear order. SpiderMonkey's unsigned 64-bit
+    // conversion.
+    static const uint8_t hoisted[] = {
+        0x0F, 0x57, 0xC0,              // xorps xmm0, xmm0
+        0x48, 0x85, 0xC0,              // test rax, rax
+        0x78, 0x07,                    // js odd
+        0xF3, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2ss xmm0, rax
+        0xEB, 0x18,                    // jmp done
+        0x49, 0x89, 0xC3,              // odd: mov r11, rax
+        0x48, 0x89, 0xC1,              // mov rcx, rax
+        0x49, 0xD1, 0xEB,              // shr r11, 1
+        0x83, 0xE1, 0x01,              // and ecx, 1
+        0x49, 0x09, 0xCB,              // or r11, rcx
+        0xF3, 0x49, 0x0F, 0x2A, 0xC3,  // cvtsi2ss xmm0, r11
+        0xF3, 0x0F, 0x58, 0xC0,        // addss xmm0, xmm0
+        0xC3,                          // done: ret
+    };
+    ASSERT_FINDINGS(hoisted, "missing SSE dependency break", 0);
+
+    // The same split with the idiom on one arm only: the other is flagged.
+    static const uint8_t one_arm[] = {
+        0x48, 0x85, 0xC0,              // test rax, rax
+        0x78, 0x0A,                    // js odd
+        0x0F, 0x57, 0xC0,              // xorps xmm0, xmm0
+        0xF3, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2ss xmm0, rax
+        0xEB, 0x18,                    // jmp done
+        0x49, 0x89, 0xC3,              // odd: mov r11, rax
+        0x48, 0x89, 0xC1,              // mov rcx, rax
+        0x49, 0xD1, 0xEB,              // shr r11, 1
+        0x83, 0xE1, 0x01,              // and ecx, 1
+        0x49, 0x09, 0xCB,              // or r11, rcx
+        0xF3, 0x49, 0x0F, 0x2A, 0xC3,  // cvtsi2ss xmm0, r11
+        0xF3, 0x0F, 0x58, 0xC0,        // addss xmm0, xmm0
+        0xC3,                          // done: ret
+    };
+    ASSERT_FINDINGS(one_arm, "missing SSE dependency break", 1);
+
+    // An idiom with no write to the register since holds at any distance.
+    static const uint8_t far[] = {
+        0x0F, 0x57, 0xC0,              // xorps xmm0, xmm0
+        0x89, 0xD1,                    // mov ecx, edx
+        0x89, 0xFE,                    // mov esi, edi
+        0x44, 0x89, 0xC0,              // mov eax, r8d
+        0x44, 0x89, 0xCA,              // mov edx, r9d
+        0x89, 0xCF,                    // mov edi, ecx
+        0x41, 0x89, 0xF0,              // mov r8d, esi
+        0x41, 0x89, 0xC1,              // mov r9d, eax
+        0x41, 0x89, 0xD2,              // mov r10d, edx
+        0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(far, "missing SSE dependency break", 0);
+
+    // But not around a loop: the back edge brings the conversion's own
+    // previous result, a real merge dependency.
+    static const uint8_t loop[] = {
+        0x0F, 0x57, 0xC0,              // xorps xmm0, xmm0
+        0x89, 0xD1,                    // mov ecx, edx
+        0x89, 0xFE,                    // mov esi, edi
+        0x44, 0x89, 0xC0,              // mov eax, r8d
+        0x44, 0x89, 0xCA,              // mov edx, r9d
+        0x89, 0xCF,                    // mov edi, ecx
+        0x41, 0x89, 0xF0,              // mov r8d, esi
+        0x41, 0x89, 0xC1,              // mov r9d, eax
+        0x41, 0x89, 0xD2,              // mov r10d, edx
+        0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // L: cvtsi2sd xmm0, rax
+        0xFF, 0xCA,                    // dec edx
+        0x75, 0xF7,                    // jnz L
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(loop, "missing SSE dependency break", 1);
+
     // Same register: the destination is the source, so the dependency is
     // real and the xor would destroy the input.
     static const uint8_t same_reg[] = {

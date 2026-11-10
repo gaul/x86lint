@@ -3183,13 +3183,22 @@ static bool rw_mov_const_fold(const struct view *v, int i, struct prog *out,
     struct ins c;
     ins_parse(v->p->it[j].text, &c);
     int s, sbits;
-    if (c.nop != 2 || !reg_op(c.op[1], &s, &sbits) || s != r ||
-        sbits > known) {
+    // The source operand, or either operand of the commutative TEST.
+    int other = 0;
+    if (c.nop == 2 && strcmp(c.mn, "test") == 0 &&
+        reg_op(c.op[0], &s, &sbits) && s == r &&
+        !(reg_op(c.op[1], &s, &sbits) && s == r)) {
+        reg_op(c.op[0], &s, &sbits);
+        other = 1;
+    } else if (c.nop != 2 || !reg_op(c.op[1], &s, &sbits) || s != r) {
         FAIL("`%s` does not read the constant as its source",
              v->p->it[j].text);
     }
+    if (sbits > known) {
+        FAIL("`%s` reads bits the MOV did not set", v->p->it[j].text);
+    }
     int64_t imm = sign_extend(val, sbits);
-    item_set(&out->it[j], "%s %s, %" PRId64, c.mn, c.op[0], imm);
+    item_set(&out->it[j], "%s %s, %" PRId64, c.mn, c.op[other], imm);
     delete_item(out, i);
     return true;
 }

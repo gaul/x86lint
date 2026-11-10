@@ -12191,11 +12191,13 @@ struct frame_record {
     bool used;
     bool held;          // `data` holds what this access left in the slot
     bool unread;        // a MOV store nothing can have read, no branch since
+    bool constant;      // the slot holds `value`, stored as an immediate
     bool store;         // armed by a store, not a load
     xed_reg_enum_t base;        // XED_REG_RSP or XED_REG_RBP
     int64_t disp;
     unsigned width;             // bytes
     xed_reg_enum_t data;        // largest enclosing register
+    uint64_t value;             // the bytes an immediate store wrote
     size_t offset;              // the access that armed the record
 };
 
@@ -12329,15 +12331,19 @@ static bool frame_gpr_move(const struct frame_table *t,
     return true;
 }
 
-// The record for this exact slot, if any.
+// The record for this exact slot that a store armed, or a load, if any. A
+// slot keeps one of each, as riscvlint's window does, because the two make
+// different claims: after `mov [rsp+8], eax ; mov ecx, [rsp+8]` both EAX and
+// ECX hold the slot's bytes, and only the store's record can say the slot
+// is unread.
 static struct frame_record *frame_find(struct frame_table *t,
                                        xed_reg_enum_t base, int64_t disp,
-                                       unsigned width)
+                                       unsigned width, bool store)
 {
     for (int i = 0; i < FRAME_RECORDS; ++i) {
         struct frame_record *r = &t->rec[i];
         if (r->used && r->base == base && r->disp == disp &&
-            r->width == width) {
+            r->width == width && r->store == store) {
             return r;
         }
     }
@@ -12350,7 +12356,22 @@ enum frame_verdict {
     FRAME_VERDICT_FORWARD,      // a load reads back what a store just wrote
     FRAME_VERDICT_HELD,         // a load into the register already holding it
     FRAME_VERDICT_DEAD_STORE,   // a store overwriting an unread one
+    FRAME_VERDICT_SILENT_STORE, // a store of the bytes the slot already holds
 };
+
+// The bytes a MOV store of an immediate writes, truncated to its width: the
+// 64-bit form sign-extends its imm32. False for any other store.
+static bool frame_store_constant(const xed_decoded_inst_t *d, unsigned width,
+                                 uint64_t *value)
+{
+    if (!xed_operand_values_has_immediate(
+            xed_decoded_inst_operands_const(d))) {
+        return false;
+    }
+    uint64_t v = (uint64_t) xed_decoded_inst_get_signed_immediate(d);
+    *value = width >= 8 ? v : v & ((UINT64_C(1) << (width * 8)) - 1);
+    return true;
+}
 
 // A plain MOV store to a frame slot, of a register at any width or of an
 // immediate: the stores whose only effect is the bytes they write.
@@ -12451,6 +12472,7 @@ static void frame_observe(struct frame_table *t, size_t offset,
             t->rec[j].unread = false;
             if (mwrite) {
                 t->rec[j].held = false;
+                t->rec[j].constant = false;
             }
         }
         break;
@@ -12475,6 +12497,7 @@ static void frame_observe(struct frame_table *t, size_t offset,
                     frame_byte_ranges_overlap(r->disp, r->width, mdisp,
                                               mwidth))) {
                     r->held = false;
+                    r->constant = false;
                 }
             }
         }
@@ -12494,18 +12517,24 @@ static void frame_observe(struct frame_table *t, size_t offset,
         xed_reg_enum_t kbase = gmove ? gbase : sbase;
         int64_t kdisp = gmove ? gdisp : sdisp;
         unsigned kwidth = gmove ? gwidth : swidth;
-        struct frame_record *r = frame_find(t, kbase, kdisp, kwidth);
+        bool kstore = gmove ? gstore : true;
+        struct frame_record *r = frame_find(t, kbase, kdisp, kwidth, kstore);
         for (int j = 0; r == NULL && j < FRAME_RECORDS; ++j) {
-            if (!t->rec[j].used || (!t->rec[j].held && !t->rec[j].unread)) {
+            if (!t->rec[j].used || (!t->rec[j].held && !t->rec[j].unread &&
+                                    !t->rec[j].constant)) {
                 r = &t->rec[j];
             }
         }
+        uint64_t value = 0;
+        bool constant = mstore && frame_store_constant(d, kwidth, &value);
         if (r != NULL) {       // full: stop recording, which stays sound
             *r = (struct frame_record) {
                 .used = true,
                 .held = gmove,
                 .unread = mstore,
-                .store = gmove ? gstore : true,
+                .constant = constant,
+                .value = value,
+                .store = kstore,
                 .base = kbase,
                 .disp = kdisp,
                 .width = kwidth,
@@ -12582,25 +12611,38 @@ static enum frame_verdict frame_step(struct frame_table *t,
     unsigned width;
     if (frame_gpr_move(t, d, &store, &base, &disp, &width, &data) &&
         !store) {
-        struct frame_record *r = frame_find(t, base, disp, width);
-        if (r != NULL && r->held &&
-            xed_reg_class(r->data) == XED_REG_CLASS_GPR) {
+        struct frame_record *held[2] = {
+            frame_find(t, base, disp, width, false),
+            frame_find(t, base, disp, width, true),
+        };
+        struct frame_record *nearest = NULL;
+        for (int k = 0; k < 2; ++k) {
+            struct frame_record *r = held[k];
+            if (r == NULL || !r->held ||
+                xed_reg_class(r->data) != XED_REG_CLASS_GPR) {
+                continue;
+            }
             if (r->data == data && (!r->store || width == 8)) {
                 // The destination already holds what the load would put
                 // there: the same bytes loaded again at the same width, or
                 // stored from it at the full width. A 32-bit store says
                 // nothing of bits 63:32, which the load would zero.
                 verdict = FRAME_VERDICT_HELD;
-            } else if (!r->store) {
-                verdict = FRAME_VERDICT_RELOAD;
-            } else if (r->store && (r->data != data || width == 4)) {
-                // The store's source still holds the bytes it wrote, so the
-                // load is MOV rD, rS at its own width -- which zero-extends
-                // at 32 bits exactly as the load does. Read back into the
-                // register it came from, that is MOV eD, eD at 32 bits; at
-                // 64 the load is a no-op, which is a different row.
-                verdict = FRAME_VERDICT_FORWARD;
+                break;
             }
+            if (nearest == NULL || r->offset > nearest->offset) {
+                nearest = r;
+            }
+        }
+        // Otherwise the copy comes from the nearer source, one rewrite per
+        // site: a load's register for a reload, or the store's source,
+        // which still holds the bytes it wrote -- MOV rD, rS at the load's
+        // width, which zero-extends at 32 bits exactly as the load does.
+        // Read back into the register it came from, that is MOV eD, eD at
+        // 32 bits; at 64 the load is a no-op, the HELD verdict above.
+        if (verdict == FRAME_VERDICT_NONE && nearest != NULL) {
+            verdict = nearest->store ? FRAME_VERDICT_FORWARD
+                                     : FRAME_VERDICT_RELOAD;
         }
     }
 
@@ -12613,10 +12655,26 @@ static enum frame_verdict frame_step(struct frame_table *t,
     unsigned swidth;
     if (verdict == FRAME_VERDICT_NONE &&
         frame_mov_store(t, d, &sbase, &sdisp, &swidth)) {
-        struct frame_record *r = frame_find(t, sbase, sdisp, swidth);
+        struct frame_record *r = frame_find(t, sbase, sdisp, swidth, true);
+        struct frame_record *l = frame_find(t, sbase, sdisp, swidth, false);
+        bool gpr = frame_gpr_move(t, d, &store, &base, &disp, &width, &data);
+        uint64_t value;
         if (r != NULL && r->unread) {
             *dead_offset = r->offset;
             verdict = FRAME_VERDICT_DEAD_STORE;
+        } else if ((r != NULL && r->held && gpr && r->data == data) ||
+                   (l != NULL && l->held && gpr && l->data == data) ||
+                   (r != NULL && r->constant &&
+                    frame_store_constant(d, swidth, &value) &&
+                    r->value == value)) {
+            // Putting back what is already there is a no-op on every path
+            // that reaches it, so unlike the dead store this needs no
+            // overwrite and survives a branch. The bytes are what is
+            // compared, not how they were read: a slot armed by a 32-bit
+            // load is written back unchanged by a 32-bit store of the same
+            // register. Where the earlier store is still unread the pair is
+            // the dead store's instead, one rewrite per site.
+            verdict = FRAME_VERDICT_SILENT_STORE;
         }
     }
 
@@ -13627,6 +13685,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             break;
         case FRAME_VERDICT_HELD:
             emit_finding(&sink, "load of a value the register still holds",
+                offset, &xedd, inst + offset);
+            ++errors;
+            break;
+        case FRAME_VERDICT_SILENT_STORE:
+            emit_finding(&sink, "store of a value the slot already holds",
                 offset, &xedd, inst + offset);
             ++errors;
             break;

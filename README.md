@@ -283,6 +283,7 @@ with the corpus populations that argue for or against each, live in
 | [redundant TEST after shift](analyses.md#redundant-test-after-shift) | branch on the shift's flags directly |
 | [redundant TEST immediate](analyses.md#redundant-test-immediate) | `TEST reg, reg` |
 | [shift pair foldable into extend](analyses.md#shift-pair-foldable-into-extend) | `MOVSX`/`MOVZX` |
+| [store of a value the slot already holds](analyses.md#store-of-a-value-the-slot-already-holds) | delete the frame-slot store; the slot already holds those bytes |
 | [rematerialized constant](analyses.md#rematerialized-constant) | `MOV rD, rS`; needs `-t skylake` or `-t zen` |
 | [suboptimal AND immediate](analyses.md#suboptimal-and-immediate) | `MOVZX` |
 | [suboptimal AND zero](analyses.md#suboptimal-and-zero) | `XOR reg, reg` |

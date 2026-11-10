@@ -3897,6 +3897,96 @@ static void check_frame_dead_store_test(void)
         &total, 0) == 0);
 }
 
+// A store of the bytes a frame slot already holds: the store goes. See
+// frame_step.
+static void check_frame_silent_store_test(void)
+{
+    int total;
+
+    // A slot loaded, branched on, and written back unchanged.
+    static const uint8_t written_back[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x85, 0xC0,              // test rax, rax
+        0x74, 0x05,                    // je +5
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(written_back, "store of a value the slot already holds",
+        1);
+
+    // Stored twice from one register with a read between, so the first is
+    // not dead; the second still writes nothing new.
+    static const uint8_t stored_twice[] = {
+        0x89, 0x44, 0x24, 0x08,        // mov [rsp+8], eax
+        0x8B, 0x4C, 0x24, 0x08,        // mov ecx, [rsp+8]
+        0x89, 0x44, 0x24, 0x08,        // mov [rsp+8], eax
+        0xC3,                          // ret
+    };
+    assert(count_findings(stored_twice, sizeof(stored_twice),
+        "store of a value the slot already holds", &total, 0) == 1);
+    assert(count_findings(stored_twice, sizeof(stored_twice),
+        "dead store to a frame slot", &total, 0) == 0);
+
+    // With nothing between, the pair is the dead store's: one rewrite per
+    // site.
+    static const uint8_t adjacent[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(adjacent, "dead store to a frame slot", 1);
+
+    // The same immediate again, across a branch; and a different one,
+    // which is not.
+    static const uint8_t same_constant[] = {
+        0xC7, 0x44, 0x24, 0x08, 0x01, 0x00, 0x00, 0x00,  // mov dword [rsp+8], 1
+        0x85, 0xC0,                                      // test eax, eax
+        0x74, 0x08,                                      // je +8
+        0xC7, 0x44, 0x24, 0x08, 0x01, 0x00, 0x00, 0x00,  // mov dword [rsp+8], 1
+        0xC3,                                            // ret
+    };
+    ASSERT_FINDINGS(same_constant, "store of a value the slot already holds",
+        1);
+    static const uint8_t other_constant[] = {
+        0xC7, 0x44, 0x24, 0x08, 0x01, 0x00, 0x00, 0x00,  // mov dword [rsp+8], 1
+        0x85, 0xC0,                                      // test eax, eax
+        0x74, 0x08,                                      // je +8
+        0xC7, 0x44, 0x24, 0x08, 0x02, 0x00, 0x00, 0x00,  // mov dword [rsp+8], 2
+        0xC3,                                            // ret
+    };
+    assert(count_findings(other_constant, sizeof(other_constant),
+        "store of a value the slot already holds", &total, 0) == 0);
+
+    // The register changed since, or the slot was overwritten through a
+    // pointer that may name it.
+    static const uint8_t register_changed[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0xFF, 0xC0,              // inc rax
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0xC3,                          // ret
+    };
+    assert(count_findings(register_changed, sizeof(register_changed),
+        "store of a value the slot already holds", &total, 0) == 0);
+    static const uint8_t slot_changed[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0x0F,              // mov [rdi], rcx
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0xC3,                          // ret
+    };
+    assert(count_findings(slot_changed, sizeof(slot_changed),
+        "store of a value the slot already holds", &total, 0) == 0);
+
+    // A 64-bit store of a register a 32-bit load filled writes eight bytes
+    // where four were read: the widths must agree.
+    static const uint8_t wider[] = {
+        0x8B, 0x44, 0x24, 0x08,        // mov eax, [rsp+8]
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0xC3,                          // ret
+    };
+    assert(count_findings(wider, sizeof(wider),
+        "store of a value the slot already holds", &total, 0) == 0);
+}
+
 // A constant another register still holds, and one the destination already
 // holds. One of the two state machines carried across the scan. See
 // const_remat_step.
@@ -9907,6 +9997,7 @@ int main(int argc, char *argv[])
     check_frame_forward_test();
     check_frame_held_test();
     check_frame_dead_store_test();
+    check_frame_silent_store_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

@@ -512,7 +512,7 @@ argue for or against each, live in [TODO.md](TODO.md).
   [redundant reload](#redundant-reload)), and a spill sequence that writes
   several slots before reading any back keeps it, since the stores between
   are to disjoint ranges through the same base
-* Five-binary sweep: go 392, libcrypto 93, libc 38, bash 27, ld.so 1. Go's
+* Five-binary sweep: go 392, libcrypto 95, libc 38, bash 27, ld.so 1. Go's
   are the goroutine pointer spilled and read back across a write-barrier
   test, `mov [rsp+0x48], r14 ; mov rdx, [rsp+0x48]`, and the C sites GCC's
   spill of a call result tested and reloaded as the next argument, `mov
@@ -531,7 +531,7 @@ argue for or against each, live in [TODO.md](TODO.md).
   [load of a just-stored value](#load-of-a-just-stored-value). The first
   shape is issue #29's "same" half; the claim is the frame-slot table's (see
   [redundant reload](#redundant-reload))
-* Five-binary sweep: go 203, libcrypto 31, libc 23, bash 16, ld.so 5. Go's
+* Five-binary sweep: go 203, libcrypto 31, libc 25, bash 16, ld.so 5. Go's
   are its register-ABI arguments spilled to their home slots at entry and
   read straight back, `mov [rsp+0x8], rax ; mov [rsp+0x10], rbx ; mov rax,
   [rsp+0x8]` in `internal/abi.TypeOf` -- the stores are for tracebacks and
@@ -1153,7 +1153,7 @@ argue for or against each, live in [TODO.md](TODO.md).
   store through the same base provably misses the slot; any store through
   another address may not. The widths must agree. A load that replaces its
   own base (`mov rbp, [rbp-8]`) arms nothing
-* Five-binary sweep: libc 59, libcrypto 34, bash 16, go 5, ld.so 3. Every
+* Five-binary sweep: libc 57, libcrypto 34, bash 16, go 5, ld.so 3. Every
   C site is GCC's spill reload through the frame pointer -- `mov edi,
   [rbp-0x224] ; test edi, edi ; je ; ... ; mov eax, [rbp-0x224]` in bash's
   `check_signals` -- and go's are RSP-based, the population issue #29
@@ -1230,6 +1230,31 @@ argue for or against each, live in [TODO.md](TODO.md).
   64-bit shift by 32). SHR instead of SAR is the zero-extending twin -> MOVZX
   (MOV EAX, EAX for 32 -> 64). Fires when the low remainder is 8/16/32 bits
   and the second shift's flags are dead (gated by flag liveness)
+
+## store of a value the slot already holds
+
+* `488B442408 4885C0 7405 4889442408` (MOV RAX, [RSP+8]; TEST RAX, RAX; JE;
+  MOV [RSP+8], RAX) -- a store of the bytes the frame slot already holds:
+  delete it. The dead store read from the other end. That row deletes the
+  first of two stores and needs the overwrite to be certain; this deletes
+  the second and needs nothing of the kind, since putting back what is there
+  is a no-op on every path that reaches it -- so it survives a conditional
+  branch and a load through a pointer, neither of which changes the slot or
+  the register. Where the earlier store is still unread, the pair is the
+  dead store's, one rewrite per site
+* What is compared is the bytes, not how they were read: the register a
+  load filled at the store's width, the register an earlier store wrote
+  from, or the same immediate an earlier `MOV` store wrote -- x86's form of
+  riscvlint's store of `x0`. A slot keeps a store's claim and a load's side
+  by side, as riscvlint's window does, so `mov [rsp+8], eax ; mov ecx,
+  [rsp+8] ; mov [rsp+8], eax` is still found
+* Five-binary sweep: go 870, libcrypto 147, bash 39, libc 36, ld.so 5.
+  Go's are register-ABI arguments spilled to their home slots on one path
+  and spilled again on the next, `mov [rsp+0xc0], rcx ; test rbx, rbx ; je ;
+  ... ; mov [rsp+0xc0], rcx` in `runtime.mapassign_faststr`. GCC's are slots
+  loaded, tested and written back unchanged -- `mov rcx, [rbp-0x28]` after
+  a call and `mov [rbp-0x28], rcx` three instructions on in
+  `ASYNC_start_job` -- often through `r8`-`r11`
 
 ## suboptimal AND immediate
 

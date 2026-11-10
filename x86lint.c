@@ -12336,6 +12336,7 @@ enum frame_verdict {
     FRAME_VERDICT_NONE,
     FRAME_VERDICT_RELOAD,       // another register holds what a load reloads
     FRAME_VERDICT_FORWARD,      // a load reads back what a store just wrote
+    FRAME_VERDICT_HELD,         // a load into the register already holding it
 };
 
 // Fold one instruction into the table, after it has been judged.
@@ -12515,7 +12516,13 @@ static enum frame_verdict frame_step(struct frame_table *t,
         struct frame_record *r = frame_find(t, base, disp, width);
         if (r != NULL && r->held &&
             xed_reg_class(r->data) == XED_REG_CLASS_GPR) {
-            if (!r->store && r->data != data) {
+            if (r->data == data && (!r->store || width == 8)) {
+                // The destination already holds what the load would put
+                // there: the same bytes loaded again at the same width, or
+                // stored from it at the full width. A 32-bit store says
+                // nothing of bits 63:32, which the load would zero.
+                verdict = FRAME_VERDICT_HELD;
+            } else if (!r->store) {
                 verdict = FRAME_VERDICT_RELOAD;
             } else if (r->store && (r->data != data || width == 4)) {
                 // The store's source still holds the bytes it wrote, so the
@@ -13505,7 +13512,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
 
         // Stateful checks: a frame slot read back while a register still
         // holds what it held, from a load or from the store that wrote it.
-        // Reported against the load the rewrite replaces.
+        // Reported against the load the rewrite replaces or deletes.
         // A function's entry is a direct-call target, an ENDBR64 or an
         // installed function's start: RBP is the caller's there. See
         // frame_step.
@@ -13530,6 +13537,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         case FRAME_VERDICT_FORWARD:
             emit_finding(&sink, "load of a just-stored value", offset, &xedd,
                 inst + offset);
+            ++errors;
+            break;
+        case FRAME_VERDICT_HELD:
+            emit_finding(&sink, "load of a value the register still holds",
+                offset, &xedd, inst + offset);
             ++errors;
             break;
         case FRAME_VERDICT_NONE:

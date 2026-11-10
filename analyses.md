@@ -494,6 +494,26 @@ argue for or against each, live in [TODO.md](TODO.md).
   spill of a call result tested and reloaded as the next argument, `mov
   [rbp-0x108], rax ; test rax, rax ; je ; mov rdi, [rbp-0x108]`
 
+## load of a value the register still holds
+
+* `488B442408 ... 488B442408` (MOV RAX, [RSP+8]; ...; MOV RAX, [RSP+8]) --
+  the frame slot loaded into the register that already holds it: delete the
+  load. Two shapes, each exact only as stated. The same slot loaded again at
+  the same width into an unwritten register recomputes the same value from
+  the same bytes, 32-bit zero-extension included. A store read back into its
+  own source is exact only at 64 bits: after `mov [rsp+8], eax`, bits 63:32
+  of RAX are whatever they were, and `mov eax, [rsp+8]` would zero them, so
+  that one is a MOV EAX, EAX under
+  [load of a just-stored value](#load-of-a-just-stored-value). The first
+  shape is issue #29's "same" half; the claim is the frame-slot table's (see
+  [redundant reload](#redundant-reload))
+* Five-binary sweep: go 203, libcrypto 31, libc 23, bash 16, ld.so 5. Go's
+  are its register-ABI arguments spilled to their home slots at entry and
+  read straight back, `mov [rsp+0x8], rax ; mov [rsp+0x10], rbx ; mov rax,
+  [rsp+0x8]` in `internal/abi.TypeOf` -- the stores are for tracebacks and
+  stay, the load has nothing to do. The C sites are GCC reloading a spilled
+  value it never overwrote, past a compare and a conditional branch
+
 ## NEG foldable into ADD/SUB
 
 * `F7DA 4101D6` (NEG EDX; ADD R14D, EDX) -- negating a value and adding it

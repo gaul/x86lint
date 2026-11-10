@@ -2226,7 +2226,8 @@ counts below come from it). What each one is:
   libxul had 550 + 1,239. Its same-register reloads, 561 today, divide 360
   C++ to 201 Rust, at 21 and 25 per million. So GCC has the gap too, at
   about the rate LLVM does. The copies into another register ship as
-  "load of a just-stored value" (2026-11-10).
+  "load of a just-stored value" (2026-11-10), and the same-register
+  reloads, 64-bit, as "load of a value the register still holds".
 * **Stack-to-stack copies through a register** -- 94,712 pure copies
   (the register dies at the store), plus 115,874 vector-register copies
   and 101,780 load-and-spill pairs. Per million instructions: rustc

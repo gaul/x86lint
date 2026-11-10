@@ -3715,6 +3715,63 @@ static void check_frame_forward_test(void)
         "load of a just-stored value", &total, 0) == 1);
 }
 
+// A frame slot loaded into the register that already holds it: the load
+// goes. See frame_step.
+static void check_frame_held_test(void)
+{
+    int total;
+
+    // The same slot loaded twice into the same register, across a
+    // conditional fall-through -- the uutils shape in issue #29.
+    static const uint8_t twice[] = {
+        0x48, 0x8B, 0x84, 0x24, 0xE0, 0x00, 0x00, 0x00,  // mov rax, [rsp+0xe0]
+        0x80, 0xB8, 0x8C, 0x00, 0x00, 0x00, 0x01,        // cmp byte [rax+0x8c], 1
+        0x75, 0x08,                                      // jne +8
+        0x48, 0x8B, 0x84, 0x24, 0xE0, 0x00, 0x00, 0x00,  // mov rax, [rsp+0xe0]
+        0xC3,                                            // ret
+    };
+    ASSERT_FINDINGS(twice, "load of a value the register still holds", 1);
+
+    // At 32 bits too: the register is unwritten, so bits 63:32 are still
+    // the zeros the first load left.
+    static const uint8_t twice32[] = {
+        0x8B, 0x44, 0x24, 0x08,        // mov eax, [rsp+8]
+        0x89, 0xC1,                    // mov ecx, eax
+        0x8B, 0x44, 0x24, 0x08,        // mov eax, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(twice32, "load of a value the register still holds", 1);
+
+    // A 64-bit store read back into its own source.
+    static const uint8_t store64[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(store64, "load of a value the register still holds", 1);
+    // At 32 bits the load zeroes bits 63:32 the store never saw: that is
+    // a MOV EAX, EAX, the store-forward row's.
+    static const uint8_t store32[] = {
+        0x89, 0x44, 0x24, 0x08,        // mov [rsp+8], eax
+        0x8B, 0x44, 0x24, 0x08,        // mov eax, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(store32, sizeof(store32),
+        "load of a value the register still holds", &total, 0) == 0);
+
+    // A pointer walk replaces the base, not the slot: the second load
+    // reads the same frame slot, so it is still a finding -- but a load
+    // through the loaded pointer is a different address.
+    static const uint8_t walk[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x8B, 0x00,              // mov rax, [rax]
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(walk, sizeof(walk),
+        "load of a value the register still holds", &total, 0) == 0);
+}
+
 // A constant another register still holds, and one the destination already
 // holds. One of the two state machines carried across the scan. See
 // const_remat_step.
@@ -9723,6 +9780,7 @@ int main(int argc, char *argv[])
     check_const_remat_test();
     check_frame_reload_test();
     check_frame_forward_test();
+    check_frame_held_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

@@ -235,6 +235,7 @@ with the corpus populations that argue for or against each, live in
 | [load foldable into vector op](analyses.md#load-foldable-into-vector-op) | fold the load into the SIMD instruction's source operand |
 | [load foldable into vector transfer](analyses.md#load-foldable-into-vector-transfer) | `MOVD`/`MOVQ`/`CVTSI2SD xmm, [mem]` |
 | [load of a just-stored value](analyses.md#load-of-a-just-stored-value) | `MOV rD, rS` from the register the frame slot was stored from |
+| [load of a value the register still holds](analyses.md#load-of-a-value-the-register-still-holds) | delete the frame-slot load; its destination already holds the bytes |
 | [NEG foldable into ADD/SUB](analyses.md#neg-foldable-into-addsub) | `SUB`/`ADD` of the original |
 | [missing ANDN (only with `-m bmi1`)](analyses.md#missing-andn-only-with--m-bmi1) | `ANDN` |
 | [missing APX NDD (only with `-m apx`)](analyses.md#missing-apx-ndd-only-with--m-apx) | the EVEX new-data-destination form, dropping the copy |

@@ -274,6 +274,30 @@ argue for or against each, live in [TODO.md](TODO.md).
   any in this table: libxul 352 and go 34, against 0 in glibc, ld.so, bash,
   libstdc++ and libcrypto
 
+## dead store to a frame slot
+
+* `4889442408 4889D1 48895C2408` (MOV [RSP+8], RAX; MOV RCX, RDX; MOV
+  [RSP+8], RBX) -- a frame slot stored twice with nothing able to read it in
+  between: delete the first store. The store analogue of a dead register
+  definition, and limited to frame slots for the reason every row on the
+  frame-slot table is (see [redundant reload](#redundant-reload)). Both are
+  plain `MOV` stores of exactly the same bytes, of a register at any width or
+  of an immediate; a read-modify-write first store reads the slot and is
+  never dead
+* "Dead" is a claim about every path, so it is ended by more than a held
+  value is: a conditional branch (on the taken path the overwrite never
+  happens), a read that may overlap the slot -- through the same base an
+  overlapping range, through the other frame base anything -- any access
+  through another address, and a divide. The last two can fault into a
+  handler that reads the frame: Go's nil checks are loads and stores through
+  a pointer, and a deferred call reads the panicking frame
+* Five-binary sweep: go 94, and none in GCC's libc, ld.so, libcrypto or
+  bash. Go's are its open-coded defer bits, 54 `mov byte [rsp+N], 0` at
+  entry overwritten by the `mov byte [rsp+N], 1` that arms the defer with
+  only frame stores and LEAs between; 32 more are zero-initializations of a
+  variable assigned again before any read, 6 other constants, and 2 register
+  stores. riscvlint's Go corpus has the same skew (4,172 of its 4,568)
+
 ## IBT-bypassing NOTRACK call
 
 *Security class: reported only under `-a security` or `-a all`.*

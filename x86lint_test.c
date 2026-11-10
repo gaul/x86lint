@@ -3772,6 +3772,131 @@ static void check_frame_held_test(void)
         "load of a value the register still holds", &total, 0) == 0);
 }
 
+// A frame slot stored twice with nothing able to read it between: the first
+// store is dead. See frame_step.
+static void check_frame_dead_store_test(void)
+{
+    int total;
+
+    // mov [rsp+8], rax ; mov rcx, rdx ; mov [rsp+8], rbx -- the first goes.
+    static const uint8_t dead[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x89, 0xD1,              // mov rcx, rdx
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(dead, "dead store to a frame slot", 1);
+
+    // Immediates and narrow stores count: the bytes are the store's only
+    // effect at any width.
+    static const uint8_t immediates[] = {
+        0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x00,  // mov dword [rsp+8], 0
+        0x88, 0x4C, 0x24, 0x10,                          // mov [rsp+16], cl
+        0x89, 0x54, 0x24, 0x08,                          // mov [rsp+8], edx
+        0xC3,                                            // ret
+    };
+    ASSERT_FINDINGS(immediates, "dead store to a frame slot", 1);
+
+    // The finding names the first store, not the second.
+    {
+        char *buf = NULL;
+        size_t bufsz = 0;
+        FILE *mem = open_memstream(&buf, &bufsz);
+        assert(mem != NULL);
+        FILE *saved = stdout;
+        fflush(stdout);
+        stdout = mem;
+        check_instructions(dead, sizeof(dead), 0, true, NULL, 0,
+            X86LINT_TARGET_GENERIC, X86LINT_CLASS_REWRITE, NULL, NULL);
+        fflush(mem);
+        stdout = saved;
+        fclose(mem);
+        assert(buf != NULL &&
+            strstr(buf, "dead store to a frame slot at offset: 0x0:") !=
+                NULL);
+        free(buf);
+    }
+
+    // A read of the slot between keeps it alive -- an overlapping read
+    // through the same base, or a read through the other frame base.
+    static const uint8_t read_between[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x8B, 0x4C, 0x24, 0x0C,        // mov ecx, [rsp+12]
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0xC3,                          // ret
+    };
+    assert(count_findings(read_between, sizeof(read_between),
+        "dead store to a frame slot", &total, 0) == 0);
+    static const uint8_t other_base_read[] = {
+        0x55,                          // push rbp
+        0x48, 0x89, 0xE5,              // mov rbp, rsp
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x8B, 0x4D, 0x08,        // mov rcx, [rbp+8]
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0x5D,                          // pop rbp
+        0xC3,                          // ret
+    };
+    assert(count_findings(other_base_read, sizeof(other_base_read),
+        "dead store to a frame slot", &total, 0) == 0);
+    // A disjoint read through the same base does not.
+    static const uint8_t disjoint_read[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x8B, 0x4C, 0x24, 0x10,  // mov rcx, [rsp+16]
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(disjoint_read, "dead store to a frame slot", 1);
+
+    // Any access through a pointer may read the slot, or fault into a
+    // handler that reads the frame -- a load or a store alike.
+    static const uint8_t pointer_store[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x89, 0x0F,              // mov [rdi], rcx
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0xC3,                          // ret
+    };
+    assert(count_findings(pointer_store, sizeof(pointer_store),
+        "dead store to a frame slot", &total, 0) == 0);
+    // And so may a divide.
+    static const uint8_t divide[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0xF7, 0xF1,              // div rcx
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0xC3,                          // ret
+    };
+    assert(count_findings(divide, sizeof(divide),
+        "dead store to a frame slot", &total, 0) == 0);
+
+    // On the taken path of a branch the overwrite does not happen.
+    static const uint8_t branch[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x85, 0xC0,              // test rax, rax
+        0x74, 0x05,                    // je +5
+        0x48, 0x89, 0x5C, 0x24, 0x08,  // mov [rsp+8], rbx
+        0xC3,                          // ret
+    };
+    assert(count_findings(branch, sizeof(branch),
+        "dead store to a frame slot", &total, 0) == 0);
+
+    // The second store must cover exactly the same bytes.
+    static const uint8_t narrower[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x89, 0x5C, 0x24, 0x08,        // mov [rsp+8], ebx
+        0xC3,                          // ret
+    };
+    assert(count_findings(narrower, sizeof(narrower),
+        "dead store to a frame slot", &total, 0) == 0);
+
+    // A read-modify-write is not a store whose only effect is its bytes.
+    static const uint8_t rmw[] = {
+        0x48, 0x83, 0x44, 0x24, 0x08, 0x01,  // add qword [rsp+8], 1
+        0x48, 0x89, 0x5C, 0x24, 0x08,        // mov [rsp+8], rbx
+        0xC3,                                // ret
+    };
+    assert(count_findings(rmw, sizeof(rmw), "dead store to a frame slot",
+        &total, 0) == 0);
+}
+
 // A constant another register still holds, and one the destination already
 // holds. One of the two state machines carried across the scan. See
 // const_remat_step.
@@ -9781,6 +9906,7 @@ int main(int argc, char *argv[])
     check_frame_reload_test();
     check_frame_forward_test();
     check_frame_held_test();
+    check_frame_dead_store_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

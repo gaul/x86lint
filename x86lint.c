@@ -3130,7 +3130,10 @@ size_t x86lint_mask_relocated(uint8_t *inst, size_t len,
     return masked;
 }
 
-#define X86LINT_SUMMARY_MAX 64
+// Distinct finding names one summary can tally; a name past the cap still
+// counts toward the total but is missing from the by-type table. The README
+// lists over 90 rows, so 64 could be reached by a binary large enough.
+#define X86LINT_SUMMARY_MAX 128
 
 struct x86lint_summary {
     struct {
@@ -12174,11 +12177,20 @@ static enum const_verdict const_remat_step(struct const_map *map,
 // is reached by falling through, so everything recorded here ran, and if it
 // is also reached by a branch it is a branch target and the table is
 // already empty there.
+//
+// The second claim a record makes, that a MOV store is `unread`, has a
+// shorter life, because it is about every path rather than the one walked:
+// a conditional branch ends it (on the taken path the overwrite never
+// happens), and so does any read that may overlap the slot, any access
+// through another address (which may read the slot, or fault into a handler
+// that does -- Go's nil checks are such accesses, and a deferred call reads
+// the panicking frame), and a divide, which can fault the same way.
 #define FRAME_RECORDS 16
 
 struct frame_record {
     bool used;
     bool held;          // `data` holds what this access left in the slot
+    bool unread;        // a MOV store nothing can have read, no branch since
     bool store;         // armed by a store, not a load
     xed_reg_enum_t base;        // XED_REG_RSP or XED_REG_RBP
     int64_t disp;
@@ -12337,7 +12349,20 @@ enum frame_verdict {
     FRAME_VERDICT_RELOAD,       // another register holds what a load reloads
     FRAME_VERDICT_FORWARD,      // a load reads back what a store just wrote
     FRAME_VERDICT_HELD,         // a load into the register already holding it
+    FRAME_VERDICT_DEAD_STORE,   // a store overwriting an unread one
 };
+
+// A plain MOV store to a frame slot, of a register at any width or of an
+// immediate: the stores whose only effect is the bytes they write.
+static bool frame_mov_store(const struct frame_table *t,
+                            const xed_decoded_inst_t *d, xed_reg_enum_t *base,
+                            int64_t *disp, unsigned *width)
+{
+    bool read, write;
+    return xed_decoded_inst_get_iclass(d) == XED_ICLASS_MOV &&
+        frame_access(t, d, base, disp, width, &read, &write) == FRAME_SLOT &&
+        write && !read;
+}
 
 // Fold one instruction into the table, after it has been judged.
 static void frame_observe(struct frame_table *t, size_t offset,
@@ -12418,13 +12443,31 @@ static void frame_observe(struct frame_table *t, size_t offset,
         frame_table_clear(t);
         break;
     case FRAME_ELSEWHERE:
-        if (mwrite) {
-            for (int j = 0; j < FRAME_RECORDS; ++j) {
+        // An access anywhere else may read the slot through an escaped
+        // address, and may fault into a handler that does: Go's nil checks
+        // are exactly such loads and stores, and a deferred call reads the
+        // panicking frame. Either way the earlier store is not dead.
+        for (int j = 0; j < FRAME_RECORDS; ++j) {
+            t->rec[j].unread = false;
+            if (mwrite) {
                 t->rec[j].held = false;
             }
         }
         break;
     case FRAME_SLOT:
+        if (mread) {
+            // A read through the same base misses the slot only where the
+            // ranges are disjoint; through the other frame base nothing is
+            // provable, RSP and RBP naming one frame.
+            for (int j = 0; j < FRAME_RECORDS; ++j) {
+                struct frame_record *r = &t->rec[j];
+                if (r->used && (r->base != mbase ||
+                    frame_byte_ranges_overlap(r->disp, r->width, mdisp,
+                                              mwidth))) {
+                    r->unread = false;
+                }
+            }
+        }
         if (mwrite) {
             for (int j = 0; j < FRAME_RECORDS; ++j) {
                 struct frame_record *r = &t->rec[j];
@@ -12438,25 +12481,35 @@ static void frame_observe(struct frame_table *t, size_t offset,
         break;
     }
 
-    // 3. Arm a record for a plain GPR move, unless the move replaced the
-    //    register the address was formed from: `mov rbp, [rbp-8]` leaves
-    //    nothing that can name the slot it read.
-    if (gmove && !base_written) {
-        struct frame_record *r = frame_find(t, gbase, gdisp, gwidth);
+    // 3. Arm a record for a plain GPR move or MOV store, unless the move
+    //    replaced the register the address was formed from: `mov rbp,
+    //    [rbp-8]` leaves nothing that can name the slot it read. A store of
+    //    an immediate or a narrow register holds nothing in a register, but
+    //    is still a store a later one can make dead.
+    xed_reg_enum_t sbase;
+    int64_t sdisp;
+    unsigned swidth;
+    bool mstore = frame_mov_store(t, d, &sbase, &sdisp, &swidth);
+    if ((gmove || mstore) && !base_written) {
+        xed_reg_enum_t kbase = gmove ? gbase : sbase;
+        int64_t kdisp = gmove ? gdisp : sdisp;
+        unsigned kwidth = gmove ? gwidth : swidth;
+        struct frame_record *r = frame_find(t, kbase, kdisp, kwidth);
         for (int j = 0; r == NULL && j < FRAME_RECORDS; ++j) {
-            if (!t->rec[j].used || !t->rec[j].held) {
+            if (!t->rec[j].used || (!t->rec[j].held && !t->rec[j].unread)) {
                 r = &t->rec[j];
             }
         }
         if (r != NULL) {       // full: stop recording, which stays sound
             *r = (struct frame_record) {
                 .used = true,
-                .held = true,
-                .store = gstore,
-                .base = gbase,
-                .disp = gdisp,
-                .width = gwidth,
-                .data = gdata,
+                .held = gmove,
+                .unread = mstore,
+                .store = gmove ? gstore : true,
+                .base = kbase,
+                .disp = kdisp,
+                .width = kwidth,
+                .data = gmove ? gdata : XED_REG_INVALID,
                 .offset = offset,
             };
         }
@@ -12468,7 +12521,22 @@ static void frame_observe(struct frame_table *t, size_t offset,
         ic == XED_ICLASS_SFENCE) {
         frame_table_clear(t);
     }
+    // A divide can fault, and a handler can read the frame (a JIT's
+    // implicit division check deoptimizes from exactly that signal).
+    if (ic == XED_ICLASS_DIV || ic == XED_ICLASS_IDIV) {
+        for (int j = 0; j < FRAME_RECORDS; ++j) {
+            t->rec[j].unread = false;
+        }
+    }
     switch (xed_decoded_inst_get_category(d)) {
+    case XED_CATEGORY_COND_BR:
+        // "Dead" means the overwrite is certain, and on the taken path it
+        // does not happen. A held value is not affected: the instruction
+        // that would use it is reached by falling through.
+        for (int j = 0; j < FRAME_RECORDS; ++j) {
+            t->rec[j].unread = false;
+        }
+        break;
     case XED_CATEGORY_RET:
     case XED_CATEGORY_UNCOND_BR:
         frame_table_clear(t);
@@ -12498,7 +12566,8 @@ static void frame_observe(struct frame_table *t, size_t offset,
 static enum frame_verdict frame_step(struct frame_table *t,
                                      const uint8_t *branch_targets,
                                      bool entry, size_t offset, size_t next,
-                                     const xed_decoded_inst_t *d)
+                                     const xed_decoded_inst_t *d,
+                                     size_t *dead_offset)
 {
     if (entry) {
         frame_table_reset(t);
@@ -12532,6 +12601,22 @@ static enum frame_verdict frame_step(struct frame_table *t,
                 // 64 the load is a no-op, which is a different row.
                 verdict = FRAME_VERDICT_FORWARD;
             }
+        }
+    }
+
+    // A MOV store over a slot whose last store nothing can have read, with
+    // no branch between: the earlier store is dead, and is what the finding
+    // names. The ranges must match exactly; a wider store would cover the
+    // slot too, but the narrower record is the only one checked here.
+    xed_reg_enum_t sbase;
+    int64_t sdisp;
+    unsigned swidth;
+    if (verdict == FRAME_VERDICT_NONE &&
+        frame_mov_store(t, d, &sbase, &sdisp, &swidth)) {
+        struct frame_record *r = frame_find(t, sbase, sdisp, swidth);
+        if (r != NULL && r->unread) {
+            *dead_offset = r->offset;
+            verdict = FRAME_VERDICT_DEAD_STORE;
         }
     }
 
@@ -13527,8 +13612,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                 frame_entry = true;
             }
         }
+        size_t frame_dead = 0;
         switch (frame_step(&frame_table, branch_targets, frame_entry, offset,
-                           next, &xedd)) {
+                           next, &xedd, &frame_dead)) {
         case FRAME_VERDICT_RELOAD:
             emit_finding(&sink, "redundant reload", offset, &xedd,
                 inst + offset);
@@ -13544,6 +13630,19 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                 offset, &xedd, inst + offset);
             ++errors;
             break;
+        case FRAME_VERDICT_DEAD_STORE: {
+            // Named at the earlier store, the one the rewrite deletes; the
+            // table recorded where it was, and it decoded then.
+            xed_decoded_inst_t dead;
+            decode_init(&dead);
+            if (xed_decode(&dead, inst + frame_dead, len - frame_dead) ==
+                    XED_ERROR_NONE) {
+                emit_finding(&sink, "dead store to a frame slot", frame_dead,
+                    &dead, inst + frame_dead);
+                ++errors;
+            }
+            break;
+        }
         case FRAME_VERDICT_NONE:
             break;
         }

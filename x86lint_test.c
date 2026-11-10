@@ -3439,8 +3439,198 @@ static void check_redundant_shift_test(void)
     ASSERT_FINDINGS(sar_test_call, "redundant TEST after shift", 1);
 }
 
+// A frame slot loaded again while another register still holds what the
+// first load read: the reload is a register copy. See frame_step.
+static void check_frame_reload_test(void)
+{
+    int total;
+
+    // mov rax, [rsp+8] ; mov rcx, rdx ; mov rbx, [rsp+8] -- MOV RBX, RAX.
+    static const uint8_t reload[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0xD1,              // mov rcx, rdx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(reload, "redundant reload", 1);
+
+    // The 32-bit form: both loads zero-extend, so MOV EBX, EAX is exact.
+    static const uint8_t reload32[] = {
+        0x8B, 0x44, 0x24, 0x08,        // mov eax, [rsp+8]
+        0x8B, 0x5C, 0x24, 0x08,        // mov ebx, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(reload32, "redundant reload", 1);
+
+    // Through the frame pointer, in a function whose prologue made it one.
+    // The fall-through of a conditional branch keeps the claim: the reload
+    // is reached only by falling through, so the first load ran.
+    static const uint8_t via_rbp[] = {
+        0x55,                          // push rbp
+        0x48, 0x89, 0xE5,              // mov rbp, rsp
+        0x48, 0x8B, 0x45, 0xF8,        // mov rax, [rbp-8]
+        0x48, 0x85, 0xC9,              // test rcx, rcx
+        0x74, 0x04,                    // je +4
+        0x48, 0x8B, 0x55, 0xF8,        // mov rdx, [rbp-8]
+        0x5D,                          // pop rbp
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(via_rbp, "redundant reload", 1);
+
+    // Without that prologue RBP is a callee-saved register like any other,
+    // and [rbp-8] may be a heap word: an atomic, which x86 loads with a
+    // plain MOV.
+    static const uint8_t rbp_not_frame[] = {
+        0x48, 0x8B, 0x45, 0xF8,        // mov rax, [rbp-8]
+        0x48, 0x8B, 0x55, 0xF8,        // mov rdx, [rbp-8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(rbp_not_frame, sizeof(rbp_not_frame),
+        "redundant reload", &total, 0) == 0);
+
+    // Nor anywhere through a pointer, which is where the shape is atomics
+    // and `volatile`.
+    static const uint8_t heap[] = {
+        0x48, 0x8B, 0x47, 0x08,        // mov rax, [rdi+8]
+        0x48, 0x8B, 0x57, 0x08,        // mov rdx, [rdi+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(heap, sizeof(heap), "redundant reload", &total,
+        0) == 0);
+
+    // A store that may land on the slot: one overlapping it through the
+    // same base, and one through a pointer, which may be the slot's address.
+    static const uint8_t overlapping_store[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x89, 0x4C, 0x24, 0x0C,        // mov [rsp+12], ecx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(overlapping_store, sizeof(overlapping_store),
+        "redundant reload", &total, 0) == 0);
+    static const uint8_t pointer_store[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0x0F,              // mov [rdi], rcx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(pointer_store, sizeof(pointer_store),
+        "redundant reload", &total, 0) == 0);
+    // A disjoint slot through the same base provably misses it.
+    static const uint8_t disjoint_store[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x89, 0x4C, 0x24, 0x10,  // mov [rsp+16], rcx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(disjoint_store, "redundant reload", 1);
+
+    // The register holding the value is overwritten, at any width.
+    static const uint8_t holder_written[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0xB0, 0x01,                    // mov al, 1
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(holder_written, sizeof(holder_written),
+        "redundant reload", &total, 0) == 0);
+
+    // RSP moves, and every slot named through it with it.
+    static const uint8_t rsp_moved[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x48, 0x83, 0xEC, 0x08,        // sub rsp, 8
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(rsp_moved, sizeof(rsp_moved), "redundant reload",
+        &total, 0) == 0);
+
+    // A call, and a branch onto the reload: paths the table did not walk.
+    static const uint8_t across_call[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call +0
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(across_call, sizeof(across_call),
+        "redundant reload", &total, 0) == 0);
+    static const uint8_t side_entry[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x74, 0x00,                    // je +0 (onto the reload)
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(side_entry, sizeof(side_entry), "redundant reload",
+        &total, 0) == 0);
+
+    // The widths must agree, and the segment must be the stack's.
+    static const uint8_t widths_differ[] = {
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0x8B, 0x5C, 0x24, 0x08,        // mov ebx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(widths_differ, sizeof(widths_differ),
+        "redundant reload", &total, 0) == 0);
+    static const uint8_t fs_slot[] = {
+        0x64, 0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, fs:[rsp+8]
+        0x64, 0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, fs:[rsp+8]
+        0xC3,                                // ret
+    };
+    assert(count_findings(fs_slot, sizeof(fs_slot), "redundant reload",
+        &total, 0) == 0);
+
+    // A push lands below RSP, not at the [RSP+0] XED reports for it, and
+    // moves RSP: nothing survives it.
+    static const uint8_t push_between[] = {
+        0x48, 0x8B, 0x04, 0x24,        // mov rax, [rsp]
+        0x51,                          // push rcx
+        0x48, 0x8B, 0x1C, 0x24,        // mov rbx, [rsp]
+        0xC3,                          // ret
+    };
+    assert(count_findings(push_between, sizeof(push_between),
+        "redundant reload", &total, 0) == 0);
+
+    // A load that replaces its own base names nothing afterwards.
+    static const uint8_t own_base[] = {
+        0x55,                          // push rbp
+        0x48, 0x89, 0xE5,              // mov rbp, rsp
+        0x48, 0x8B, 0x6D, 0xF8,        // mov rbp, [rbp-8]
+        0x48, 0x8B, 0x45, 0xF8,        // mov rax, [rbp-8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(own_base, sizeof(own_base), "redundant reload",
+        &total, 0) == 0);
+
+    // RBP is the frame pointer again in the blocks laid out after the
+    // epilogue, which are reached from the body -- but not across a call
+    // target, where it is some other function's.
+    static const uint8_t after_epilogue[] = {
+        0x55,                          // push rbp
+        0x48, 0x89, 0xE5,              // mov rbp, rsp
+        0x74, 0x02,                    // je +2
+        0x5D,                          // pop rbp
+        0xC3,                          // ret
+        0x48, 0x8B, 0x45, 0xF8,        // mov rax, [rbp-8]
+        0x48, 0x8B, 0x55, 0xF8,        // mov rdx, [rbp-8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(after_epilogue, "redundant reload", 1);
+    static const uint8_t next_function[] = {
+        0x55,                          // push rbp
+        0x48, 0x89, 0xE5,              // mov rbp, rsp
+        0xE8, 0x02, 0x00, 0x00, 0x00,  // call +2 (the next function)
+        0x5D,                          // pop rbp
+        0xC3,                          // ret
+        0x48, 0x8B, 0x45, 0xF8,        // mov rax, [rbp-8]
+        0x48, 0x8B, 0x55, 0xF8,        // mov rdx, [rbp-8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(next_function, sizeof(next_function),
+        "redundant reload", &total, 0) == 0);
+}
+
 // A constant another register still holds, and one the destination already
-// holds. The only check here that carries state across the scan. See
+// holds. One of the two state machines carried across the scan. See
 // const_remat_step.
 static void check_const_remat_test(void)
 {
@@ -9445,6 +9635,7 @@ int main(int argc, char *argv[])
     check_movimm_condition_test();
     check_redundant_shift_test();
     check_const_remat_test();
+    check_frame_reload_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

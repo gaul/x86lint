@@ -1530,7 +1530,9 @@ static void scan_section(const corpus_section *sec, void *vctx)
         memcpy(buf + sec->ranges[r].start, sec->code + sec->ranges[r].start,
             sec->ranges[r].end - sec->ranges[r].start);
     }
-    uint8_t *targets = collect_branch_targets(buf, sec->size);
+    uint8_t *backward = NULL;
+    uint8_t *targets = collect_branch_targets(buf, sec->size, &backward,
+        NULL);
 
     for (size_t i = 0; i < NCAND; ++i) {
         if (candidates[i].run == NULL) {
@@ -1583,6 +1585,7 @@ static void scan_section(const corpus_section *sec, void *vctx)
         offset = next;
     }
     free(targets);
+    free(backward);
     free(buf);
 }
 

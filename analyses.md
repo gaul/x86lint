@@ -986,8 +986,8 @@ argue for or against each, live in [TODO.md](TODO.md).
   a copy: MOV EDI, R10D, three bytes against five, and against ten where the
   immediate needed a MOVABS. There is no imm8 form of MOV, so the copy is
   shorter at every width
-* **This is the only check here that carries state across the scan**, because
-  the rewrite's precondition is about a value rather than a pattern. The map
+* **This check carries state across the scan**, as the frame-slot rows do,
+  because the rewrite's precondition is about a value rather than a pattern. The map
   is deliberately small and loses toward not-a-finding: only the 32- and
   64-bit `MOV r, imm` forms are recorded, as the full 64-bit contents the
   write leaves behind; every register an instruction writes is cleared; and
@@ -1073,6 +1073,30 @@ argue for or against each, live in [TODO.md](TODO.md).
   must agree on destination width, since the 32-bit form zeroes bits 63:32
   where the 64-bit form sign-fills them). Rejected when a direct branch
   targets the re-extension -- a path that skips the producer
+
+## redundant reload
+
+* `488B442408 4889D1 488B5C2408` (MOV RAX, [RSP+8]; MOV RCX, RDX; MOV RBX,
+  [RSP+8]) -- the frame slot is loaded again while the first load's value is
+  still in a register, so the reload is MOV RBX, RAX: a load-port uop and the
+  cache latency gone, and one to five bytes, since every load form of a
+  frame slot is longer than the register copy at the same width. The 32-bit
+  form is exact too, both the load and MOV r32, r32 zero-extending. Frame
+  slots only, and RBP only as the frame pointer; see "Memory accesses: frame
+  slots only" in the README for why, and for the table this check shares with
+  the other frame-slot rows
+* The claim survives anything that leaves the slot, the holding register and
+  the base alone, including the fall-through of a conditional branch: the
+  reload is reached by falling through, so the first load ran. A disjoint
+  store through the same base provably misses the slot; any store through
+  another address may not. The widths must agree. A load that replaces its
+  own base (`mov rbp, [rbp-8]`) arms nothing
+* Five-binary sweep: libc 59, libcrypto 34, bash 16, go 5, ld.so 3. Every
+  C site is GCC's spill reload through the frame pointer -- `mov edi,
+  [rbp-0x224] ; test edi, edi ; je ; ... ; mov eax, [rbp-0x224]` in bash's
+  `check_signals` -- and go's are RSP-based, the population issue #29
+  predicted from `tools/defuse` (libc 65, bash 27, libcrypto 33, counting the
+  same-register reloads, which are their own row)
 
 ## redundant shift/rotate by zero
 

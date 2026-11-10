@@ -642,8 +642,10 @@ bool check_cmp_zero(const xed_decoded_inst_t *xedd)
 // Deleting it would remove the load, which may be the entire point: Go spells
 // a nil check as `TESTB AL, (AX)`, whose flags nothing reads and whose fault is
 // the check. The same rule keeps the tool off MMIO reads and stack-probe
-// compares, and it is the standing line that no finding changes the set of
-// memory accesses (cf. check_shift_zero, issues #29 and #30).
+// compares, and it is the standing line that no finding changes an access
+// outside a frame slot (cf. check_shift_zero and frame_step, issues #29 and
+// #30). A compare against a frame slot is excluded too: nothing here would
+// gain by the narrower rule, and the fault is the same argument.
 bool check_dead_compare(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -1304,12 +1306,13 @@ bool check_missing_shlx(const xed_decoded_inst_t *xedd)
 // cycle fires at count 0 is not architecturally settled (cf. CMPXCHG, whose
 // destination is documented to receive a write cycle regardless of the
 // comparison), and no forward walk can prove any of this dead. This is the
-// same standard the rest of the tool holds: no other finding suggests a
-// rewrite that changes the set of memory accesses. In practice the excluded
-// form is data, not code: every memory-destination count-0 shift in a
-// 2,583-binary /bin sweep was a GHC info table decoding as instructions
-// (c0 00 00 = rol byte [rax], 0), while every genuine finding was a
-// register form.
+// same standard the rest of the tool holds: no finding changes an access
+// outside a frame slot, and the frame-slot rows (frame_step) have a table
+// proving what the slot holds, which a lone shift does not. In practice the
+// excluded form is data, not code: every memory-destination count-0 shift in
+// a 2,583-binary /bin sweep was a GHC info table decoding as instructions
+// (c0 00 00 = rol byte [rax], 0), while every genuine finding was a register
+// form.
 bool check_shift_zero(const xed_decoded_inst_t *xedd)
 {
     switch (xed_decoded_inst_get_iclass(xedd)) {
@@ -6970,10 +6973,20 @@ static const struct check_entry checks[] = {
 // code, notrack jump tables, entries from another section -- remain a
 // documented residual risk of operating on raw bytes (README, "Linear sweep
 // with resync").
+//
+// `calls` receives the subset that are the targets of a direct CALL, plus
+// every ENDBR64: the offsets the scan can name as a function's entry rather
+// than a label inside one (an ENDBR64 is usually the former and sometimes a
+// jump-table label, which costs only recall). The frame-slot table needs that
+// distinction for RBP, which is a frame pointer for a whole function or not
+// at all (see frame_step). NULL leaves it uncollected.
 static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len,
-                                       uint8_t **backward)
+                                       uint8_t **backward, uint8_t **calls)
 {
     *backward = calloc((len + 7) / 8, 1);
+    if (calls != NULL) {
+        *calls = calloc((len + 7) / 8, 1);
+    }
     uint8_t *targets = calloc((len + 7) / 8, 1);
     if (targets == NULL) {
         return NULL;    // branch_target_in treats this as every-offset-hit
@@ -6991,6 +7004,9 @@ static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len,
         // the binary announces. Mark it as an entry of its own.
         if (xed_decoded_inst_get_iclass(&xedd) == XED_ICLASS_ENDBR64) {
             targets[offset >> 3] |= (uint8_t) (1u << (offset & 7));
+            if (calls != NULL && *calls != NULL) {
+                (*calls)[offset >> 3] |= (uint8_t) (1u << (offset & 7));
+            }
         }
         // A nonzero branch-displacement width marks every direct relative
         // transfer (jmp/jcc rel8/rel32, call rel32, loop/jrcxz); indirect
@@ -7000,6 +7016,11 @@ static uint8_t *collect_branch_targets(const uint8_t *inst, size_t len,
                 xed_decoded_inst_get_branch_displacement(&xedd);
             if (target >= 0 && (uint64_t) target < (uint64_t) len) {
                 targets[target >> 3] |= (uint8_t) (1u << (target & 7));
+                if (calls != NULL && *calls != NULL &&
+                    xed_decoded_inst_get_category(&xedd) ==
+                        XED_CATEGORY_CALL) {
+                    (*calls)[target >> 3] |= (uint8_t) (1u << (target & 7));
+                }
                 if ((uint64_t) target <= offset && *backward != NULL) {
                     (*backward)[target >> 3] |=
                         (uint8_t) (1u << (target & 7));
@@ -12096,6 +12117,412 @@ static enum const_verdict const_remat_step(struct const_map *map,
 }
 
 
+// The frame-slot table: what each recently accessed stack slot is known to
+// hold, carried forward one instruction at a time like the constant map
+// above, so that a load or store can be judged against it. This is where
+// x86lint stops holding the line that no finding changes the set of memory
+// accesses -- the line riscvlint never drew -- and the restriction to frame
+// slots is the whole of the argument for crossing it.
+//
+// A slot is [RSP + disp], or [RBP + disp] where RBP is provably this
+// function's frame pointer, with no index and no segment override. Such a
+// slot is private to its thread and is never device memory, so a load of it
+// that is dropped cannot be an MMIO read, cannot race another thread, and
+// cannot be the relaxed or seq_cst atomic load that x86 spells as a plain
+// MOV. None of that holds for a global or a pointer target, and there the
+// shape is worse than unprovable: a plain load surviving -O2 next to its
+// twin is one the source told the compiler not to merge, which is what
+// issue #29 found when it sampled libxul's heap reloads -- 14 of 14 atomic.
+// riscvlint's window takes any base for its reloads and ends at the fences
+// and AMOs RISC-V spells its acquire loads with; x86 has no such marker on a
+// load, so here the frame is the only place a claim is made at all. The
+// residual risk is a `volatile` local, the setjmp pattern, which no
+// encoding tells apart from a spill the allocator reloaded without noticing
+// the value was still in a register.
+//
+// RBP is a frame pointer only where `mov rbp, rsp` made it one, and only in
+// that function: an -O2 build without frame pointers allocates RBP like
+// any callee-saved register, and a reload through it there is a reload
+// through a heap pointer. So the table tracks RBP's role (enum frame_rbp)
+// and takes RBP-based slots only while it is FRAME. Any other write to RBP
+// ends that, and so does a function entry -- a direct-call target, an
+// ENDBR64, the start of an installed function, or INT3 padding -- since
+// RBP there is the caller's. The epilogue's own `pop rbp` or `leave` ends it
+// only until the RET or JMP that follows: code laid out after the epilogue
+// is reached from the body, where RBP was still the frame pointer. What the
+// scan cannot see is an entry with none of those marks, reached only
+// indirectly in a binary without IBT or symbols, whose first RBP-based
+// access precedes its own write to RBP in layout order. That is the
+// "edges the sweep cannot see" risk of README.md, in one more form.
+//
+// A record's claims are dropped, toward not-a-finding, by:
+//   * a write to the register holding the value (`held`), at any width;
+//   * a write to the base register, which moves every slot based on it;
+//   * a store that may overlap the slot: through the same base, a
+//     non-disjoint byte range; through anything else -- another base, an
+//     index, a segment, RIP -- anywhere at all, since the slot's address may
+//     have escaped;
+//   * any instruction whose memory access XED cannot place: a stack push or
+//     pop (XED reports PUSH's slot as [RSP+0], which is not where it lands),
+//     two memory operands, an XSAVE-sized operand;
+//   * a LOCK prefix or a fence, which riscvlint treats as ending its window
+//     too;
+//   * a call, any unconditional transfer, an interrupt or a syscall, a
+//     branch target (another path arrives with other contents) and a decode
+//     error.
+// A conditional branch drops nothing: the instruction the claim is used at
+// is reached by falling through, so everything recorded here ran, and if it
+// is also reached by a branch it is a branch target and the table is
+// already empty there.
+#define FRAME_RECORDS 16
+
+struct frame_record {
+    bool used;
+    bool held;          // `data` holds what this access left in the slot
+    bool store;         // armed by a store, not a load
+    xed_reg_enum_t base;        // XED_REG_RSP or XED_REG_RBP
+    int64_t disp;
+    unsigned width;             // bytes
+    xed_reg_enum_t data;        // largest enclosing register
+    size_t offset;              // the access that armed the record
+};
+
+enum frame_rbp {
+    FRAME_RBP_UNKNOWN,  // RBP may be anything
+    FRAME_RBP_FRAME,    // RBP is this function's frame pointer
+    FRAME_RBP_EPILOGUE, // restored for the return; FRAME again past it
+};
+
+struct frame_table {
+    struct frame_record rec[FRAME_RECORDS];
+    enum frame_rbp rbp;
+};
+
+// Drop every claim, keeping what is known about RBP's role.
+static void frame_table_clear(struct frame_table *t)
+{
+    memset(t->rec, 0, sizeof(t->rec));
+}
+
+// Drop every claim and RBP's role with them: a function entry, or a point
+// the scan cannot connect to what it saw before.
+static void frame_table_reset(struct frame_table *t)
+{
+    frame_table_clear(t);
+    t->rbp = FRAME_RBP_UNKNOWN;
+}
+
+enum frame_place {
+    FRAME_NONE,         // no memory access
+    FRAME_SLOT,         // a frame slot, at a known base, offset and width
+    FRAME_ELSEWHERE,    // somewhere that may be any slot
+    FRAME_ANYWHERE,     // an access XED's operand does not describe
+};
+
+static bool frame_byte_ranges_overlap(int64_t a, unsigned aw, int64_t b,
+                                      unsigned bw)
+{
+    return a < b + (int64_t) bw && b < a + (int64_t) aw;
+}
+
+// Where the instruction's memory access lands, and whether it reads or
+// writes there.
+static enum frame_place frame_access(const struct frame_table *t,
+                                     const xed_decoded_inst_t *d,
+                                     xed_reg_enum_t *base, int64_t *disp,
+                                     unsigned *width, bool *read, bool *write)
+{
+    unsigned nmem = xed_decoded_inst_number_of_memory_operands(d);
+    if (nmem == 0) {
+        return FRAME_NONE;
+    }
+    // A multi-byte NOP's ModRM names an address it never touches.
+    switch (xed_decoded_inst_get_category(d)) {
+    case XED_CATEGORY_NOP:
+    case XED_CATEGORY_WIDENOP:
+        return FRAME_NONE;
+    case XED_CATEGORY_PUSH:
+    case XED_CATEGORY_POP:
+    case XED_CATEGORY_CALL:
+    case XED_CATEGORY_RET:
+        return FRAME_ANYWHERE;
+    default:
+        break;
+    }
+    if (nmem > 1) {
+        return FRAME_ANYWHERE;
+    }
+    *read = xed_decoded_inst_mem_read(d, 0);
+    *write = xed_decoded_inst_mem_written(d, 0);
+    if (!*read && !*write) {
+        return FRAME_NONE;              // LEA's address generation
+    }
+    // ENTER and LEAVE move RSP as part of the access; the categories above
+    // catch the rest of the stack instructions.
+    const xed_inst_t *xi = xed_decoded_inst_inst(d);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t nm = xed_operand_name(op);
+        if (!xed_operand_is_register(nm) || !xed_operand_written(op)) {
+            continue;
+        }
+        xed_reg_enum_t r = xed_decoded_inst_get_reg(d, nm);
+        if (r == XED_REG_STACKPUSH || r == XED_REG_STACKPOP ||
+            xed_get_largest_enclosing_register(r) == XED_REG_RSP) {
+            return FRAME_ANYWHERE;
+        }
+    }
+    *width = xed_decoded_inst_get_memory_operand_length(d, 0);
+    if (*width == 0 || *width > 64) {
+        return FRAME_ANYWHERE;          // XSAVE and kin
+    }
+    xed_reg_enum_t seg = xed_decoded_inst_get_seg_reg(d, 0);
+    xed_reg_enum_t b = xed_decoded_inst_get_base_reg(d, 0);
+    if (seg == XED_REG_FS || seg == XED_REG_GS ||
+        xed_decoded_inst_get_index_reg(d, 0) != XED_REG_INVALID ||
+        !(b == XED_REG_RSP ||
+          (b == XED_REG_RBP && t->rbp == FRAME_RBP_FRAME))) {
+        return FRAME_ELSEWHERE;
+    }
+    *base = b;
+    *disp = xed_decoded_inst_get_memory_displacement(d, 0);
+    return FRAME_SLOT;
+}
+
+// A plain MOV between a 32- or 64-bit GPR and a frame slot: the accesses
+// whose register afterwards holds exactly the slot's bytes (zero-extended,
+// for the 32-bit load). *data is that register's largest enclosing form.
+static bool frame_gpr_move(const struct frame_table *t,
+                           const xed_decoded_inst_t *d, bool *store,
+                           xed_reg_enum_t *base, int64_t *disp,
+                           unsigned *width, xed_reg_enum_t *data)
+{
+    if (xed_decoded_inst_get_iclass(d) != XED_ICLASS_MOV) {
+        return false;
+    }
+    bool read, write;
+    if (frame_access(t, d, base, disp, width, &read, &write) != FRAME_SLOT ||
+        (*width != 4 && *width != 8)) {
+        return false;
+    }
+    // XED names the register REG0 in both directions; an immediate store
+    // has none.
+    xed_reg_enum_t r = xed_decoded_inst_get_reg(d, XED_OPERAND_REG0);
+    if (r == XED_REG_INVALID || xed_reg_class(r) != XED_REG_CLASS_GPR ||
+        xed_get_register_width_bits64(r) != *width * 8) {
+        return false;
+    }
+    *store = write;
+    *data = xed_get_largest_enclosing_register(r);
+    return true;
+}
+
+// The record for this exact slot, if any.
+static struct frame_record *frame_find(struct frame_table *t,
+                                       xed_reg_enum_t base, int64_t disp,
+                                       unsigned width)
+{
+    for (int i = 0; i < FRAME_RECORDS; ++i) {
+        struct frame_record *r = &t->rec[i];
+        if (r->used && r->base == base && r->disp == disp &&
+            r->width == width) {
+            return r;
+        }
+    }
+    return NULL;
+}
+
+enum frame_verdict {
+    FRAME_VERDICT_NONE,
+    FRAME_VERDICT_RELOAD,       // another register holds what a load reloads
+};
+
+// Fold one instruction into the table, after it has been judged.
+static void frame_observe(struct frame_table *t, size_t offset,
+                          const xed_decoded_inst_t *d)
+{
+    xed_iclass_enum_t ic = xed_decoded_inst_get_iclass(d);
+
+    // Read the access before RBP's role can change under it: `mov rbp,
+    // [rbp-8]` loads through the frame pointer it is about to replace.
+    xed_reg_enum_t mbase = XED_REG_INVALID;
+    int64_t mdisp = 0;
+    unsigned mwidth = 0;
+    bool mread = false, mwrite = false;
+    enum frame_place place = frame_access(t, d, &mbase, &mdisp, &mwidth,
+                                          &mread, &mwrite);
+    bool gstore = false;
+    xed_reg_enum_t gbase, gdata;
+    int64_t gdisp;
+    unsigned gwidth;
+    bool gmove = frame_gpr_move(t, d, &gstore, &gbase, &gdisp, &gwidth,
+                                &gdata);
+
+    // 1. Register writes, so that a load's own destination is cleared
+    //    before the load records itself into it.
+    bool base_written = false;
+    const xed_inst_t *xi = xed_decoded_inst_inst(d);
+    for (unsigned i = 0; i < xed_inst_noperands(xi); ++i) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t nm = xed_operand_name(op);
+        if (!xed_operand_is_register(nm) || !xed_operand_written(op)) {
+            continue;
+        }
+        xed_reg_enum_t w = xed_decoded_inst_get_reg(d, nm);
+        if (w == XED_REG_STACKPUSH || w == XED_REG_STACKPOP) {
+            w = XED_REG_RSP;
+        }
+        w = xed_get_largest_enclosing_register(w);
+        if (w == XED_REG_INVALID) {
+            continue;
+        }
+        for (int j = 0; j < FRAME_RECORDS; ++j) {
+            struct frame_record *r = &t->rec[j];
+            if (r->data == w) {
+                r->held = false;
+            }
+            // Moving the base moves every slot named through it.
+            if (r->base == w) {
+                r->used = false;
+            }
+        }
+        if (w == mbase) {
+            base_written = true;
+        }
+        if (w == XED_REG_RBP) {
+            bool fp = ic == XED_ICLASS_MOV &&
+                xed_decoded_inst_get_reg(d, XED_OPERAND_REG0) ==
+                    XED_REG_RBP &&
+                xed_decoded_inst_get_reg(d, XED_OPERAND_REG1) == XED_REG_RSP;
+            bool restore = ic == XED_ICLASS_LEAVE ||
+                (ic == XED_ICLASS_POP &&
+                 xed_decoded_inst_get_reg(d, XED_OPERAND_REG0) ==
+                     XED_REG_RBP);
+            if (fp) {
+                t->rbp = FRAME_RBP_FRAME;
+            } else if (restore && t->rbp == FRAME_RBP_FRAME) {
+                t->rbp = FRAME_RBP_EPILOGUE;
+            } else {
+                t->rbp = FRAME_RBP_UNKNOWN;
+            }
+        }
+    }
+
+    // 2. The memory access.
+    switch (place) {
+    case FRAME_NONE:
+        break;
+    case FRAME_ANYWHERE:
+        frame_table_clear(t);
+        break;
+    case FRAME_ELSEWHERE:
+        if (mwrite) {
+            for (int j = 0; j < FRAME_RECORDS; ++j) {
+                t->rec[j].held = false;
+            }
+        }
+        break;
+    case FRAME_SLOT:
+        if (mwrite) {
+            for (int j = 0; j < FRAME_RECORDS; ++j) {
+                struct frame_record *r = &t->rec[j];
+                if (r->used && (r->base != mbase ||
+                    frame_byte_ranges_overlap(r->disp, r->width, mdisp,
+                                              mwidth))) {
+                    r->held = false;
+                }
+            }
+        }
+        break;
+    }
+
+    // 3. Arm a record for a plain GPR move, unless the move replaced the
+    //    register the address was formed from: `mov rbp, [rbp-8]` leaves
+    //    nothing that can name the slot it read.
+    if (gmove && !base_written) {
+        struct frame_record *r = frame_find(t, gbase, gdisp, gwidth);
+        for (int j = 0; r == NULL && j < FRAME_RECORDS; ++j) {
+            if (!t->rec[j].used || !t->rec[j].held) {
+                r = &t->rec[j];
+            }
+        }
+        if (r != NULL) {       // full: stop recording, which stays sound
+            *r = (struct frame_record) {
+                .used = true,
+                .held = true,
+                .store = gstore,
+                .base = gbase,
+                .disp = gdisp,
+                .width = gwidth,
+                .data = gdata,
+                .offset = offset,
+            };
+        }
+    }
+
+    // 4. Whatever can change memory or the path behind the table's back.
+    if (xed_decoded_inst_get_attribute(d, XED_ATTRIBUTE_LOCKED) ||
+        ic == XED_ICLASS_MFENCE || ic == XED_ICLASS_LFENCE ||
+        ic == XED_ICLASS_SFENCE) {
+        frame_table_clear(t);
+    }
+    switch (xed_decoded_inst_get_category(d)) {
+    case XED_CATEGORY_RET:
+    case XED_CATEGORY_UNCOND_BR:
+        frame_table_clear(t);
+        // Past the epilogue's own transfer, layout is back in the body.
+        if (t->rbp == FRAME_RBP_EPILOGUE) {
+            t->rbp = FRAME_RBP_FRAME;
+        }
+        break;
+    case XED_CATEGORY_INTERRUPT:
+        // INT3 is the padding between functions as well as a trap.
+        frame_table_reset(t);
+        break;
+    case XED_CATEGORY_CALL:
+    case XED_CATEGORY_SYSCALL:
+    case XED_CATEGORY_SYSRET:
+    case XED_CATEGORY_SYSTEM:
+        frame_table_clear(t);
+        break;
+    default:
+        break;
+    }
+}
+
+// One step of the table: judge the instruction at `offset` against what the
+// table held before it, then fold the instruction in. `entry` says the
+// instruction is a function's first, where RBP is the caller's.
+static enum frame_verdict frame_step(struct frame_table *t,
+                                     const uint8_t *branch_targets,
+                                     bool entry, size_t offset, size_t next,
+                                     const xed_decoded_inst_t *d)
+{
+    if (entry) {
+        frame_table_reset(t);
+    } else if (branch_target_in(branch_targets, offset, next)) {
+        frame_table_clear(t);           // another path reaches here
+    }
+
+    enum frame_verdict verdict = FRAME_VERDICT_NONE;
+    bool store;
+    xed_reg_enum_t base, data;
+    int64_t disp;
+    unsigned width;
+    if (frame_gpr_move(t, d, &store, &base, &disp, &width, &data) &&
+        !store) {
+        struct frame_record *r = frame_find(t, base, disp, width);
+        if (r != NULL && r->held && !r->store &&
+            xed_reg_class(r->data) == XED_REG_CLASS_GPR &&
+            r->data != data) {
+            verdict = FRAME_VERDICT_RELOAD;
+        }
+    }
+
+    frame_observe(t, offset, d);
+    return verdict;
+}
+
 // NEG then an ADD of the negated value is a SUB of the original, and the
 // mirror: `neg edx ; add r14d, edx` is `sub r14d, edx`, one instruction and
 // one scratch register fewer.
@@ -12805,8 +13232,15 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
     // findings are then conservatively suppressed while the single-instruction
     // checks proceed.
     uint8_t *backward_targets;
+    uint8_t *call_targets;
     uint8_t *branch_targets =
-        collect_branch_targets(inst, len, &backward_targets);
+        collect_branch_targets(inst, len, &backward_targets, &call_targets);
+
+    // What each recently accessed frame slot holds (see frame_step), and the
+    // next installed function whose start is a function entry for it.
+    struct frame_table frame_table;
+    frame_table_reset(&frame_table);
+    size_t frame_func = 0;
 
     // Idiom-zeroed vector registers on every path here (see struct
     // xmm_zero_state).
@@ -12836,6 +13270,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             dep_history_reset(&dep_history);
             ymm_upper_dirty = false;
             memset(&const_map, 0, sizeof(const_map));
+            frame_table_reset(&frame_table);
             xmm_zero.mask = 0;
             xmm_zero.falls_through = false;
             offset += 1;
@@ -13056,6 +13491,33 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             }
             break;
         case CONST_NONE:
+            break;
+        }
+
+        // Stateful check: a frame slot read back while a register still
+        // holds what it held. Reported against the load the rewrite replaces.
+        // A function's entry is a direct-call target, an ENDBR64 or an
+        // installed function's start: RBP is the caller's there. See
+        // frame_step.
+        bool frame_entry = branch_target_in(call_targets, offset, next);
+        if (summary != NULL && summary->funcs != NULL) {
+            while (frame_func < summary->nfuncs &&
+                   summary->funcs[frame_func].start < vaddr + offset) {
+                ++frame_func;
+            }
+            if (frame_func < summary->nfuncs &&
+                summary->funcs[frame_func].start < vaddr + next) {
+                frame_entry = true;
+            }
+        }
+        switch (frame_step(&frame_table, branch_targets, frame_entry, offset,
+                           next, &xedd)) {
+        case FRAME_VERDICT_RELOAD:
+            emit_finding(&sink, "redundant reload", offset, &xedd,
+                inst + offset);
+            ++errors;
+            break;
+        case FRAME_VERDICT_NONE:
             break;
         }
 
@@ -13475,6 +13937,7 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
 
     free(xmm_zero.heap);
     free(backward_targets);
+    free(call_targets);
     free(branch_targets);
     return errors;
 }

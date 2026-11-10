@@ -125,6 +125,42 @@ never suggests a rewrite whose soundness would hinge on a fact about a branch
 target it cannot see. The one boundary it reads through is a function return,
 and only for flags -- the ABI guarantees they do not survive it.
 
+**Memory accesses: frame slots only.** Until November 2026 no finding changed
+the set of memory accesses a program makes, and the rewrites that would have
+deleted a load or a store were recorded and left alone (issue
+[#29](https://github.com/gaul/x86lint/issues/29)). riscvlint never drew that
+line, and x86lint now matches it, with the one restriction that makes it
+sound: a finding may delete or replace an access only to a *frame slot*,
+`[RSP + disp]` or `[RBP + disp]` with no index and no segment override. A
+frame slot is private to its thread and is never device memory, so the access
+being dropped cannot be an MMIO side effect, cannot race another thread, and
+cannot be an atomic -- which matters more on x86 than on RISC-V, since x86
+spells even a sequentially consistent load as a plain `MOV`, with no fence for
+a window to stop at. Everywhere else the old line holds. A plain load that
+survives -O2 beside its twin is one the source told the compiler not to merge
+(issue #29 sampled libxul's heap reloads: 14 of 14 were atomics), Go spells a
+nil check as a compare whose only purpose is the load's fault, and a store
+through a pointer may be the one a signal handler or another thread reads.
+
+RBP qualifies only where `mov rbp, rsp` made it the frame pointer, and only in
+that function, because a build without frame pointers allocates it like any
+callee-saved register. The scan tracks its role from the prologue, ends it at
+any other write to RBP and at every function entry it can name (a direct-call
+target, an `ENDBR64`, an installed function's start, `INT3` padding), and
+restores it past the epilogue's own transfer, since the blocks laid out after
+an epilogue are reached from the body. The table those checks share drops a
+claim at any store that may overlap the slot -- through the same base an
+overlapping byte range, through any other address anything at all -- and at
+calls, unconditional transfers, branch targets, `LOCK` and fences; it keeps
+its claims across the fall-through of a conditional branch, which is where the
+compiler leaves most of them. Two residual risks are accepted and named. A
+`volatile` local -- the setjmp pattern -- is reloaded on purpose, and nothing
+in the encoding tells it from a spill reload. And a function reached only
+indirectly, in a binary with neither symbols nor IBT, whose layout puts an
+RBP-based access ahead of its own write to RBP, inherits the previous
+function's frame-pointer state: the same class of edge the sweep cannot see as
+the one under "Linear sweep with resync".
+
 **The model differential.** Both scans above rest on claims about what
 instructions do, and those claims were read out of the SDM by hand and written
 into a switch: `reg_kill_iclass`'s list of instructions that overwrite a
@@ -237,6 +273,7 @@ with the corpus populations that argue for or against each, live in
 | [redundant OR/XOR zero](analyses.md#redundant-orxor-zero) | `TEST`, or remove |
 | [redundant zero-extension](analyses.md#redundant-zero-extension) | drop it; the producer already zeroed those bits |
 | [redundant re-extension](analyses.md#redundant-re-extension) | remove the second extension |
+| [redundant reload](analyses.md#redundant-reload) | `MOV rD, rS` from the register still holding the frame slot's value |
 | [redundant shift/rotate by zero](analyses.md#redundant-shiftrotate-by-zero) | remove |
 | [redundant TEST after flags](analyses.md#redundant-test-after-flags) | delete the `TEST`; the ALU before it already set the flags |
 | [redundant TEST after SETcc](analyses.md#redundant-test-after-setcc) | branch on the compare's flags directly |

@@ -1137,7 +1137,12 @@ bool check_lea_to_mov(const xed_decoded_inst_t *xedd)
 // The registers are compared by enclosing register, so a mixed operand/address
 // size folds too: lea eax, [rax + rcx] is add eax, ecx because low-width
 // arithmetic is closed (the low W bits of base + index equal the sum of their
-// low W bits). A scale (lea rax, [rax + rcx*2]) or a displacement is not a plain
+// low W bits). That argument runs one way only. An address narrower than the
+// destination -- lea rax, [eax + ecx], under the 67 prefix -- sums in 32 bits
+// and zero-extends, where add rax, rcx carries into bits 32-63 and keeps the
+// registers' upper halves; tools/rwfuzz ran that rewrite and found the
+// difference. So the address must be at least as wide as the destination. A
+// scale (lea rax, [rax + rcx*2]) or a displacement is not a plain
 // two-register add and is excluded, as is the pure base or RIP-relative form
 // (no index), which check_lea_to_mov owns.
 bool check_lea_to_add(const xed_decoded_inst_t *xedd)
@@ -1154,10 +1159,15 @@ bool check_lea_to_add(const xed_decoded_inst_t *xedd)
         return true;
     }
 
+    xed_reg_enum_t dst_reg = xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0);
+    if (xed_decoded_inst_get_memop_address_width(xedd, 0) <
+        xed_get_register_width_bits64(dst_reg)) {
+        return true;    // a narrow sum zero-extended: no ADD computes it
+    }
+
     // The destination must be one of the two address registers, so the add is
     // in place rather than a three-operand sum.
-    xed_reg_enum_t dst = xed_get_largest_enclosing_register(
-        xed_decoded_inst_get_reg(xedd, XED_OPERAND_REG0));
+    xed_reg_enum_t dst = xed_get_largest_enclosing_register(dst_reg);
     if (dst != xed_get_largest_enclosing_register(base) &&
         dst != xed_get_largest_enclosing_register(index)) {
         return true;

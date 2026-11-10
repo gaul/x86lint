@@ -1339,7 +1339,10 @@ argue for or against each, live in [TODO.md](TODO.md).
 * `488D03` (LEA RAX, [RBX]) -- use MOV RAX, RBX (more ports, no AGU)
 * `488D0408` (LEA RAX, [RAX+RCX]) -- an in-place two-register LEA is ADD RAX,
   RCX, a byte shorter (no SIB) and on more ports, when the arithmetic flags
-  are dead (gated by flag liveness)
+  are dead (gated by flag liveness). Not when the address is narrower than
+  the destination: `67488D0408` (LEA RAX, [EAX+ECX]) sums in 32 bits and
+  zero-extends, which no ADD computes. `tools/rwfuzz` ran that rewrite and
+  found the difference (124 of 3,409 findings at 10,000 programs)
 
 ## suboptimal MOV zero
 

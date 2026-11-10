@@ -1323,6 +1323,10 @@ static void check_lea_to_add_test(void)
     CHECK_BYTES( check_lea_to_add, 0x48, 0x8d, 0x03);            // lea rax, [rbx] (no index)
     CHECK_BYTES( check_lea_to_add, 0x48, 0x8d, 0x05, 0,0,0,0);   // lea rax, [rip+0]
     CHECK_BYTES( check_lea_to_add, 0x48, 0x89, 0xd8);           // mov rax, rbx (not LEA)
+    // A 32-bit address under a 64-bit destination zero-extends a 32-bit sum,
+    // which add rax, rcx does not compute; at the address's own width it does.
+    CHECK_BYTES( check_lea_to_add, 0x67, 0x48, 0x8d, 0x04, 0x08); // lea rax, [eax+ecx]
+    CHECK_BYTES(!check_lea_to_add, 0x67, 0x8d, 0x04, 0x08);      // lea eax, [eax+ecx]
 
     // Flag gating: add writes the arithmetic flags the lea preserves, so the
     // dispatcher fires only when they are dead downstream.

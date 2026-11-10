@@ -3987,6 +3987,80 @@ static void check_frame_silent_store_test(void)
         "store of a value the slot already holds", &total, 0) == 0);
 }
 
+// A value moved between the register files by storing it to a frame slot
+// and loading it back: MOVD/MOVQ does it without memory. See frame_step.
+static void check_frame_bitcast_test(void)
+{
+    int total;
+
+    // movsd [rsp+8], xmm0 ; mov rax, [rsp+8] -- MOVQ RAX, XMM0, five bytes
+    // for five.
+    static const uint8_t to_gpr[] = {
+        0xF2, 0x0F, 0x11, 0x44, 0x24, 0x08,  // movsd [rsp+8], xmm0
+        0x48, 0x8B, 0x44, 0x24, 0x08,        // mov rax, [rsp+8]
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(to_gpr, "bit-cast routed through a frame slot", 1);
+
+    // The other direction: mov [rsp+8], eax ; movss xmm1, [rsp+8] --
+    // MOVD XMM1, EAX, four bytes for six. Both zero bits 127:32.
+    static const uint8_t to_xmm[] = {
+        0x89, 0x44, 0x24, 0x08,              // mov [rsp+8], eax
+        0xF3, 0x0F, 0x10, 0x4C, 0x24, 0x08,  // movss xmm1, [rsp+8]
+        0xC3,                                // ret
+    };
+    ASSERT_FINDINGS(to_xmm, "bit-cast routed through a frame slot", 1);
+
+    // A 3-byte load through the frame pointer is shorter than the 4-byte
+    // MOVD that would replace it.
+    static const uint8_t longer[] = {
+        0x55,                                // push rbp
+        0x48, 0x89, 0xE5,                    // mov rbp, rsp
+        0x66, 0x0F, 0x7E, 0x45, 0xF8,        // movd [rbp-8], xmm0
+        0x8B, 0x45, 0xF8,                    // mov eax, [rbp-8]
+        0x5D,                                // pop rbp
+        0xC3,                                // ret
+    };
+    assert(count_findings(longer, sizeof(longer),
+        "bit-cast routed through a frame slot", &total, 0) == 0);
+
+    // The XMM register rewritten in between, at any width.
+    static const uint8_t xmm_written[] = {
+        0xF2, 0x0F, 0x11, 0x44, 0x24, 0x08,  // movsd [rsp+8], xmm0
+        0xC5, 0xFC, 0x57, 0xC0,              // vxorps ymm0, ymm0, ymm0
+        0x48, 0x8B, 0x44, 0x24, 0x08,        // mov rax, [rsp+8]
+        0xC3,                                // ret
+    };
+    assert(count_findings(xmm_written, sizeof(xmm_written),
+        "bit-cast routed through a frame slot", &total, 0) == 0);
+    static const uint8_t zeroall[] = {
+        0xF2, 0x0F, 0x11, 0x44, 0x24, 0x08,  // movsd [rsp+8], xmm0
+        0xC5, 0xFC, 0x77,                    // vzeroall
+        0x48, 0x8B, 0x44, 0x24, 0x08,        // mov rax, [rsp+8]
+        0xC3,                                // ret
+    };
+    assert(count_findings(zeroall, sizeof(zeroall),
+        "bit-cast routed through a frame slot", &total, 0) == 0);
+
+    // The widths must agree: four bytes stored, eight loaded.
+    static const uint8_t widths[] = {
+        0xF3, 0x0F, 0x11, 0x44, 0x24, 0x08,  // movss [rsp+8], xmm0
+        0x48, 0x8B, 0x44, 0x24, 0x08,        // mov rax, [rsp+8]
+        0xC3,                                // ret
+    };
+    assert(count_findings(widths, sizeof(widths),
+        "bit-cast routed through a frame slot", &total, 0) == 0);
+
+    // A masked EVEX load merges where the mask is clear; MOVD does not.
+    static const uint8_t masked[] = {
+        0x89, 0x44, 0x24, 0x08,                    // mov [rsp+8], eax
+        0x62, 0xF1, 0x7E, 0x09, 0x10, 0x4C, 0x24, 0x02,  // vmovss xmm1{k1}, [rsp+8]
+        0xC3,                                      // ret
+    };
+    assert(count_findings(masked, sizeof(masked),
+        "bit-cast routed through a frame slot", &total, 0) == 0);
+}
+
 // A constant another register still holds, and one the destination already
 // holds. One of the two state machines carried across the scan. See
 // const_remat_step.
@@ -9998,6 +10072,7 @@ int main(int argc, char *argv[])
     check_frame_held_test();
     check_frame_dead_store_test();
     check_frame_silent_store_test();
+    check_frame_bitcast_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

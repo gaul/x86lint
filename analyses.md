@@ -88,6 +88,34 @@ argue for or against each, live in [TODO.md](TODO.md).
   edge could only reach a flagged site with clean uppers, where both
   fixes stay harmless
 
+## bit-cast routed through a frame slot
+
+* `F20F11442408 488B442408` (MOVSD [RSP+8], XMM0; MOV RAX, [RSP+8]) -- a
+  value moved between the register files by storing it to a frame slot and
+  loading it back, where MOVQ RAX, XMM0 moves the same bits and touches no
+  memory. Both directions, both widths: an XMM store by MOVD, MOVQ, MOVSS or
+  MOVSD (or their VEX and EVEX forms) read back by a GPR `MOV`, and a GPR
+  store read back by one of those into an XMM register. Every one of them
+  moves exactly the low 32 or 64 bits, and a load into XMM zeroes the rest
+  of the low lane as MOVD/MOVQ from a GPR does, legacy forms leaving the
+  upper lanes alone and VEX/EVEX zeroing them, so the replacement is priced
+  in the vector half's own encoding family and introduces no SSE/AVX mix.
+  A masked EVEX load merges and is refused. The store stays; the load is
+  replaced. The claim is the frame-slot table's (see
+  [redundant reload](#redundant-reload)), and the bit-cast rides on the
+  store's record, which an XMM store now arms
+* This is the one frame-slot row whose worth is not bytes: MOVD/MOVQ is four
+  to six bytes against a load of three to nine, and the rewrite is refused
+  where it would be longer -- a three-byte `mov eax, [rbp-8]` against a
+  four-byte MOVD -- which is the line riscvlint draws for its own `fmv`
+  forms. What it removes is the store-to-load round trip
+* Five-binary sweep: libcrypto 1 and none in libc, ld.so, bash or go -- plus
+  libm 1 -- because GCC moves between the files directly. Both sites are
+  break-even, five bytes for five: libm's `mov [rbp-0x38], rdi ; movsd
+  xmm0, [rbp-0x38]` is MOVQ XMM0, RDI. Mozilla's clang-built libxul (Firefox
+  160) has 31, among them a red-zone pair after a `__stack_chk_fail` call,
+  `mov [rsp-0x4], ecx ; vmovd xmm2, [rsp-0x4]`
+
 ## branch to the next instruction
 
 * `EB00` (JMP .+0) -- a direct branch whose displacement is zero transfers

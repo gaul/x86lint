@@ -12198,6 +12198,7 @@ struct frame_record {
     unsigned width;             // bytes
     xed_reg_enum_t data;        // largest enclosing register
     uint64_t value;             // the bytes an immediate store wrote
+    unsigned family;            // an XMM store's vexvalid: 0, 1 or 2
     size_t offset;              // the access that armed the record
 };
 
@@ -12357,7 +12358,67 @@ enum frame_verdict {
     FRAME_VERDICT_HELD,         // a load into the register already holding it
     FRAME_VERDICT_DEAD_STORE,   // a store overwriting an unread one
     FRAME_VERDICT_SILENT_STORE, // a store of the bytes the slot already holds
+    FRAME_VERDICT_BITCAST,      // a value crossing register files via a slot
 };
+
+// A scalar move between an XMM register and a frame slot at 4 or 8 bytes,
+// unmasked: MOVD/MOVQ/MOVSS/MOVSD and their VEX and EVEX forms. Every one
+// moves exactly the low 32 or 64 bits of the register, and a load zeroes
+// the rest of the low lane as MOVD/MOVQ from a GPR does -- legacy forms
+// leaving the upper lanes alone, VEX and EVEX zeroing them, in both cases
+// alike. *data is the register's largest enclosing form.
+static bool frame_xmm_move(const struct frame_table *t,
+                           const xed_decoded_inst_t *d, bool *store,
+                           xed_reg_enum_t *base, int64_t *disp,
+                           unsigned *width, xed_reg_enum_t *data)
+{
+    switch (xed_decoded_inst_get_iclass(d)) {
+    case XED_ICLASS_MOVD:
+    case XED_ICLASS_MOVQ:
+    case XED_ICLASS_MOVSS:
+    case XED_ICLASS_MOVSD_XMM:
+    case XED_ICLASS_VMOVD:
+    case XED_ICLASS_VMOVQ:
+    case XED_ICLASS_VMOVSS:
+    case XED_ICLASS_VMOVSD:
+        break;
+    default:
+        return false;
+    }
+    bool read, write;
+    if (xed_decoded_inst_masking(d) ||
+        frame_access(t, d, base, disp, width, &read, &write) != FRAME_SLOT ||
+        (*width != 4 && *width != 8)) {
+        return false;
+    }
+    xed_reg_enum_t r = xed_decoded_inst_get_reg(d, XED_OPERAND_REG0);
+    if (xed_reg_class(r) != XED_REG_CLASS_XMM) {
+        return false;
+    }
+    *store = write;
+    *data = xed_get_largest_enclosing_register(r);
+    return true;
+}
+
+// The length of MOVD/MOVQ between `gpr` and `xmm` (both largest enclosing)
+// in encoding family `family` (vexvalid 0, 1 or 2) -- the family of the
+// vector half of the pair, so the rewrite introduces no SSE/AVX mix: legacy
+// 66 [REX] 0F 6E/7E /r, VEX in two bytes unless W or the GPR's B bit asks
+// for three, EVEX always four.
+static unsigned frame_xmm_transfer_length(unsigned family, xed_reg_enum_t gpr,
+                                          xed_reg_enum_t xmm, unsigned width)
+{
+    bool high_gpr = gpr >= XED_REG_R8 && gpr <= XED_REG_R15;
+    unsigned x = (unsigned) (xmm - XED_REG_ZMM0);
+    switch (family) {
+    case 0:
+        return 4 + (width == 8 || high_gpr || x >= 8 ? 1 : 0);
+    case 1:
+        return width == 8 || high_gpr ? 5 : 4;
+    default:
+        return 6;
+    }
+}
 
 // The bytes a MOV store of an immediate writes, truncated to its width: the
 // 64-bit form sign-extends its imm32. False for any other store.
@@ -12456,6 +12517,16 @@ static void frame_observe(struct frame_table *t, size_t offset,
         }
     }
 
+    // VZEROALL zeroes every vector register and XED's operand list does not
+    // say so; VZEROUPPER leaves the low lanes a claim is about.
+    if (ic == XED_ICLASS_VZEROALL) {
+        for (int j = 0; j < FRAME_RECORDS; ++j) {
+            if (xed_reg_class(t->rec[j].data) == XED_REG_CLASS_ZMM) {
+                t->rec[j].held = false;
+            }
+        }
+    }
+
     // 2. The memory access.
     switch (place) {
     case FRAME_NONE:
@@ -12513,6 +12584,22 @@ static void frame_observe(struct frame_table *t, size_t offset,
     int64_t sdisp;
     unsigned swidth;
     bool mstore = frame_mov_store(t, d, &sbase, &sdisp, &swidth);
+    // A scalar XMM store holds its register's low bits in the slot just as
+    // a GPR store does; only the bit-cast row reads that claim.
+    bool xstore = false;
+    xed_reg_enum_t xbase, xdata;
+    int64_t xdisp;
+    unsigned xwidth;
+    if (!gmove && !mstore &&
+        frame_xmm_move(t, d, &xstore, &xbase, &xdisp, &xwidth, &xdata) &&
+        xstore) {
+        gmove = true;
+        gstore = true;
+        gbase = xbase;
+        gdisp = xdisp;
+        gwidth = xwidth;
+        gdata = xdata;
+    }
     if ((gmove || mstore) && !base_written) {
         xed_reg_enum_t kbase = gmove ? gbase : sbase;
         int64_t kdisp = gmove ? gdisp : sdisp;
@@ -12534,6 +12621,7 @@ static void frame_observe(struct frame_table *t, size_t offset,
                 .unread = mstore,
                 .constant = constant,
                 .value = value,
+                .family = xstore ? xed3_operand_get_vexvalid(d) : 0,
                 .store = kstore,
                 .base = kbase,
                 .disp = kdisp,
@@ -12643,6 +12731,36 @@ static enum frame_verdict frame_step(struct frame_table *t,
         if (verdict == FRAME_VERDICT_NONE && nearest != NULL) {
             verdict = nearest->store ? FRAME_VERDICT_FORWARD
                                      : FRAME_VERDICT_RELOAD;
+        }
+        // Stored from an XMM register: MOVD/MOVQ rD, xmm moves the same
+        // bits and touches no memory. Its worth is the store-to-load round
+        // trip rather than bytes, but it is refused where it would be longer
+        // than the load -- a 3-byte `mov eax, [rbp-8]` against a 4-byte
+        // MOVD -- which is where riscvlint draws the same line.
+        struct frame_record *x = held[1];
+        if (verdict == FRAME_VERDICT_NONE && x != NULL && x->held &&
+            xed_reg_class(x->data) == XED_REG_CLASS_ZMM) {
+            if (frame_xmm_transfer_length(x->family, data, x->data, width) <=
+                xed_decoded_inst_get_length(d)) {
+                verdict = FRAME_VERDICT_BITCAST;
+            }
+        }
+    }
+
+    // Loaded into an XMM register from a slot a GPR store wrote: MOVD/MOVQ
+    // xmm, rS, in the load's own encoding family.
+    bool xload;
+    xed_reg_enum_t xdata;
+    if (verdict == FRAME_VERDICT_NONE &&
+        frame_xmm_move(t, d, &xload, &base, &disp, &width, &xdata) &&
+        !xload) {
+        struct frame_record *r = frame_find(t, base, disp, width, true);
+        if (r != NULL && r->held &&
+            xed_reg_class(r->data) == XED_REG_CLASS_GPR &&
+            frame_xmm_transfer_length(xed3_operand_get_vexvalid(d), r->data,
+                                      xdata, width) <=
+                xed_decoded_inst_get_length(d)) {
+            verdict = FRAME_VERDICT_BITCAST;
         }
     }
 
@@ -13685,6 +13803,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             break;
         case FRAME_VERDICT_HELD:
             emit_finding(&sink, "load of a value the register still holds",
+                offset, &xedd, inst + offset);
+            ++errors;
+            break;
+        case FRAME_VERDICT_BITCAST:
+            emit_finding(&sink, "bit-cast routed through a frame slot",
                 offset, &xedd, inst + offset);
             ++errors;
             break;

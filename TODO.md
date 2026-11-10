@@ -981,7 +981,11 @@ A fifth came out of a second seed (777) after the four were fixed:
 "load foldable into vector op" took a register-form `MOVSD` into the
 loaded register as a kill, though it merges into the upper lanes the load
 filled. **Fixed**; one of the two libxul findings it removed was a real
-instance (`movsd xmm3, xmm2 ; divpd xmm1, xmm3` after the load).
+instance (`movsd xmm3, xmm2 ; divpd xmm1, xmm3` after the load). A sixth
+came out of seed 2: "redundant zero-extension" read an AND producer's
+imm8 raw, so `and esi, -17` (0xEF) seemed to clear bits 31:8. **Fixed**;
+both libxul findings it removed were real (`and edi, 0xfffffffc ; movzx
+edi, di`).
 
 Rows not run, and why:
 

@@ -1172,6 +1172,12 @@ argue for or against each, live in [TODO.md](TODO.md).
   recognized: an immediate `SHR`, an immediate `AND`, and any `SETcc`.
   Consumers: an in-place `MOVZX`, and an `AND` with a run of low bits, which
   writes the flags and so needs them dead where `MOVZX` does not.
+* An `AND` producer's mask is its immediate sign-extended to the operand
+  width, not the raw encoded byte: `AND EDI, 0xFFFFFFFC` encodes imm8 0xFC
+  and clears only bits 1:0, so the `MOVZX EDI, DI` after it still clears
+  bits 31:16. Reading the raw byte reported that pair; `tools/rwfuzz` found
+  the deletion (`and esi, -17 ; movzx esi, sil`, seed 2), and Mozilla's
+  libxul had two real ones, which took it from 59 findings to 57
 * **MOVZX and MOVSX producers are deliberately absent**, being the shipped
   "redundant re-extension" check's own. That exclusion is most of the shape:
   counting them put this at 285 on libxul against that check's 254, which is

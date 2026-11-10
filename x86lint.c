@@ -13046,8 +13046,17 @@ static void zero_guarantee(const xed_decoded_inst_t *d, unsigned *from,
         break;
     case XED_ICLASS_AND:
         if (has_imm) {
+            // The mask the AND applies: its immediate sign-extended to the
+            // operand width. `and esi, -17` encodes imm8 0xEF, read raw, but
+            // clears only bit 4 (tools/rwfuzz found it read as 0xEF).
+            uint64_t mask = (uint64_t) (int64_t)
+                xed_decoded_inst_get_signed_immediate(d);
+            unsigned ow = xed_decoded_inst_get_operand_width(d);
+            if (ow < 64) {
+                mask &= ((uint64_t) 1 << ow) - 1;
+            }
             unsigned bits = 0;
-            while (imm != 0) { imm >>= 1; ++bits; }
+            while (mask != 0) { mask >>= 1; ++bits; }
             *from = bits;
         }
         break;

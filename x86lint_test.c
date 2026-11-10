@@ -4268,6 +4268,23 @@ static void check_small_sound_test(void)
         0xC3,              // ret
     };
     ASSERT_FINDINGS(setcc_and1, "redundant zero-extension", 1);
+
+    // An AND mask is its immediate sign-extended to the operand width:
+    // `and esi, -17` (imm8 0xEF) clears bit 4 alone and leaves bits 31:8 for
+    // the movzx to clear, where `and esi, 0x7f` has already cleared them.
+    // tools/rwfuzz ran the deletion after the first.
+    static const uint8_t and_negative[] = {
+        0x83, 0xE6, 0xEF,        // and esi, -17
+        0x40, 0x0F, 0xB6, 0xF6,  // movzx esi, sil
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(and_negative, "redundant zero-extension", 0);
+    static const uint8_t and_narrow[] = {
+        0x83, 0xE6, 0x7F,        // and esi, 0x7f
+        0x40, 0x0F, 0xB6, 0xF6,  // movzx esi, sil
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(and_narrow, "redundant zero-extension", 1);
 }
 
 // A defensive zero-source constant in front of a TZCNT or LZCNT, which

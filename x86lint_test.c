@@ -2897,7 +2897,7 @@ static void check_zeroed_condition_test(void)
         0x31, 0xC9,              // xor ecx, ecx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_test_je, "constant condition after zeroing", 1);
 
@@ -2918,6 +2918,7 @@ static void check_zeroed_condition_test(void)
         0x31, 0xC9,              // xor ecx, ecx
         0x84, 0xC9,              // test cl, cl
         0x48, 0x0F, 0x44, 0xD8,  // cmove rbx, rax
+        0xC3,                    // ret: the test's flags die
     };
     ASSERT_FINDINGS(xor_test_cmove, "constant condition after zeroing", 1);
 
@@ -2928,7 +2929,7 @@ static void check_zeroed_condition_test(void)
         0x48, 0x29, 0xC9,        // sub rcx, rcx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     int sub_total;
     assert(count_findings(sub_test_jne, sizeof(sub_test_jne),
@@ -2947,7 +2948,7 @@ static void check_zeroed_condition_test(void)
         0x31, 0xD9,              // xor ecx, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_not_zeroing, "constant condition after zeroing", 0);
 
@@ -2957,7 +2958,7 @@ static void check_zeroed_condition_test(void)
         0x30, 0xC9,              // xor cl, cl
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_narrow, "constant condition after zeroing", 0);
 
@@ -2969,7 +2970,7 @@ static void check_zeroed_condition_test(void)
         0x30, 0xC9,              // xor cl, cl
         0x84, 0xC9,              // test cl, cl
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_narrow_same, "constant condition after zeroing", 1);
 
@@ -2978,7 +2979,7 @@ static void check_zeroed_condition_test(void)
         0x30, 0xE4,              // xor ah, ah
         0x84, 0xE4,              // test ah, ah
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_high_byte, "constant condition after zeroing", 1);
 
@@ -2988,7 +2989,7 @@ static void check_zeroed_condition_test(void)
         0x30, 0xC0,              // xor al, al
         0x84, 0xE4,              // test ah, ah
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_low_test_high, "constant condition after zeroing", 0);
 
@@ -2998,7 +2999,7 @@ static void check_zeroed_condition_test(void)
         0x31, 0xC9,              // xor ecx, ecx
         0x48, 0x85, 0xD2,        // test rdx, rdx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_test_other, "constant condition after zeroing", 0);
 
@@ -3031,7 +3032,7 @@ static void check_zeroed_condition_test(void)
         0x39, 0xD8,              // cmp eax, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     // The gap instruction draws a correct second finding of its own: nothing
     // reads what cmp eax, ebx set, since the test redefines every flag.
@@ -3048,7 +3049,7 @@ static void check_zeroed_condition_test(void)
         0x89, 0xD9,              // mov ecx, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(xor_reg_gap, "constant condition after zeroing", 0);
 
@@ -3077,10 +3078,47 @@ static void check_zeroed_condition_test(void)
     static const uint8_t edge_on_head[] = {
         0x31, 0xC9,              // 0: xor ecx, ecx  <- branch target
         0x48, 0x85, 0xC9,        // 2: test rcx, rcx
-        0x74, 0x00,              // 5: je +0
-        0xEB, 0xF7,              // 7: jmp 0
+        0x74, 0x01,              // 5: je 8
+        0xC3,                    // 7: ret
+        0xC3,                    // 8: ret
+        0xEB, 0xF5,              // 9: jmp 0
     };
-    ASSERT_FINDINGS_AMONG(edge_on_head, "constant condition after zeroing", 1, 2);
+    ASSERT_FINDINGS(edge_on_head, "constant condition after zeroing", 1);
+
+    // Deleting the test hands every later reader of its flags older ones, so
+    // they must die past the consumer: a second CMOVcc reading them, or an
+    // ADC at the branch target, keeps the test. tools/rwfuzz ran the deletion
+    // past both.
+    static const uint8_t second_reader[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x48, 0x0F, 0x44, 0xD8,  // cmove rbx, rax
+        0x48, 0x0F, 0x42, 0xD0,  // cmovb rdx, rax
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_AMONG(second_reader, "constant condition after zeroing",
+                          0, 0);
+    static const uint8_t reader_at_target[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x74, 0x01,              // je +1
+        0xC3,                    // ret
+        0x83, 0xD2, 0x00,        // adc edx, 0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS_AMONG(reader_at_target, "constant condition after zeroing",
+                          0, 0);
+    // Only the decided successor counts: JNE after a zero test is never
+    // taken, so the ADC at its target never sees these flags.
+    static const uint8_t reader_not_taken[] = {
+        0x31, 0xC9,              // xor ecx, ecx
+        0x48, 0x85, 0xC9,        // test rcx, rcx
+        0x75, 0x01,              // jne +1 (never taken)
+        0xC3,                    // ret
+        0x83, 0xD2, 0x00,        // adc edx, 0
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(reader_not_taken, "constant condition after zeroing", 1);
 }
 
 // Multi-instruction peephole: the second arm of the same family. A register
@@ -3095,7 +3133,7 @@ static void check_movimm_condition_test(void)
         0x41, 0xBA, 0x3F, 0x00, 0x00, 0x00,  // mov r10d, 0x3f
         0x45, 0x85, 0xD2,                    // test r10d, r10d
         0x7F, 0x01,                          // jg +1
-        0x90,                          // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                          // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_test_jg, "constant condition after immediate", 1);
 
@@ -3107,7 +3145,7 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x48, 0x83, 0xF9, 0x28,        // cmp rcx, 0x28
         0x77, 0x01,                    // ja +1
-        0x90,                    // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                    // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_cmp_ja, "constant condition after immediate", 1);
 
@@ -3116,6 +3154,7 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x83, 0xF9, 0x10,              // cmp ecx, 0x10
         0x48, 0x0F, 0x44, 0xD8,        // cmove rbx, rax
+        0xC3,                          // ret: the compare's flags die
     };
     ASSERT_FINDINGS(mov_cmp_cmove, "constant condition after immediate", 1);
 
@@ -3125,7 +3164,7 @@ static void check_movimm_condition_test(void)
         0xB1, 0x05,              // mov cl, 5
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_narrow, "constant condition after immediate", 0);
 
@@ -3136,7 +3175,7 @@ static void check_movimm_condition_test(void)
         0xB1, 0x05,              // mov cl, 5
         0x84, 0xC9,              // test cl, cl
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_narrow_same, "constant condition after immediate", 1);
 
@@ -3147,7 +3186,7 @@ static void check_movimm_condition_test(void)
         0xB4, 0x05,              // mov ah, 5
         0x84, 0xE4,              // test ah, ah
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_high_byte, "constant condition after immediate", 1);
 
@@ -3157,7 +3196,7 @@ static void check_movimm_condition_test(void)
         0xB0, 0x05,              // mov al, 5
         0x84, 0xE4,              // test ah, ah
         0x75, 0x01,              // jne +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_low_test_high, "constant condition after immediate", 0);
 
@@ -3167,7 +3206,7 @@ static void check_movimm_condition_test(void)
         0x89, 0xD9,              // mov ecx, ebx
         0x48, 0x85, 0xC9,        // test rcx, rcx
         0x74, 0x01,              // je +1
-        0x90,              // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,              // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(mov_reg, "constant condition after immediate", 0);
 
@@ -3177,7 +3216,7 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x48, 0x39, 0xD1,              // cmp rcx, rdx
         0x74, 0x01,                    // je +1
-        0x90,                    // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                    // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(cmp_reg, "constant condition after immediate", 0);
 
@@ -3186,7 +3225,7 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x48, 0x3B, 0x08,              // cmp rcx, [rax]
         0x74, 0x01,                    // je +1
-        0x90,                    // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                    // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(cmp_mem, "constant condition after immediate", 0);
 
@@ -3195,7 +3234,7 @@ static void check_movimm_condition_test(void)
         0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
         0x85, 0xD2,                    // test edx, edx
         0x74, 0x01,                    // je +1
-        0x90,                    // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                    // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(test_other, "constant condition after immediate", 0);
 
@@ -3216,7 +3255,7 @@ static void check_movimm_condition_test(void)
         0x39, 0xD8,                    // cmp eax, ebx
         0x85, 0xC9,                    // test ecx, ecx
         0x74, 0x01,                    // je +1
-        0x90,                    // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                    // ret ; ret: the flags die on both successors
     };
     // As in the zeroing arm, the gap instruction draws its own correct finding:
     // the test redefines every flag cmp eax, ebx set, so nothing reads it.
@@ -3232,7 +3271,7 @@ static void check_movimm_condition_test(void)
         0x89, 0xD9,                    // mov ecx, ebx
         0x85, 0xC9,                    // test ecx, ecx
         0x74, 0x01,                    // je +1
-        0x90,                    // skipped: a zero displacement is its own finding
+        0xC3, 0xC3,                    // ret ; ret: the flags die on both successors
     };
     ASSERT_FINDINGS(reg_gap, "constant condition after immediate", 0);
 
@@ -3250,10 +3289,23 @@ static void check_movimm_condition_test(void)
     static const uint8_t edge_on_head[] = {
         0xB9, 0x10, 0x00, 0x00, 0x00,  // 0: mov ecx, 0x10  <- branch target
         0x85, 0xC9,                    // 5: test ecx, ecx
-        0x74, 0x00,                    // 7: je +0
-        0xEB, 0xF5,                    // 9: jmp 0
+        0x74, 0x01,                    // 7: je 10
+        0xC3,                          // 9: ret
+        0xC3,                          // 10: ret
+        0xEB, 0xF3,                    // 11: jmp 0
     };
-    ASSERT_FINDINGS_AMONG(edge_on_head, "constant condition after immediate", 1, 2);
+    ASSERT_FINDINGS(edge_on_head, "constant condition after immediate", 1);
+
+    // The compare's CF is read again past the SETcc: the compare stays.
+    static const uint8_t second_reader[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x83, 0xF9, 0x05,              // cmp ecx, 5
+        0x0F, 0x92, 0xC0,              // setb al
+        0x19, 0xD2,                    // sbb edx, edx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_AMONG(second_reader, "constant condition after immediate",
+                          0, 0);
 }
 
 // Multi-instruction peephole: a SHL/SHR/SAR of a register by a statically

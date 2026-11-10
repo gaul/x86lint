@@ -204,8 +204,9 @@ argue for or against each, live in [TODO.md](TODO.md).
   zeroing", sharing its consumer search and its side-entry gate; the
   difference is only where the constant comes from, read here from the
   encoding rather than from a producer whose two operands name one register.
-  Neither arm evaluates the condition -- knowing that both operands are fixed
-  is enough to know the outcome is.
+  Knowing that both operands are fixed is enough to know the outcome is
+  decided; both arms do evaluate it, for one purpose: the flags past the
+  consumer (see the zeroing arm).
   The compare must read only bits the MOV wrote, which is a real constraint
   rather than a formality: `MOV CL, 5; TEST CL, CL` is admitted and
   `MOV CL, 5; TEST RCX, RCX` is not, the latter reading 56 bits the MOV left
@@ -245,7 +246,17 @@ argue for or against each, live in [TODO.md](TODO.md).
   `TEST RCX, RCX` and `TEST CL, CL` alike; `XOR CL, CL` proves only the
   narrow one, since a wider TEST reads 56 bits it never touched; and
   `XOR AL, AL` proves nothing about `TEST AH, AH`, the high-byte names
-  covering bits 15:8. The TEST is searched for through `APX_NDD_WINDOW`, and
+  covering bits 15:8. **The rewrite deletes the TEST**, so every later reader
+  of its flags, not only the consumer, would see older ones: a second CMOVcc
+  on the same compare, an ADC, a caller reading flags across a return. Both
+  arms therefore require the compare's flags dead past the consumer -- for a
+  Jcc, past the successor the decided condition takes, so a never-taken
+  branch's target may read flags freely. `tools/rwfuzz` found the deletion
+  run past such readers (31 of 1,722 findings of this arm and 345 of 1,948 of
+  the immediate one mismatched at 10,000 programs). On Mozilla's 160 libxul
+  the gate costs 9 of 94 immediate-arm findings and 2 of 24 zeroing-arm ones,
+  every one a decided side that falls into a JMP or runs past the flag walk's
+  16-instruction lookahead, where the walk stops conservatively The TEST is searched for through `APX_NDD_WINDOW`, and
   a consumer is required, since without one the site is a dead TEST rather
   than a decided condition. The side-entry
   gate is stricter than the redundant-TEST checks': a direct edge onto the

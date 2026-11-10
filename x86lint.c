@@ -7409,6 +7409,70 @@ static bool shift_test_redundant(const uint8_t *inst, size_t len,
     return false;
 }
 
+// The arithmetic flags (FLAG_* bits) a TEST of a register with itself, or a
+// CMP of it against an immediate, sets when the compared register holds
+// `value`. AF is left out, as everywhere here.
+static uint32_t known_compare_flags(const xed_decoded_inst_t *cmp,
+                                    uint64_t value)
+{
+    unsigned int w = xed_decoded_inst_get_operand_width(cmp);
+    uint64_t mask = w >= 64 ? UINT64_MAX : (((uint64_t) 1 << w) - 1);
+    uint64_t a = value & mask;
+    uint64_t r = a;
+    uint32_t f = 0;
+    if (xed_decoded_inst_get_iclass(cmp) == XED_ICLASS_CMP) {
+        uint64_t b = (uint64_t) (int64_t)
+            xed_decoded_inst_get_signed_immediate(cmp) & mask;
+        r = (a - b) & mask;
+        if (a < b) {
+            f |= FLAG_CF;
+        }
+        if ((((a ^ b) & (a ^ r)) >> (w - 1)) & 1) {
+            f |= FLAG_OF;
+        }
+    }
+    if (r == 0) {
+        f |= FLAG_ZF;
+    }
+    if ((r >> (w - 1)) & 1) {
+        f |= FLAG_SF;
+    }
+    if ((__builtin_popcountll(r & 0xff) & 1) == 0) {
+        f |= FLAG_PF;
+    }
+    return f;
+}
+
+// Whether a Jcc is taken under `flags` (FLAG_* bits); false for anything
+// that is not one of the sixteen conditions.
+static bool jcc_decided(xed_iclass_enum_t ic, uint32_t flags, bool *taken)
+{
+    bool cf = (flags & FLAG_CF) != 0, zf = (flags & FLAG_ZF) != 0;
+    bool sf = (flags & FLAG_SF) != 0, of = (flags & FLAG_OF) != 0;
+    bool pf = (flags & FLAG_PF) != 0;
+    switch (ic) {
+    case XED_ICLASS_JO:   *taken = of; break;
+    case XED_ICLASS_JNO:  *taken = !of; break;
+    case XED_ICLASS_JB:   *taken = cf; break;
+    case XED_ICLASS_JNB:  *taken = !cf; break;
+    case XED_ICLASS_JZ:   *taken = zf; break;
+    case XED_ICLASS_JNZ:  *taken = !zf; break;
+    case XED_ICLASS_JBE:  *taken = cf || zf; break;
+    case XED_ICLASS_JNBE: *taken = !cf && !zf; break;
+    case XED_ICLASS_JS:   *taken = sf; break;
+    case XED_ICLASS_JNS:  *taken = !sf; break;
+    case XED_ICLASS_JP:   *taken = pf; break;
+    case XED_ICLASS_JNP:  *taken = !pf; break;
+    case XED_ICLASS_JL:   *taken = sf != of; break;
+    case XED_ICLASS_JNL:  *taken = sf == of; break;
+    case XED_ICLASS_JLE:  *taken = zf || sf != of; break;
+    case XED_ICLASS_JNLE: *taken = !zf && sf == of; break;
+    default:
+        return false;
+    }
+    return true;
+}
+
 // The shared tail of the two constant-condition checks below: from
 // `after_compare`, find the first instruction that reads a flag and decide
 // whether it is a consumer this rewrite reaches. The compare above it has set
@@ -7425,10 +7489,24 @@ static bool shift_test_redundant(const uint8_t *inst, size_t len,
 // the argument that a path jumping to the consumer sees the flags unchanged --
 // true when the rewrite merely deletes a compare, false when the whole claim
 // is about the consumer.
+//
+// The rewrite deletes the compare, so the consumer is not the only reader it
+// must answer for: every flag the compare set is gone, and whatever reads one
+// past the consumer -- a second CMOVcc on the same compare, an ADC, the
+// caller of a function that returns in the flags -- would see the older
+// value. So the compare's flags must be dead past the consumer
+// (flags_live_after_ext, with a call ending the walk as the ABI allows). For
+// a Jcc that means past the successor it decides on: `flags` is what the
+// compare sets (known_compare_flags), which says whether the branch is taken,
+// and the side never executed need not be dead. tools/rwfuzz ran the deletion
+// past such readers: 345 of 1,948 findings of the immediate arm and 31 of
+// 1,722 of the zeroing arm mismatched at 10,000 programs. Requiring both
+// successors instead lost 65 of the 94 immediate-arm findings in Mozilla's
+// libxul, nearly all to a never-executed side whose walk ended at a JMP.
 static bool constant_condition_consumed(const uint8_t *inst, size_t len,
                                         const uint8_t *branch_targets,
                                         size_t after_producer,
-                                        size_t after_compare)
+                                        size_t after_compare, uint32_t flags)
 {
     size_t consumer = after_compare;
     for (int step = 0; step < APX_NDD_WINDOW - 1; ++step) {
@@ -7460,9 +7538,26 @@ static bool constant_condition_consumed(const uint8_t *inst, size_t len,
             // decided condition. Others that read a flag (ADC and SBB read CF,
             // which is likewise constant here) would need their own rewrite
             // and are left alone.
-            return category == XED_CATEGORY_COND_BR ||
-                   category == XED_CATEGORY_CMOV ||
-                   category == XED_CATEGORY_SETCC;
+            if (category == XED_CATEGORY_CMOV ||
+                category == XED_CATEGORY_SETCC) {
+                return !flags_live_after_ext(inst, len, after_consumer,
+                                             FLAG_ARITH, true);
+            }
+            bool taken;
+            if (category != XED_CATEGORY_COND_BR ||
+                !jcc_decided(xed_decoded_inst_get_iclass(&user), flags,
+                             &taken)) {
+                return false;
+            }
+            if (!taken) {
+                return !flags_live_after_ext(inst, len, after_consumer,
+                                             FLAG_ARITH, true);
+            }
+            int64_t target = (int64_t) after_consumer +
+                xed_decoded_inst_get_branch_displacement(&user);
+            return target >= 0 && (uint64_t) target < (uint64_t) len &&
+                !flags_live_after_ext(inst, len, (size_t) target, FLAG_ARITH,
+                                      true);
         }
         if (written != 0) {
             return false;
@@ -7673,7 +7768,8 @@ static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
         }
 
         if (!constant_condition_consumed(inst, len, branch_targets,
-                                         after_producer, after)) {
+                                         after_producer, after,
+                                         known_compare_flags(test_out, 0))) {
             return false;
         }
         *test_offset_out = cur;
@@ -7696,9 +7792,10 @@ static bool zeroed_test_condition_constant(const uint8_t *inst, size_t len,
 // producer's operands, this one reads it from the encoding, which is the only
 // difference in the proof: both leave every flag the consumer reads a function
 // of values fixed at assembly time, so neither needs to evaluate the condition
-// to know it has one outcome. The consumer search, the side-entry gate and the
-// gap rule are shared with the zeroing arm; see constant_condition_consumed
-// and known_reg_gap_transparent.
+// to know it has one outcome. Both do evaluate it, to know which successor of
+// a Jcc consumer runs and so must find the compare's flags dead. The consumer
+// search, the side-entry gate and the gap rule are shared with the zeroing
+// arm; see constant_condition_consumed and known_reg_gap_transparent.
 //
 // Where the zeroing arm accepts a compare at any width, because a zeroed
 // register is zero in all of them, this one has to say which bits it knows.
@@ -7750,6 +7847,17 @@ static bool movimm_condition_constant(const uint8_t *inst, size_t len,
         known_hi = 64;          // a 32-bit write zero-extends
     }
     xed_reg_enum_t dest_enc = xed_get_largest_enclosing_register(loaded);
+    // The bits the MOV wrote, from known_lo up: a 64-bit destination takes
+    // the imm32 sign-extended (or a full imm64), a 32-bit one zero-extends.
+    unsigned int loaded_width = xed_get_register_width_bits64(loaded);
+    uint64_t imm = xed_decoded_inst_get_unsigned_immediate(producer);
+    uint64_t loaded_value = imm;
+    if (loaded_width == 64 &&
+        xed_decoded_inst_get_immediate_width_bits(producer) == 32) {
+        loaded_value = (uint64_t) (int64_t) (int32_t) imm;
+    } else if (loaded_width < 64) {
+        loaded_value = imm & (((uint64_t) 1 << loaded_width) - 1);
+    }
 
     size_t cur = after_producer;
     for (int slot = 0; slot < APX_NDD_WINDOW - 1; ++slot) {
@@ -7793,7 +7901,9 @@ static bool movimm_condition_constant(const uint8_t *inst, size_t len,
         }
 
         if (!constant_condition_consumed(inst, len, branch_targets,
-                                         after_producer, after)) {
+                after_producer, after,
+                known_compare_flags(cmp_out,
+                                    loaded_value >> (read_lo - known_lo)))) {
             return false;
         }
         *cmp_offset_out = cur;

@@ -3629,6 +3629,92 @@ static void check_frame_reload_test(void)
         "redundant reload", &total, 0) == 0);
 }
 
+// A frame slot read straight back after a store: the store's source still
+// holds the bytes, so the load is a register copy. See frame_step.
+static void check_frame_forward_test(void)
+{
+    int total;
+
+    // mov [rsp+8], rax ; mov rbx, [rsp+8] -- MOV RBX, RAX; the store stays.
+    static const uint8_t forward[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(forward, "load of a just-stored value", 1);
+
+    // A spill sequence writes several slots before reading any back; the
+    // disjoint stores between leave the claim standing.
+    static const uint8_t spill_run[] = {
+        0x55,                          // push rbp
+        0x48, 0x89, 0xE5,              // mov rbp, rsp
+        0x48, 0x89, 0x45, 0xF8,        // mov [rbp-8], rax
+        0x48, 0x89, 0x5D, 0xF0,        // mov [rbp-16], rbx
+        0x89, 0x4D, 0xEC,              // mov [rbp-20], ecx
+        0x48, 0x8B, 0x55, 0xF8,        // mov rdx, [rbp-8]
+        0x5D,                          // pop rbp
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(spill_run, "load of a just-stored value", 1);
+
+    // Read back into the register it came from: at 32 bits the load
+    // zero-extends, so it is MOV EAX, EAX ...
+    static const uint8_t same32[] = {
+        0x89, 0x44, 0x24, 0x08,        // mov [rsp+8], eax
+        0x8B, 0x44, 0x24, 0x08,        // mov eax, [rsp+8]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS(same32, "load of a just-stored value", 1);
+    // ... and at 64 there is nothing to copy, which is not this row.
+    static const uint8_t same64[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x8B, 0x44, 0x24, 0x08,  // mov rax, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(same64, sizeof(same64),
+        "load of a just-stored value", &total, 0) == 0);
+
+    // The source rewritten after the store no longer holds the bytes.
+    static const uint8_t source_written[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x83, 0xC0, 0x01,        // add rax, 1
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(source_written, sizeof(source_written),
+        "load of a just-stored value", &total, 0) == 0);
+
+    // A narrower load reads part of the bytes; the widths must agree.
+    static const uint8_t narrower[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x8B, 0x5C, 0x24, 0x08,        // mov ebx, [rsp+8]
+        0xC3,                          // ret
+    };
+    assert(count_findings(narrower, sizeof(narrower),
+        "load of a just-stored value", &total, 0) == 0);
+
+    // An immediate store leaves no register holding the value.
+    static const uint8_t immediate[] = {
+        0x48, 0xC7, 0x44, 0x24, 0x08, 0x05, 0x00, 0x00, 0x00,  // mov [rsp+8], 5
+        0x48, 0x8B, 0x5C, 0x24, 0x08,                          // mov rbx, [rsp+8]
+        0xC3,                                                  // ret
+    };
+    assert(count_findings(immediate, sizeof(immediate),
+        "load of a just-stored value", &total, 0) == 0);
+
+    // A later store over the slot from another register is what the load
+    // reads: the claim moves to that register, and the first is forgotten.
+    static const uint8_t restored[] = {
+        0x48, 0x89, 0x44, 0x24, 0x08,  // mov [rsp+8], rax
+        0x48, 0x89, 0x4C, 0x24, 0x08,  // mov [rsp+8], rcx
+        0x48, 0x8B, 0x5C, 0x24, 0x08,  // mov rbx, [rsp+8]
+        0x48, 0x89, 0xC2,              // mov rdx, rax
+        0xC3,                          // ret
+    };
+    assert(count_findings(restored, sizeof(restored),
+        "load of a just-stored value", &total, 0) == 1);
+}
+
 // A constant another register still holds, and one the destination already
 // holds. One of the two state machines carried across the scan. See
 // const_remat_step.
@@ -9636,6 +9722,7 @@ int main(int argc, char *argv[])
     check_redundant_shift_test();
     check_const_remat_test();
     check_frame_reload_test();
+    check_frame_forward_test();
     check_small_sound_test();
     check_bitscan_default_test();
     check_branch_to_next_test();

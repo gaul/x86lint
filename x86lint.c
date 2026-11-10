@@ -12335,6 +12335,7 @@ static struct frame_record *frame_find(struct frame_table *t,
 enum frame_verdict {
     FRAME_VERDICT_NONE,
     FRAME_VERDICT_RELOAD,       // another register holds what a load reloads
+    FRAME_VERDICT_FORWARD,      // a load reads back what a store just wrote
 };
 
 // Fold one instruction into the table, after it has been judged.
@@ -12512,10 +12513,18 @@ static enum frame_verdict frame_step(struct frame_table *t,
     if (frame_gpr_move(t, d, &store, &base, &disp, &width, &data) &&
         !store) {
         struct frame_record *r = frame_find(t, base, disp, width);
-        if (r != NULL && r->held && !r->store &&
-            xed_reg_class(r->data) == XED_REG_CLASS_GPR &&
-            r->data != data) {
-            verdict = FRAME_VERDICT_RELOAD;
+        if (r != NULL && r->held &&
+            xed_reg_class(r->data) == XED_REG_CLASS_GPR) {
+            if (!r->store && r->data != data) {
+                verdict = FRAME_VERDICT_RELOAD;
+            } else if (r->store && (r->data != data || width == 4)) {
+                // The store's source still holds the bytes it wrote, so the
+                // load is MOV rD, rS at its own width -- which zero-extends
+                // at 32 bits exactly as the load does. Read back into the
+                // register it came from, that is MOV eD, eD at 32 bits; at
+                // 64 the load is a no-op, which is a different row.
+                verdict = FRAME_VERDICT_FORWARD;
+            }
         }
     }
 
@@ -13494,8 +13503,9 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
             break;
         }
 
-        // Stateful check: a frame slot read back while a register still
-        // holds what it held. Reported against the load the rewrite replaces.
+        // Stateful checks: a frame slot read back while a register still
+        // holds what it held, from a load or from the store that wrote it.
+        // Reported against the load the rewrite replaces.
         // A function's entry is a direct-call target, an ENDBR64 or an
         // installed function's start: RBP is the caller's there. See
         // frame_step.
@@ -13514,6 +13524,11 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
                            next, &xedd)) {
         case FRAME_VERDICT_RELOAD:
             emit_finding(&sink, "redundant reload", offset, &xedd,
+                inst + offset);
+            ++errors;
+            break;
+        case FRAME_VERDICT_FORWARD:
+            emit_finding(&sink, "load of a just-stored value", offset, &xedd,
                 inst + offset);
             ++errors;
             break;

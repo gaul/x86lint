@@ -2225,7 +2225,8 @@ counts below come from it). What each one is:
   rustc 1,416 + 298, and clang's C++ 302 / 213 same-register reloads.
   libxul had 550 + 1,239. Its same-register reloads, 561 today, divide 360
   C++ to 201 Rust, at 21 and 25 per million. So GCC has the gap too, at
-  about the rate LLVM does.
+  about the rate LLVM does. The copies into another register ship as
+  "load of a just-stored value" (2026-11-10).
 * **Stack-to-stack copies through a register** -- 94,712 pure copies
   (the register dies at the store), plus 115,874 vector-register copies
   and 101,780 load-and-spill pairs. Per million instructions: rustc
@@ -2933,7 +2934,10 @@ store's source register, so the rewrite is a register copy, or a deletion
 when the load targets that register, and the adjacency leaves no gap to
 rule on. It is the same spill phenomenon behind the same policy line,
 and is recorded on [#29](https://github.com/gaul/x86lint/issues/29) as a
-sibling shape.
+sibling shape. **Shipped 2026-11-10** as "load of a just-stored value", the
+copy half, and not only adjacent: the frame-slot table carries the claim
+across disjoint stores and conditional fall-throughs, which is why go
+reports 392 against the 19 frame-slot sites the adjacent count found.
 
 **The immediate-misfit and flag-reorder audits: no x86 analog (measured
 2026-09-14 over four corpora).** armlint's `-a imm` finds constants that miss

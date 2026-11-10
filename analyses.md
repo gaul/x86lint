@@ -476,6 +476,24 @@ argue for or against each, live in [TODO.md](TODO.md).
   independent and both correct, one saying fold the load and the other
   saying zero the destination first
 
+## load of a just-stored value
+
+* `4889442408 488B5C2408` (MOV [RSP+8], RAX; MOV RBX, [RSP+8]) -- the bytes
+  a store just wrote to a frame slot, read straight back: the store's source
+  still holds them, so the load is MOV RBX, RAX and the store stays. At 32
+  bits the copy zero-extends exactly as the load does, which also makes a
+  32-bit read-back into the source register itself MOV EAX, EAX; at 64 bits
+  that load has nothing left to do and is the row below. Nothing is deleted,
+  so no liveness question arises. The claim is the frame-slot table's (see
+  [redundant reload](#redundant-reload)), and a spill sequence that writes
+  several slots before reading any back keeps it, since the stores between
+  are to disjoint ranges through the same base
+* Five-binary sweep: go 392, libcrypto 93, libc 38, bash 27, ld.so 1. Go's
+  are the goroutine pointer spilled and read back across a write-barrier
+  test, `mov [rsp+0x48], r14 ; mov rdx, [rsp+0x48]`, and the C sites GCC's
+  spill of a call result tested and reloaded as the next argument, `mov
+  [rbp-0x108], rax ; test rax, rax ; je ; mov rdi, [rbp-0x108]`
+
 ## NEG foldable into ADD/SUB
 
 * `F7DA 4101D6` (NEG EDX; ADD R14D, EDX) -- negating a value and adding it

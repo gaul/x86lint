@@ -475,7 +475,14 @@ argue for or against each, live in [TODO.md](TODO.md).
   it must be dead afterward, proved by a vector-register liveness walk whose
   kill rule is structural (an operand written, not read, and at least as wide
   as the value) rather than an iclass list, since a legacy 128-bit write
-  leaves bits 255:128 standing where a VEX write zeroes them
+  leaves bits 255:128 standing where a VEX write zeroes them. One exception
+  to the structural rule: XED marks the legacy register-form `MOVSS` and
+  `MOVSD` destination written-only, yet they merge into its upper lanes, so
+  they are no kill. `tools/rwfuzz` found the fold run past one, and so did
+  Mozilla's libxul: `movapd xmm3, [rsp+0x30] ; unpcklpd xmm1, xmm3 ; mulpd
+  xmm1, xmm0 ; movsd xmm3, xmm2 ; divpd xmm1, xmm3` divides by the loaded
+  upper half the MOVSD kept. The correction took libxul from 379 findings
+  to 377
 * **Alignment is the one gate with no scalar counterpart, and it resolves
   through the instruction being deleted.** A legacy SSE instruction with a
   memory operand requires 16-byte alignment and #GPs otherwise, which looks

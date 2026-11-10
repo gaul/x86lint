@@ -4442,6 +4442,18 @@ static void check_vecop_fold_test(void)
     };
     ASSERT_FINDINGS(aligned_legacy, "load foldable into vector op", 1);
 
+    // A register-form MOVSD writes only the low 64 bits and merges the rest,
+    // so the load's upper half survives it: not a kill. tools/rwfuzz ran the
+    // fold past one.
+    static const uint8_t merged_after[] = {
+        0x0F, 0x28, 0x17,        // movaps xmm2, [rdi]
+        0x0F, 0x59, 0xC2,        // mulps xmm0, xmm2
+        0xF2, 0x0F, 0x10, 0xD3,  // movsd xmm2, xmm3 (merges into xmm2)
+        0x0F, 0x29, 0x16,        // movaps [rsi], xmm2
+        0xC3,                    // ret
+    };
+    ASSERT_FINDINGS(merged_after, "load foldable into vector op", 0);
+
     // vmovdqu xmm1, [rdi] ; vpxor xmm0, xmm2, xmm1 -- an unaligned load proves
     // nothing about the address, but a VEX consumer requires nothing either:
     // vpxor xmm0, xmm2, [rdi].

@@ -11913,6 +11913,13 @@ static bool vec_move_iclass(xed_iclass_enum_t iclass)
 // Same bias as every other walk here: reads count inclusively and kills
 // exclusively, so a decode error, a control transfer, or the end of the
 // window all resolve toward LIVE and suppress the finding.
+//
+// One writer XED marks written-only is no kill: the legacy register-form
+// MOVSS and MOVSD merge into the destination's upper lanes, which keep the
+// value in question (the exception redefines_xmm_full makes for the same
+// reason). tools/rwfuzz found the load fold deleting `movdqa xmm3, [m]`
+// ahead of `movsd xmm3, xmm7`, whose result still carried the load's upper
+// half.
 static bool vec_live_after(const uint8_t *inst, size_t len, size_t offset,
                            xed_reg_enum_t parent, unsigned value_bits)
 {
@@ -11939,9 +11946,13 @@ static bool vec_live_after(const uint8_t *inst, size_t len, size_t offset,
             return true;
         }
 
+        xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
+        bool merges = (iclass == XED_ICLASS_MOVSS ||
+                       iclass == XED_ICLASS_MOVSD_XMM) &&
+                      xed_decoded_inst_number_of_memory_operands(&xedd) == 0;
         const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
         unsigned nops = xed_inst_noperands(xi);
-        for (unsigned i = 0; i < nops; ++i) {
+        for (unsigned i = 0; i < nops && !merges; ++i) {
             const xed_operand_t *op = xed_inst_operand(xi, i);
             xed_operand_enum_t name = xed_operand_name(op);
             if (!xed_operand_is_register(name) || !xed_operand_written(op)) {

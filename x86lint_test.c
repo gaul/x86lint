@@ -4264,6 +4264,40 @@ static void check_bitscan_default_test(void)
     ASSERT_FINDINGS_TARGET(wrong_constant, "redundant bit-scan default", 0,
                            X86LINT_TARGET_SKYLAKE);
 
+    // The scan reads the constant: as its source it counts the 64's zeroes,
+    // and as an address it loads through it. tools/rwfuzz ran the deletion.
+    static const uint8_t self_source[] = {
+        0xB9, 0x40, 0x00, 0x00, 0x00,  // mov ecx, 0x40
+        0xF3, 0x48, 0x0F, 0xBC, 0xC9,  // tzcnt rcx, rcx
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(self_source, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_SKYLAKE);
+    static const uint8_t self_address[] = {
+        0xB9, 0x40, 0x00, 0x00, 0x00,  // mov ecx, 0x40
+        0xF3, 0x48, 0x0F, 0xBC, 0x09,  // tzcnt rcx, [rcx]
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(self_address, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_SKYLAKE);
+
+    // A 16-bit scan writes bits 15:0 only, so a 32-bit MOV's zeroes above
+    // them survive it and the MOV is not dead; a 16-bit MOV is.
+    static const uint8_t narrow_scan[] = {
+        0xB9, 0x10, 0x00, 0x00, 0x00,  // mov ecx, 0x10
+        0x66, 0xF3, 0x0F, 0xBC, 0xCE,  // tzcnt cx, si
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(narrow_scan, "redundant bit-scan default", 0,
+                           X86LINT_TARGET_SKYLAKE);
+    static const uint8_t narrow_both[] = {
+        0x66, 0xB9, 0x10, 0x00,        // mov cx, 0x10
+        0x66, 0xF3, 0x0F, 0xBC, 0xCE,  // tzcnt cx, si
+        0xC3,                          // ret
+    };
+    ASSERT_FINDINGS_TARGET(narrow_both, "redundant bit-scan default", 1,
+                           X86LINT_TARGET_SKYLAKE);
+
     // The complementary gate: POPCNT keeps its phantom destination through
     // Cascade Lake, so the dependency-break advice survives on Skylake where
     // the bit-scan half of the same erratum is already fixed.

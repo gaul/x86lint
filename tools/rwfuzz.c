@@ -1428,8 +1428,21 @@ static void plant_fold(struct gen *g)
         static const char *const SH[] = {"shl", "shr", "sar"};
         ADD("%s %s, cl", SH[rnd(&g->rng, 3)], gpr(r, w));
         if (chance(&g->rng, 50)) {
-            ADD("mov %s, %d", gpr(s, w), w);
-            ADD("tzcnt %s, %s", gpr(s, w), gpr(t, w));
+            // A bit scan's zero-source default, set by hand: at each width,
+            // from a source that may be the destination itself or memory,
+            // and from a MOV wider than the scan.
+            int bw = chance(&g->rng, 20) ? 16 : w;
+            int mw = bw == 16 && chance(&g->rng, 50) ? 32 : bw;
+            const char *scan = chance(&g->rng, 70) ? "tzcnt" : "lzcnt";
+            if (chance(&g->rng, 20)) {
+                ADD("mov %s, %d", gpr(s, mw), bw);
+                any_mem(g, bw, a, sizeof(a));
+                ADD("%s %s, %s", scan, gpr(s, bw), a);
+            } else {
+                ADD("mov %s, %d", gpr(s, mw), bw);
+                ADD("%s %s, %s", scan, gpr(s, bw),
+                    gpr(chance(&g->rng, 25) ? s : t, bw));
+            }
             gen_flag_definer(g);
         }
         break;

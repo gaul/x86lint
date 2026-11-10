@@ -1020,6 +1020,14 @@ argue for or against each, live in [TODO.md](TODO.md).
   operand size and they write the destination unconditionally, so for those
   two spellings the MOV is dead outright. The constant carries its own
   proof, being equal to the width the instruction already returns.
+* "Dead" needs two conditions the constant does not carry, both found by
+  `tools/rwfuzz` (246 of 1,511 findings mismatched at 10,000 programs). The
+  scan must not read the MOV's register: `MOV RCX, 64; TZCNT RCX, RCX`
+  counts the 64, and an address formed from RCX loads through it. And the
+  scan's write must cover the MOV's: a 16-bit `TZCNT CX, SI` writes bits
+  15:0 only, so after `MOV ECX, 16` the zeroes in bits 63:16 are the MOV's,
+  and deleting it would leave whatever RCX held before. `MOV CX, 16` in
+  front of the same scan is still dead
 * `BSF` and `BSR` are never matched, for the reason that makes this sound at
   all: their preserved destination is the mechanism, so the same MOV in
   front of one is load-bearing. The two are easy to tell apart by the

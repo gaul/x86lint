@@ -2433,6 +2433,14 @@ bool check_lane0_extract(const xed_decoded_inst_t *xedd)
 // makes the width test a proof rather than a heuristic. The BSR sites in the
 // same shape (1,067 of them) carry a sentinel instead, `mov ecx, 0x7f`
 // before `bsr rcx, rdx ; xor ecx, 0x3f`, and are correctly not matched.
+//
+// "Dead" needs two more things the width test does not say, both found by
+// tools/rwfuzz. The scan must not read the MOV's register: `mov rcx, 64 ;
+// tzcnt rcx, rcx` counts the 64 (giving 6), and an address formed from RCX
+// would read through it. And the scan's write must cover the MOV's: a
+// 16-bit TZCNT writes only bits 15:0, so `mov ecx, 16 ; tzcnt cx, si`
+// leaves the MOV's zeroes standing in bits 63:16, which deleting it would
+// replace with whatever RCX held before.
 static bool bitscan_default_dead(const uint8_t *inst, size_t len, size_t next,
                                  const xed_decoded_inst_t *mov)
 {
@@ -2463,10 +2471,30 @@ static bool bitscan_default_dead(const uint8_t *inst, size_t len, size_t next,
     }
     // The constant must be the width the instruction returns for a zero
     // source, and must land in the register it overwrites.
-    return imm == xed_decoded_inst_get_operand_width(&use) &&
+    unsigned use_width = xed_decoded_inst_get_operand_width(&use);
+    xed_reg_enum_t parent = xed_get_largest_enclosing_register(dest);
+    if (imm != use_width ||
         xed_get_largest_enclosing_register(
-            xed_decoded_inst_get_reg(&use, XED_OPERAND_REG0)) ==
-        xed_get_largest_enclosing_register(dest);
+            xed_decoded_inst_get_reg(&use, XED_OPERAND_REG0)) != parent) {
+        return false;
+    }
+    // The scan must not read the MOV's register, as its source or in its
+    // address.
+    if (xed_get_largest_enclosing_register(
+            xed_decoded_inst_get_reg(&use, XED_OPERAND_REG1)) == parent ||
+        (xed_decoded_inst_number_of_memory_operands(&use) > 0 &&
+         (xed_get_largest_enclosing_register(
+              xed_decoded_inst_get_base_reg(&use, 0)) == parent ||
+          xed_get_largest_enclosing_register(
+              xed_decoded_inst_get_index_reg(&use, 0)) == parent))) {
+        return false;
+    }
+    // And its write must cover the MOV's: a 32- or 64-bit write reaches bit
+    // 63, a 16-bit one only bit 15.
+    unsigned mov_width = xed_get_register_width_bits64(dest);
+    unsigned mov_top = mov_width == 32 ? 64 : mov_width;
+    unsigned use_top = use_width >= 32 ? 64 : use_width;
+    return use_top >= mov_top;
 }
 
 // A direct branch whose displacement is zero transfers control to the

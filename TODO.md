@@ -975,7 +975,7 @@ refused rewrites. Four rows mismatched, each a soundness bug in the check:
 | constant condition after immediate | 1,948 | 345 | the compare's flags are read past the consumer -- a second Jcc/CMOVcc/SETcc, an ADC, or the function's end -- and deleting the compare hands that reader older flags |
 | constant condition after zeroing | 1,722 | 31 | the same, through the zeroing arm |
 | ~~suboptimal LEA~~ | 3,409 | 124 | `lea rax, [eax+ecx]`: a 32-bit address under a 64-bit destination zero-extends a 32-bit sum, which `add rax, rcx` does not. **Fixed:** the address must be at least as wide as the destination |
-| redundant bit-scan default | 1,509 | 72 | `mov rcx, 64 ; tzcnt rcx, rcx`: the bit scan reads the default it is said to overwrite |
+| ~~redundant bit-scan default~~ | 1,509 | 72 | `mov rcx, 64 ; tzcnt rcx, rcx`: the bit scan reads the default it is said to overwrite. **Fixed**, with a second hole the widened plant then found (246 of 1,511): `mov ecx, 16 ; tzcnt cx, si`, whose 16-bit write leaves the MOV's upper zeroes standing. The scan may not read the MOV's register, and its write must cover the MOV's |
 
 Rows not run, and why:
 

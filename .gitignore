@@ -8,3 +8,4 @@ tools/shapescan
 tools/framescan
 *.o
 tools/__pycache__/
+tools/rwfuzz

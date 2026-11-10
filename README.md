@@ -352,6 +352,27 @@ regression the layer exists to catch. The script never skips itself; an
 environment that cannot build the fixtures exits 2, because a skip that exits 0
 is indistinguishable from a pass.
 
+On an x86-64 host, `XED_PATH=/path/to/xed make rwfuzz-test` runs x86lint's
+advice. `tools/rwfuzz` generates random programs as assembly text -- ALU,
+shift, multiply, LEA, extension, CMOVcc, SETcc and SSE instructions, loads
+and stores to frame slots named through both RSP and RBP and to a scratch
+buffer, pushes, pointers to the frame, forward branches and calls, and
+planted shapes for the checks -- assembles them with the host's compiler
+driver (`RWFUZZ_CC`, default `cc`), and runs `check_instructions` over the
+bytes. A finding names one instruction and carries no rewrite, so rwfuzz
+holds a rewriter per finding name that applies the row's rewrite as the
+table below states it, finding a window's partner the plain way and assuming
+nothing the check had to prove. Each rewrite is assembled from its own text
+and run natively against the original from the same random registers, flags
+and memory; a difference in the general registers, `xmm0`-`xmm7`, the
+defined flags or the scratch memory is a soundness bug, and so is a rewrite
+the rewriter or the assembler cannot apply. A control arm applies the same
+rewrites where x86lint refused to and must see some of them change a result.
+68 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
+the rest and why. `RWFUZZ_PROGRAMS` (10000) and `RWFUZZ_SEED` size and vary
+the run, and `tools/rwfuzz -f NAME MODE` narrows one to a single finding over
+the same programs.
+
 ## Usage
 
 x86lint is intended to be part of compiler test suites, which should
@@ -1440,7 +1461,9 @@ is what says so.
 ## Mining tools
 
 `tools/` holds the research utilities that feed x86lint's check backlog,
-built separately with `XED_PATH=/path/to/xed make tools`:
+built separately with `XED_PATH=/path/to/xed make tools` (which also builds
+`tools/rwfuzz`, the execution test described under
+[Compilation](#compilation)):
 
 * `tools/shapescan` sizes a *named* candidate with the rewrite's own
   conditions applied, and says what refused the rest. Where pairscan ranks

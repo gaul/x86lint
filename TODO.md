@@ -962,6 +962,39 @@ It carries the actionability caveat armlint records for `adrp`+`add`:
 where the LEA holds a relocation this is a codegen suggestion rather
 than a byte patch.
 
+## rwfuzz coverage (2026-11-10)
+
+`tools/rwfuzz` (README, "Compilation") runs each finding's rewrite
+against the original on random programs. Its first full run, `all` at
+10,000 programs (seed 0, `-t zen`, BMI1/BMI2/MOVBE on), ran 107,940
+findings of 68 kinds; the control arm changed the result in 1,824 of 5,296
+refused rewrites. Four rows mismatched, each a soundness bug in the check:
+
+| Row | Run | Mismatched | Shape |
+| --- | --- | --- | --- |
+| constant condition after immediate | 1,948 | 345 | the compare's flags are read past the consumer -- a second Jcc/CMOVcc/SETcc, an ADC, or the function's end -- and deleting the compare hands that reader older flags |
+| constant condition after zeroing | 1,722 | 31 | the same, through the zeroing arm |
+| suboptimal LEA | 3,409 | 124 | `lea rax, [eax+ecx]`: a 32-bit address under a 64-bit destination zero-extends a 32-bit sum, which `add rax, rcx` does not |
+| redundant bit-scan default | 1,509 | 72 | `mov rcx, 64 ; tzcnt rcx, rcx`: the bit scan reads the default it is said to overwrite |
+
+Rows not run, and why:
+
+| Rows | Why |
+| --- | --- |
+| unneeded REX prefix, unneeded SIB byte, unneeded zero displacement, oversized displacement, oversized branch displacement, oversized XCHG encoding, oversized VEX/EVEX encoding, suboptimal VEX operand order, unneeded explicit register/immediate, unneeded LOCK prefix, unneeded REP prefix on RET | encoding-only: the assembler never emits the original from text, so a plant would need raw bytes. The REX row is found (584 times) but has no rewriter |
+| CAS loop foldable into LOCK op, missing MULX | no plant yet; both need a multi-instruction shape (a retry loop, the fixed-register MUL) the generator does not draw |
+| missing APX NDD, missing APX SETZU | no host here runs APX |
+| OR foldable into memory | needs `-m v8` and V8's pointer-compression register conventions |
+| missing BZHI, length-changing prefix stall, AVX-SSE transition, IBT-bypassing NOTRACK call, suboptimal SETcc zero-extension, stale VEX merge operand | advisory or security classes, or advice with no single rewrite; rwfuzz asks only for `X86LINT_CLASS_REWRITE` |
+
+Two rows run under their stated assumption rather than a proof: "merging
+scalar move" and "missing SSE dependency break" assume a scalar's upper
+lanes are dead where their lookahead cannot see. rwfuzz ignores the
+destination's upper lanes for them and counts a difference that still shows
+(the lanes copied elsewhere first) apart: 10 and 14 at 10,000 programs, the
+residue their analyses describe. Both report under the REWRITE class,
+though the scalar-move analysis calls that residue an advisory's.
+
 ## JIT corpora (2026-09-15)
 
 The first measurement made by *running the tool* over JIT output rather

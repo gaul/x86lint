@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  # Weekly and on demand for rwfuzz-long, which draws programs no run has
+  # drawn before.
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,9 +23,9 @@ jobs:
       # (dnf5 is C++), and no diffutils either, which driver_test.sh needs to
       # compare its report snapshots. Install before checkout so
       # actions/checkout finds git and does a real clone instead of the
-      # REST-API tarball fallback.
+      # REST-API tarball fallback. clang is for rwfuzz's second assembler.
       - name: Install build dependencies
-        run: dnf install -y gcc gcc-c++ make git python3 diffutils
+        run: dnf install -y gcc gcc-c++ clang make git python3 diffutils
 
       - uses: actions/checkout@v7
 
@@ -37,3 +42,54 @@ jobs:
 
       - name: Run tests
         run: XED_PATH=${PWD}/xed make check
+
+      # tools/rwfuzz runs every finding's rewrite against the original on
+      # random programs (rwfuzz_test.sh), natively on this x86-64 runner,
+      # with the default seed so a failure reproduces anywhere with the
+      # same command. Under both assemblers: GNU as and clang's integrated
+      # one must each take every rewrite the rows spell. A worker per CPU;
+      # the output does not depend on how many.
+      - name: Build rwfuzz
+        run: XED_PATH=${PWD}/xed make tools/rwfuzz
+
+      - name: Run rwfuzz (GNU as)
+        run: >
+          RWFUZZ_CC=gcc RWFUZZ_JOBS="$(nproc)"
+          XED_PATH=${PWD}/xed make rwfuzz-test
+
+      - name: Run rwfuzz (clang)
+        run: >
+          RWFUZZ_CC=clang RWFUZZ_JOBS="$(nproc)"
+          XED_PATH=${PWD}/xed make rwfuzz-test
+
+  rwfuzz-long:
+    # rwfuzz again on programs no run has drawn before: the seed is this
+    # run's id, which the log prints with the command that replays a
+    # failure, and ten times the programs. On pushes to master, weekly and
+    # on demand, not on every pull request.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    container: fedora:44
+    env:
+      RWFUZZ_SEED: ${{ github.run_id }}
+      RWFUZZ_PROGRAMS: 100000
+
+    steps:
+      - name: Install build dependencies
+        run: dnf install -y gcc gcc-c++ make git python3 diffutils
+
+      - uses: actions/checkout@v7
+
+      - name: Clone XED and mbuild
+        run: |
+          git clone https://github.com/intelxed/xed.git xed
+          git clone https://github.com/intelxed/mbuild.git mbuild
+
+      - name: Build XED
+        run: cd xed && ./mfile.py install --install-dir=kits/xed-install
+
+      - name: Build rwfuzz
+        run: XED_PATH=${PWD}/xed make tools/rwfuzz
+
+      - name: Run rwfuzz
+        run: RWFUZZ_JOBS="$(nproc)" XED_PATH=${PWD}/xed make rwfuzz-test

@@ -371,8 +371,10 @@ rewrites where x86lint refused to and must see some of them change a result.
 66 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
 the rest and why. `RWFUZZ_PROGRAMS` (10000) and `RWFUZZ_SEED` size and vary
 the run, `RWFUZZ_JOBS` splits it across worker processes without changing
-what it prints, and `tools/rwfuzz -f NAME MODE` narrows one to a single finding over
-the same programs.
+what it prints, and `tools/rwfuzz -f NAME MODE` narrows one to a single
+finding over the same programs. CI runs it on every pull request under gcc's
+assembler and clang's with the default seed, and on pushes to master, weekly
+and on demand with the run's id as the seed and ten times the programs.
 
 ## Usage
 

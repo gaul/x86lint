@@ -3838,7 +3838,10 @@ static struct stat_row *stat_for(const char *name)
 // landing in rwfuzz's own globals, its C stack or the code it is running.
 // The three are 3 GB and 1.25 GB apart, off the 2 GB and 4 GB multiples
 // the edge values move a register by.
+#ifndef STATE_ADDR   // overridable for a sanitizer build, whose shadow
+                     // memory claims this range
 #define STATE_ADDR 0x10040000000ull
+#endif
 // The state block's address truncated to 32 bits. The fold plants form some
 // pointers with a 32-bit LEA or ADD, which truncates them; a decoy page
 // there, filled with other bytes, lets the original run and makes a rewrite
@@ -3881,7 +3884,10 @@ static uint8_t *exec_stack_top;
 
 // rwfuzz_enter(fn, state, stack_top): run fn(state) on the given stack.
 // The C side's callee-saved registers and stack pointer are kept here
-// rather than on the program's stack, where a stray store could reach them.
+// rather than on the program's stack, where a stray store could reach them,
+// and they are cleared first: the prologue pushes them just above its frame,
+// and a body that read one back could hand a control rewrite a base into
+// rwfuzz's own memory.
 static uint64_t enter_saved[7] __attribute__((used));
 void rwfuzz_enter(void *fn, struct rstate *st, void *stack_top);
 __asm__(
@@ -3897,6 +3903,14 @@ __asm__(
     "\tmovq %r15, enter_saved+40(%rip)\n"
     "\tmovq %rsp, enter_saved+48(%rip)\n"
     "\tmovq %rdx, %rsp\n"
+    // The prologue pushes the callee-saved registers just above its frame;
+    // let them hold nothing of the C side's.
+    "\txorl %ebx, %ebx\n"
+    "\txorl %ebp, %ebp\n"
+    "\txorl %r12d, %r12d\n"
+    "\txorl %r13d, %r13d\n"
+    "\txorl %r14d, %r14d\n"
+    "\txorl %r15d, %r15d\n"
     "\tmovq %rdi, %rax\n"
     "\tmovq %rsi, %rdi\n"
     "\tcall *%rax\n"
@@ -3992,7 +4006,8 @@ static void init_signals(void)
     sa.sa_handler = on_signal;
     sa.sa_flags = SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
-    int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGALRM};
+    int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGALRM,
+                  SIGABRT};
     for (size_t k = 0; k < sizeof(sigs) / sizeof(sigs[0]); ++k) {
         sigaction(sigs[k], &sa, NULL);
     }

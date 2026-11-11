@@ -3452,6 +3452,16 @@ static bool load_fold(const struct view *v, int i, struct prog *out,
 static bool rw_load_alu(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
+    // A one-operand consumer (MUL, IMUL, DIV) takes the load in its only
+    // operand.
+    int j = next_insn(v, i);
+    struct ins c;
+    if (j >= 0) {
+        ins_parse(v->p->it[j].text, &c);
+        if (c.nop == 1) {
+            return load_fold(v, i, out, why, whylen, 0, false);
+        }
+    }
     return load_fold(v, i, out, why, whylen, 1, false);
 }
 

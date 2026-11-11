@@ -370,7 +370,8 @@ the rewriter or the assembler cannot apply. A control arm applies the same
 rewrites where x86lint refused to and must see some of them change a result.
 66 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
 the rest and why. `RWFUZZ_PROGRAMS` (10000) and `RWFUZZ_SEED` size and vary
-the run, and `tools/rwfuzz -f NAME MODE` narrows one to a single finding over
+the run, `RWFUZZ_JOBS` splits it across worker processes without changing
+what it prints, and `tools/rwfuzz -f NAME MODE` narrows one to a single finding over
 the same programs.
 
 ## Usage

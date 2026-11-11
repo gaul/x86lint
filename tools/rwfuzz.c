@@ -74,7 +74,8 @@
 // the overlapping-store invalidation in frame_observe, say), rebuild, and
 // expect mismatches within a few thousand programs.
 //
-// Usage: rwfuzz [-n PROGRAMS] [-s SEED] [-f NAME] [-k KINDS] [-t TARGET] MODE
+// Usage: rwfuzz [-n PROGRAMS] [-s SEED] [-f NAME] [-k KINDS] [-t TARGET]
+//               [-j JOBS] MODE
 //   -n  programs to generate (default 10000)
 //   -s  seed (default 0); programs and register values derive from it
 //   -f  run only the findings named NAME, over the same programs
@@ -82,6 +83,13 @@
 //   -t  x86lint's tuning target (default zen, which enables the rows that
 //       need move elimination; skylake adds the POPCNT row, silvermont the
 //       SUB reg, reg one)
+//   -j  worker processes (default 1). Each program's generator and register
+//       values derive from its index and the seed alone, the workers take
+//       batches of 128 from a counter in shared memory, and the parent
+//       prints the batches' reports in order, so the output is the same
+//       bytes for any number of workers. Processes rather than threads:
+//       the signal handlers, the alarm and the fixed mappings a run uses
+//       are per process.
 // Modes: all, flags, frame, fold (listed after `modes:` in the usage text).
 // Each mode plants its family's shapes, runs every finding with a
 // rewriter, and runs its family's control arm; `all` plants every family.
@@ -147,6 +155,9 @@ struct rstate {
 } __attribute__((aligned(64)));
 
 #define OFF(field) ((int) offsetof(struct rstate, field))
+
+// Where a batch's reports go: a file the parent prints from in order.
+static FILE *rep;
 
 enum {
     FL_CF = 1u << 0, FL_PF = 1u << 2, FL_AF = 1u << 4, FL_ZF = 1u << 6,
@@ -1528,7 +1539,7 @@ static void generate(struct prog *p, uint64_t seed, enum mode mode)
 // ------------------------------------------------------------- assemble ---
 
 static const char *cc_driver = "cc";
-static char workdir[256];
+static char workdir[320];
 
 struct code {
     uint8_t *bytes;
@@ -1634,7 +1645,7 @@ static void assemble(struct prog *const *progs, int n, struct code *out,
         ok[k] = true;
     }
     for (;;) {
-        char spath[300], opath[300], epath[300];
+        char spath[400], opath[400], epath[400];
         snprintf(spath, sizeof(spath), "%s/b.s", workdir);
         snprintf(opath, sizeof(opath), "%s/b.o", workdir);
         snprintf(epath, sizeof(epath), "%s/b.err", workdir);
@@ -1658,7 +1669,7 @@ static void assemble(struct prog *const *progs, int n, struct code *out,
         first[n] = line;
         fclose(f);
 
-        char cmd[1200];
+        char cmd[1400];
         snprintf(cmd, sizeof(cmd),
                  "%s -c -x assembler -o '%s' '%s' 2> '%s'", cc_driver, opath,
                  spath, epath);
@@ -4004,10 +4015,10 @@ static void print_prog(const struct prog *p, int mark, const struct prog *q)
             continue;
         }
         if (p->it[i].label >= 0) {
-            fprintf(stderr, "    @%d:\n", p->it[i].label);
+            fprintf(rep, "    @%d:\n", p->it[i].label);
         }
         bool changed = q != NULL && strcmp(p->it[i].text, q->it[i].text) != 0;
-        fprintf(stderr, "  %s %-40s%s%s\n", i == mark ? ">>" : "  ",
+        fprintf(rep, "  %s %-40s%s%s\n", i == mark ? ">>" : "  ",
                 p->it[i].text[0] ? p->it[i].text : "(label)",
                 changed ? "  =>  " : "",
                 changed ? (q->it[i].text[0] ? q->it[i].text : "(deleted)")
@@ -4026,7 +4037,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: rwfuzz [-n PROGRAMS] [-s SEED] [-f NAME] [-k KINDS] "
-            "[-t TARGET] MODE\n");
+            "[-t TARGET] [-j JOBS] MODE\n");
     fprintf(stderr, "modes:");
     for (int m = 0; m < NMODES; ++m) {
         fprintf(stderr, " %s", MODE_NAMES[m]);
@@ -4038,91 +4049,126 @@ static void usage(void)
 #define RUNS 4
 #define CONTROLS_PER_PROG 3
 
-int main(int argc, char **argv)
+// ---------------------------------------------------------------- batches ---
+
+// A batch's counts beyond the per-kind rows.
+struct totals {
+    long programs, orig_faults, skipped_progs, undefined_progs, total_runs;
+};
+static struct totals tot;
+
+static void batch_path(char *out, size_t n, const char *topdir, char kind,
+                       long b)
 {
-    long nprogs = 10000;
-    uint64_t seed = 0;
-    const char *only = NULL;
-    long min_kinds = 0;
-    enum x86lint_target target = X86LINT_TARGET_ZEN;
-    int opt;
-    while ((opt = getopt(argc, argv, "n:s:f:k:t:")) != -1) {
-        switch (opt) {
-        case 'n':
-            nprogs = atol(optarg);
-            break;
-        case 's':
-            seed = strtoull(optarg, NULL, 0);
-            break;
-        case 'f':
-            only = optarg;
-            break;
-        case 'k':
-            min_kinds = atol(optarg);
-            break;
-        case 't':
-            if (!x86lint_target_parse(optarg, &target)) {
-                fprintf(stderr, "rwfuzz: unknown target %s\n", optarg);
-                return 2;
+    snprintf(out, n, "%s/%c%06ld.txt", topdir, kind, b);
+}
+
+static void begin_batch(const char *topdir, long b)
+{
+    char path[400];
+    batch_path(path, sizeof(path), topdir, 'r', b);
+    rep = fopen(path, "w");
+    if (rep == NULL) {
+        perror(path);
+        exit(2);
+    }
+    memset(stats, 0, sizeof(stats));
+    nstats = 0;
+    memset(&tot, 0, sizeof(tot));
+}
+
+static void end_batch(const char *topdir, long b)
+{
+    fclose(rep);
+    rep = stderr;
+    char path[400];
+    batch_path(path, sizeof(path), topdir, 's', b);
+    FILE *f = fopen(path, "w");
+    if (f == NULL) {
+        perror(path);
+        exit(2);
+    }
+    fprintf(f, "T %ld %ld %ld %ld %ld\n", tot.programs, tot.orig_faults,
+            tot.skipped_progs, tot.undefined_progs, tot.total_runs);
+    for (int k = 0; k < nstats; ++k) {
+        const struct stat_row *r = &stats[k];
+        fprintf(f, "S %ld %ld %ld %ld %ld %ld %ld %ld %s\n", r->findings,
+                r->run, r->mismatches, r->not_applied, r->harness,
+                r->unmapped, r->control_tried, r->control_changed, r->name);
+    }
+    fclose(f);
+}
+
+// Add batch b's tallies to the parent's, and print its reports while the
+// run has printed fewer than REPORT_CAP of them.
+#define REPORT_CAP 40
+static void merge_batch(const char *topdir, long b, struct totals *all,
+                        long *printed)
+{
+    char path[400], line[512];
+    batch_path(path, sizeof(path), topdir, 'r', b);
+    FILE *f = fopen(path, "r");
+    bool printing = false;
+    while (f != NULL && fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "MISMATCH ", 9) == 0 ||
+            strncmp(line, "NOT APPLIED ", 12) == 0 ||
+            strncmp(line, "rwfuzz: ", 8) == 0) {
+            printing = *printed < REPORT_CAP;
+            if (printing) {
+                ++*printed;
             }
-            break;
-        default:
-            usage();
-            return 2;
+        }
+        if (printing) {
+            fputs(line, stderr);
         }
     }
-    if (optind + 1 != argc) {
-        usage();
-        return 2;
+    if (f != NULL) {
+        fclose(f);
     }
-    enum mode mode = NMODES;
-    for (int m = 0; m < NMODES; ++m) {
-        if (strcmp(argv[optind], MODE_NAMES[m]) == 0) {
-            mode = (enum mode) m;
+    batch_path(path, sizeof(path), topdir, 's', b);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        fprintf(stderr, "rwfuzz: batch %ld left no tallies\n", b);
+        exit(2);
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        struct totals t;
+        struct stat_row r;
+        int name_at = 0;
+        if (sscanf(line, "T %ld %ld %ld %ld %ld", &t.programs,
+                   &t.orig_faults, &t.skipped_progs, &t.undefined_progs,
+                   &t.total_runs) == 5) {
+            all->programs += t.programs;
+            all->orig_faults += t.orig_faults;
+            all->skipped_progs += t.skipped_progs;
+            all->undefined_progs += t.undefined_progs;
+            all->total_runs += t.total_runs;
+        } else if (sscanf(line, "S %ld %ld %ld %ld %ld %ld %ld %ld %n",
+                          &r.findings, &r.run, &r.mismatches,
+                          &r.not_applied, &r.harness, &r.unmapped,
+                          &r.control_tried, &r.control_changed,
+                          &name_at) == 8 && name_at > 0) {
+            line[strcspn(line, "\n")] = '\0';
+            struct stat_row *row = stat_for(strdup(line + name_at));
+            row->findings += r.findings;
+            row->run += r.run;
+            row->mismatches += r.mismatches;
+            row->not_applied += r.not_applied;
+            row->harness += r.harness;
+            row->unmapped += r.unmapped;
+            row->control_tried += r.control_tried;
+            row->control_changed += r.control_changed;
         }
     }
-    if (mode == NMODES) {
-        usage();
-        return 2;
-    }
-    if (only != NULL && kind_of(only) < 0) {
-        fprintf(stderr, "rwfuzz: no rewriter for \"%s\"\n", only);
-        return 2;
-    }
-    if (getenv("RWFUZZ_CC") != NULL) {
-        cc_driver = getenv("RWFUZZ_CC");
-    }
+    fclose(f);
+}
 
-    uint32_t extensions = 0;
-    __builtin_cpu_init();
-    if (__builtin_cpu_supports("bmi")) {
-        extensions |= X86LINT_EXT_BMI1;
-    }
-    if (__builtin_cpu_supports("bmi2")) {
-        extensions |= X86LINT_EXT_BMI2;
-    }
-    {
-        // MOVBE: CPUID.1:ECX bit 22.
-        unsigned eax = 1, ebx, ecx = 0, edx;
-        __asm__("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
-        if (ecx & (1u << 22)) {
-            extensions |= X86LINT_EXT_MOVBE;
-        }
-    }
-
-    const char *tmp = getenv("TMPDIR") != NULL ? getenv("TMPDIR") : "/tmp";
-    snprintf(workdir, sizeof(workdir), "%s/rwfuzz.XXXXXX", tmp);
-    if (mkdtemp(workdir) == NULL) {
-        perror("mkdtemp");
-        return 2;
-    }
-    init_exec();
-    init_signals();
-    xed_tables_init();
-
-    long programs = 0, orig_faults = 0, printed = 0, skipped_progs = 0;
-    long undefined_progs = 0;
-    long total_runs = 0;
+// Process the batches this worker draws from the shared counter.
+static void run_batches(long *next_batch, long nbatches, long nprogs,
+                        uint64_t seed, enum mode mode, const char *only,
+                        uint32_t extensions, enum x86lint_target target,
+                        const char *topdir)
+{
     struct prog *progs = malloc(sizeof(struct prog) * BATCH);
     struct prog **pp = malloc(sizeof(struct prog *) * BATCH);
     struct code *codes = calloc(BATCH, sizeof(struct code));
@@ -4132,8 +4178,13 @@ int main(int argc, char **argv)
     struct code *rcodes = calloc(BATCH, sizeof(struct code));
     bool *rok = malloc(BATCH);
 
-    for (long base = 0; base < nprogs; base += BATCH) {
+    long bi;
+    while ((bi = __atomic_fetch_add(next_batch, 1, __ATOMIC_SEQ_CST)) <
+           nbatches) {
+        long base = bi * BATCH;
         int nb = (int) (nprogs - base < BATCH ? nprogs - base : BATCH);
+        long printed = 0;
+        begin_batch(topdir, bi);
         for (int k = 0; k < nb; ++k) {
             generate(&progs[k], prog_seed(seed, base + k, 0), mode);
             pp[k] = &progs[k];
@@ -4184,20 +4235,20 @@ int main(int argc, char **argv)
         for (int k = 0; k < nb; ++k) {
             current_program = base + k;
             if (!ok[k]) {
-                fprintf(stderr, "rwfuzz: program %ld did not assemble\n",
+                fprintf(rep, "rwfuzz: program %ld did not assemble\n",
                         base + k);
-                ++skipped_progs;
+                ++tot.skipped_progs;
                 continue;
             }
-            ++programs;
+            ++tot.programs;
             view_build(&views[k], &progs[k], &codes[k]);
             bool reads_undefined;
             flag_mask[k] = FL_COMPARED & ~flags_undefined_at_end(&views[k],
                 &reads_undefined);
             if (reads_undefined) {
-                ++undefined_progs;
+                ++tot.undefined_progs;
                 ok[k] = false;
-                --programs;
+                --tot.programs;
                 view_free(&views[k]);
                 continue;
             }
@@ -4235,7 +4286,7 @@ int main(int argc, char **argv)
                 if (!KINDS[kind].fn(&views[k], item, q, why, sizeof(why))) {
                     ++st->not_applied;
                     if (printed < 20) {
-                        fprintf(stderr, "NOT APPLIED %s (program %ld, item "
+                        fprintf(rep, "NOT APPLIED %s (program %ld, item "
                                 "%d): %s\n", name, base + k, item, why);
                         print_prog(&progs[k], item, NULL);
                         ++printed;
@@ -4309,7 +4360,7 @@ int main(int argc, char **argv)
                 struct stat_row *st = stat_for(vars[k].name);
                 ++st->not_applied;
                 if (printed < 20) {
-                    fprintf(stderr, "NOT APPLIED %s (program %ld, item %d): "
+                    fprintf(rep, "NOT APPLIED %s (program %ld, item %d): "
                             "the assembler refused the rewrite\n",
                             vars[k].name, base + vars[k].prog, vars[k].item);
                     print_prog(&progs[vars[k].prog], vars[k].item, vars[k].p);
@@ -4338,10 +4389,10 @@ int main(int argc, char **argv)
                         fprintf(stderr, "original %ld run %d: signal %d\n",
                                 base + k, r, osig);
                     }
-                    ++orig_faults;
+                    ++tot.orig_faults;
                     continue;
                 }
-                ++total_runs;
+                ++tot.total_runs;
                 for (int x = 0; x < nv; ++x) {
                     if (vars[x].prog != k || !vok[x] || mismatched[x]) {
                         continue;
@@ -4366,7 +4417,7 @@ int main(int argc, char **argv)
                         mismatched[x] = true;
                         ++stat_for(vars[x].name)->mismatches;
                         if (printed < 40) {
-                            fprintf(stderr, "MISMATCH %s (program %ld, item "
+                            fprintf(rep, "MISMATCH %s (program %ld, item "
                                     "%d, run %d): %s\n", vars[x].name,
                                     base + k, vars[x].item, r, d);
                             print_prog(&progs[k], vars[x].item, vars[x].p);
@@ -4399,8 +4450,167 @@ int main(int argc, char **argv)
         free(vars);
         free(views);
         free(flag_mask);
+        end_batch(topdir, bi);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    long nprogs = 10000;
+    uint64_t seed = 0;
+    const char *only = NULL;
+    long min_kinds = 0;
+    enum x86lint_target target = X86LINT_TARGET_ZEN;
+    int opt;
+    int jobs = 1;
+    while ((opt = getopt(argc, argv, "n:s:f:k:t:j:")) != -1) {
+        switch (opt) {
+        case 'j':
+            jobs = atoi(optarg);
+            if (jobs < 1) {
+                jobs = 1;
+            }
+            break;
+        case 'n':
+            nprogs = atol(optarg);
+            break;
+        case 's':
+            seed = strtoull(optarg, NULL, 0);
+            break;
+        case 'f':
+            only = optarg;
+            break;
+        case 'k':
+            min_kinds = atol(optarg);
+            break;
+        case 't':
+            if (!x86lint_target_parse(optarg, &target)) {
+                fprintf(stderr, "rwfuzz: unknown target %s\n", optarg);
+                return 2;
+            }
+            break;
+        default:
+            usage();
+            return 2;
+        }
+    }
+    if (optind + 1 != argc) {
+        usage();
+        return 2;
+    }
+    enum mode mode = NMODES;
+    for (int m = 0; m < NMODES; ++m) {
+        if (strcmp(argv[optind], MODE_NAMES[m]) == 0) {
+            mode = (enum mode) m;
+        }
+    }
+    if (mode == NMODES) {
+        usage();
+        return 2;
+    }
+    if (only != NULL && kind_of(only) < 0) {
+        fprintf(stderr, "rwfuzz: no rewriter for \"%s\"\n", only);
+        return 2;
+    }
+    if (getenv("RWFUZZ_CC") != NULL) {
+        cc_driver = getenv("RWFUZZ_CC");
     }
 
+    uint32_t extensions = 0;
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("bmi")) {
+        extensions |= X86LINT_EXT_BMI1;
+    }
+    if (__builtin_cpu_supports("bmi2")) {
+        extensions |= X86LINT_EXT_BMI2;
+    }
+    {
+        // MOVBE: CPUID.1:ECX bit 22.
+        unsigned eax = 1, ebx, ecx = 0, edx;
+        __asm__("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+        if (ecx & (1u << 22)) {
+            extensions |= X86LINT_EXT_MOVBE;
+        }
+    }
+
+    const char *tmp = getenv("TMPDIR") != NULL ? getenv("TMPDIR") : "/tmp";
+    snprintf(workdir, sizeof(workdir), "%s/rwfuzz.XXXXXX", tmp);
+    if (mkdtemp(workdir) == NULL) {
+        perror("mkdtemp");
+        return 2;
+    }
+    xed_tables_init();
+
+    // Workers take batches from a shared counter; each writes a batch's
+    // reports and tallies to files the parent reads back in batch order,
+    // so what is printed does not depend on how many workers ran.
+    long nbatches = (nprogs + BATCH - 1) / BATCH;
+    long *next_batch = mmap(NULL, sizeof(long), PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (next_batch == MAP_FAILED) {
+        perror("rwfuzz: mmap");
+        return 2;
+    }
+    *next_batch = 0;
+    char topdir[256];
+    if (strlen(workdir) >= sizeof(topdir)) {
+        fprintf(stderr, "rwfuzz: %s is too long\n", workdir);
+        return 2;
+    }
+    strcpy(topdir, workdir);
+    fflush(NULL);
+    pid_t *pids = calloc((size_t) jobs, sizeof(pid_t));
+    for (int w = 0; w < jobs; ++w) {
+        pids[w] = fork();
+        if (pids[w] < 0) {
+            perror("rwfuzz: fork");
+            return 2;
+        }
+        if (pids[w] == 0) {
+            snprintf(workdir, sizeof(workdir), "%s/w%d", topdir, w);
+            if (mkdir(workdir, 0700) != 0) {
+                perror(workdir);
+                _exit(2);
+            }
+            init_exec();
+            init_signals();
+            run_batches(next_batch, nbatches, nprogs, seed, mode, only,
+                        extensions, target, topdir);
+            fflush(NULL);
+            _exit(0);
+        }
+    }
+    int worker_failed = 0;
+    for (int w = 0; w < jobs; ++w) {
+        int status;
+        if (waitpid(pids[w], &status, 0) < 0) {
+            perror("rwfuzz: waitpid");
+            return 2;
+        }
+        if (WIFSIGNALED(status)) {
+            fprintf(stderr, "rwfuzz: worker %d died of signal %d\n", w,
+                    WTERMSIG(status));
+            worker_failed = 2;
+        } else if (WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "rwfuzz: worker %d exited %d\n", w,
+                    WEXITSTATUS(status));
+            worker_failed = 2;
+        }
+    }
+    free(pids);
+    if (worker_failed) {
+        return worker_failed;
+    }
+    struct totals all = {0};
+    long printed = 0;
+    for (long b = 0; b < nbatches; ++b) {
+        merge_batch(topdir, b, &all, &printed);
+    }
+    tot = all;
+    long programs = tot.programs, orig_faults = tot.orig_faults;
+    long skipped_progs = tot.skipped_progs;
+    long undefined_progs = tot.undefined_progs, total_runs = tot.total_runs;
+    snprintf(workdir, sizeof(workdir), "%s", topdir);
     // Report.
     long mism = 0, notap = 0, kinds_run = 0, run_total = 0;
     printf("rwfuzz %s: %ld programs, seed %" PRIu64 ", %ld runs\n",

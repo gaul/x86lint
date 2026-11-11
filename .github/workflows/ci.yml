@@ -13,10 +13,10 @@ on:
 
 jobs:
   build:
-    # GitHub hosts no Fedora runners, so run the job inside a Fedora 44
+    # GitHub hosts no Fedora runners, so run the job inside a Fedora 45
     # container on the Ubuntu host.
     runs-on: ubuntu-latest
-    container: fedora:44
+    container: fedora:45
 
     steps:
       # The Fedora base image ships neither a toolchain nor git nor python3
@@ -69,7 +69,7 @@ jobs:
     # on demand, not on every pull request.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    container: fedora:44
+    container: fedora:45
     env:
       RWFUZZ_SEED: ${{ github.run_id }}
       RWFUZZ_PROGRAMS: 100000

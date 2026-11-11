@@ -141,6 +141,9 @@ struct rstate {
     uint64_t stub[16];
     uint8_t frame[FRAME_SIZE] __attribute__((aligned(16)));
     uint8_t scratch[SCRATCH_SIZE] __attribute__((aligned(16)));
+    // Not in the mapped block: what the run left in the decoy's scratch
+    // bytes (see DECOY_ADDR), compared like the scratch buffer.
+    uint8_t decoy[SCRATCH_SIZE];
 } __attribute__((aligned(64)));
 
 #define OFF(field) ((int) offsetof(struct rstate, field))
@@ -3699,8 +3702,33 @@ static struct stat_row *stat_for(const char *name)
 
 // ------------------------------------------------------------ execution ---
 
+// Where the programs run. The body can leave a pointer into the state
+// block (R14, R15) or its stack (RSP, RBP) in a register, so both sit at
+// fixed addresses: an outcome then cannot turn on where ASLR put them, and
+// a failure replays anywhere. Each sits in its own mapping between
+// PROT_NONE guard pages, and the code runs from a view of a memfd that is
+// not writable, so a stray store -- which the control arm makes on purpose,
+// applying rewrites x86lint refused -- faults and is counted, rather than
+// landing in rwfuzz's own globals, its C stack or the code it is running.
+// The three are 3 GB and 1.25 GB apart, off the 2 GB and 4 GB multiples
+// the edge values move a register by.
+#define STATE_ADDR 0x10040000000ull
+// The state block's address truncated to 32 bits. The fold plants form some
+// pointers with a 32-bit LEA or ADD, which truncates them; a decoy page
+// there, filled with other bytes, lets the original run and makes a rewrite
+// that drops the truncation read different data. In low memory the
+// truncation would change nothing, and such a rewrite would pass.
+#define DECOY_ADDR (STATE_ADDR & 0xffffffffull)
+#define STACK_ADDR (STATE_ADDR + 0x50000000ull)
+#define CODE_ADDR (STATE_ADDR - 0xC0000000ull)
+#define PAGE 4096
+#define STACK_SIZE (16 * PAGE)
+#define EXEC_SIZE (1 << 16)
+
 static sigjmp_buf run_jmp;
 static volatile sig_atomic_t in_run;
+// The program being analysed or run, for a fault outside a run.
+static volatile long current_program = -1;
 
 static void on_signal(int sig)
 {
@@ -3708,46 +3736,124 @@ static void on_signal(int sig)
         in_run = 0;
         siglongjmp(run_jmp, sig);
     }
+    char msg[96];
+    int n = snprintf(msg, sizeof(msg),
+                     "rwfuzz: signal %d outside a run, at program %ld\n", sig,
+                     (long) current_program);
+    if (write(2, msg, (size_t) n) < 0) {
+        // nothing more to do
+    }
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
-static uint8_t *exec_mem;
-#define EXEC_SIZE (1 << 16)
+static uint8_t *exec_code;     // the executable view, at CODE_ADDR
+static uint8_t *exec_code_w;   // the writable view of the same pages
+static struct rstate *exec_state;
+static uint8_t *exec_decoy;
+static uint8_t *exec_stack_top;
 
-typedef void (*prog_fn)(struct rstate *);
+// rwfuzz_enter(fn, state, stack_top): run fn(state) on the given stack.
+// The C side's callee-saved registers and stack pointer are kept here
+// rather than on the program's stack, where a stray store could reach them.
+static uint64_t enter_saved[7] __attribute__((used));
+void rwfuzz_enter(void *fn, struct rstate *st, void *stack_top);
+__asm__(
+    "\t.text\n"
+    "\t.globl rwfuzz_enter\n"
+    "\t.type rwfuzz_enter, @function\n"
+    "rwfuzz_enter:\n"
+    "\tmovq %rbx, enter_saved+0(%rip)\n"
+    "\tmovq %rbp, enter_saved+8(%rip)\n"
+    "\tmovq %r12, enter_saved+16(%rip)\n"
+    "\tmovq %r13, enter_saved+24(%rip)\n"
+    "\tmovq %r14, enter_saved+32(%rip)\n"
+    "\tmovq %r15, enter_saved+40(%rip)\n"
+    "\tmovq %rsp, enter_saved+48(%rip)\n"
+    "\tmovq %rdx, %rsp\n"
+    "\tmovq %rdi, %rax\n"
+    "\tmovq %rsi, %rdi\n"
+    "\tcall *%rax\n"
+    "\tmovq enter_saved+0(%rip), %rbx\n"
+    "\tmovq enter_saved+8(%rip), %rbp\n"
+    "\tmovq enter_saved+16(%rip), %r12\n"
+    "\tmovq enter_saved+24(%rip), %r13\n"
+    "\tmovq enter_saved+32(%rip), %r14\n"
+    "\tmovq enter_saved+40(%rip), %r15\n"
+    "\tmovq enter_saved+48(%rip), %rsp\n"
+    "\tret\n"
+    "\t.size rwfuzz_enter, .-rwfuzz_enter\n");
 
-// Every run uses the same state block and the same stack depth, since the
-// body can leave a pointer into either in a register.
-static struct rstate exec_state;
-
-static int run_code_at(const struct code *c, struct rstate *st);
-
-static int run_code(const struct code *c, struct rstate *st)
+// Map `size` bytes at `addr` between two PROT_NONE guard pages.
+static void *map_guarded(uint64_t addr, size_t size)
 {
-    exec_state = *st;
-    int sig = run_code_at(c, &exec_state);
-    *st = exec_state;
-    return sig;
+    size_t total = size + 2 * PAGE;
+    uint8_t *base = mmap((void *) (uintptr_t) (addr - PAGE), total, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
+                         0);
+    if (base == MAP_FAILED || base != (uint8_t *) (uintptr_t) (addr - PAGE) ||
+        mprotect(base + PAGE, size, PROT_READ | PROT_WRITE) != 0) {
+        fprintf(stderr, "rwfuzz: cannot map %#" PRIx64 ": %s\n", addr,
+                strerror(errno));
+        exit(2);
+    }
+    return base + PAGE;
 }
 
-static int run_code_at(const struct code *c, struct rstate *st)
+static void init_exec(void)
+{
+    size_t state_pages = (offsetof(struct rstate, decoy) + PAGE - 1) &
+                         ~(size_t) (PAGE - 1);
+    exec_state = map_guarded(STATE_ADDR, state_pages);
+    exec_decoy = map_guarded(DECOY_ADDR, state_pages);
+    exec_stack_top = (uint8_t *) map_guarded(STACK_ADDR, STACK_SIZE) +
+                     STACK_SIZE;
+    int fd = memfd_create("rwfuzz-code", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, EXEC_SIZE) != 0) {
+        perror("rwfuzz: memfd_create");
+        exit(2);
+    }
+    exec_code_w = mmap(NULL, EXEC_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       fd, 0);
+    uint8_t *guard = mmap((void *) (uintptr_t) (CODE_ADDR - PAGE),
+                          EXEC_SIZE + 2 * PAGE, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                          -1, 0);
+    exec_code = guard == MAP_FAILED ? MAP_FAILED :
+        mmap(guard + PAGE, EXEC_SIZE, PROT_READ | PROT_EXEC,
+             MAP_SHARED | MAP_FIXED, fd, 0);
+    if (exec_code_w == MAP_FAILED || exec_code == MAP_FAILED ||
+        exec_code != (uint8_t *) (uintptr_t) CODE_ADDR) {
+        perror("rwfuzz: mapping the code");
+        exit(2);
+    }
+    close(fd);
+}
+
+static int run_code(const struct code *c, struct rstate *st)
 {
     if (c->size > EXEC_SIZE) {
         return -1;
     }
-    memcpy(exec_mem, c->bytes, c->size);
-    __builtin___clear_cache((char *) exec_mem, (char *) exec_mem + c->size);
-    int sig = sigsetjmp(run_jmp, 1);
-    if (sig != 0) {
-        return sig;
+    memcpy(exec_code_w, c->bytes, c->size);
+    size_t mapped = offsetof(struct rstate, decoy);
+    memcpy(exec_state, st, mapped);
+    for (size_t k = 0; k < mapped; ++k) {
+        exec_decoy[k] = ((const uint8_t *) st)[k] ^ 0xa5;
     }
-    in_run = 1;
-    alarm(2);
-    ((prog_fn) (void *) exec_mem)(st);
+    int sig = sigsetjmp(run_jmp, 1);
+    if (sig == 0) {
+        in_run = 1;
+        alarm(2);
+        rwfuzz_enter(exec_code, exec_state, exec_stack_top);
+        alarm(0);
+        in_run = 0;
+    }
     alarm(0);
-    in_run = 0;
-    return 0;
+    memcpy(st, exec_state, mapped);
+    memcpy(st->decoy, exec_decoy + offsetof(struct rstate, scratch),
+           SCRATCH_SIZE);
+    return sig;
 }
 
 static void init_signals(void)
@@ -3823,6 +3929,11 @@ static const char *state_diff(const struct rstate *a, const struct rstate *b,
         if (a->scratch[k] != b->scratch[k]) {
             snprintf(buf, n, "scratch byte %d: %#x vs %#x", k, a->scratch[k],
                      b->scratch[k]);
+            return buf;
+        }
+        if (a->decoy[k] != b->decoy[k]) {
+            snprintf(buf, n, "decoy scratch byte %d: %#x vs %#x", k,
+                     a->decoy[k], b->decoy[k]);
             return buf;
         }
     }
@@ -4005,12 +4116,7 @@ int main(int argc, char **argv)
         perror("mkdtemp");
         return 2;
     }
-    exec_mem = mmap(NULL, EXEC_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (exec_mem == MAP_FAILED) {
-        perror("mmap");
-        return 2;
-    }
+    init_exec();
     init_signals();
     xed_tables_init();
 
@@ -4076,6 +4182,7 @@ int main(int argc, char **argv)
         struct view *views = calloc((size_t) nb, sizeof(*views));
         uint32_t *flag_mask = calloc((size_t) nb, sizeof(uint32_t));
         for (int k = 0; k < nb; ++k) {
+            current_program = base + k;
             if (!ok[k]) {
                 fprintf(stderr, "rwfuzz: program %ld did not assemble\n",
                         base + k);
@@ -4215,6 +4322,7 @@ int main(int argc, char **argv)
         bool *changed = calloc((size_t) nv + 1, 1);
         bool *mismatched = calloc((size_t) nv + 1, 1);
         for (int k = 0; k < nb; ++k) {
+            current_program = base + k;
             if (!ok[k]) {
                 continue;
             }
@@ -4224,7 +4332,12 @@ int main(int argc, char **argv)
                 struct rstate in, want, got;
                 random_state(&in, &ss);
                 want = in;
-                if (run_code(&codes[k], &want) != 0) {
+                int osig = run_code(&codes[k], &want);
+                if (osig != 0) {
+                    if (getenv("RWFUZZ_DEBUG") != NULL) {
+                        fprintf(stderr, "original %ld run %d: signal %d\n",
+                                base + k, r, osig);
+                    }
                     ++orig_faults;
                     continue;
                 }

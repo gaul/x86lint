@@ -58,18 +58,12 @@
 // store be deleted. Every run uses one state block at one stack depth, since
 // the body can leave a pointer to either in a register.
 //
-// Two rows rest on an assumption their analyses state rather than on a
-// proof: "merging scalar move" and "missing SSE dependency break" assume
-// the lanes above a scalar are never read where their lookahead cannot
-// see, and the epilogue here reads every lane. Their rewrites are compared
-// with the destination's upper lanes ignored, and a difference that still
-// shows (the lanes copied elsewhere first) is counted apart, not failed.
-//
 // Rows not run: the encoding-only rows whose original the assembler never
 // emits from text (an unneeded REX prefix, SIB byte or displacement, the
 // VEX/EVEX and XCHG encodings, the branch displacement), the security and
-// advisory classes, the APX rows (no host runs them), and CAS loop
-// foldable into LOCK op and missing MULX, for which nothing is planted yet.
+// advisory classes (the scalar-merge rows among them), the APX rows (no
+// host runs them), and CAS loop foldable into LOCK op and missing MULX,
+// for which nothing is planted yet.
 // A finding without a rewriter is counted as "no rewriter".
 //
 // A control arm applies the same rewrites where x86lint REFUSED to -- an
@@ -301,11 +295,6 @@ struct item {
 struct prog {
     int n;
     int nlabels;
-    // The lanes a row's advice assumes dead: bits [dead_from, 128) of
-    // xmm dead_xmm, or dead_xmm < 0 for none. Set by the rewriters of the
-    // scalar-merge rows (see their rewriters).
-    int dead_xmm;
-    int dead_from;
     struct item it[MAXITEMS];
 };
 
@@ -1498,7 +1487,6 @@ static void generate(struct prog *p, uint64_t seed, enum mode mode)
     struct gen g = {.rng = seed, .p = p, .mode = mode};
     memset(p, 0, sizeof(*p));
     p->nlabels = 1;   // label 0 is the stub
-    p->dead_xmm = -1;
     emit_prologue(p);
     int body_start = p->n;
     int count = 30 + (int) rnd(&g.rng, 40);
@@ -2529,22 +2517,6 @@ static bool rw_sse_zero(const struct view *v, int i, struct prog *out,
     return true;
 }
 
-static bool rw_scalar_move(const struct view *v, int i, struct prog *out,
-                           char *why, size_t whylen)
-{
-    struct ins in;
-    ins_parse(v->p->it[i].text, &in);
-    int a, b;
-    if ((strcmp(in.mn, "movss") != 0 && strcmp(in.mn, "movsd") != 0) ||
-        !xmm_parse(in.op[0], &a) || !xmm_parse(in.op[1], &b)) {
-        FAIL("not a register MOVSS/MOVSD");
-    }
-    item_set(&out->it[i], "movaps %s, %s", in.op[0], in.op[1]);
-    out->dead_xmm = a;
-    out->dead_from = strcmp(in.mn, "movss") == 0 ? 32 : 64;
-    return true;
-}
-
 static bool rw_narrow_move(const struct view *v, int i, struct prog *out,
                            char *why, size_t whylen)
 {
@@ -2600,28 +2572,6 @@ static bool rw_insert_xor(const struct view *v, int i, struct prog *out,
     if (!prog_insert(out, i, t)) {
         FAIL("program full");
     }
-    return true;
-}
-
-static bool rw_insert_xorps(const struct view *v, int i, struct prog *out,
-                            char *why, size_t whylen)
-{
-    struct ins in;
-    ins_parse(v->p->it[i].text, &in);
-    int d;
-    if (!xmm_parse(in.op[0], &d)) {
-        FAIL("no xmm destination");
-    }
-    char t[TEXTLEN];
-    snprintf(t, sizeof(t), "xorps xmm%d, xmm%d", d, d);
-    if (!prog_insert(out, i, t)) {
-        FAIL("program full");
-    }
-    // The element the instruction writes: a single-precision result is 32
-    // bits, a double 64.
-    size_t n = strlen(in.mn);
-    out->dead_xmm = d;
-    out->dead_from = n > 0 && in.mn[n - 1] == 's' ? 32 : 64;
     return true;
 }
 
@@ -3637,13 +3587,6 @@ struct kind {
     const char *name;
     rewrite_fn fn;
     enum mode family;
-    // The row's advice rests on an assumption the README states rather
-    // than on a proof: the scalar-merge rows assume a scalar kept in a
-    // vector register never has its upper lanes read, and say a blend
-    // whose vector consumer lies past a branch or beyond their lookahead
-    // is misflagged. The harness's epilogue reads every lane, so their
-    // differences are counted apart and do not fail the run.
-    bool assumed;
 };
 
 static const struct kind KINDS[] = {
@@ -3706,11 +3649,9 @@ static const struct kind KINDS[] = {
     {"load foldable into extend", rw_load_ext, MODE_FOLD},
     {"load foldable into vector op", rw_load_vecop, MODE_FOLD},
     {"load foldable into vector transfer", rw_load_vec_transfer, MODE_FOLD},
-    {"merging scalar move", rw_scalar_move, MODE_FOLD, true},
     {"merging narrow move", rw_narrow_move, MODE_FOLD},
     {"missing SHLX/SHRX/SARX", rw_shlx, MODE_FOLD},
     {"missing POPCNT dependency break", rw_insert_xor, MODE_FOLD},
-    {"missing SSE dependency break", rw_insert_xorps, MODE_FOLD, true},
     {"redundant reload", rw_frame_forward, MODE_FRAME},
     {"load of a just-stored value", rw_frame_forward, MODE_FRAME},
     {"load of a value the register still holds", rw_delete_frame_load,
@@ -3737,7 +3678,6 @@ static int kind_of(const char *name)
 struct stat_row {
     const char *name;
     long findings, run, mismatches, not_applied, harness, unmapped;
-    long assumed;   // differences of an assumed row (see struct kind)
     long control_tried, control_changed;
 };
 
@@ -3852,17 +3792,8 @@ static void random_state(struct rstate *st, uint64_t *s)
 
 // What differs between two final states, or NULL.
 static const char *state_diff(const struct rstate *a, const struct rstate *b,
-                              uint32_t flag_mask, int dead_xmm, int dead_from,
-                              char *buf, size_t n)
+                              uint32_t flag_mask, char *buf, size_t n)
 {
-    struct rstate bb;
-    if (dead_xmm >= 0 && dead_xmm < 8) {
-        bb = *b;
-        memcpy(bb.out_xmm[dead_xmm] + dead_from / 8,
-               a->out_xmm[dead_xmm] + dead_from / 8,
-               (size_t) (16 - dead_from / 8));
-        b = &bb;
-    }
     for (int k = 0; k < NBODY; ++k) {
         int r = BODY[k];
         if (a->out_gpr[r] != b->out_gpr[r]) {
@@ -4307,9 +4238,8 @@ int main(int argc, char **argv)
                     char buf[200];
                     const char *d = sig != 0 ? (snprintf(buf, sizeof(buf),
                         "the rewrite died of signal %d", sig), buf) :
-                        state_diff(&want, &got, flag_mask[k],
-                                   vars[x].p->dead_xmm, vars[x].p->dead_from,
-                                   buf, sizeof(buf));
+                        state_diff(&want, &got, flag_mask[k], buf,
+                                   sizeof(buf));
                     if (vars[x].control) {
                         if (d != NULL) {
                             changed[x] = true;
@@ -4319,10 +4249,7 @@ int main(int argc, char **argv)
                     if (r == 0) {
                         ++stat_for(vars[x].name)->run;
                     }
-                    if (d != NULL && KINDS[vars[x].kind].assumed) {
-                        mismatched[x] = true;
-                        ++stat_for(vars[x].name)->assumed;
-                    } else if (d != NULL) {
+                    if (d != NULL) {
                         mismatched[x] = true;
                         ++stat_for(vars[x].name)->mismatches;
                         if (printed < 40) {
@@ -4386,9 +4313,6 @@ int main(int argc, char **argv)
             printf(", %7ld run, %ld mismatched", s->run, s->mismatches);
         } else {
             printf(", no rewriter");
-        }
-        if (s->assumed) {
-            printf(" (%ld differ past the row's assumption)", s->assumed);
         }
         if (s->not_applied) {
             printf(", %ld NOT APPLIED", s->not_applied);

@@ -4556,17 +4556,18 @@ static void check_vec_transfer_fold_test(void)
 
     // The conversion form: cvtsi2sd xmm0, dword ptr [rdi]. CVTSI2SD merges
     // into its destination's upper bits whether its source is a register or
-    // memory, so "missing SSE dependency break" reports the same site -- both
-    // findings are correct and independent, one saying fold the load and the
-    // other saying zero xmm0 first.
+    // memory, so "missing SSE dependency break" reports the same site under
+    // -a advisory -- the two are independent, one saying fold the load and
+    // the other saying zero xmm0 first.
     static const uint8_t cvtsi2sd_load[] = {
         0x8B, 0x07,              // mov eax, [rdi]
         0xF2, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, eax
         0x89, 0xD0,              // mov eax, edx (kills rax)
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS_AMONG(cvtsi2sd_load, "load foldable into vector transfer",
-                          1, 2);
+    ASSERT_FINDINGS(cvtsi2sd_load, "load foldable into vector transfer", 1);
+    ASSERT_FINDINGS_AMONG_CLASSES(cvtsi2sd_load,
+                                  "load foldable into vector transfer", 1, 2);
 
     // mov eax, [rdi] ; movq xmm0, rax -- the transfer reads eight bytes where
     // the load wrote four. The exact-register match refuses it without a
@@ -6693,12 +6694,14 @@ static void check_sse_merge_false_dep_test(void)
     static const uint8_t cvtss2sd[] = {
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(cvtss2sd, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(cvtss2sd, "missing SSE dependency break", 1);
+    // Advisory class: the default scan does not report it.
+    ASSERT_FINDINGS(cvtss2sd, "missing SSE dependency break", 0);
 
     static const uint8_t cvtsd2ss[] = {
         0xF2, 0x0F, 0x5A, 0xC1,  // cvtsd2ss xmm0, xmm1
     };
-    ASSERT_FINDINGS(cvtsd2ss, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(cvtsd2ss, "missing SSE dependency break", 1);
 
     // The zero idiom that breaks the merge dependency need not be adjacent:
     // libcrypto emits it and then an unrelated instruction before the
@@ -6708,8 +6711,8 @@ static void check_sse_merge_false_dep_test(void)
         0xF2, 0x48, 0x0F, 0x2C, 0xC1,  // cvttsd2si rax, xmm1  (independent)
         0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
     };
-    ASSERT_FINDINGS(mitigated_gap, "missing SSE dependency break",
-                    APX_NDD_WINDOW >= 3 ? 0 : 1);
+    ASSERT_FINDINGS_CLASSES(mitigated_gap, "missing SSE dependency break",
+                            APX_NDD_WINDOW >= 3 ? 0 : 1);
 
     // An ordinary full producer suppresses only from the adjacent slot, where
     // the dependency is one instruction stale; from further back it may still
@@ -6718,28 +6721,28 @@ static void check_sse_merge_false_dep_test(void)
         0x0F, 0x28, 0xC1,              // movaps xmm0, xmm1
         0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
     };
-    ASSERT_FINDINGS(producer_adjacent, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(producer_adjacent, "missing SSE dependency break", 0);
     static const uint8_t producer_gap[] = {
         0x0F, 0x28, 0xC1,              // movaps xmm0, xmm1
         0x89, 0xD1,                    // mov ecx, edx
         0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
     };
-    ASSERT_FINDINGS(producer_gap, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(producer_gap, "missing SSE dependency break", 1);
 
     static const uint8_t sqrtsd[] = {
         0xF2, 0x0F, 0x51, 0xC1,  // sqrtsd xmm0, xmm1
     };
-    ASSERT_FINDINGS(sqrtsd, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(sqrtsd, "missing SSE dependency break", 1);
 
     static const uint8_t roundsd[] = {
         0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x03,  // roundsd xmm0, xmm1, 0x3
     };
-    ASSERT_FINDINGS(roundsd, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(roundsd, "missing SSE dependency break", 1);
 
     static const uint8_t rsqrtss[] = {
         0xF3, 0x0F, 0x52, 0xC1,  // rsqrtss xmm0, xmm1
     };
-    ASSERT_FINDINGS(rsqrtss, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(rsqrtss, "missing SSE dependency break", 1);
 
     // An integer source lives in a GPR, so the destination can never be the
     // source: the form is always flagged, memory operand or not. The address
@@ -6748,12 +6751,12 @@ static void check_sse_merge_false_dep_test(void)
     static const uint8_t cvtsi2sd[] = {
         0xF2, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, eax
     };
-    ASSERT_FINDINGS(cvtsi2sd, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(cvtsi2sd, "missing SSE dependency break", 1);
 
     static const uint8_t mem_src[] = {
         0xF3, 0x0F, 0x5A, 0x00,  // cvtss2sd xmm0, dword ptr [rax]
     };
-    ASSERT_FINDINGS(mem_src, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(mem_src, "missing SSE dependency break", 1);
 
     // A zero idiom hoisted above a branch covers both arms, though the odd
     // arm sits after a jmp, beyond the window, and past the other arm's
@@ -6774,7 +6777,7 @@ static void check_sse_merge_false_dep_test(void)
         0xF3, 0x0F, 0x58, 0xC0,        // addss xmm0, xmm0
         0xC3,                          // done: ret
     };
-    ASSERT_FINDINGS(hoisted, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(hoisted, "missing SSE dependency break", 0);
 
     // The same split with the idiom on one arm only: the other is flagged.
     static const uint8_t one_arm[] = {
@@ -6792,7 +6795,7 @@ static void check_sse_merge_false_dep_test(void)
         0xF3, 0x0F, 0x58, 0xC0,        // addss xmm0, xmm0
         0xC3,                          // done: ret
     };
-    ASSERT_FINDINGS(one_arm, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(one_arm, "missing SSE dependency break", 1);
 
     // An idiom with no write to the register since holds at any distance.
     static const uint8_t far[] = {
@@ -6808,7 +6811,7 @@ static void check_sse_merge_false_dep_test(void)
         0xF2, 0x48, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, rax
         0xC3,                          // ret
     };
-    ASSERT_FINDINGS(far, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(far, "missing SSE dependency break", 0);
 
     // But not around a loop: the back edge brings the conversion's own
     // previous result, a real merge dependency.
@@ -6827,21 +6830,21 @@ static void check_sse_merge_false_dep_test(void)
         0x75, 0xF7,                    // jnz L
         0xC3,                          // ret
     };
-    ASSERT_FINDINGS(loop, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(loop, "missing SSE dependency break", 1);
 
     // Same register: the destination is the source, so the dependency is
     // real and the xor would destroy the input.
     static const uint8_t same_reg[] = {
         0xF3, 0x0F, 0x5A, 0xC0,  // cvtss2sd xmm0, xmm0
     };
-    ASSERT_FINDINGS(same_reg, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(same_reg, "missing SSE dependency break", 0);
 
     // The scalar arithmetic that merges the same way is never flagged: its
     // destination is a genuine source operand.
     static const uint8_t addsd[] = {
         0xF2, 0x0F, 0x58, 0xC1,  // addsd xmm0, xmm1
     };
-    ASSERT_FINDINGS(addsd, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(addsd, "missing SSE dependency break", 0);
 
     // VEX names the merge source outright, so the fix is to choose that
     // operand, not to insert a zero idiom: a different rewrite, left to
@@ -6849,7 +6852,7 @@ static void check_sse_merge_false_dep_test(void)
     static const uint8_t vex[] = {
         0xC5, 0xEA, 0x5A, 0xC2,  // vcvtss2sd xmm0, xmm2, xmm2
     };
-    ASSERT_FINDINGS(vex, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(vex, "missing SSE dependency break", 0);
 
     // xorps xmm0, xmm0 ; cvtss2sd xmm0, xmm1 -- the mitigation gcc, clang
     // and Go all emit. XED models the xor's destination as read-and-written,
@@ -6858,7 +6861,7 @@ static void check_sse_merge_false_dep_test(void)
         0x0F, 0x57, 0xC0,        // xorps xmm0, xmm0
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(mitigated, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(mitigated, "missing SSE dependency break", 0);
 
     // The integer-domain zero idiom breaks the dependency just as well. Its
     // legacy form is spelled vpxor here only so the fixture stands alone:
@@ -6868,20 +6871,20 @@ static void check_sse_merge_false_dep_test(void)
         0xC5, 0xF9, 0xEF, 0xC0,  // vpxor xmm0, xmm0, xmm0
         0xF2, 0x0F, 0x2A, 0xC0,  // cvtsi2sd xmm0, eax
     };
-    ASSERT_FINDINGS(mitigated_vpxor, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(mitigated_vpxor, "missing SSE dependency break", 0);
 
     static const uint8_t mitigated_vex_xor[] = {
         0xC5, 0xF8, 0x57, 0xC0,  // vxorps xmm0, xmm0, xmm0
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(mitigated_vex_xor, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(mitigated_vex_xor, "missing SSE dependency break", 0);
 
     // Zeroing a DIFFERENT register mitigates nothing.
     static const uint8_t wrong_reg[] = {
         0x0F, 0x57, 0xDB,        // xorps xmm3, xmm3
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(wrong_reg, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(wrong_reg, "missing SSE dependency break", 1);
 
     // Nor does a vector XOR against another register: xorps xmm0, xmm1
     // zeroes nothing and leaves the dependency in place.
@@ -6889,7 +6892,7 @@ static void check_sse_merge_false_dep_test(void)
         0x0F, 0x57, 0xC1,        // xorps xmm0, xmm1
         0xF3, 0x0F, 0x5A, 0xC2,  // cvtss2sd xmm0, xmm2
     };
-    ASSERT_FINDINGS(xor_other, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(xor_other, "missing SSE dependency break", 1);
 
     // Any adjacent producer that rewrites the whole register leaves the
     // dependency one instruction stale, which is what the advice would buy.
@@ -6897,13 +6900,13 @@ static void check_sse_merge_false_dep_test(void)
         0x0F, 0x28, 0xC3,        // movaps xmm0, xmm3
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(full_write, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(full_write, "missing SSE dependency break", 0);
 
     static const uint8_t movd[] = {
         0x66, 0x0F, 0x6E, 0xC0,  // movd xmm0, eax
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(movd, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(movd, "missing SSE dependency break", 0);
 
     // A partial write leaves the upper lanes -- and the dependency -- in
     // place. XED reports MOVSS's destination written-only in both forms, so
@@ -6916,20 +6919,20 @@ static void check_sse_merge_false_dep_test(void)
         0xF3, 0x0F, 0x10, 0xC3,  // movss xmm0, xmm3
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(movss_reg, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(movss_reg, "missing SSE dependency break", 1);
 
     static const uint8_t movss_mem[] = {
         0xF3, 0x0F, 0x10, 0x00,  // movss xmm0, dword ptr [rax]
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(movss_mem, "missing SSE dependency break", 0);
+    ASSERT_FINDINGS_CLASSES(movss_mem, "missing SSE dependency break", 0);
 
     // A lane insert writes half the register and merges the other half.
     static const uint8_t movhps[] = {
         0x0F, 0x16, 0x00,        // movhps xmm0, qword ptr [rax]
         0xF3, 0x0F, 0x5A, 0xC1,  // cvtss2sd xmm0, xmm1
     };
-    ASSERT_FINDINGS(movhps, "missing SSE dependency break", 1);
+    ASSERT_FINDINGS_CLASSES(movhps, "missing SSE dependency break", 1);
 }
 
 // Advisory: the VEX three-operand scalar forms name their merge source, so
@@ -7001,30 +7004,32 @@ static void check_scalar_move_false_dep_test(void)
     static const uint8_t movsd_stale[] = {
         0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
     };
-    ASSERT_FINDINGS(movsd_stale, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(movsd_stale, "merging scalar move", 1);
+    // Advisory class: the default scan does not report it.
+    ASSERT_FINDINGS(movsd_stale, "merging scalar move", 0);
 
     static const uint8_t movss_stale[] = {
         0xF3, 0x0F, 0x10, 0xCA,  // movss xmm1, xmm2
     };
-    ASSERT_FINDINGS(movss_stale, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(movss_stale, "merging scalar move", 1);
 
     // The load form zeroes the upper lanes and the store form writes no
     // register: neither merges.
     static const uint8_t movsd_load[] = {
         0xF2, 0x0F, 0x10, 0x08,  // movsd xmm1, qword ptr [rax]
     };
-    ASSERT_FINDINGS(movsd_load, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(movsd_load, "merging scalar move", 0);
 
     static const uint8_t movsd_store[] = {
         0xF2, 0x0F, 0x11, 0x08,  // movsd qword ptr [rax], xmm1
     };
-    ASSERT_FINDINGS(movsd_store, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(movsd_store, "merging scalar move", 0);
 
     // Same register: a pure no-op, not a merge hazard.
     static const uint8_t movsd_self[] = {
         0xF2, 0x0F, 0x10, 0xC0,  // movsd xmm0, xmm0
     };
-    ASSERT_FINDINGS(movsd_self, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(movsd_self, "merging scalar move", 0);
 
     // An adjacent full producer leaves the merge one instruction stale;
     // suppressed as everywhere in the family.
@@ -7032,7 +7037,7 @@ static void check_scalar_move_false_dep_test(void)
         0x0F, 0x28, 0xCB,        // movaps xmm1, xmm3
         0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
     };
-    ASSERT_FINDINGS(fresh_dest, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(fresh_dest, "merging scalar move", 0);
 
     // The zero-idiom mitigation suppresses through the window, not just
     // adjacency.
@@ -7041,50 +7046,50 @@ static void check_scalar_move_false_dep_test(void)
         0x0F, 0x28, 0xE5,        // movaps xmm4, xmm5
         0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
     };
-    ASSERT_FINDINGS(mitigated_window, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(mitigated_window, "merging scalar move", 0);
 
     // VEX with a merge operand that is neither the source nor fresh.
     static const uint8_t vmovsd_stale[] = {
         0xC5, 0xEB, 0x10, 0xCB,  // vmovsd xmm1, xmm2, xmm3
     };
-    ASSERT_FINDINGS(vmovsd_stale, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(vmovsd_stale, "merging scalar move", 1);
 
     static const uint8_t vmovss_stale[] = {
         0xC5, 0xEA, 0x10, 0xCB,  // vmovss xmm1, xmm2, xmm3
     };
-    ASSERT_FINDINGS(vmovss_stale, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(vmovss_stale, "merging scalar move", 1);
 
     // Destination as merge operand: the legacy hazard reproduced in an
     // encoding that names the merge outright.
     static const uint8_t vmovsd_dest_merge[] = {
         0xC5, 0xF3, 0x10, 0xCB,  // vmovsd xmm1, xmm1, xmm3
     };
-    ASSERT_FINDINGS(vmovsd_dest_merge, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(vmovsd_dest_merge, "merging scalar move", 1);
 
     // Merge equal to the source: a full copy of xmm3, however spelled.
     static const uint8_t vmovsd_full_copy[] = {
         0xC5, 0xE3, 0x10, 0xCB,  // vmovsd xmm1, xmm3, xmm3
     };
-    ASSERT_FINDINGS(vmovsd_full_copy, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(vmovsd_full_copy, "merging scalar move", 0);
 
     // Destination equal to the source: as a move this would be a no-op, so
     // the shape only ever means the deliberate blend.
     static const uint8_t vmovsd_blend_self[] = {
         0xC5, 0xEB, 0x10, 0xC9,  // vmovsd xmm1, xmm2, xmm1
     };
-    ASSERT_FINDINGS(vmovsd_blend_self, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(vmovsd_blend_self, "merging scalar move", 0);
 
     static const uint8_t vmovsd_load[] = {
         0xC5, 0xFB, 0x10, 0x08,  // vmovsd xmm1, qword ptr [rax]
     };
-    ASSERT_FINDINGS(vmovsd_load, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(vmovsd_load, "merging scalar move", 0);
 
     // A masked EVEX form surfaces the opmask as the second register
     // operand and is skipped: the mask makes the merge deliberate.
     static const uint8_t evex_masked[] = {
         0x62, 0xF1, 0xF7, 0x09, 0x10, 0xCB,  // vmovsd xmm1{k1}, xmm2, xmm3
     };
-    ASSERT_FINDINGS(evex_masked, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(evex_masked, "merging scalar move", 0);
 
     // The forward gate: gcc's SSE2 vectorized shape, a movss merging one
     // recomputed lane into a pair whose both lanes are then stored -- the
@@ -7094,7 +7099,7 @@ static void check_scalar_move_false_dep_test(void)
         0xF3, 0x0F, 0x10, 0xC2,        // movss xmm0, xmm2
         0x66, 0x0F, 0xD6, 0x40, 0x08,  // movq qword ptr [rax+8], xmm0
     };
-    ASSERT_FINDINGS(blend_store, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(blend_store, "merging scalar move", 0);
 
     // Likewise a single-precision move whose result is consumed at double
     // width: bits 32-63 came from the merge.
@@ -7102,7 +7107,7 @@ static void check_scalar_move_false_dep_test(void)
         0xF3, 0x0F, 0x10, 0xCA,        // movss xmm1, xmm2
         0xF2, 0x0F, 0x11, 0x48, 0x08,  // movsd qword ptr [rax+8], xmm1
     };
-    ASSERT_FINDINGS(double_read, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(double_read, "merging scalar move", 0);
 
     // A scalar consumer reads only the moved element: no blend evidence,
     // the finding stands.
@@ -7110,7 +7115,7 @@ static void check_scalar_move_false_dep_test(void)
         0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
         0xF2, 0x0F, 0x58, 0xCB,  // addsd xmm1, xmm3
     };
-    ASSERT_FINDINGS(scalar_read, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(scalar_read, "merging scalar move", 1);
 
     // A full redefinition kills the merged lanes before anything reads
     // them: dead, so the finding stands.
@@ -7118,7 +7123,7 @@ static void check_scalar_move_false_dep_test(void)
         0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
         0x0F, 0x28, 0xCC,        // movaps xmm1, xmm4
     };
-    ASSERT_FINDINGS(redefined_after, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(redefined_after, "merging scalar move", 1);
 
     // An escape ends the walk with the finding standing: glibc's fmax
     // moves the chosen argument into the return register and returns, and
@@ -7127,7 +7132,7 @@ static void check_scalar_move_false_dep_test(void)
         0xF2, 0x0F, 0x10, 0xC1,  // movsd xmm0, xmm1
         0xC3,                    // ret
     };
-    ASSERT_FINDINGS(escape_ret, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(escape_ret, "merging scalar move", 1);
 
     // The walk follows an unconditional direct branch -- gcc enters loops
     // with a jump into the middle, and the blend's vector consumer sits at
@@ -7138,14 +7143,14 @@ static void check_scalar_move_false_dep_test(void)
         0x90, 0x90,              // nop; nop (jumped over)
         0x0F, 0x11, 0x00,        // movups xmmword ptr [rax], xmm0
     };
-    ASSERT_FINDINGS(blend_past_jmp, "merging scalar move", 0);
+    ASSERT_FINDINGS_CLASSES(blend_past_jmp, "merging scalar move", 0);
 
     // An indirect branch cannot be followed: the finding stands.
     static const uint8_t escape_indirect[] = {
         0xF2, 0x0F, 0x10, 0xCA,  // movsd xmm1, xmm2
         0xFF, 0xE0,              // jmp rax
     };
-    ASSERT_FINDINGS(escape_indirect, "merging scalar move", 1);
+    ASSERT_FINDINGS_CLASSES(escape_indirect, "merging scalar move", 1);
 }
 
 // Gated equivalence rewrite: an 8- or 16-bit register-destination MOV

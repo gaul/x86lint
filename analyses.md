@@ -766,6 +766,10 @@ argue for or against each, live in [TODO.md](TODO.md).
 
 ## missing SSE dependency break
 
+*Advisory class: reported only under `-a advisory` or `-a all`. The
+rewrite changes the destination's upper lanes and the check assumes, rather
+than proves, that nothing reads them; `tools/rwfuzz` found the residue.*
+
 * `F30F5AC1` (CVTSS2SD XMM0, XMM1) -- the legacy scalar SSE instructions
   write only their destination's low element and leave the rest of the
   register standing ("DEST[127:64] (unmodified)" in the SDM), so the
@@ -812,6 +816,10 @@ argue for or against each, live in [TODO.md](TODO.md).
   register is clean. Masked EVEX forms are skipped
 
 ## merging scalar move
+
+*Advisory class: reported only under `-a advisory` or `-a all`. The
+rewrite changes the destination's upper lanes and the check assumes, rather
+than proves, that nothing reads them; `tools/rwfuzz` found the residue.*
 
 * `F20F10CA` (MOVSD XMM1, XMM2) -- between registers MOVSS and MOVSD copy
   one element and merge the rest, the legacy forms from the destination's

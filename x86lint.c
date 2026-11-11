@@ -14308,7 +14308,15 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // and merges into the rest, so a destination the adjacent
         // predecessor did not rewrite carries a false dependency; a vector
         // zero idiom just before breaks it. See sse_merge_false_dep.
-        if (sse_merge_false_dep(&xedd, &dep_history, xmm_zeroed)) {
+        //
+        // Advisory class, with the merging scalar move below: the inserted
+        // XORPS zeroes the destination's upper lanes, which is right only
+        // where nothing reads them, and the check assumes that rather than
+        // proving it -- code that keeps scalars in vector registers never
+        // wants those bits, but no walk here can see every reader.
+        // tools/rwfuzz, whose epilogue reads every lane, shows the residue.
+        if ((classes & X86LINT_CLASS_ADVISORY) != 0 &&
+            sse_merge_false_dep(&xedd, &dep_history, xmm_zeroed)) {
             emit_finding(&sink, "missing SSE dependency break", offset, &xedd,
                 inst + offset);
             ++errors;
@@ -14329,7 +14337,10 @@ int check_instructions(const uint8_t *inst, size_t len, uint64_t vaddr,
         // fresh) merges where MOVAPS would copy -- a false dependency and
         // a lost move elimination in one, unless a downstream vector read
         // proves the merge a deliberate blend. See scalar_move_false_dep.
-        if (scalar_move_false_dep(&xedd, &dep_history, inst, len, next)) {
+        // Advisory class: the forward gate finds blends within its
+        // lookahead, and past it MOVAPS would overwrite lanes a blend wants.
+        if ((classes & X86LINT_CLASS_ADVISORY) != 0 &&
+            scalar_move_false_dep(&xedd, &dep_history, inst, len, next)) {
             emit_finding(&sink, "merging scalar move", offset, &xedd,
                 inst + offset);
             ++errors;

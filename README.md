@@ -249,9 +249,9 @@ with the corpus populations that argue for or against each, live in
 | [missing MOVBE (only with `-m movbe`)](analyses.md#missing-movbe-only-with--m-movbe) | `MOVBE` |
 | [missing MULX (only with `-m bmi2`)](analyses.md#missing-mulx-only-with--m-bmi2) | `MULX`, dropping the move out of the fixed register |
 | [missing POPCNT dependency break](analyses.md#missing-popcnt-dependency-break) | insert `XOR dst, dst` ahead of it |
-| [missing SSE dependency break](analyses.md#missing-sse-dependency-break) | insert `XORPS dst, dst` ahead of it |
+| [missing SSE dependency break](analyses.md#missing-sse-dependency-break) | insert `XORPS dst, dst` ahead of it; advisory |
 | [stale VEX merge operand](analyses.md#stale-vex-merge-operand) | name the data source, or a dead register, as the merge operand |
-| [merging scalar move](analyses.md#merging-scalar-move) | `MOVAPS` |
+| [merging scalar move](analyses.md#merging-scalar-move) | `MOVAPS`; advisory |
 | [merging narrow move](analyses.md#merging-narrow-move) | `MOVZX`, or `MOVSX` where the sign is wanted |
 | [missing SHLX/SHRX/SARX (only with `-m bmi2`)](analyses.md#missing-shlxshrxsarx-only-with--m-bmi2) | `SHLX`/`SHRX`/`SARX`, which write no flags |
 | [MOV constant foldable](analyses.md#mov-constant-foldable) | fold the constant into the consumer's immediate |
@@ -368,7 +368,7 @@ and memory; a difference in the general registers, `xmm0`-`xmm7`, the
 defined flags or the scratch memory is a soundness bug, and so is a rewrite
 the rewriter or the assembler cannot apply. A control arm applies the same
 rewrites where x86lint refused to and must see some of them change a result.
-68 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
+66 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
 the rest and why. `RWFUZZ_PROGRAMS` (10000) and `RWFUZZ_SEED` size and vary
 the run, and `tools/rwfuzz -f NAME MODE` narrows one to a single finding over
 the same programs.
@@ -641,7 +641,11 @@ that description and were, until now, reported beside them as though they did.
   length-changing prefix stall's clean fix is 32-bit operands, which needs
   upper-16 liveness this tool does not track. Both said so in their own
   documentation before they had a class to sit in. A build should not fail on
-  advice the tool cannot check.
+  advice the tool cannot check. The two scalar-merge rows, "missing SSE
+  dependency break" and "merging scalar move", joined them on 2026-11-10:
+  their rewrites change a vector register's upper lanes, and they assume
+  rather than prove that nothing reads those lanes past what their walk can
+  see, which `tools/rwfuzz` showed is not always so.
 * **security** is not a rewrite at all. The IBT-bypassing NOTRACK call is a
   review item, since dropping the prefix without padding the target trades
   the bypass for a `#CP` fault, so the reader is being asked to look rather

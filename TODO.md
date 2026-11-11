@@ -995,15 +995,16 @@ Rows not run, and why:
 | CAS loop foldable into LOCK op, missing MULX | no plant yet; both need a multi-instruction shape (a retry loop, the fixed-register MUL) the generator does not draw |
 | missing APX NDD, missing APX SETZU | no host here runs APX |
 | OR foldable into memory | needs `-m v8` and V8's pointer-compression register conventions |
-| missing BZHI, length-changing prefix stall, AVX-SSE transition, IBT-bypassing NOTRACK call, suboptimal SETcc zero-extension, stale VEX merge operand | advisory or security classes, or advice with no single rewrite; rwfuzz asks only for `X86LINT_CLASS_REWRITE` |
+| missing BZHI, length-changing prefix stall, AVX-SSE transition, IBT-bypassing NOTRACK call, suboptimal SETcc zero-extension, missing SSE dependency break, merging scalar move, stale VEX merge operand | advisory or security classes, or advice with no single rewrite; rwfuzz asks only for `X86LINT_CLASS_REWRITE` |
 
-Two rows run under their stated assumption rather than a proof: "merging
-scalar move" and "missing SSE dependency break" assume a scalar's upper
-lanes are dead where their lookahead cannot see. rwfuzz ignores the
-destination's upper lanes for them and counts a difference that still shows
-(the lanes copied elsewhere first) apart: 10 and 14 at 10,000 programs, the
-residue their analyses describe. Both report under the REWRITE class,
-though the scalar-move analysis calls that residue an advisory's.
+Two rows rest on an assumption rather than a proof: "merging scalar move"
+and "missing SSE dependency break" assume a scalar's upper lanes are dead
+where their lookahead cannot see. Run with those lanes ignored, a difference
+still showed where the lanes had been copied elsewhere first (10 and 14 at
+10,000 programs), the residue their analyses describe. **Reclassified as
+advisory** (2026-11-10), so the default scan, and rwfuzz, no longer report
+them; libxul's 6,217 and 213, go's 49 and libstdc++'s 2 now appear only
+under `-a advisory`.
 
 ## JIT corpora (2026-09-15)
 

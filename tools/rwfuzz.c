@@ -58,11 +58,21 @@
 // store be deleted. Every run uses one state block at one stack depth, since
 // the body can leave a pointer to either in a register.
 //
-// Rows not run: the encoding-only rows whose original the assembler never
-// emits from text (an unneeded REX prefix, SIB byte or displacement, the
-// VEX/EVEX and XCHG encodings, the branch displacement), the security and
-// advisory classes (the scalar-merge rows among them), and the APX rows (no
-// host runs them).
+// The encoding-only rows (an unneeded REX prefix, SIB byte, LOCK or REP, a
+// displacement or immediate wider than it needs, the XCHG, VEX and EVEX
+// encodings, ...) name instructions the assembler never emits from text,
+// so the `encode` family plants them as raw `.byte` items, or with the
+// assemblers' {disp32}, {vex3} and {evex} pseudo-prefixes, and their
+// rewriters make the byte edit the row names -- drop the prefix, fold the
+// SIB into ModRM, shrink the displacement, switch to the accumulator
+// opcode, rebuild the VEX prefix -- rather than reassembling a
+// disassembly, which would pick a correct encoding whatever the check
+// claimed. The text-based rewriters read a `.byte` item through XED's
+// disassembly, so a row reported on a raw-bytes plant is rewritten like the
+// same instruction from text.
+//
+// Rows not run: the security and advisory classes (the scalar-merge rows
+// among them), and the APX rows (no host runs them).
 // A finding without a rewriter is counted as "no rewriter".
 //
 // A control arm applies the same rewrites where x86lint REFUSED to -- an
@@ -89,7 +99,8 @@
 //       bytes for any number of workers. Processes rather than threads:
 //       the signal handlers, the alarm and the fixed mappings a run uses
 //       are per process.
-// Modes: all, flags, frame, fold (listed after `modes:` in the usage text).
+// Modes: all, flags, frame, fold, encode (listed after `modes:` in the
+// usage text).
 // Each mode plants its family's shapes, runs every finding with a
 // rewriter, and runs its family's control arm; `all` plants every family.
 // BMI1, BMI2 and MOVBE rows run when the host has the extension.
@@ -308,6 +319,11 @@ struct item {
 struct prog {
     int n;
     int nlabels;
+    // A rewrite's claim about its own encoding, checked once it is
+    // assembled: item expect_item must come out expect_len bytes long
+    // (expect_item < 0 for none). The branch row's rel8 form says so.
+    int expect_item;
+    int expect_len;
     struct item it[MAXITEMS];
 };
 
@@ -356,7 +372,7 @@ static bool prog_insert(struct prog *p, int i, const char *text)
 // ------------------------------------------------------- text structure ---
 
 struct ins {
-    char mn[16];
+    char mn[24];
     char op[3][48];
     int nop;
 };
@@ -368,12 +384,36 @@ static void ins_parse(const char *text, struct ins *in)
     while (*p == ' ') {
         ++p;
     }
+    // An assembler pseudo-prefix ({disp32}, {vex3}, {evex}) says how to
+    // encode, not what: skip it.
+    while (*p == '{') {
+        while (*p != '\0' && *p != '}') {
+            ++p;
+        }
+        if (*p == '}') {
+            ++p;
+        }
+        while (*p == ' ') {
+            ++p;
+        }
+    }
     size_t k = 0;
     while (*p != '\0' && *p != ' ' && k + 1 < sizeof(in->mn)) {
         in->mn[k++] = *p++;
     }
     while (*p == ' ') {
         ++p;
+    }
+    // A prefix stays with its mnemonic: "lock xchg".
+    if ((strcmp(in->mn, "lock") == 0 || strncmp(in->mn, "rep", 3) == 0) &&
+        *p != '\0') {
+        in->mn[k++] = ' ';
+        while (*p != '\0' && *p != ' ' && k + 1 < sizeof(in->mn)) {
+            in->mn[k++] = *p++;
+        }
+        while (*p == ' ') {
+            ++p;
+        }
     }
     while (*p != '\0' && in->nop < 3) {
         const char *comma = strstr(p, ", ");
@@ -527,9 +567,11 @@ static void emit_prologue(struct prog *p)
     prog_add(p, R_PRO, "lea rsi, [r15+%d]", OFF(frame));
     prog_add(p, R_PRO, "mov ecx, %d", FRAME_SIZE);
     prog_add(p, R_PRO, "rep movsb");
-    for (int x = 0; x < 8; ++x) {
+    for (int x = 0; x < 16; ++x) {
+        // xmm8-15 are loaded too, though never compared: the encoding
+        // plants read them, and they must not hold what rwfuzz left.
         prog_add(p, R_PRO, "movdqu xmm%d, xmmword ptr [r15+%d]", x,
-                 OFF(in_xmm) + 16 * x);
+                 OFF(in_xmm) + 16 * (x & 7));
     }
     for (int k = 0; k < NBODY; ++k) {
         prog_add(p, R_PRO, "mov %s, qword ptr [r15+%d]", gpr(BODY[k], 64),
@@ -584,9 +626,13 @@ static void emit_epilogue(struct prog *p)
 
 // ------------------------------------------------------------ generator ---
 
-enum mode { MODE_ALL, MODE_FLAGS, MODE_FRAME, MODE_FOLD, NMODES };
+enum mode { MODE_ALL, MODE_FLAGS, MODE_FRAME, MODE_FOLD, MODE_ENCODE,
+            NMODES };
 static const char *const MODE_NAMES[NMODES] = {"all", "flags", "frame",
-                                               "fold"};
+                                               "fold", "encode"};
+
+// Whether the host runs AVX-512VL, which the EVEX plants need.
+static bool host_avx512vl;
 
 struct gen {
     uint64_t rng;
@@ -1498,6 +1544,312 @@ static void plant_fold(struct gen *g)
     }
 }
 
+// ---------------------------------------------------------- encode plants ---
+
+// An instruction as raw bytes, for the encodings the assembler never
+// chooses from text.
+static void add_bytes(struct gen *g, const uint8_t *b, int n)
+{
+    char t[TEXTLEN];
+    int k = snprintf(t, sizeof(t), ".byte ");
+    for (int i = 0; i < n; ++i) {
+        k += snprintf(t + k, sizeof(t) - (size_t) k, "%s0x%02x", i ? "," : "",
+                      b[i]);
+    }
+    prog_add(g->p, R_BODY, "%s", t);
+}
+
+// A low body register (no REX needed): RAX, RCX, RDX, RBX, RSI, RDI.
+static int low_reg(struct gen *g)
+{
+    static const int LOW[] = {0, 1, 2, 3, 6, 7};
+    return LOW[rnd(&g->rng, 6)];
+}
+
+static void put32(uint8_t *b, int32_t v)
+{
+    memcpy(b, &v, 4);
+}
+
+// The encoding-only rows: each plant spells an instruction the long way,
+// as the row describes, and sometimes the way the row must refuse.
+static void plant_encode(struct gen *g)
+{
+    uint8_t b[16];
+    int n = 0;
+    int r = low_reg(g), s = low_reg(g);
+    int x = (int) rnd(&g->rng, 8), y = (int) rnd(&g->rng, 8),
+        z = (int) rnd(&g->rng, 8);
+    switch (rnd(&g->rng, 15)) {
+    case 0: { // a REX the operation does not need, and some it does
+        static const uint8_t OPS[] = {0x89, 0x01, 0x31, 0x21, 0x09, 0x29,
+                                      0x39, 0x85};
+        switch (rnd(&g->rng, 4)) {
+        case 0:
+            b[n++] = 0x40;
+            b[n++] = OPS[rnd(&g->rng, 8)];
+            b[n++] = (uint8_t) (0xC0 | s << 3 | r);
+            break;
+        case 1:   // xor r64, r64: the 32-bit form zero-extends the same
+            b[n++] = 0x48;
+            b[n++] = 0x31;
+            b[n++] = (uint8_t) (0xC0 | r << 3 | r);
+            break;
+        case 2:   // movzx r64, r8: the 32-bit form zero-extends the same
+            b[n++] = 0x48;
+            b[n++] = 0x0F;
+            b[n++] = 0xB6;
+            b[n++] = (uint8_t) (0xC0 | r << 3 | (int) rnd(&g->rng, 8));
+            break;
+        default:  // a byte move, where REX turns AH..BH into SPL..DIL
+            b[n++] = 0x40;
+            b[n++] = 0x88;
+            b[n++] = (uint8_t) (0xC0 | (int) rnd(&g->rng, 8) << 3 | r);
+            break;
+        }
+        add_bytes(g, b, n);
+        break;
+    }
+    case 1:   // a SIB byte with no index
+    case 2:   // a zero displacement
+    case 3: { // a displacement that fits eight bits, spelled in 32
+        int which = (int) rnd(&g->rng, 3);   // r14, rsp, rbp
+        bool store = chance(&g->rng, 30) && which != 2;
+        int mod = 0, disp = 0;
+        if (which == 0) {
+            disp = (int) rnd(&g->rng, 16) * 8;   // within a disp8
+        } else if (which == 1) {
+            disp = (int) rnd(&g->rng, 15) * 8;
+        } else {
+            disp = -8 * (1 + (int) rnd(&g->rng, 15));
+        }
+        bool sib = which == 1 || chance(&g->rng, 50);
+        int kind = 0;
+        switch (rnd(&g->rng, 3)) {
+        case 0: kind = 0; break;   // as it is
+        case 1: kind = 1; break;   // zero displacement
+        default: kind = 2; break;  // disp32
+        }
+        if (kind == 1) {
+            disp = 0;
+            mod = which == 2 ? 2 : (chance(&g->rng, 50) ? 1 : 2);
+        } else if (kind == 2) {
+            mod = 2;
+        } else {
+            mod = disp == 0 && which != 2 ? 0 : 1;
+        }
+        if (which == 0) {
+            b[n++] = 0x41;   // REX.B: r14
+        }
+        b[n++] = store ? 0x89 : 0x8B;
+        int rm = which == 0 ? 6 : which == 1 ? 4 : 5;
+        b[n++] = (uint8_t) (mod << 6 | r << 3 | (sib ? 4 : rm));
+        if (sib) {
+            b[n++] = (uint8_t) (0x20 | rm);   // no index, the base
+        }
+        if (mod == 1) {
+            b[n++] = (uint8_t) (int8_t) disp;
+        } else if (mod == 2) {
+            put32(b + n, disp);
+            n += 4;
+        }
+        add_bytes(g, b, n);
+        break;
+    }
+    case 4: { // a branch spelled with rel32
+        if (g->npending < (int) (sizeof(g->pending) / sizeof(g->pending[0]))) {
+            int l = new_label(g->p);
+            g->pending[g->npending++] = l;
+            if (chance(&g->rng, 30)) {
+                ADD("{disp32} jmp @%d", l);
+            } else {
+                ADD("{disp32} j%s @%d", rand_cc(g), l);
+            }
+        }
+        break;
+    }
+    case 5: { // XCHG through ModRM
+        int w = (int) rnd(&g->rng, 3);   // 16, 32, 64
+        int a = chance(&g->rng, 80) ? 0 : low_reg(g);
+        if (w == 0) {
+            b[n++] = 0x66;
+        } else if (w == 2) {
+            b[n++] = 0x48;
+        }
+        b[n++] = 0x87;
+        b[n++] = chance(&g->rng, 50) ? (uint8_t) (0xC0 | a << 3 | s)
+                                     : (uint8_t) (0xC0 | s << 3 | a);
+        add_bytes(g, b, n);
+        break;
+    }
+    case 6: { // an ALU immediate on the accumulator through ModRM
+        int op = (int) rnd(&g->rng, 8);
+        int reg = chance(&g->rng, 80) ? 0 : low_reg(g);
+        switch (rnd(&g->rng, 4)) {
+        case 0:   // 8 bits: AL..BL, since without REX 4-7 name AH..BH
+            reg &= 3;
+            b[n++] = 0x80;
+            b[n++] = (uint8_t) (0xC0 | op << 3 | reg);
+            b[n++] = (uint8_t) rnd(&g->rng, 256);
+            break;
+        case 1:   // 16 bits
+            b[n++] = 0x66;
+            b[n++] = 0x81;
+            b[n++] = (uint8_t) (0xC0 | op << 3 | reg);
+            b[n++] = (uint8_t) rnd(&g->rng, 256);
+            b[n++] = (uint8_t) rnd(&g->rng, 256);
+            break;
+        case 2:   // TEST
+            b[n++] = 0xF7;
+            b[n++] = (uint8_t) (0xC0 | reg);
+            put32(b + n, (int32_t) (uint32_t) edge_value(&g->rng));
+            n += 4;
+            break;
+        default:  // 32 or 64 bits
+            if (chance(&g->rng, 50)) {
+                b[n++] = 0x48;
+            }
+            b[n++] = 0x81;
+            b[n++] = (uint8_t) (0xC0 | op << 3 | reg);
+            put32(b + n, (int32_t) (uint32_t) edge_value(&g->rng));
+            n += 4;
+            break;
+        }
+        add_bytes(g, b, n);
+        if (op == 2 || op == 3) {
+            gen_flag_definer(g);   // ADC and SBB read CF; keep it defined
+        }
+        break;
+    }
+    case 7: { // a shift or rotate by an explicit 1
+        static const int OPS[] = {0, 1, 2, 3, 5, 7};
+        if (chance(&g->rng, 50)) {
+            b[n++] = 0x48;
+        }
+        b[n++] = 0xC1;
+        b[n++] = (uint8_t) (0xC0 | OPS[rnd(&g->rng, 6)] << 3 | r);
+        b[n++] = chance(&g->rng, 85) ? 1 : 2;
+        add_bytes(g, b, n);
+        gen_flag_definer(g);
+        break;
+    }
+    case 8: { // an immediate that fits eight bits, spelled in 32
+        int op = (int) rnd(&g->rng, 8);
+        if (chance(&g->rng, 50)) {
+            b[n++] = 0x48;
+        }
+        if (chance(&g->rng, 25)) {
+            b[n++] = 0x69;   // IMUL r, r, imm32
+            b[n++] = (uint8_t) (0xC0 | r << 3 | s);
+        } else {
+            b[n++] = 0x81;
+            b[n++] = (uint8_t) (0xC0 | op << 3 | (r == 0 ? 1 : r));
+        }
+        put32(b + n, (int32_t) rnd(&g->rng, 256) - 128);
+        n += 4;
+        add_bytes(g, b, n);
+        gen_flag_definer(g);
+        break;
+    }
+    case 9: { // LOCK on an XCHG with memory
+        char a[48];
+        int w = chance(&g->rng, 50) ? 64 : 32;
+        any_mem(g, w, a, sizeof(a));
+        ADD("lock xchg %s, %s", a, gpr(r, w));
+        break;
+    }
+    case 10: { // REP RET, in a function of the body's own
+        int fn = new_label(g->p), after = new_label(g->p);
+        int start = g->p->n;
+        ADD("jmp @%d", after);
+        ADD("add %s, %s", gpr(r, 64), gpr(s, 64))->label = (short) fn;
+        b[n++] = 0xF3;
+        b[n++] = 0xC3;
+        add_bytes(g, b, n);
+        ADD("call @%d", fn)->label = (short) after;
+        seal_last(g, g->p->n - start);
+        break;
+    }
+    case 11: { // a three-byte VEX prefix the two-byte one could carry
+        static const char *const OPS[] = {"vaddps", "vpaddd", "vpxor",
+                                          "vmulps", "vpsubd"};
+        if (chance(&g->rng, 70)) {
+            ADD("{vex3} %s xmm%d, xmm%d, xmm%d", OPS[rnd(&g->rng, 5)], x, y,
+                z);
+        } else {
+            ADD("{vex3} vmovaps xmm%d, xmm%d", x, y);
+        }
+        break;
+    }
+    case 12: { // EVEX where VEX would do
+        if (!host_avx512vl) {
+            break;
+        }
+        static const char *const OPS[] = {"vaddps", "vpaddd", "vpxord",
+                                          "vmulps", "vpandq"};
+        switch (rnd(&g->rng, 3)) {
+        case 0:
+            ADD("{evex} %s xmm%d, xmm%d, xmm%d", OPS[rnd(&g->rng, 5)], x, y,
+                z);
+            break;
+        case 1: {
+            // A memory source whose displacement the EVEX form compresses.
+            int d = (int) rnd(&g->rng, 16) * 16;
+            ADD("{evex} %s xmm%d, xmm%d, xmmword ptr [r14+%d]",
+                OPS[rnd(&g->rng, 5)], x, y, d);
+            break;
+        }
+        default:
+            ADD("{evex} vmovdqu32 xmm%d, xmm%d", x, y);
+            break;
+        }
+        break;
+    }
+    case 13: { // a high source in ModRM.rm, forcing the three-byte VEX
+        int hi = 8 + (int) rnd(&g->rng, 8);
+        int start = g->p->n;
+        ADD("vmovaps xmm%d, xmm%d", hi, y);
+        static const char *const OPS[] = {"vpaddd", "vpand", "vpxor",
+                                          "vpcmpeqd", "vaddps", "vpsubd",
+                                          "vpminud"};
+        // {vex3} keeps the spelling: clang's assembler would otherwise
+        // swap a commutative op's sources, or pick the store-form move,
+        // for the two-byte prefix itself.
+        if (chance(&g->rng, 70)) {
+            ADD("{vex3} %s xmm%d, xmm%d, xmm%d", OPS[rnd(&g->rng, 7)], x, z,
+                hi);
+        } else {
+            static const char *const MV[] = {"vmovaps", "vmovups",
+                                             "vmovdqa", "vmovdqu",
+                                             "vmovapd"};
+            ADD("{vex3} %s xmm%d, xmm%d", MV[rnd(&g->rng, 5)], x, hi);
+        }
+        seal_last(g, g->p->n - start);
+        break;
+    }
+    default: { // a MOV of a small immediate through ModRM
+        int w = (int) rnd(&g->rng, 3);
+        if (w == 0) {
+            b[n++] = 0x66;
+            b[n++] = 0xC7;
+            b[n++] = (uint8_t) (0xC0 | r);
+            b[n++] = (uint8_t) rnd(&g->rng, 256);
+            b[n++] = 0;
+        } else {
+            if (w == 2) {
+                b[n++] = 0x48;
+            }
+            b[n++] = 0xC7;
+            b[n++] = (uint8_t) (0xC0 | r);
+            put32(b + n, (int32_t) edge_value(&g->rng));
+            n += 4;
+        }
+        add_bytes(g, b, n);
+        break;
+    }
+    }
+}
+
 // Place the pending labels at random later points of the body.
 static void place_labels(struct gen *g, int body_start, int body_end)
 {
@@ -1546,6 +1898,7 @@ static void generate(struct prog *p, uint64_t seed, enum mode mode)
     struct gen g = {.rng = seed, .p = p, .mode = mode};
     memset(p, 0, sizeof(*p));
     p->nlabels = 1;   // label 0 is the stub
+    p->expect_item = -1;
     emit_prologue(p);
     int body_start = p->n;
     int count = 30 + (int) rnd(&g.rng, 40);
@@ -1554,9 +1907,14 @@ static void generate(struct prog *p, uint64_t seed, enum mode mode)
         bool frame = mode == MODE_ALL || mode == MODE_FRAME;
         bool flags = mode == MODE_ALL || mode == MODE_FLAGS;
         bool fold = mode == MODE_ALL || mode == MODE_FOLD;
+        bool encode = mode == MODE_ALL || mode == MODE_ENCODE;
         unsigned planted = mode == MODE_ALL ? 45 : 40;
         if (pick < planted) {
-            unsigned which = rnd(&g.rng, 3);
+            unsigned which = rnd(&g.rng, mode == MODE_ALL ? 4 : 3);
+            if (mode == MODE_ENCODE || (which == 3 && encode)) {
+                plant_encode(&g);
+                continue;
+            }
             if (which == 0 && frame) {
                 plant_frame(&g);
             } else if (which == 1 && flags) {
@@ -1765,6 +2123,7 @@ static void assemble(struct prog *const *progs, int n, struct code *out,
             if (!ok[k]) {
                 continue;
             }
+            bool bad = false;
             const struct prog *p = progs[k];
             out[k].n = p->n;
             out[k].off = calloc((size_t) p->n + 1, sizeof(size_t));
@@ -1775,19 +2134,41 @@ static void assemble(struct prog *const *progs, int n, struct code *out,
                 if (p->it[i].text[0] == '\0') {
                     continue;
                 }
+                // A .byte item's length is its byte count, whatever it
+                // decodes as, so a rewrite whose bytes are not one
+                // instruction cannot throw the rest out of step; the
+                // program is marked as not assembled instead.
+                const char *t = p->it[i].text;
+                int nbytes = 0;
+                if (strncmp(t, ".byte ", 6) == 0) {
+                    nbytes = 1;
+                    for (const char *c = t; *c != '\0'; ++c) {
+                        nbytes += *c == ',';
+                    }
+                }
                 xed_decoded_inst_t x;
                 decode_init(&x);
-                if (at >= tsize || xed_decode(&x, text + at,
-                        (unsigned) (tsize - at)) != XED_ERROR_NONE) {
-                    fprintf(stderr, "rwfuzz: cannot decode `%s`\n",
-                            p->it[i].text);
-                    exit(2);
+                unsigned dlen = 0;
+                if (at < tsize && xed_decode(&x, text + at,
+                        (unsigned) (tsize - at)) == XED_ERROR_NONE) {
+                    dlen = xed_decoded_inst_get_length(&x);
                 }
-                out[k].len[i] = (uint8_t) xed_decoded_inst_get_length(&x);
+                if (dlen == 0 || (nbytes > 0 && dlen != (unsigned) nbytes)) {
+                    if (getenv("RWFUZZ_DEBUG") != NULL) {
+                        fprintf(stderr, "rwfuzz: `%s` is not one "
+                                "instruction\n", t);
+                    }
+                    bad = true;
+                    dlen = nbytes > 0 ? (unsigned) nbytes : 1;
+                }
+                out[k].len[i] = (uint8_t) dlen;
                 at += out[k].len[i];
             }
             out[k].off[p->n] = at - start;
             out[k].size = at - start;
+            if (bad) {
+                ok[k] = false;
+            }
             out[k].bytes = malloc(out[k].size);
             memcpy(out[k].bytes, text + start, out[k].size);
         }
@@ -1803,7 +2184,16 @@ struct view {
     const struct prog *p;
     const struct code *c;
     xed_decoded_inst_t *dec;   // per item; zeroed for a bare label
+    // Per item, the text the rewriters read: the item's own, or for a
+    // `.byte` item XED's disassembly of it, so that a row reported on a
+    // raw-bytes plant is rewritten like the same instruction from text.
+    char (*text)[TEXTLEN];
 };
+
+static const char *itext(const struct view *v, int i)
+{
+    return v->text[i];
+}
 
 static void view_build(struct view *v, const struct prog *p,
                        const struct code *c)
@@ -1811,17 +2201,40 @@ static void view_build(struct view *v, const struct prog *p,
     v->p = p;
     v->c = c;
     v->dec = calloc((size_t) p->n, sizeof(xed_decoded_inst_t));
+    v->text = calloc((size_t) p->n, TEXTLEN);
     for (int i = 0; i < p->n; ++i) {
+        snprintf(v->text[i], TEXTLEN, "%s", p->it[i].text);
         if (c->len[i] == 0) {
             continue;
         }
         decode_init(&v->dec[i]);
         xed_decode(&v->dec[i], c->bytes + c->off[i], c->len[i]);
+        if (strncmp(p->it[i].text, ".byte ", 6) == 0 &&
+            !xed_format_context(XED_SYNTAX_INTEL, &v->dec[i], v->text[i],
+                                TEXTLEN, 0, NULL, NULL)) {
+            snprintf(v->text[i], TEXTLEN, "%s", p->it[i].text);
+        } else if (strncmp(p->it[i].text, ".byte ", 6) == 0) {
+            // XED prints an immediate as its unsigned bits; the
+            // generator's text, and the rewriters, spell it signed, as
+            // the operation sign-extends it.
+            const xed_decoded_inst_t *x = &v->dec[i];
+            char *last = strrchr(v->text[i], ' ');
+            if (xed_operand_values_has_immediate(
+                    xed_decoded_inst_operands_const(x)) &&
+                xed_decoded_inst_get_immediate_width_bits(x) < 64 &&
+                xed_decoded_inst_get_immediate_is_signed(x) &&
+                last != NULL && strncmp(last + 1, "0x", 2) == 0) {
+                snprintf(last + 1, (size_t) (TEXTLEN - (last + 1 -
+                         v->text[i])), "%d",
+                         (int) xed_decoded_inst_get_signed_immediate(x));
+            }
+        }
     }
 }
 
 static void view_free(struct view *v)
 {
+    free(v->text);
     free(v->dec);
 }
 
@@ -2131,7 +2544,7 @@ static bool rw_delete_compare(const struct view *v, int i, struct prog *out,
                               char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     if ((strcmp(in.mn, "cmp") != 0 && strcmp(in.mn, "test") != 0) ||
         is_mem(in.op[0]) || is_mem(in.op[1])) {
         FAIL("not a register CMP/TEST");
@@ -2145,14 +2558,14 @@ static bool rw_delete_if(const struct view *v, int i, struct prog *out,
                          char *why, size_t whylen, const char *const *mns)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     for (const char *const *m = mns; *m != NULL; ++m) {
         if (strcmp(in.mn, *m) == 0) {
             delete_item(out, i);
             return true;
         }
     }
-    FAIL("`%s` is not what the row deletes", v->p->it[i].text);
+    FAIL("`%s` is not what the row deletes", itext(v, i));
 }
 
 #define DELETER(fn, ...)                                                     \
@@ -2167,7 +2580,7 @@ static bool rw_mov_self(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     if ((strcmp(in.mn, "mov") != 0 && strncmp(in.mn, "cmov", 4) != 0) ||
         strcmp(in.op[0], in.op[1]) != 0) {
         FAIL("not a MOV/CMOVcc onto itself");
@@ -2180,7 +2593,7 @@ static bool rw_shift_zero(const struct view *v, int i, struct prog *out,
                           char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int64_t imm;
     if (in.nop < 2 || !imm_parse(in.op[in.nop - 1], &imm) || imm != 0) {
         FAIL("not a shift by an immediate zero");
@@ -2192,7 +2605,7 @@ static bool rw_shift_zero(const struct view *v, int i, struct prog *out,
 static bool rw_branch_next(const struct view *v, int i, struct prog *out,
                            char *why, size_t whylen)
 {
-    if (v->p->it[i].text[0] != 'j') {
+    if (itext(v, i)[0] != 'j') {
         FAIL("not a branch");
     }
     delete_item(out, i);
@@ -2203,7 +2616,7 @@ static bool rw_delete_test(const struct view *v, int i, struct prog *out,
                            char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     if (strcmp(in.mn, "test") != 0 || strcmp(in.op[0], in.op[1]) != 0) {
         FAIL("not TEST reg, reg");
     }
@@ -2217,7 +2630,7 @@ static bool rw_delete_mov_imm(const struct view *v, int i, struct prog *out,
                               char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int r, bits;
     int64_t x;
     if (strcmp(in.mn, "mov") != 0 || in.nop != 2 ||
@@ -2238,7 +2651,7 @@ static bool rw_delete_frame_load(const struct view *v, int i, struct prog *out,
                                  char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     struct mem m;
     int num, bits;
     if (strcmp(in.mn, "mov") != 0 || !reg_op(in.op[0], &num, &bits) ||
@@ -2253,7 +2666,7 @@ static bool rw_delete_frame_store(const struct view *v, int i,
                                   struct prog *out, char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     struct mem m;
     if (in.nop != 2 || !frame_operand(in.op[0], &m)) {
         FAIL("not a frame-slot store");
@@ -2266,7 +2679,7 @@ static bool rw_mov_zero(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int num, bits;
     int64_t imm;
     if (strcmp(in.mn, "mov") != 0 || !reg_op(in.op[0], &num, &bits) ||
@@ -2282,7 +2695,7 @@ static bool reg_imm(const struct view *v, int i, const char *mn, int *num,
                     int *bits, uint64_t *imm)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int64_t x;
     if (strcmp(in.mn, mn) != 0 || in.nop != 2 ||
         !reg_op(in.op[0], num, bits) || !imm_parse(in.op[1], &x)) {
@@ -2311,14 +2724,14 @@ static bool rw_to_test_self(const struct view *v, int i, struct prog *out,
                             bool need_imm, uint64_t want, bool want_mask)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int num, bits;
     bool mn_ok = false;
     for (const char *const *m = mns; *m != NULL; ++m) {
         mn_ok |= strcmp(in.mn, *m) == 0;
     }
     if (!mn_ok || in.nop != 2 || !reg_op(in.op[0], &num, &bits)) {
-        FAIL("`%s` is not the row's shape", v->p->it[i].text);
+        FAIL("`%s` is not the row's shape", itext(v, i));
     }
     if (need_imm) {
         int64_t x;
@@ -2367,7 +2780,7 @@ static bool rw_sub_self(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     if (strcmp(in.mn, "sub") != 0 || strcmp(in.op[0], in.op[1]) != 0) {
         FAIL("not SUB reg, reg");
     }
@@ -2379,7 +2792,7 @@ static bool rw_xor_not(const struct view *v, int i, struct prog *out,
                        char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int64_t x;
     if (strcmp(in.mn, "xor") != 0 || in.nop != 2 ||
         !imm_parse(in.op[1], &x)) {
@@ -2393,11 +2806,19 @@ static bool rw_inc_dec(const struct view *v, int i, struct prog *out,
                        char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int64_t x;
     bool add = strcmp(in.mn, "add") == 0, sub = strcmp(in.mn, "sub") == 0;
+    // Disassembly prints a sign-extended -1 as its unsigned bits, so the
+    // immediate is read at the operand's width.
+    int r, bits = 64;
+    struct mem mm;
+    if (!reg_op(in.op[0], &r, &bits) && mem_parse(in.op[0], &mm) &&
+        mm.bits != 0) {
+        bits = mm.bits;
+    }
     if ((!add && !sub) || in.nop != 2 || !imm_parse(in.op[1], &x) ||
-        (x != 1 && x != -1)) {
+        ((x = sign_extend((uint64_t) x, bits)) != 1 && x != -1)) {
         FAIL("not ADD/SUB x, +-1");
     }
     bool inc = (add && x == 1) || (sub && x == -1);
@@ -2409,7 +2830,7 @@ static bool rw_add_sub_128(const struct view *v, int i, struct prog *out,
                            char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int64_t x;
     bool add = strcmp(in.mn, "add") == 0, sub = strcmp(in.mn, "sub") == 0;
     if ((!add && !sub) || in.nop != 2 || !imm_parse(in.op[1], &x) ||
@@ -2424,7 +2845,7 @@ static bool rw_shl_one(const struct view *v, int i, struct prog *out,
                        char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int num, bits;
     int64_t x;
     if (strcmp(in.mn, "shl") != 0 || !reg_op(in.op[0], &num, &bits) ||
@@ -2439,7 +2860,7 @@ static bool rw_imul(const struct view *v, int i, struct prog *out, char *why,
                     size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits, s, sbits;
     int64_t x;
     if (strcmp(in.mn, "imul") != 0 || in.nop != 3 ||
@@ -2473,7 +2894,7 @@ static bool rw_lea(const struct view *v, int i, struct prog *out, char *why,
                    size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     struct mem m;
     if (strcmp(in.mn, "lea") != 0 || !reg_op(in.op[0], &d, &dbits) ||
@@ -2498,7 +2919,7 @@ static bool rw_lea_width(const struct view *v, int i, struct prog *out,
                          char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     if (strcmp(in.mn, "lea") != 0 || !reg_op(in.op[0], &d, &dbits) ||
         dbits != 64) {
@@ -2511,7 +2932,7 @@ static bool rw_lea_width(const struct view *v, int i, struct prog *out,
 static bool rw_movsx_implicit(const struct view *v, int i, struct prog *out,
                               char *why, size_t whylen)
 {
-    const char *t = v->p->it[i].text;
+    const char *t = itext(v, i);
     if (strcmp(t, "movsxd rax, eax") == 0) {
         item_set(&out->it[i], "cdqe");
     } else if (strcmp(t, "movsx eax, ax") == 0) {
@@ -2528,7 +2949,7 @@ static bool rw_lane0(const struct view *v, int i, struct prog *out, char *why,
                      size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int64_t x;
     if (in.nop != 3 || !imm_parse(in.op[2], &x) || x != 0) {
         FAIL("not a lane-0 extract");
@@ -2550,7 +2971,7 @@ static bool rw_sse_mov(const struct view *v, int i, struct prog *out,
                        char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     const char *to;
     if (strcmp(in.mn, "movapd") == 0 || strcmp(in.mn, "movdqa") == 0) {
         to = "movaps";
@@ -2567,7 +2988,7 @@ static bool rw_sse_zero(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     if ((strcmp(in.mn, "pxor") != 0 && strcmp(in.mn, "xorpd") != 0) ||
         strcmp(in.op[0], in.op[1]) != 0) {
         FAIL("not a PXOR/XORPD zeroing idiom");
@@ -2580,7 +3001,7 @@ static bool rw_narrow_move(const struct view *v, int i, struct prog *out,
                            char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     if (strcmp(in.mn, "mov") != 0 || !reg_op(in.op[0], &d, &dbits) ||
         dbits > 16) {
@@ -2603,7 +3024,7 @@ static bool rw_shlx(const struct view *v, int i, struct prog *out, char *why,
                     size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     const char *to = strcmp(in.mn, "shl") == 0 ? "shlx" :
                      strcmp(in.mn, "shr") == 0 ? "shrx" :
@@ -2621,7 +3042,7 @@ static bool rw_insert_xor(const struct view *v, int i, struct prog *out,
                           char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     if (!reg_op(in.op[0], &d, &dbits)) {
         FAIL("no register destination");
@@ -2641,7 +3062,7 @@ static bool rw_mov_imm_short(const struct view *v, int i, struct prog *out,
                              char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int r, bits;
     int64_t x;
     if (strcmp(in.mn, "mov") != 0 || in.nop != 2 ||
@@ -2680,23 +3101,23 @@ static bool rw_setcc_test(const struct view *v, int i, struct prog *out,
                           char *why, size_t whylen)
 {
     struct ins a, t, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int code = strncmp(a.mn, "set", 3) == 0 ? cc_code(a.mn + 3) : -1;
     int j = next_insn(v, i);
     int k = j >= 0 ? next_insn(v, j) : -1;
     if (code < 0 || k < 0) {
         FAIL("not SETcc, TEST, Jcc");
     }
-    ins_parse(v->p->it[j].text, &t);
-    ins_parse(v->p->it[k].text, &b);
+    ins_parse(itext(v, j), &t);
+    ins_parse(itext(v, k), &b);
     if (strcmp(t.mn, "test") != 0 || strcmp(t.op[0], a.op[0]) != 0 ||
         strcmp(t.op[1], a.op[0]) != 0) {
-        FAIL("`%s` does not test the SETcc's register", v->p->it[j].text);
+        FAIL("`%s` does not test the SETcc's register", itext(v, j));
     }
     bool je = strcmp(b.mn, "je") == 0 || strcmp(b.mn, "jz") == 0;
     bool jne = strcmp(b.mn, "jne") == 0 || strcmp(b.mn, "jnz") == 0;
     if (!je && !jne) {
-        FAIL("`%s` is not JE/JNE", v->p->it[k].text);
+        FAIL("`%s` is not JE/JNE", itext(v, k));
     }
     delete_item(out, j);
     item_set(&out->it[k], "j%s %s", CC[je ? code ^ 1 : code], b.op[0]);
@@ -2707,18 +3128,18 @@ static bool rw_setcc_xor(const struct view *v, int i, struct prog *out,
                          char *why, size_t whylen)
 {
     struct ins a, x;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int code = strncmp(a.mn, "set", 3) == 0 ? cc_code(a.mn + 3) : -1;
     int j = next_insn(v, i);
     if (code < 0 || j < 0) {
         FAIL("not SETcc then XOR");
     }
-    ins_parse(v->p->it[j].text, &x);
+    ins_parse(itext(v, j), &x);
     int64_t imm;
     if (strcmp(x.mn, "xor") != 0 || strcmp(x.op[0], a.op[0]) != 0 ||
         !imm_parse(x.op[1], &imm) || imm != 1) {
         FAIL("`%s` is not XOR of the SETcc's register with 1",
-             v->p->it[j].text);
+             itext(v, j));
     }
     item_set(&out->it[i], "set%s %s", CC[code ^ 1], a.op[0]);
     delete_item(out, j);
@@ -2731,14 +3152,14 @@ static bool rw_andn(const struct view *v, int i, struct prog *out, char *why,
                     size_t whylen)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int j = next_insn(v, i);
     if (strcmp(a.mn, "not") != 0 || j < 0) {
         FAIL("not NOT then AND");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     if (strcmp(b.mn, "and") != 0 || strcmp(b.op[0], a.op[0]) != 0) {
-        FAIL("`%s` is not an AND of the NOT's register", v->p->it[j].text);
+        FAIL("`%s` is not an AND of the NOT's register", itext(v, j));
     }
     item_set(&out->it[j], "andn %s, %s, %s", a.op[0], a.op[0], b.op[1]);
     delete_item(out, i);
@@ -2751,7 +3172,7 @@ static bool rw_lea_bmi(const struct view *v, int i, struct prog *out,
                        const char *to)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int d, dbits, s, sbits;
     struct mem m;
     int j = next_insn(v, i);
@@ -2760,11 +3181,11 @@ static bool rw_lea_bmi(const struct view *v, int i, struct prog *out,
         !gpr_parse(m.base, &s, &sbits) || j < 0) {
         FAIL("not LEA D, [S-1]");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     int bs, bbits;
     if (strcmp(b.mn, op) != 0 || strcmp(b.op[0], a.op[0]) != 0 ||
         !reg_op(b.op[1], &bs, &bbits) || bs != s) {
-        FAIL("`%s` is not %s D, S", v->p->it[j].text, op);
+        FAIL("`%s` is not %s D, S", itext(v, j), op);
     }
     item_set(&out->it[j], "%s %s, %s", to, a.op[0], gpr(s, dbits));
     delete_item(out, i);
@@ -2788,14 +3209,14 @@ static bool rw_blsi(const struct view *v, int i, struct prog *out, char *why,
                     size_t whylen)
 {
     struct ins a, b, c;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int j = next_insn(v, i);
     int k = j >= 0 ? next_insn(v, j) : -1;
     if (strcmp(a.mn, "mov") != 0 || k < 0) {
         FAIL("not MOV, NEG, AND");
     }
-    ins_parse(v->p->it[j].text, &b);
-    ins_parse(v->p->it[k].text, &c);
+    ins_parse(itext(v, j), &b);
+    ins_parse(itext(v, k), &c);
     if (strcmp(b.mn, "neg") != 0 || strcmp(b.op[0], a.op[0]) != 0 ||
         strcmp(c.mn, "and") != 0 || strcmp(c.op[0], a.op[0]) != 0 ||
         strcmp(c.op[1], a.op[1]) != 0) {
@@ -2811,18 +3232,453 @@ static bool rw_movbe(const struct view *v, int i, struct prog *out, char *why,
                      size_t whylen)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int j = next_insn(v, i);
     if (strcmp(a.mn, "mov") != 0 || !is_mem(a.op[1]) || j < 0) {
         FAIL("not a load");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     if (strcmp(b.mn, "bswap") != 0 || strcmp(b.op[0], a.op[0]) != 0) {
-        FAIL("`%s` does not swap the loaded register", v->p->it[j].text);
+        FAIL("`%s` does not swap the loaded register", itext(v, j));
     }
     item_set(&out->it[j], "movbe %s, %s", a.op[0], a.op[1]);
     delete_item(out, i);
     return true;
+}
+
+// --- the encoding rows, as byte edits ---
+
+// One instruction's bytes and where XED found its parts.
+struct enc {
+    uint8_t b[16];
+    int len;
+    int rex;        // position of the REX byte, or -1
+    int opc;        // position of the (last) opcode byte
+    int modrm;      // position of ModRM, or -1
+    int sib;        // position of SIB, or -1
+    int disp;       // position of the displacement, or -1
+    int disp_len;   // its bytes
+    int imm;        // position of the immediate, or -1
+    int imm_len;
+};
+
+static bool enc_of(const struct view *v, int i, struct enc *e)
+{
+    if (v->c->len[i] == 0) {
+        return false;
+    }
+    const xed_decoded_inst_t *x = &v->dec[i];
+    memset(e, 0, sizeof(*e));
+    e->len = v->c->len[i];
+    memcpy(e->b, v->c->bytes + v->c->off[i], (size_t) e->len);
+    e->rex = -1;
+    for (int k = 0; k < e->len; ++k) {
+        uint8_t c = e->b[k];
+        if (c == 0x66 || c == 0x67 || c == 0xF0 || c == 0xF2 || c == 0xF3 ||
+            c == 0x2E || c == 0x36 || c == 0x3E || c == 0x26 || c == 0x64 ||
+            c == 0x65) {
+            continue;
+        }
+        if ((c & 0xF0) == 0x40) {
+            e->rex = k;
+        }
+        break;
+    }
+    e->opc = xed3_operand_get_pos_nominal_opcode(x);
+    e->modrm = xed_operand_values_has_modrm_byte(x) ?
+        (int) xed3_operand_get_pos_modrm(x) : -1;
+    e->sib = xed_operand_values_has_sib_byte(
+        xed_decoded_inst_operands_const(x)) ?
+        (int) xed3_operand_get_pos_sib(x) : -1;
+    e->disp_len = (int) xed3_operand_get_disp_width(x) / 8;
+    e->disp = e->disp_len > 0 ? (int) xed3_operand_get_pos_disp(x) : -1;
+    e->imm_len = (int) xed_decoded_inst_get_immediate_width(x);
+    e->imm = e->imm_len > 0 ? (int) xed3_operand_get_pos_imm(x) : -1;
+    return true;
+}
+
+// Delete n bytes at position at.
+static void enc_cut(struct enc *e, int at, int n)
+{
+    memmove(e->b + at, e->b + at + n, (size_t) (e->len - at - n));
+    e->len -= n;
+}
+
+static void enc_emit(struct prog *out, int i, const struct enc *e)
+{
+    char t[TEXTLEN];
+    int k = snprintf(t, sizeof(t), ".byte ");
+    for (int j = 0; j < e->len; ++j) {
+        k += snprintf(t + k, sizeof(t) - (size_t) k, "%s0x%02x", j ? "," : "",
+                      e->b[j]);
+    }
+    item_set(&out->it[i], "%s", t);
+}
+
+// Delete the first byte equal to `prefix` among the legacy prefixes.
+static bool rw_drop_prefix(const struct view *v, int i, struct prog *out,
+                           char *why, size_t whylen, uint8_t prefix)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e)) {
+        FAIL("no instruction");
+    }
+    for (int k = 0; k < e.len && k < e.opc; ++k) {
+        if (e.b[k] == prefix) {
+            enc_cut(&e, k, 1);
+            enc_emit(out, i, &e);
+            return true;
+        }
+    }
+    FAIL("no %#x prefix", prefix);
+}
+
+static bool rw_drop_lock(const struct view *v, int i, struct prog *out,
+                         char *why, size_t whylen)
+{
+    if (xed_decoded_inst_get_iclass(&v->dec[i]) != XED_ICLASS_XCHG) {
+        FAIL("not XCHG");
+    }
+    return rw_drop_prefix(v, i, out, why, whylen, 0xF0);
+}
+
+static bool rw_drop_rep(const struct view *v, int i, struct prog *out,
+                        char *why, size_t whylen)
+{
+    if (xed_decoded_inst_get_iclass(&v->dec[i]) != XED_ICLASS_RET_NEAR) {
+        FAIL("not RET");
+    }
+    return rw_drop_prefix(v, i, out, why, whylen, 0xF3);
+}
+
+static bool rw_drop_rex(const struct view *v, int i, struct prog *out,
+                        char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.rex < 0) {
+        FAIL("no REX prefix");
+    }
+    enc_cut(&e, e.rex, 1);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+// The SIB's base moves into ModRM.rm and the SIB goes.
+static bool rw_drop_sib(const struct view *v, int i, struct prog *out,
+                        char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.sib < 0 || e.modrm < 0 ||
+        (e.b[e.sib] >> 3 & 7) != 4 || (e.b[e.sib] & 7) == 4 ||
+        ((e.b[e.sib] & 7) == 5 && (e.b[e.modrm] >> 6) == 0)) {
+        FAIL("no SIB byte without an index, over a base ModRM can name");
+    }
+    e.b[e.modrm] = (uint8_t) ((e.b[e.modrm] & 0xF8) | (e.b[e.sib] & 7));
+    enc_cut(&e, e.sib, 1);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+// The low three bits of the memory operand's base register.
+static int enc_base_low(const struct enc *e)
+{
+    return e->sib >= 0 ? e->b[e->sib] & 7 : e->b[e->modrm] & 7;
+}
+
+// A zero displacement goes, ModRM's mod becoming 00 -- except under an
+// RBP or R13 base, where mod 00 means no base (or RIP), and the zero
+// shrinks to a disp8 instead.
+static bool rw_drop_zero_disp(const struct view *v, int i, struct prog *out,
+                              char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.disp < 0 || e.modrm < 0) {
+        FAIL("no displacement");
+    }
+    for (int k = 0; k < e.disp_len; ++k) {
+        if (e.b[e.disp + k] != 0) {
+            FAIL("the displacement is not zero");
+        }
+    }
+    if (enc_base_low(&e) == 5) {
+        if (e.disp_len != 4) {
+            FAIL("a disp8 under RBP/R13 is already the shortest");
+        }
+        e.b[e.modrm] = (uint8_t) ((e.b[e.modrm] & 0x3F) | 0x40);
+        enc_cut(&e, e.disp + 1, 3);
+    } else {
+        e.b[e.modrm] &= 0x3F;
+        enc_cut(&e, e.disp, e.disp_len);
+    }
+    enc_emit(out, i, &e);
+    return true;
+}
+
+static bool rw_disp8(const struct view *v, int i, struct prog *out, char *why,
+                     size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.disp < 0 || e.disp_len != 4 ||
+        e.modrm < 0 || (e.b[e.modrm] >> 6) != 2) {
+        FAIL("no disp32");
+    }
+    int32_t d;
+    memcpy(&d, e.b + e.disp, 4);
+    if (d < -128 || d > 127) {
+        FAIL("the displacement %d needs 32 bits", d);
+    }
+    e.b[e.modrm] = (uint8_t) ((e.b[e.modrm] & 0x3F) | 0x40);
+    enc_cut(&e, e.disp + 1, 3);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+// The rel8 form: the assembler picks it when it reaches, so the claim is
+// checked on the result (expect_len).
+static bool rw_branch_rel8(const struct view *v, int i, struct prog *out,
+                           char *why, size_t whylen)
+{
+    const char *t = itext(v, i);
+    if (strncmp(t, "{disp32} j", 10) != 0) {
+        FAIL("not a branch spelled with rel32");
+    }
+    item_set(&out->it[i], "%s", t + 9);
+    out->expect_item = i;
+    out->expect_len = 2;
+    return true;
+}
+
+// 87 /r with the accumulator -> 90+r.
+static bool rw_xchg_acc(const struct view *v, int i, struct prog *out,
+                        char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.modrm < 0 || e.b[e.opc] != 0x87 ||
+        (e.b[e.modrm] >> 6) != 3) {
+        FAIL("not XCHG reg, reg through ModRM");
+    }
+    uint8_t m = e.b[e.modrm];
+    uint8_t rex = e.rex >= 0 ? e.b[e.rex] : 0;
+    int reg = (m >> 3 & 7) | ((rex & 4) ? 8 : 0);
+    int rm = (m & 7) | ((rex & 1) ? 8 : 0);
+    int other = reg == 0 ? rm : rm == 0 ? reg : -1;
+    if (other < 0) {
+        FAIL("neither operand is the accumulator");
+    }
+    struct enc o = e;
+    o.len = 0;
+    for (int k = 0; k < e.len && k < (e.rex >= 0 ? e.rex : e.opc); ++k) {
+        o.b[o.len++] = e.b[k];   // legacy prefixes (66)
+    }
+    uint8_t nrex = (uint8_t) (0x40 | (rex & 8) | (other >= 8 ? 1 : 0));
+    if (nrex != 0x40) {
+        o.b[o.len++] = nrex;
+    }
+    o.b[o.len++] = (uint8_t) (0x90 | (other & 7));
+    enc_emit(out, i, &o);
+    return true;
+}
+
+// 80/81 /op AL/eAX, imm -> the accumulator opcode; F6/F7 /0 -> A8/A9.
+static bool rw_implicit_reg(const struct view *v, int i, struct prog *out,
+                            char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.modrm < 0 || e.imm < 0 ||
+        (e.b[e.modrm] & 0xC7) != 0xC0) {
+        FAIL("not an immediate operation on the accumulator through ModRM");
+    }
+    uint8_t opc = e.b[e.opc], op = e.b[e.modrm] >> 3 & 7;
+    uint8_t to;
+    if (opc == 0x80 || opc == 0x81) {
+        to = (uint8_t) (op << 3 | (opc == 0x80 ? 4 : 5));
+    } else if ((opc == 0xF6 || opc == 0xF7) && op == 0) {
+        to = opc == 0xF6 ? 0xA8 : 0xA9;
+    } else {
+        FAIL("opcode %#x has no accumulator form", opc);
+    }
+    e.b[e.opc] = to;
+    enc_cut(&e, e.modrm, 1);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+// C1 /op r, 1 -> D1 /op r.
+static bool rw_implicit_imm(const struct view *v, int i, struct prog *out,
+                            char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.b[e.opc] != 0xC1 || e.imm < 0 ||
+        e.b[e.imm] != 1) {
+        FAIL("not C1 /op r, 1");
+    }
+    e.b[e.opc] = 0xD1;
+    enc_cut(&e, e.imm, 1);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+// 81 /op and 69 /r with an imm32 (or imm16) that fits eight bits ->
+// 83 /op and 6B /r with an imm8.
+static bool rw_imm8_bytes(const struct view *v, int i, struct prog *out,
+                          char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || e.imm < 0 || e.imm_len < 2) {
+        FAIL("no wide immediate");
+    }
+    uint8_t opc = e.b[e.opc];
+    if (opc != 0x81 && opc != 0x69) {
+        FAIL("opcode %#x has no imm8 form here", opc);
+    }
+    int32_t imm = e.imm_len == 2 ? (int16_t) (e.b[e.imm] | e.b[e.imm + 1] << 8)
+                                 : (int32_t) (e.b[e.imm] | e.b[e.imm + 1] << 8 |
+                                              e.b[e.imm + 2] << 16 |
+                                              (uint32_t) e.b[e.imm + 3] << 24);
+    if (imm < -128 || imm > 127) {
+        FAIL("the immediate %d needs more than eight bits", imm);
+    }
+    e.b[e.opc] = opc == 0x81 ? 0x83 : 0x6B;
+    e.b[e.imm] = (uint8_t) (int8_t) imm;
+    enc_cut(&e, e.imm + 1, e.imm_len - 1);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+static bool rw_mov_imm_short(const struct view *v, int i, struct prog *out,
+                             char *why, size_t whylen);
+
+// The MOV rows from text, everything else from its bytes.
+static bool rw_imm_short(const struct view *v, int i, struct prog *out,
+                         char *why, size_t whylen)
+{
+    if (strncmp(v->p->it[i].text, ".byte ", 6) != 0) {
+        return rw_mov_imm_short(v, i, out, why, whylen);
+    }
+    struct enc e;
+    if (enc_of(v, i, &e) && (e.b[e.opc] == 0xC7) && e.modrm >= 0) {
+        // C7 /0 r, imm -> B8+r: imm32 for 32 bits; for 64 bits the 32-bit
+        // B8+r, which zero-extends a non-negative imm32.
+        uint8_t rex = e.rex >= 0 ? e.b[e.rex] : 0;
+        int reg = (e.b[e.modrm] & 7) | ((rex & 1) ? 8 : 0);
+        struct enc o;
+        o.len = 0;
+        for (int k = 0; k < (e.rex >= 0 ? e.rex : e.opc); ++k) {
+            o.b[o.len++] = e.b[k];
+        }
+        if (reg >= 8) {
+            o.b[o.len++] = 0x41;
+        }
+        o.b[o.len++] = (uint8_t) (0xB8 | (reg & 7));
+        memcpy(o.b + o.len, e.b + e.imm, (size_t) e.imm_len);
+        o.len += e.imm_len;
+        enc_emit(out, i, &o);
+        return true;
+    }
+    return rw_imm8_bytes(v, i, out, why, whylen);
+}
+
+// C4 three-byte VEX -> C5 two-byte: R from the first payload byte, vvvv,
+// L and pp from the second.
+static bool rw_vex2(const struct view *v, int i, struct prog *out, char *why,
+                    size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || xed3_operand_get_vexvalid(&v->dec[i]) != 1) {
+        FAIL("not VEX");
+    }
+    int at = e.opc - 3;
+    if (at < 0 || e.b[at] != 0xC4 || (e.b[at + 1] & 0x1F) != 1) {
+        FAIL("no three-byte VEX prefix in map 0F");
+    }
+    uint8_t p0 = e.b[at + 1], p1 = e.b[at + 2];
+    e.b[at] = 0xC5;
+    e.b[at + 1] = (uint8_t) ((p0 & 0x80) | (p1 & 0x7F));
+    enc_cut(&e, at + 2, 1);
+    enc_emit(out, i, &e);
+    return true;
+}
+
+// 62 EVEX -> C4 VEX: R, X, B and the map from P0; W, vvvv and pp from P1;
+// L from P2. A compressed disp8 is scaled back: XED reports the effective
+// displacement, which VEX spells as a disp8 when it fits and a disp32
+// otherwise.
+static bool rw_evex_to_vex(const struct view *v, int i, struct prog *out,
+                           char *why, size_t whylen)
+{
+    struct enc e;
+    if (!enc_of(v, i, &e) || xed3_operand_get_vexvalid(&v->dec[i]) != 2 ||
+        e.b[0] != 0x62 || e.opc != 4) {
+        FAIL("no EVEX prefix");
+    }
+    uint8_t p0 = e.b[1], p1 = e.b[2], p2 = e.b[3];
+    int64_t disp = e.disp >= 0 ?
+        xed_decoded_inst_get_memory_displacement(&v->dec[i], 0) : 0;
+    struct enc o;
+    o.len = 0;
+    o.b[o.len++] = 0xC4;
+    o.b[o.len++] = (uint8_t) ((p0 & 0xE0) | (p0 & 0x07));
+    o.b[o.len++] = (uint8_t) ((p1 & 0xF8) | ((p2 >> 5) & 1) << 2 | (p1 & 3));
+    // The opcode onward, the disp8 rescaled.
+    bool widen = e.disp_len == 1 && (disp < -128 || disp > 127);
+    for (int k = 4; k < e.len; ++k) {
+        if (k == e.modrm && widen) {
+            o.b[o.len++] = (uint8_t) ((e.b[k] & 0x3F) | 0x80);
+        } else if (k == e.disp && e.disp_len == 1 && widen) {
+            put32(o.b + o.len, (int32_t) disp);
+            o.len += 4;
+        } else if (k == e.disp && e.disp_len == 1) {
+            o.b[o.len++] = (uint8_t) (int8_t) disp;
+        } else {
+            o.b[o.len++] = e.b[k];
+        }
+    }
+    enc_emit(out, i, &o);
+    return true;
+}
+
+// A three-operand commutative op with its high source in rm: swap the
+// sources. A register move: the other direction's opcode, two-byte VEX.
+static bool rw_vex_order(const struct view *v, int i, struct prog *out,
+                         char *why, size_t whylen)
+{
+    struct ins in;
+    ins_parse(itext(v, i), &in);
+    int a3, b3, c3;
+    if (in.nop == 3 && in.mn[0] == 'v' && xmm_parse(in.op[0], &a3) &&
+        xmm_parse(in.op[1], &b3) && xmm_parse(in.op[2], &c3)) {
+        item_set(&out->it[i], "%s %s, %s, %s", in.mn, in.op[0], in.op[2],
+                 in.op[1]);
+        return true;
+    }
+    int d, src;
+    if (in.nop != 2 || !xmm_parse(in.op[0], &d) || !xmm_parse(in.op[1], &src)) {
+        FAIL("not a register move");
+    }
+    static const struct {
+        const char *mn;
+        uint8_t pp, store;
+    } MV[] = {
+        {"vmovaps", 0, 0x29}, {"vmovapd", 1, 0x29}, {"vmovups", 0, 0x11},
+        {"vmovupd", 1, 0x11}, {"vmovdqa", 1, 0x7F}, {"vmovdqu", 2, 0x7F},
+    };
+    for (size_t k = 0; k < sizeof(MV) / sizeof(MV[0]); ++k) {
+        if (strcmp(in.mn, MV[k].mn) != 0) {
+            continue;
+        }
+        if (d >= 8) {
+            FAIL("the destination is a high register");
+        }
+        struct enc o;
+        o.len = 0;
+        o.b[o.len++] = 0xC5;
+        o.b[o.len++] = (uint8_t) ((src >= 8 ? 0 : 0x80) | 0x78 | MV[k].pp);
+        o.b[o.len++] = MV[k].store;
+        o.b[o.len++] = (uint8_t) (0xC0 | (src & 7) << 3 | d);
+        enc_emit(out, i, &o);
+        return true;
+    }
+    FAIL("`%s` has no other-direction move here", in.mn);
 }
 
 // --- CAS loops and MULX ---
@@ -2833,16 +3689,16 @@ static bool rw_cas_loop(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
     struct ins m, o, c;
-    ins_parse(v->p->it[i].text, &m);
+    ins_parse(itext(v, i), &m);
     int j = next_insn(v, i);
     int k = j >= 0 ? next_insn(v, j) : -1;
     int l = k >= 0 ? next_insn(v, k) : -1;
     if (strcmp(m.mn, "mov") != 0 || l < 0 ||
-        strncmp(v->p->it[k].text, "lock cmpxchg ", 13) != 0) {
+        strncmp(itext(v, k), "lock cmpxchg ", 13) != 0) {
         FAIL("not MOV, op, LOCK CMPXCHG, JNE");
     }
-    ins_parse(v->p->it[j].text, &o);
-    ins_parse(v->p->it[k].text + 5, &c);
+    ins_parse(itext(v, j), &o);
+    ins_parse(itext(v, k) + 5, &c);
     if ((strcmp(o.mn, "or") != 0 && strcmp(o.mn, "and") != 0 &&
          strcmp(o.mn, "xor") != 0) || strcmp(o.op[0], m.op[0]) != 0 ||
         strcmp(c.op[1], m.op[0]) != 0) {
@@ -2850,8 +3706,8 @@ static bool rw_cas_loop(const struct view *v, int i, struct prog *out,
     }
     char jne[TEXTLEN];
     snprintf(jne, sizeof(jne), "jne @%d", v->p->it[i].label);
-    if (v->p->it[i].label < 0 || strcmp(v->p->it[l].text, jne) != 0) {
-        FAIL("`%s` does not branch back to the head", v->p->it[l].text);
+    if (v->p->it[i].label < 0 || strcmp(itext(v, l), jne) != 0) {
+        FAIL("`%s` does not branch back to the head", itext(v, l));
     }
     item_set(&out->it[i], "lock %s %s, %s", o.mn, c.op[0], o.op[1]);
     delete_item(out, j);
@@ -2865,17 +3721,17 @@ static bool rw_mulx(const struct view *v, int i, struct prog *out, char *why,
                     size_t whylen)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int j = next_insn(v, i);
     int r, bits, d, dbits, s2, sbits;
     if (strcmp(a.mn, "mul") != 0 || !reg_op(a.op[0], &r, &bits) || r != 2 ||
         j < 0) {
         FAIL("not MUL RDX/EDX");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     if (strcmp(b.mn, "mov") != 0 || !reg_op(b.op[0], &d, &dbits) || d != 0 ||
         !reg_op(b.op[1], &s2, &sbits) || s2 != 2 || dbits != bits) {
-        FAIL("`%s` is not MOV RAX, RDX at the MUL's width", v->p->it[j].text);
+        FAIL("`%s` is not MOV RAX, RDX at the MUL's width", itext(v, j));
     }
     item_set(&out->it[i], "mulx %s, %s, %s", gpr(0, bits), gpr(2, bits),
              gpr(0, bits));
@@ -2898,7 +3754,7 @@ static bool known_value(const struct view *v, int i, int num, uint64_t *val,
             continue;
         }
         struct ins in;
-        ins_parse(v->p->it[j].text, &in);
+        ins_parse(itext(v, j), &in);
         int r, bits;
         int64_t x;
         if ((strcmp(in.mn, "xor") == 0 || strcmp(in.mn, "sub") == 0) &&
@@ -2927,7 +3783,7 @@ static bool rw_const_condition(const struct view *v, int i, struct prog *out,
                                char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int r, bits;
     if ((strcmp(in.mn, "test") != 0 && strcmp(in.mn, "cmp") != 0) ||
         in.nop != 2 || !reg_op(in.op[0], &r, &bits)) {
@@ -2957,7 +3813,7 @@ static bool rw_const_condition(const struct view *v, int i, struct prog *out,
             continue;
         }
         struct ins c;
-        ins_parse(v->p->it[j].text, &c);
+        ins_parse(itext(v, j), &c);
         const char *cc = NULL;
         if (c.mn[0] == 'j' && strcmp(c.mn, "jmp") != 0) {
             cc = c.mn + 1;
@@ -3017,7 +3873,7 @@ static bool frame_access_of(const struct view *v, int j, struct mem *m,
                             struct slot_access *a)
 {
     struct ins in;
-    ins_parse(v->p->it[j].text, &in);
+    ins_parse(itext(v, j), &in);
     if (in.nop != 2) {
         return false;
     }
@@ -3103,7 +3959,7 @@ static int frame_partner(const struct view *v, int i, const struct mem *slot,
             continue;
         }
         struct ins in;
-        ins_parse(v->p->it[j].text, &in);
+        ins_parse(itext(v, j), &in);
         bool is_access = frame_access_of(v, j, &m, &a);
         if (is_access && same_slot(&m, slot) && a.reg >= 0 &&
             a.xmm == want_xmm &&
@@ -3175,7 +4031,7 @@ static bool const_producer(const struct view *v, int j, int *reg,
                            uint64_t *val, int *known)
 {
     struct ins in;
-    ins_parse(v->p->it[j].text, &in);
+    ins_parse(itext(v, j), &in);
     int bits;
     int64_t x;
     if (strcmp(in.mn, "mov") == 0 && in.nop == 2 &&
@@ -3200,7 +4056,7 @@ static bool rw_remat(const struct view *v, int i, struct prog *out, char *why,
     int d, known;
     uint64_t want;
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int dbits;
     if (!const_producer(v, i, &d, &want, &known) ||
         !reg_op(in.op[0], &d, &dbits)) {
@@ -3248,7 +4104,7 @@ static bool rw_mov_const_fold(const struct view *v, int i, struct prog *out,
         FAIL("no consumer");
     }
     struct ins c;
-    ins_parse(v->p->it[j].text, &c);
+    ins_parse(itext(v, j), &c);
     int s, sbits;
     // The source operand, or either operand of the commutative TEST.
     int other = 0;
@@ -3259,10 +4115,10 @@ static bool rw_mov_const_fold(const struct view *v, int i, struct prog *out,
         other = 1;
     } else if (c.nop != 2 || !reg_op(c.op[1], &s, &sbits) || s != r) {
         FAIL("`%s` does not read the constant as its source",
-             v->p->it[j].text);
+             itext(v, j));
     }
     if (sbits > known) {
-        FAIL("`%s` reads bits the MOV did not set", v->p->it[j].text);
+        FAIL("`%s` reads bits the MOV did not set", itext(v, j));
     }
     int64_t imm = sign_extend(val, sbits);
     item_set(&out->it[j], "%s %s, %" PRId64, c.mn, c.op[other], imm);
@@ -3315,7 +4171,7 @@ static bool rw_lea_into_mem(const struct view *v, int i, struct prog *out,
                             char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     struct mem a;
     if (strcmp(in.mn, "lea") != 0 || !reg_op(in.op[0], &d, &dbits) ||
@@ -3327,7 +4183,7 @@ static bool rw_lea_into_mem(const struct view *v, int i, struct prog *out,
         FAIL("no consumer");
     }
     char t[TEXTLEN];
-    if (!fold_address(v->p->it[j].text, gpr(d, 64), &a, t, sizeof(t), why,
+    if (!fold_address(itext(v, j), gpr(d, 64), &a, t, sizeof(t), why,
                       whylen)) {
         return false;
     }
@@ -3340,7 +4196,7 @@ static bool rw_add_into_mem(const struct view *v, int i, struct prog *out,
                             char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     if (!reg_op(in.op[0], &d, &dbits)) {
         FAIL("no register destination");
@@ -3369,7 +4225,7 @@ static bool rw_add_into_mem(const struct view *v, int i, struct prog *out,
         FAIL("no consumer");
     }
     char text[TEXTLEN];
-    if (!fold_address(v->p->it[j].text, gpr(d, 64), &a, text, sizeof(text),
+    if (!fold_address(itext(v, j), gpr(d, 64), &a, text, sizeof(text),
                       why, whylen)) {
         return false;
     }
@@ -3405,7 +4261,7 @@ static bool rw_add_into_lea(const struct view *v, int i, struct prog *out,
                             char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits;
     struct mem a;
     if (strcmp(in.mn, "lea") != 0 || !reg_op(in.op[0], &d, &dbits) ||
@@ -3417,11 +4273,11 @@ static bool rw_add_into_lea(const struct view *v, int i, struct prog *out,
         FAIL("no ADD");
     }
     struct ins c;
-    ins_parse(v->p->it[j].text, &c);
+    ins_parse(itext(v, j), &c);
     int cd, cbits, term;
     int64_t disp;
     if (!reg_op(c.op[0], &cd, &cbits) || !add_term(&c, &disp, &term)) {
-        FAIL("`%s` is not an ADD", v->p->it[j].text);
+        FAIL("`%s` is not an ADD", itext(v, j));
     }
     int dest = d;
     if (cd == d) {
@@ -3456,7 +4312,7 @@ static bool rw_mov_add_lea(const struct view *v, int i, struct prog *out,
                            char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int d, dbits, s, sbits;
     if (strcmp(in.mn, "mov") != 0 || !reg_op(in.op[0], &d, &dbits) ||
         !reg_op(in.op[1], &s, &sbits)) {
@@ -3472,12 +4328,12 @@ static bool rw_mov_add_lea(const struct view *v, int i, struct prog *out,
         FAIL("no ADD");
     }
     struct ins c;
-    ins_parse(v->p->it[j].text, &c);
+    ins_parse(itext(v, j), &c);
     int cd, cbits, term;
     int64_t disp;
     if (!reg_op(c.op[0], &cd, &cbits) || cd != d ||
         !add_term(&c, &disp, &term)) {
-        FAIL("`%s` is not an ADD to the copy", v->p->it[j].text);
+        FAIL("`%s` is not an ADD to the copy", itext(v, j));
     }
     struct mem a;
     memset(&a, 0, sizeof(a));
@@ -3501,7 +4357,7 @@ static bool load_fold(const struct view *v, int i, struct prog *out,
                       bool compare)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int r, rbits;
     struct mem m;
     if (strcmp(in.mn, "mov") != 0 || !reg_op(in.op[0], &r, &rbits) ||
@@ -3513,7 +4369,7 @@ static bool load_fold(const struct view *v, int i, struct prog *out,
         FAIL("no consumer");
     }
     struct ins c;
-    ins_parse(v->p->it[j].text, &c);
+    ins_parse(itext(v, j), &c);
     int s, sbits;
     char mt[64];
     if (compare) {
@@ -3530,13 +4386,13 @@ static bool load_fold(const struct view *v, int i, struct prog *out,
             item_set(&out->it[j], "%s %s, %s", c.mn, c.op[0], mt);
         } else {
             FAIL("`%s` does not compare the loaded register",
-                 v->p->it[j].text);
+                 itext(v, j));
         }
     } else {
         if (c.nop <= src_operand ||
             !reg_op(c.op[src_operand], &s, &sbits) || s != r) {
             FAIL("`%s` does not read the loaded register",
-                 v->p->it[j].text);
+                 itext(v, j));
         }
         mem_format(&m, strncmp(c.mn, "movsxd", 6) == 0 ? 32 : sbits, mt,
                    sizeof(mt));
@@ -3560,7 +4416,7 @@ static bool rw_load_alu(const struct view *v, int i, struct prog *out,
     int j = next_insn(v, i);
     struct ins c;
     if (j >= 0) {
-        ins_parse(v->p->it[j].text, &c);
+        ins_parse(itext(v, j), &c);
         if (c.nop == 1) {
             return load_fold(v, i, out, why, whylen, 0, false);
         }
@@ -3590,7 +4446,7 @@ static bool rw_load_vecop(const struct view *v, int i, struct prog *out,
                           char *why, size_t whylen)
 {
     struct ins in;
-    ins_parse(v->p->it[i].text, &in);
+    ins_parse(itext(v, i), &in);
     int x;
     struct mem m;
     if (!xmm_parse(in.op[0], &x) || !mem_parse(in.op[1], &m)) {
@@ -3601,9 +4457,9 @@ static bool rw_load_vecop(const struct view *v, int i, struct prog *out,
         FAIL("no consumer");
     }
     struct ins c;
-    ins_parse(v->p->it[j].text, &c);
+    ins_parse(itext(v, j), &c);
     if (c.nop != 2 || strcmp(c.op[1], in.op[0]) != 0) {
-        FAIL("`%s` does not read the loaded register", v->p->it[j].text);
+        FAIL("`%s` does not read the loaded register", itext(v, j));
     }
     item_set(&out->it[j], "%s %s, %s", c.mn, c.op[0], in.op[1]);
     delete_item(out, i);
@@ -3614,12 +4470,12 @@ static bool rw_shift_pair(const struct view *v, int i, struct prog *out,
                           char *why, size_t whylen)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int j = next_insn(v, i);
     if (j < 0) {
         FAIL("no second shift");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     int r, bits;
     int64_t k1, k2;
     if (strcmp(a.mn, "shl") != 0 || !reg_op(a.op[0], &r, &bits) ||
@@ -3652,7 +4508,7 @@ static bool rw_cmp_one(const struct view *v, int i, struct prog *out,
                        char *why, size_t whylen)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int r, bits;
     int64_t x;
     if (strcmp(a.mn, "cmp") != 0 || !reg_op(a.op[0], &r, &bits) ||
@@ -3663,7 +4519,7 @@ static bool rw_cmp_one(const struct view *v, int i, struct prog *out,
     if (j < 0) {
         FAIL("no branch");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     const char *to;
     if (strcmp(b.mn, "jb") == 0 || strcmp(b.mn, "jc") == 0 ||
         strcmp(b.mn, "jnae") == 0) {
@@ -3683,7 +4539,7 @@ static bool rw_neg_fold(const struct view *v, int i, struct prog *out,
                         char *why, size_t whylen)
 {
     struct ins a, b;
-    ins_parse(v->p->it[i].text, &a);
+    ins_parse(itext(v, i), &a);
     int r, bits;
     if (strcmp(a.mn, "neg") != 0 || !reg_op(a.op[0], &r, &bits)) {
         FAIL("not NEG reg");
@@ -3692,10 +4548,10 @@ static bool rw_neg_fold(const struct view *v, int i, struct prog *out,
     if (j < 0) {
         FAIL("no ADD/SUB");
     }
-    ins_parse(v->p->it[j].text, &b);
+    ins_parse(itext(v, j), &b);
     if (b.nop != 2 || strcmp(b.op[1], a.op[0]) != 0) {
         FAIL("`%s` does not take the negated register as its source",
-             v->p->it[j].text);
+             itext(v, j));
     }
     if (strcmp(b.mn, "add") == 0) {
         item_set(&out->it[j], "sub %s, %s", b.op[0], b.op[1]);
@@ -3719,8 +4575,8 @@ struct kind {
 static const struct kind KINDS[] = {
     {"dead compare", rw_delete_compare, MODE_FLAGS},
     {"suboptimal MOV zero", rw_mov_zero, MODE_FLAGS},
-    {"oversized MOV encoding", rw_mov_imm_short, MODE_FOLD},
-    {"oversized immediate", rw_mov_imm_short, MODE_FOLD},
+    {"oversized MOV encoding", rw_imm_short, MODE_ENCODE},
+    {"oversized immediate", rw_imm_short, MODE_ENCODE},
     {"oversized TEST immediate", rw_test_imm8, MODE_FLAGS},
     {"suboptimal AND immediate", rw_and_imm_movzx, MODE_FLAGS},
     {"redundant AND immediate", rw_and_minus_one, MODE_FLAGS},
@@ -3760,6 +4616,19 @@ static const struct kind KINDS[] = {
     {"missing BLSI", rw_blsi, MODE_FOLD},
     {"missing MOVBE", rw_movbe, MODE_FOLD},
     {"missing MULX", rw_mulx, MODE_FOLD},
+    {"unneeded REX prefix", rw_drop_rex, MODE_ENCODE},
+    {"unneeded SIB byte", rw_drop_sib, MODE_ENCODE},
+    {"unneeded zero displacement", rw_drop_zero_disp, MODE_ENCODE},
+    {"oversized displacement", rw_disp8, MODE_ENCODE},
+    {"oversized branch displacement", rw_branch_rel8, MODE_ENCODE},
+    {"oversized XCHG encoding", rw_xchg_acc, MODE_ENCODE},
+    {"unneeded explicit register", rw_implicit_reg, MODE_ENCODE},
+    {"unneeded explicit immediate", rw_implicit_imm, MODE_ENCODE},
+    {"unneeded LOCK prefix", rw_drop_lock, MODE_ENCODE},
+    {"unneeded REP prefix on RET", rw_drop_rep, MODE_ENCODE},
+    {"oversized VEX encoding", rw_vex2, MODE_ENCODE},
+    {"oversized EVEX encoding", rw_evex_to_vex, MODE_ENCODE},
+    {"suboptimal VEX operand order", rw_vex_order, MODE_ENCODE},
     {"CAS loop foldable into LOCK op", rw_cas_loop, MODE_FOLD},
     {"shift pair foldable into extend", rw_shift_pair, MODE_FLAGS},
     {"NEG foldable into ADD/SUB", rw_neg_fold, MODE_FLAGS},
@@ -4486,6 +5355,27 @@ static void run_batches(long *next_batch, long nbatches, long nprogs,
             assemble(vp, nv, vcodes, vok);
         }
         for (int k = 0; k < nv; ++k) {
+            const struct prog *q = vars[k].p;
+            if (vok[k] && q->expect_item >= 0 &&
+                vcodes[k].len[q->expect_item] != q->expect_len) {
+                // The rewrite's own encoding is not what its row claims
+                // (a rel8 branch that does not reach).
+                vok[k] = false;
+                if (!vars[k].control) {
+                    struct stat_row *st = stat_for(vars[k].name);
+                    ++st->not_applied;
+                    if (printed < 20) {
+                        fprintf(rep, "NOT APPLIED %s (program %ld, item %d): "
+                                "the rewrite encodes in %d bytes, not %d\n",
+                                vars[k].name, base + vars[k].prog,
+                                vars[k].item, vcodes[k].len[q->expect_item],
+                                q->expect_len);
+                        print_prog(&progs[vars[k].prog], vars[k].item, q);
+                        ++printed;
+                    }
+                }
+                continue;
+            }
             if (!vok[k] && !vars[k].control) {
                 struct stat_row *st = stat_for(vars[k].name);
                 ++st->not_applied;
@@ -4654,6 +5544,7 @@ int main(int argc, char **argv)
     if (__builtin_cpu_supports("bmi2")) {
         extensions |= X86LINT_EXT_BMI2;
     }
+    host_avx512vl = __builtin_cpu_supports("avx512vl");
     {
         // MOVBE: CPUID.1:ECX bit 22.
         unsigned eax = 1, ebx, ecx = 0, edx;

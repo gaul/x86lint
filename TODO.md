@@ -991,10 +991,17 @@ Rows not run, and why:
 
 | Rows | Why |
 | --- | --- |
-| unneeded REX prefix, unneeded SIB byte, unneeded zero displacement, oversized displacement, oversized branch displacement, oversized XCHG encoding, oversized VEX/EVEX encoding, suboptimal VEX operand order, unneeded explicit register/immediate, unneeded LOCK prefix, unneeded REP prefix on RET | encoding-only: the assembler never emits the original from text, so a plant would need raw bytes. The REX row is found (584 times) but has no rewriter |
 | missing APX NDD, missing APX SETZU | no host here runs APX |
 | OR foldable into memory | needs `-m v8` and V8's pointer-compression register conventions |
 | missing BZHI, length-changing prefix stall, AVX-SSE transition, IBT-bypassing NOTRACK call, suboptimal SETcc zero-extension, missing SSE dependency break, merging scalar move, stale VEX merge operand | advisory or security classes, or advice with no single rewrite; rwfuzz asks only for `X86LINT_CLASS_REWRITE` |
+
+The encoding-only rows (REX, SIB, LOCK and REP prefixes, displacement and
+immediate widths, the XCHG, VEX and EVEX encodings, the branch
+displacement, the accumulator and one-bit forms) were planted on
+2026-11-10 by the `encode` family, as raw bytes the assembler would never
+choose, with rewriters that make the byte edit each row names. All 13 run
+clean (343,171 findings at 20,000 `encode` programs); a check that ignored
+REX's effect on SPL..DIL was caught 1,404 times in 5,000.
 
 Two rows rest on an assumption rather than a proof: "merging scalar move"
 and "missing SSE dependency break" assume a scalar's upper lanes are dead

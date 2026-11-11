@@ -12,7 +12,7 @@
 #
 #   RWFUZZ_PROGRAMS   programs for `all` (default 10000)
 #   RWFUZZ_SEED       seed (default 0: the same programs every run)
-#   RWFUZZ_MIN_KINDS  the floor on the kinds `all` runs (default 60)
+#   RWFUZZ_MIN_KINDS  the floor on the kinds `all` runs (default 75)
 #   RWFUZZ_CC         the compiler driver rwfuzz assembles with (default cc)
 #   RWFUZZ_JOBS       worker processes (default 1); the output is the same
 #                     for any number
@@ -36,7 +36,7 @@ fi
 
 PROGRAMS=${RWFUZZ_PROGRAMS:-10000}
 SEED=${RWFUZZ_SEED:-0}
-MIN_KINDS=${RWFUZZ_MIN_KINDS:-60}
+MIN_KINDS=${RWFUZZ_MIN_KINDS:-75}
 JOBS=${RWFUZZ_JOBS:-1}
 SHORT=$((PROGRAMS / 10 > 0 ? PROGRAMS / 10 : 1))
 MODES=$("$RWFUZZ" 2>&1 | sed -n 's/^modes: //p' || true)

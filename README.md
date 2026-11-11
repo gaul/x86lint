@@ -368,7 +368,7 @@ and memory; a difference in the general registers, `xmm0`-`xmm7`, the
 defined flags or the scratch memory is a soundness bug, and so is a rewrite
 the rewriter or the assembler cannot apply. A control arm applies the same
 rewrites where x86lint refused to and must see some of them change a result.
-68 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
+81 of the rewriting rows run; [TODO.md](TODO.md), "rwfuzz coverage", lists
 the rest and why. `RWFUZZ_PROGRAMS` (10000) and `RWFUZZ_SEED` size and vary
 the run, `RWFUZZ_JOBS` splits it across worker processes without changing
 what it prints, and `tools/rwfuzz -f NAME MODE` narrows one to a single

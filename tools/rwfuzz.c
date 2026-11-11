@@ -61,9 +61,8 @@
 // Rows not run: the encoding-only rows whose original the assembler never
 // emits from text (an unneeded REX prefix, SIB byte or displacement, the
 // VEX/EVEX and XCHG encodings, the branch displacement), the security and
-// advisory classes (the scalar-merge rows among them), the APX rows (no
-// host runs them), and CAS loop foldable into LOCK op and missing MULX,
-// for which nothing is planted yet.
+// advisory classes (the scalar-merge rows among them), and the APX rows (no
+// host runs them).
 // A finding without a rewriter is counted as "no rewriter".
 //
 // A control arm applies the same rewrites where x86lint REFUSED to -- an
@@ -1258,7 +1257,53 @@ static void plant_fold(struct gen *g)
     int w = chance(&g->rng, 60) ? 64 : 32;
     static const char *const ALU[] = {"add", "sub", "and", "or", "xor", "cmp",
                                       "test", "mov"};
-    switch (rnd(&g->rng, 14)) {
+    switch (rnd(&g->rng, 16)) {
+    case 14: { // a LOCK CMPXCHG retry loop around one bitwise op
+        static const int CW[] = {64, 64, 32, 32, 16, 8};
+        int cw = CW[rnd(&g->rng, 6)];
+        int scratch = body_reg_other(g, 0);
+        int src = body_reg_other(g, 0);
+        static const char *const OPS[] = {"or", "and", "xor"};
+        any_mem(g, cw, a, sizeof(a));
+        if (chance(&g->rng, 60)) {
+            ADD("mov %s, %s", gpr(0, cw), a);   // the seed load
+        }
+        int start = g->p->n;
+        int head = new_label(g->p);
+        ADD("mov %s, %s", gpr(scratch, cw), gpr(0, cw))->label =
+            (short) head;
+        if (chance(&g->rng, 50) && src != scratch) {
+            ADD("%s %s, %s", OPS[rnd(&g->rng, 3)], gpr(scratch, cw),
+                gpr(src, cw));
+        } else {
+            imm_text(g, cw, b, sizeof(b));
+            ADD("%s %s, %s", OPS[rnd(&g->rng, 3)], gpr(scratch, cw), b);
+        }
+        ADD("lock cmpxchg %s, %s", a, gpr(scratch, cw));
+        ADD("jne @%d", head);
+        seal_last(g, g->p->n - start);
+        // Often kill what the loop leaves behind: RAX, the scratch and
+        // the flags, which the fold must prove dead.
+        if (chance(&g->rng, 70)) {
+            ADD("mov %s, 7", gpr(0, 32));
+            ADD("mov %s, 7", gpr(scratch, 32));
+            gen_flag_definer(g);
+        }
+        break;
+    }
+    case 15: { // a widening MUL whose high half is moved out of RDX
+        int mw = chance(&g->rng, 60) ? 64 : 32;
+        if (chance(&g->rng, 50)) {
+            ADD("mov %s, %s", gpr(0, mw), gpr(body_reg_other(g, 2), mw));
+        }
+        ADD("mul %s", gpr(chance(&g->rng, 85) ? 2 : body_reg(g), mw));
+        ADD("mov %s, %s", gpr(0, mw), gpr(2, mw));
+        if (chance(&g->rng, 70)) {
+            ADD("mov %s, 7", gpr(2, 32));
+        }
+        gen_flag_definer(g);
+        break;
+    }
     case 13: { // BMI and MOVBE shapes
         int bw = chance(&g->rng, 50) ? 64 : 32;
         switch (rnd(&g->rng, 4)) {
@@ -2780,6 +2825,64 @@ static bool rw_movbe(const struct view *v, int i, struct prog *out, char *why,
     return true;
 }
 
+// --- CAS loops and MULX ---
+
+// mov S, A ; op S, src ; lock cmpxchg [m], S ; jne head
+//   ->  lock op [m], src
+static bool rw_cas_loop(const struct view *v, int i, struct prog *out,
+                        char *why, size_t whylen)
+{
+    struct ins m, o, c;
+    ins_parse(v->p->it[i].text, &m);
+    int j = next_insn(v, i);
+    int k = j >= 0 ? next_insn(v, j) : -1;
+    int l = k >= 0 ? next_insn(v, k) : -1;
+    if (strcmp(m.mn, "mov") != 0 || l < 0 ||
+        strncmp(v->p->it[k].text, "lock cmpxchg ", 13) != 0) {
+        FAIL("not MOV, op, LOCK CMPXCHG, JNE");
+    }
+    ins_parse(v->p->it[j].text, &o);
+    ins_parse(v->p->it[k].text + 5, &c);
+    if ((strcmp(o.mn, "or") != 0 && strcmp(o.mn, "and") != 0 &&
+         strcmp(o.mn, "xor") != 0) || strcmp(o.op[0], m.op[0]) != 0 ||
+        strcmp(c.op[1], m.op[0]) != 0) {
+        FAIL("the loop's body is not one bitwise op on the CMPXCHG source");
+    }
+    char jne[TEXTLEN];
+    snprintf(jne, sizeof(jne), "jne @%d", v->p->it[i].label);
+    if (v->p->it[i].label < 0 || strcmp(v->p->it[l].text, jne) != 0) {
+        FAIL("`%s` does not branch back to the head", v->p->it[l].text);
+    }
+    item_set(&out->it[i], "lock %s %s, %s", o.mn, c.op[0], o.op[1]);
+    delete_item(out, j);
+    delete_item(out, k);
+    delete_item(out, l);
+    return true;
+}
+
+// mul rdx ; mov rax, rdx  ->  mulx rax, rdx, rax
+static bool rw_mulx(const struct view *v, int i, struct prog *out, char *why,
+                    size_t whylen)
+{
+    struct ins a, b;
+    ins_parse(v->p->it[i].text, &a);
+    int j = next_insn(v, i);
+    int r, bits, d, dbits, s2, sbits;
+    if (strcmp(a.mn, "mul") != 0 || !reg_op(a.op[0], &r, &bits) || r != 2 ||
+        j < 0) {
+        FAIL("not MUL RDX/EDX");
+    }
+    ins_parse(v->p->it[j].text, &b);
+    if (strcmp(b.mn, "mov") != 0 || !reg_op(b.op[0], &d, &dbits) || d != 0 ||
+        !reg_op(b.op[1], &s2, &sbits) || s2 != 2 || dbits != bits) {
+        FAIL("`%s` is not MOV RAX, RDX at the MUL's width", v->p->it[j].text);
+    }
+    item_set(&out->it[i], "mulx %s, %s, %s", gpr(0, bits), gpr(2, bits),
+             gpr(0, bits));
+    delete_item(out, j);
+    return true;
+}
+
 // --- the constant conditions ---
 
 // The value a straight-line producer leaves in register `num`, known in
@@ -3656,6 +3759,8 @@ static const struct kind KINDS[] = {
     {"missing BLSMSK", rw_blsmsk, MODE_FOLD},
     {"missing BLSI", rw_blsi, MODE_FOLD},
     {"missing MOVBE", rw_movbe, MODE_FOLD},
+    {"missing MULX", rw_mulx, MODE_FOLD},
+    {"CAS loop foldable into LOCK op", rw_cas_loop, MODE_FOLD},
     {"shift pair foldable into extend", rw_shift_pair, MODE_FLAGS},
     {"NEG foldable into ADD/SUB", rw_neg_fold, MODE_FLAGS},
     {"redundant zero-extension", rw_delete_ext, MODE_FLAGS},

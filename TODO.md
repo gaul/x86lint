@@ -992,7 +992,6 @@ Rows not run, and why:
 | Rows | Why |
 | --- | --- |
 | unneeded REX prefix, unneeded SIB byte, unneeded zero displacement, oversized displacement, oversized branch displacement, oversized XCHG encoding, oversized VEX/EVEX encoding, suboptimal VEX operand order, unneeded explicit register/immediate, unneeded LOCK prefix, unneeded REP prefix on RET | encoding-only: the assembler never emits the original from text, so a plant would need raw bytes. The REX row is found (584 times) but has no rewriter |
-| CAS loop foldable into LOCK op, missing MULX | no plant yet; both need a multi-instruction shape (a retry loop, the fixed-register MUL) the generator does not draw |
 | missing APX NDD, missing APX SETZU | no host here runs APX |
 | OR foldable into memory | needs `-m v8` and V8's pointer-compression register conventions |
 | missing BZHI, length-changing prefix stall, AVX-SSE transition, IBT-bypassing NOTRACK call, suboptimal SETcc zero-extension, missing SSE dependency break, merging scalar move, stale VEX merge operand | advisory or security classes, or advice with no single rewrite; rwfuzz asks only for `X86LINT_CLASS_REWRITE` |

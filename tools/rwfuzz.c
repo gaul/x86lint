@@ -1479,7 +1479,21 @@ static void plant_fold(struct gen *g)
         ADD("%s xmm%d, %s", LOADS[rnd(&g->rng, 5)], x, a);
         static const char *const OPS[] = {"addps", "paddd", "pxor", "xorps",
                                           "pand", "mulps"};
-        ADD("%s xmm%d, xmm%d", OPS[rnd(&g->rng, 6)], y, x);
+        unsigned shape = (unsigned) rnd(&g->rng, 10);
+        if (shape < 3) {
+            // VEX takes memory in its second source only; a load read as
+            // the first stays in its register.
+            int z = (int) rnd(&g->rng, 8);
+            if (shape < 2) {
+                ADD("v%s xmm%d, xmm%d, xmm%d", OPS[rnd(&g->rng, 6)], y, z, x);
+            } else {
+                ADD("v%s xmm%d, xmm%d, xmm%d", OPS[rnd(&g->rng, 6)], y, x, z);
+            }
+        } else if (shape < 4) {
+            ADD("pshufd xmm%d, xmm%d, %d", y, x, (int) rnd(&g->rng, 256));
+        } else {
+            ADD("%s xmm%d, xmm%d", OPS[rnd(&g->rng, 6)], y, x);
+        }
         if (chance(&g->rng, 60)) {
             ADD("xorps xmm%d, xmm%d", x, x);
         }
@@ -4456,12 +4470,35 @@ static bool rw_load_vecop(const struct view *v, int i, struct prog *out,
     if (j < 0) {
         FAIL("no consumer");
     }
+    // Memory takes the ModRM r/m slot: the last operand that is not an
+    // immediate, in the two-operand SSE forms (`paddd xmm0, xmm3`) and the
+    // three-operand ones, SSE with an immediate (`pshufd xmm0, xmm3, 27`)
+    // and VEX (`vpsubd xmm0, xmm1, xmm3`) alike. A VEX consumer reading the
+    // load in its first source has no memory form there.
     struct ins c;
     ins_parse(itext(v, j), &c);
-    if (c.nop != 2 || strcmp(c.op[1], in.op[0]) != 0) {
-        FAIL("`%s` does not read the loaded register", itext(v, j));
+    int64_t imm;
+    int rm = c.nop - 1;
+    if (rm >= 0 && imm_parse(c.op[rm], &imm)) {
+        --rm;
     }
-    item_set(&out->it[j], "%s %s, %s", c.mn, c.op[0], in.op[1]);
+    if (c.nop < 2 || c.nop > 3 || rm < 1 ||
+        strcmp(c.op[rm], in.op[0]) != 0) {
+        FAIL("`%s` does not read the loaded register in its r/m slot",
+             itext(v, j));
+    }
+    for (int o = 0; o < c.nop; ++o) {
+        if (o != rm && strcmp(c.op[o], in.op[0]) == 0) {
+            FAIL("`%s` reads the loaded register twice", itext(v, j));
+        }
+    }
+    char t[160];
+    int k = snprintf(t, sizeof(t), "%s ", c.mn);
+    for (int o = 0; o < c.nop; ++o) {
+        k += snprintf(t + k, sizeof(t) - (size_t) k, "%s%s", o ? ", " : "",
+                      o == rm ? in.op[1] : c.op[o]);
+    }
+    item_set(&out->it[j], "%s", t);
     delete_item(out, i);
     return true;
 }

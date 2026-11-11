@@ -4670,6 +4670,16 @@ int main(int argc, char **argv)
         return 2;
     }
     xed_tables_init();
+    // A stray store forms its address from a register, and the generator's
+    // register values cluster below 4 GB (small numbers, 32-bit values,
+    // truncated pointers); so must nothing of rwfuzz's. Linked without
+    // PIE, its .data, .bss and heap sit there, and a control rewrite
+    // storing through such a value corrupted them.
+    if ((uintptr_t) &enter_saved < ((uintptr_t) 1 << 32)) {
+        fprintf(stderr, "rwfuzz: linked without -pie, its own memory sits "
+                "below 4 GB where a program's stray stores reach it\n");
+        return 2;
+    }
 
     // Workers take batches from a shared counter; each writes a batch's
     // reports and tallies to files the parent reads back in batch order,

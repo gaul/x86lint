@@ -53,9 +53,11 @@ tools/shapescan: tools/shapescan.c tools/corpus.c tools/corpus.h x86lint.c x86li
 		tools/shapescan.c tools/corpus.c $(TOOL_LIBS) -o $@
 
 # rwfuzz runs x86lint's advice: it links the linter and assembles with the
-# host's compiler driver (RWFUZZ_CC, default cc). See rwfuzz-test.
+# host's compiler driver (RWFUZZ_CC, default cc). See rwfuzz-test. It must be
+# a PIE: the programs it runs form addresses from register values that
+# cluster below 4 GB, where a non-PIE link puts rwfuzz's own data and heap.
 tools/rwfuzz: tools/rwfuzz.c x86lint.o x86lint.h
-	$(CC) $(CFLAGS) -I ${XED_PATH}/kits/xed-install/include/ \
+	$(CC) $(CFLAGS) -pie -I ${XED_PATH}/kits/xed-install/include/ \
 		tools/rwfuzz.c x86lint.o ${XED_PATH}/obj/libxed.a -o $@
 
 tools/defuse: tools/defuse.c tools/corpus.c tools/corpus.h
